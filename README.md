@@ -54,37 +54,118 @@ Prefill throughput increases with prompt length (higher arithmetic intensity —
 - **Chat templates** — Llama 3 and ChatML (Qwen) instruct formats with `--chat`
 - **Temperature + top-p sampling** — configurable via `--temperature` and `--top-p`
 - **Streaming output** — tokens printed as generated
+- **API server** — OpenAI and Anthropic compatible HTTP endpoints with SSE streaming
 
 ## Usage
 
+### CLI inference
+
 ```
-cargo run --release -- --model models/llama-3.2-1b --prompt "The meaning of life is" --max-tokens 128
+cargo run --release -- run --model models/llama-3.2-1b --prompt "The meaning of life is" --max-tokens 128
 ```
 
 With Q4 quantization:
 
 ```
-cargo run --release -- --model models/llama-3.2-1b --prompt "The meaning of life is" --max-tokens 128 --quantize
+cargo run --release -- run --model models/llama-3.2-1b --prompt "The meaning of life is" --max-tokens 128 --quantize
 ```
 
 Chat mode (instruct models — auto-detects Llama 3 or ChatML template):
 
 ```
-cargo run --release -- --model models/llama-3.2-3b-instruct --prompt "Write a Python program that adds 4 numbers" --chat --temperature 0
-cargo run --release -- --model models/qwen-2.5-7b-instruct --prompt "Explain hash maps" --chat --temperature 0
+cargo run --release -- run --model models/llama-3.2-3b-instruct --prompt "Write a Python program that adds 4 numbers" --chat --temperature 0
+cargo run --release -- run --model models/qwen-2.5-7b-instruct --prompt "Explain hash maps" --chat --temperature 0
 ```
 
 Continuous batching (multiple prompts from a file):
 
 ```
-cargo run --release -- --model models/llama-3.2-1b --batch-file test_prompts.txt --max-tokens 64
+cargo run --release -- run --model models/llama-3.2-1b --batch-file test_prompts.txt --max-tokens 64
 ```
+
+### API server
+
+Start an OpenAI/Anthropic-compatible API server:
+
+```
+cargo run --release -- serve --model models/llama-3.2-1b-instruct --port 8080
+```
+
+The server exposes these endpoints:
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/v1/chat/completions` | POST | OpenAI chat completions |
+| `/v1/completions` | POST | OpenAI text completions |
+| `/v1/models` | GET | List available models |
+| `/v1/messages` | POST | Anthropic messages |
+| `/health` | GET | Health check |
+
+All POST endpoints support `"stream": true` for Server-Sent Events (SSE) streaming.
+
+**OpenAI chat completion:**
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "What is 2+2?"}],
+    "max_tokens": 64,
+    "temperature": 0
+  }'
+```
+
+**OpenAI chat completion (streaming):**
+
+```bash
+curl -N http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "Explain hash maps"}],
+    "max_tokens": 256,
+    "stream": true
+  }'
+```
+
+**OpenAI text completion:**
+
+```bash
+curl http://localhost:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "The capital of France is", "max_tokens": 32}'
+```
+
+**Anthropic messages:**
+
+```bash
+curl http://localhost:8080/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "What is 2+2?"}],
+    "max_tokens": 64,
+    "system": "You are a helpful math tutor."
+  }'
+```
+
+**Anthropic messages (streaming):**
+
+```bash
+curl -N http://localhost:8080/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "Hello"}],
+    "max_tokens": 64,
+    "stream": true
+  }'
+```
+
+The server works as a drop-in backend for any tool that speaks the OpenAI or Anthropic API — just change the base URL to `http://localhost:8080`.
 
 ## Architecture
 
 ```
 src/
-├── main.rs        — CLI, single-sequence inference (prefill + decode)
+├── main.rs        — CLI entry point (run / serve subcommands)
 ├── config.rs      — HuggingFace config.json parsing, ModelArch detection
 ├── model.rs       — Transformer forward pass (single-token + batched prefill)
 ├── engine.rs      — Continuous batching loop (scheduler + model)
@@ -94,6 +175,10 @@ src/
 ├── tokenizer.rs   — BPE tokenizer with per-model special tokens
 ├── chat.rs        — Chat template formatter (Llama 3 + ChatML)
 ├── sampler.rs     — Temperature + top-p sampling
+├── api/
+│   ├── mod.rs     — HTTP server setup, inference worker thread
+│   ├── openai.rs  — OpenAI-compatible handlers (chat/completions/models)
+│   └── anthropic.rs — Anthropic-compatible handler (messages)
 └── gpu/
     ├── mod.rs     — GpuBackend trait (platform-generic interface)
     ├── metal/     — Metal backend + compute shaders
@@ -112,15 +197,20 @@ Model code is generic over a `GpuBackend` trait with an associated `Tensor` type
 ### Inference pipeline
 
 ```
-Single-sequence mode:
+Single-sequence mode (rllm run):
   load config → create backend → load tokenizer → load weights → create model
   → create paged KV pool + prefill buffers
   → encode prompt → batched GEMM prefill → decode loop (stream tokens)
 
-Batch mode:
+Batch mode (rllm run --batch-file):
   load config → create backend → load tokenizer → load weights → create model
   → create KV pool + scheduler + engine
   → submit all prompts → engine.step() loop until all sequences complete
+
+Server mode (rllm serve):
+  spawn worker thread (owns backend + model + KV pool)
+  → start axum HTTP server on tokio runtime
+  → per request: handler → channel → worker (prefill + decode) → stream tokens back
 ```
 
 ### Optimisation stack

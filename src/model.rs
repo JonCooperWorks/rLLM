@@ -81,6 +81,7 @@ const MAX_SEQ_LEN: usize = 4096;
 /// Flat mode pre-allocates [MAX_SEQ_LEN, kv_dim] per layer — simple but
 /// wastes memory for short sequences and can't share across concurrent
 /// requests.  Paged mode allocates blocks on demand from a shared pool.
+#[allow(dead_code)]
 pub(crate) enum KvMode<B: GpuBackend> {
     /// Original flat cache (backward compatible).
     Flat {
@@ -103,6 +104,7 @@ pub(crate) struct Model<'a, B: GpuBackend> {
     // -----------------------------------------------------------------------
     // KV cache: either flat or paged.
     // -----------------------------------------------------------------------
+    #[allow(dead_code)]
     kv_mode: KvMode<B>,
 
     // -----------------------------------------------------------------------
@@ -157,6 +159,7 @@ impl<'a, B: GpuBackend> Model<'a, B> {
     ///
     /// `num_blocks` controls the total KV cache capacity across all sequences.
     /// Each block holds BLOCK_SIZE (16) token positions.
+    #[allow(dead_code)]
     pub fn new_paged(
         config: ModelConfig,
         weights: ModelWeights<B>,
@@ -231,6 +234,7 @@ impl<'a, B: GpuBackend> Model<'a, B> {
     // once per generated token.  The KV cache accumulates across all calls,
     // so each new token attends to the full history.
     // =======================================================================
+    #[allow(dead_code)]
     pub fn forward(&mut self, token_id: u32) -> anyhow::Result<()> {
         let hidden_size = self.config.hidden_size as u32;
         let num_heads = self.config.num_attention_heads as u32;
@@ -676,6 +680,7 @@ pub(crate) struct PrefillBuffers<B: GpuBackend> {
     pub up_buf: B::Tensor,      // [max_chunk, intermediate_size]
     pub positions: B::Tensor,   // [max_chunk] u32 (stored as F32 for byte compat)
     pub token_ids: B::Tensor,   // [max_chunk] u32 (stored as F32 for byte compat)
+    #[allow(dead_code)]
     pub max_chunk: usize,
 }
 

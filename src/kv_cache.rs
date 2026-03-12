@@ -45,6 +45,7 @@ pub(crate) const MAX_BLOCKS_PER_SEQ: usize = 256;
 /// The pool owns the physical GPU memory for all K and V caches across all
 /// layers.  Individual sequences get assigned physical blocks from this pool
 /// via their block tables.
+#[allow(dead_code)]
 pub(crate) struct KvPool<B: GpuBackend> {
     /// Physical K cache pool: one buffer per layer.
     /// Shape per buffer: [num_physical_blocks * BLOCK_SIZE, kv_dim] in bf16.
@@ -119,6 +120,7 @@ impl<B: GpuBackend> KvPool<B> {
     }
 
     /// Number of physical blocks in the pool.
+    #[allow(dead_code)]
     pub fn total_blocks(&self) -> usize {
         self.num_physical_blocks
     }
@@ -156,11 +158,13 @@ impl<B: GpuBackend> KvPool<B> {
     }
 
     /// Number of layers.
+    #[allow(dead_code)]
     pub fn num_layers(&self) -> usize {
         self.num_layers
     }
 
     /// KV dimension.
+    #[allow(dead_code)]
     pub fn kv_dim(&self) -> usize {
         self.kv_dim
     }
@@ -235,6 +239,7 @@ impl<B: GpuBackend> SeqKvState<B> {
     }
 
     /// Number of logical blocks currently allocated.
+    #[allow(dead_code)]
     pub fn num_blocks(&self) -> usize {
         self.block_table_cpu.len()
     }

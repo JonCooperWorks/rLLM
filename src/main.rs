@@ -7,17 +7,21 @@
 //   Entry point for the inference engine.  Parses CLI arguments, wires up all
 //   components (config, backend, tokenizer, weights, model), and runs inference.
 //
-// Two inference modes:
+// Three modes:
 //
-//   1. SINGLE-SEQUENCE MODE (default — just --prompt):
+//   1. SINGLE-SEQUENCE MODE (`rllm run --prompt "..."`)
 //      Processes one prompt, generates tokens, streams output.  Uses:
 //        - Batched prefill: entire prompt in one GEMM forward pass (fast)
 //        - Single-token decode: one mat-vec forward per generated token
 //        - Paged KV cache: allocates memory on demand in 16-token blocks
 //
-//   2. BATCHED MODE (--batch-file):
+//   2. BATCHED MODE (`rllm run --batch-file prompts.txt`)
 //      Processes multiple prompts concurrently via the engine's continuous
 //      batching loop.  Uses the scheduler to manage sequences.
+//
+//   3. SERVER MODE (`rllm serve --model path --port 8080`)
+//      Starts an HTTP server with OpenAI and Anthropic compatible APIs.
+//      Supports both streaming (SSE) and non-streaming responses.
 //
 // Prefill vs. generation (the two phases of inference):
 //
@@ -44,6 +48,7 @@
 //   weight matrix is reused across all 100 input rows.
 // ===========================================================================
 
+mod api;
 mod chat;
 mod config;
 mod engine;
@@ -62,10 +67,25 @@ use std::process::ExitCode;
 use clap::Parser;
 use gpu::GpuBackend; // Import the trait so we can call .device_name() on the backend.
 
-/// CLI argument definition using clap's derive API.
+/// CLI definition using clap subcommands.
 #[derive(Parser)]
 #[command(name = "rllm", about = "Rust LLM inference engine")]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Run inference on a single prompt or batch file.
+    Run(RunArgs),
+    /// Start an OpenAI/Anthropic-compatible API server.
+    Serve(api::ServeArgs),
+}
+
+/// Arguments for the `run` subcommand (single-sequence and batched inference).
+#[derive(clap::Args)]
+struct RunArgs {
     /// Path to model directory (contains config.json, tokenizer.json, *.safetensors).
     #[arg(long)]
     model: PathBuf,
@@ -108,12 +128,17 @@ struct Args {
 }
 
 fn main() -> ExitCode {
-    let args = Args::parse();
+    let cli = Cli::parse();
 
-    let result = if args.batch_file.is_some() {
-        run_batched(args)
-    } else {
-        run(args)
+    let result = match cli.command {
+        Command::Run(args) => {
+            if args.batch_file.is_some() {
+                run_batched(args)
+            } else {
+                run(args)
+            }
+        }
+        Command::Serve(args) => api::serve(args),
     };
 
     if let Err(e) = result {
@@ -125,7 +150,7 @@ fn main() -> ExitCode {
 
 /// Main inference pipeline.  Separated from main() for clean error propagation
 /// via anyhow (main() returns ExitCode, not Result).
-fn run(args: Args) -> anyhow::Result<()> {
+fn run(args: RunArgs) -> anyhow::Result<()> {
     // --- Step 1: Load model configuration + detect architecture ---
     let config = config::ModelConfig::from_file(&args.model.join("config.json"))?;
     let arch = config.arch()?;
@@ -276,7 +301,7 @@ fn run(args: Args) -> anyhow::Result<()> {
 ///
 /// Reads prompts from a file (one per line), submits them all to the engine,
 /// and runs the continuous batching loop until all sequences are complete.
-fn run_batched(args: Args) -> anyhow::Result<()> {
+fn run_batched(args: RunArgs) -> anyhow::Result<()> {
     let batch_file = args.batch_file.as_ref().unwrap();
 
     // Load config, backend, tokenizer, weights (same as single mode).

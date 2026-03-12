@@ -108,6 +108,7 @@ impl ModelArch {
 /// Uses serde's `Deserialize` trait — any field not present in the JSON
 /// that has a `#[serde(default)]` attribute will use its type's Default value.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct ModelConfig {
     /// Architecture identifier (e.g. "llama", "qwen2").
     /// Detected automatically from config.json.
@@ -155,6 +156,7 @@ pub struct ModelConfig {
 /// to some RoPE dimensions, allowing extrapolation to 131072 tokens.
 /// This is unused in Phase 1 (max 4096 tokens).
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct RopeScaling {
     /// Scaling algorithm type (e.g. "llama3").
     pub rope_type: String,
@@ -189,6 +191,7 @@ impl ModelConfig {
 
     /// How many query heads share each KV head.
     /// For Llama 3.2 1B: 32 / 8 = 4 query heads per KV group.
+    #[allow(dead_code)]
     pub fn num_heads_per_kv_group(&self) -> usize {
         self.num_attention_heads / self.num_key_value_heads
     }

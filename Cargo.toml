@@ -14,6 +14,10 @@ tokenizers = { version = "0.21", default-features = false, features = ["progress
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["derive"] }
 rand = "0.9"
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+async-stream = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.33.0"

@@ -199,6 +199,7 @@ pub(crate) trait GpuBackend: Send + Sync {
     /// Grouped-Query Attention: compute softmax(Q·K^T / √d) · V
     /// Uses the flat KV cache (all positions 0..seq_len).
     /// With GQA, multiple query heads share one KV head (4:1 in Llama 3.2).
+    #[allow(dead_code)]
     fn attention(
         &self,
         q: &Self::Tensor,
@@ -231,6 +232,7 @@ pub(crate) trait GpuBackend: Send + Sync {
 
     /// Write a new K or V vector into the flat KV cache at position `pos`.
     /// The cache layout is [max_seq_len, num_kv_heads, head_dim].
+    #[allow(dead_code)]
     fn copy_to_kv_cache(
         &self,
         src: &Self::Tensor,

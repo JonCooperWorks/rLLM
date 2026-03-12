@@ -44,6 +44,7 @@ pub(crate) struct SequenceRequest {
 
 /// State of a single active sequence.
 pub(crate) struct Sequence<B: GpuBackend> {
+    #[allow(dead_code)]
     pub id: SeqId,
     /// Tokens remaining to prefill (drained as prefill progresses).
     pub pending_prefill: VecDeque<u32>,
@@ -58,6 +59,7 @@ pub(crate) struct Sequence<B: GpuBackend> {
 }
 
 /// A batch of tokens to process in one forward pass.
+#[allow(dead_code)]
 pub(crate) struct Batch {
     /// Token IDs to process.
     pub token_ids: Vec<u32>,
@@ -155,6 +157,7 @@ impl<B: GpuBackend> Scheduler<B> {
     }
 
     /// Number of active sequences.
+    #[allow(dead_code)]
     pub fn active_count(&self) -> usize {
         self.active.len()
     }

@@ -125,10 +125,12 @@ pub(crate) struct MetalBackend {
     pipeline_matvec: metal::ComputePipelineState,
     pipeline_matvec_q4: metal::ComputePipelineState,
     pipeline_rope: metal::ComputePipelineState,
+    #[allow(dead_code)]
     pipeline_attention: metal::ComputePipelineState,
     pipeline_silu_mul: metal::ComputePipelineState,
     pipeline_add: metal::ComputePipelineState,
     pipeline_embed_lookup: metal::ComputePipelineState,
+    #[allow(dead_code)]
     pipeline_copy_kv: metal::ComputePipelineState,
     pipeline_paged_copy_kv: metal::ComputePipelineState,
     pipeline_paged_attention: metal::ComputePipelineState,
@@ -353,6 +355,7 @@ struct RopeParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 struct AttentionParams {
     seq_len: u32,
     num_heads: u32,
@@ -375,6 +378,7 @@ struct EmbedParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 struct CopyKvParams {
     pos: u32,
     num_kv_heads: u32,
