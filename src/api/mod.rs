@@ -263,17 +263,20 @@ fn spawn_worker(
 
             let mut model = model::Model::new(config.clone(), weights, &backend)?;
 
-            // KV pool: 512 blocks × 16 tokens/block = 8192 max context.
-            let num_blocks = 512;
+            // KV pool: 8192 blocks × 16 tokens/block = 131072 (128K) max context.
+            // Memory: num_blocks * BLOCK_SIZE * kv_dim * 2 bytes * 2 (K+V) * num_layers.
+            // For Llama 3.1 8B (kv_dim=1024, 32 layers): 8192 * 16 * 1024 * 2 * 2 * 32 = ~16 GB.
+            let num_blocks = 8192;
             let kv_dim = config.num_key_value_heads * config.head_dim;
             let mut kv_pool = kv_cache::KvPool::new(
                 &backend, num_blocks, kv_dim, config.num_hidden_layers,
             );
-            let prefill_bufs = model::PrefillBuffers::new(&backend, &config, 1024);
+            let max_prefill = 4096;
+            let prefill_bufs = model::PrefillBuffers::new(&backend, &config, max_prefill);
 
             eprintln!(
-                "KV cache: {} blocks ({} max tokens), prefill up to 1024 tokens",
-                num_blocks, num_blocks * kv_cache::BLOCK_SIZE
+                "KV cache: {} blocks ({} max tokens), prefill up to {} tokens",
+                num_blocks, num_blocks * kv_cache::BLOCK_SIZE, max_prefill
             );
 
             // Signal success to the main thread.

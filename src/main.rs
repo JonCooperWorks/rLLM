@@ -193,14 +193,15 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
     // used by the GEMM-based prefill forward pass.  Allocated once, reused.
     let mut model = model::Model::new(config.clone(), weights, &backend)?;
 
-    let num_blocks = 256; // 256 blocks × 16 tokens/block = 4096 max positions.
+    let num_blocks = 8192; // 8192 blocks × 16 tokens/block = 131072 (128K) max positions.
     let kv_dim = config.num_key_value_heads * config.head_dim;
     let mut kv_pool = kv_cache::KvPool::new(&backend, num_blocks, kv_dim, config.num_hidden_layers);
     let mut seq_state = kv_pool.new_sequence(&backend);
-    let prefill_bufs = model::PrefillBuffers::new(&backend, &config, 1024);
+    let max_prefill = 4096;
+    let prefill_bufs = model::PrefillBuffers::new(&backend, &config, max_prefill);
     eprintln!(
-        "KV cache: {} blocks × {} tokens/block, batched prefill up to 1024 tokens",
-        num_blocks, kv_cache::BLOCK_SIZE
+        "KV cache: {} blocks ({} max tokens), prefill up to {} tokens",
+        num_blocks, num_blocks * kv_cache::BLOCK_SIZE, max_prefill
     );
 
     // --- Step 6: Encode prompt ---

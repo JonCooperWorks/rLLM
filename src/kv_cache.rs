@@ -37,8 +37,8 @@ use crate::gpu::{GpuBackend, TensorDtype};
 pub(crate) const BLOCK_SIZE: usize = 16;
 
 /// Maximum number of logical blocks per sequence (supports up to
-/// MAX_BLOCKS_PER_SEQ * BLOCK_SIZE = 256 * 16 = 4096 tokens).
-pub(crate) const MAX_BLOCKS_PER_SEQ: usize = 256;
+/// MAX_BLOCKS_PER_SEQ * BLOCK_SIZE = 8192 * 16 = 131072 tokens = 128K context).
+pub(crate) const MAX_BLOCKS_PER_SEQ: usize = 8192;
 
 /// A pool of KV cache blocks shared across all sequences.
 ///

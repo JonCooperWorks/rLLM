@@ -69,7 +69,7 @@ pub(crate) struct MessagesRequest {
     pub system: Option<String>,
 }
 
-fn default_max_tokens() -> usize { 128 }
+fn default_max_tokens() -> usize { 4096 }
 
 // ---------------------------------------------------------------------------
 // Response types.

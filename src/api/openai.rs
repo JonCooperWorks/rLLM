@@ -72,7 +72,7 @@ pub(crate) struct CompletionRequest {
     pub stream: bool,
 }
 
-fn default_max_tokens() -> usize { 128 }
+fn default_max_tokens() -> usize { 4096 }
 fn default_temperature() -> f32 { 1.0 }
 fn default_top_p() -> f32 { 0.9 }
 
