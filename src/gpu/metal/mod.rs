@@ -130,6 +130,17 @@ pub(crate) struct MetalBackend {
     pipeline_add: metal::ComputePipelineState,
     pipeline_embed_lookup: metal::ComputePipelineState,
     pipeline_copy_kv: metal::ComputePipelineState,
+    pipeline_paged_copy_kv: metal::ComputePipelineState,
+    pipeline_paged_attention: metal::ComputePipelineState,
+
+    // Phase 3: batched prefill pipelines.
+    pipeline_gemm_bf16: metal::ComputePipelineState,
+    pipeline_gemm_q4: metal::ComputePipelineState,
+    pipeline_rms_norm_batch: metal::ComputePipelineState,
+    pipeline_embed_lookup_batch: metal::ComputePipelineState,
+    pipeline_rope_batch: metal::ComputePipelineState,
+    pipeline_paged_copy_kv_batch: metal::ComputePipelineState,
+    pipeline_prefill_attention: metal::ComputePipelineState,
 
     // Async dispatch tracking.
     // Set to true when any command buffer is committed without waiting.
@@ -164,6 +175,26 @@ impl MetalBackend {
             Self::make_pipeline(&device, METAL_SOURCE_EMBED, "embed_lookup", &compile_opts)?;
         let pipeline_copy_kv =
             Self::make_pipeline(&device, METAL_SOURCE_ATTENTION, "copy_to_kv_cache", &compile_opts)?;
+        let pipeline_paged_copy_kv =
+            Self::make_pipeline(&device, METAL_SOURCE_ATTENTION, "copy_to_paged_kv_cache", &compile_opts)?;
+        let pipeline_paged_attention =
+            Self::make_pipeline(&device, METAL_SOURCE_ATTENTION, "paged_attention", &compile_opts)?;
+
+        // Phase 3: batched prefill pipelines.
+        let pipeline_gemm_bf16 =
+            Self::make_pipeline(&device, METAL_SOURCE_MATMUL, "gemm_bf16", &compile_opts)?;
+        let pipeline_gemm_q4 =
+            Self::make_pipeline(&device, METAL_SOURCE_MATMUL, "gemm_q4", &compile_opts)?;
+        let pipeline_rms_norm_batch =
+            Self::make_pipeline(&device, METAL_SOURCE_RMS_NORM, "rms_norm_batch", &compile_opts)?;
+        let pipeline_embed_lookup_batch =
+            Self::make_pipeline(&device, METAL_SOURCE_EMBED, "embed_lookup_batch", &compile_opts)?;
+        let pipeline_rope_batch =
+            Self::make_pipeline(&device, METAL_SOURCE_ROPE, "rotary_embedding_batch", &compile_opts)?;
+        let pipeline_paged_copy_kv_batch =
+            Self::make_pipeline(&device, METAL_SOURCE_ATTENTION, "copy_to_paged_kv_cache_batch", &compile_opts)?;
+        let pipeline_prefill_attention =
+            Self::make_pipeline(&device, METAL_SOURCE_ATTENTION, "prefill_attention", &compile_opts)?;
 
         Ok(Self {
             device,
@@ -178,6 +209,15 @@ impl MetalBackend {
             pipeline_add,
             pipeline_embed_lookup,
             pipeline_copy_kv,
+            pipeline_paged_copy_kv,
+            pipeline_paged_attention,
+            pipeline_gemm_bf16,
+            pipeline_gemm_q4,
+            pipeline_rms_norm_batch,
+            pipeline_embed_lookup_batch,
+            pipeline_rope_batch,
+            pipeline_paged_copy_kv_batch,
+            pipeline_prefill_attention,
             has_pending_work: AtomicBool::new(false),
         })
     }
@@ -341,6 +381,79 @@ struct CopyKvParams {
     head_dim: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PagedCopyKvParams {
+    pos: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    block_size: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PagedAttentionParams {
+    seq_len: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    block_size: u32,
+}
+
+// Phase 3: batched prefill param structs.
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GemmParams {
+    batch_size: u32,
+    m: u32,
+    k: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RmsNormBatchParams {
+    hidden_size: u32,
+    eps: f32,
+    batch_size: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct EmbedBatchParams {
+    batch_size: u32,
+    hidden_dim: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RopeBatchParams {
+    batch_size: u32,
+    rope_theta: f32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PagedCopyKvBatchParams {
+    batch_size: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    block_size: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PrefillAttentionParams {
+    chunk_size: u32,
+    start_pos: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+}
+
 // ---------------------------------------------------------------------------
 // GpuBackend trait implementation.
 //
@@ -398,6 +511,23 @@ impl GpuBackend for MetalBackend {
             buffer,
             shape: shape.to_vec(),
             dtype,
+        }
+    }
+
+    fn copy_to_tensor(&self, tensor: &MetalTensor, src: &[u8]) {
+        let byte_count = tensor.byte_count();
+        assert!(
+            src.len() <= byte_count,
+            "copy_to_tensor: src too large ({} > {})",
+            src.len(),
+            byte_count
+        );
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                tensor.buffer.contents() as *mut u8,
+                src.len(),
+            );
         }
     }
 
@@ -603,6 +733,267 @@ impl GpuBackend for MetalBackend {
             &[(&src.buffer, 1), (&cache.buffer, 2)],
             MTLSize::new(size as u64, 1, 1),
             MTLSize::new(256.min(size as u64), 1, 1),
+        );
+    }
+
+    /// Copy a new K or V vector into a paged KV cache pool.
+    fn copy_to_paged_kv_cache(
+        &self,
+        src: &MetalTensor,
+        pool: &MetalTensor,
+        block_table: &MetalTensor,
+        pos: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) {
+        let params = PagedCopyKvParams {
+            pos,
+            num_kv_heads,
+            head_dim,
+            block_size: crate::kv_cache::BLOCK_SIZE as u32,
+        };
+        let size = num_kv_heads * head_dim;
+        self.dispatch_async(
+            &self.pipeline_paged_copy_kv,
+            &params,
+            &[
+                (&src.buffer, 1),
+                (&pool.buffer, 2),
+                (&block_table.buffer, 3),
+            ],
+            MTLSize::new(size as u64, 1, 1),
+            MTLSize::new(256.min(size as u64), 1, 1),
+        );
+    }
+
+    /// Paged attention: one threadgroup of 256 threads per query head.
+    fn paged_attention(
+        &self,
+        q: &MetalTensor,
+        k_pool: &MetalTensor,
+        v_pool: &MetalTensor,
+        block_table: &MetalTensor,
+        out: &MetalTensor,
+        seq_len: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) {
+        let params = PagedAttentionParams {
+            seq_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            block_size: crate::kv_cache::BLOCK_SIZE as u32,
+        };
+        let threads_per_group: u64 = 256;
+        self.dispatch_async(
+            &self.pipeline_paged_attention,
+            &params,
+            &[
+                (&q.buffer, 1),
+                (&k_pool.buffer, 2),
+                (&v_pool.buffer, 3),
+                (&block_table.buffer, 4),
+                (&out.buffer, 5),
+            ],
+            MTLSize::new(num_heads as u64 * threads_per_group, 1, 1),
+            MTLSize::new(threads_per_group, 1, 1),
+        );
+    }
+
+    // --- Batched / prefill operations ---
+    //
+    // These methods replace the single-token operations above for the prefill
+    // phase.  Instead of processing one token at a time (mat-vec), they process
+    // the entire prompt (mat-mat / GEMM).
+    //
+    // The key difference in dispatch: where single-token operations have
+    //   grid = M * 32   (one SIMD group per output row)
+    // batched operations have
+    //   grid = batch_size * M * 32   (one SIMD group per (batch, row) pair)
+    //
+    // This launches batch_size × more thread groups, fully saturating the GPU's
+    // compute units.  The weight matrix is loaded once and reused across all
+    // batch elements — the fundamental reason GEMM is faster than repeated matvec.
+
+    /// Batched GEMM: out = input @ weight^T for batch_size input rows.
+    /// Grid: batch_size * M * 32 threads (32 per output element).
+    fn matmul_batch(
+        &self,
+        weight: &MetalTensor,
+        input: &MetalTensor,
+        out: &MetalTensor,
+        batch_size: u32,
+        m: u32,
+        k: u32,
+    ) {
+        let params = GemmParams { batch_size, m, k };
+        let pipeline = match weight.dtype {
+            TensorDtype::Q4 => &self.pipeline_gemm_q4,
+            _ => &self.pipeline_gemm_bf16,
+        };
+        self.dispatch_async(
+            pipeline,
+            &params,
+            &[
+                (&weight.buffer, 1),
+                (&input.buffer, 2),
+                (&out.buffer, 3),
+            ],
+            MTLSize::new(batch_size as u64 * m as u64 * 32, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+    }
+
+    /// Batched RMSNorm: one threadgroup of 256 per row.
+    fn rms_norm_batch(
+        &self,
+        input: &MetalTensor,
+        weight: &MetalTensor,
+        eps: f32,
+        out: &MetalTensor,
+        batch_size: u32,
+    ) {
+        let hidden_size = weight.shape[0] as u32;
+        let params = RmsNormBatchParams { hidden_size, eps, batch_size };
+        self.dispatch_async(
+            &self.pipeline_rms_norm_batch,
+            &params,
+            &[
+                (&input.buffer, 1),
+                (&weight.buffer, 2),
+                (&out.buffer, 3),
+            ],
+            MTLSize::new(batch_size as u64 * 256, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+    }
+
+    /// Batched embedding lookup: N token IDs → [batch_size, hidden_dim].
+    fn embed_lookup_batch(
+        &self,
+        table: &MetalTensor,
+        token_ids: &MetalTensor,
+        out: &MetalTensor,
+        batch_size: u32,
+        hidden_dim: u32,
+    ) {
+        let params = EmbedBatchParams { batch_size, hidden_dim };
+        let total = batch_size as u64 * hidden_dim as u64;
+        self.dispatch_async(
+            &self.pipeline_embed_lookup_batch,
+            &params,
+            &[
+                (&table.buffer, 1),
+                (&token_ids.buffer, 2),
+                (&out.buffer, 3),
+            ],
+            MTLSize::new(total, 1, 1),
+            MTLSize::new(256.min(total), 1, 1),
+        );
+    }
+
+    /// Batched RoPE: per-token positions.
+    fn rope_batch(
+        &self,
+        q: &MetalTensor,
+        k: &MetalTensor,
+        positions: &MetalTensor,
+        rope_theta: f32,
+        batch_size: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) {
+        let params = RopeBatchParams {
+            batch_size,
+            rope_theta,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        };
+        let pairs_per_token = (num_heads + num_kv_heads) * (head_dim / 2);
+        let total = batch_size as u64 * pairs_per_token as u64;
+        self.dispatch_async(
+            &self.pipeline_rope_batch,
+            &params,
+            &[
+                (&q.buffer, 1),
+                (&k.buffer, 2),
+                (&positions.buffer, 3),
+            ],
+            MTLSize::new(total, 1, 1),
+            MTLSize::new(256.min(total), 1, 1),
+        );
+    }
+
+    /// Batched paged KV cache write: N vectors at different positions.
+    fn copy_to_paged_kv_cache_batch(
+        &self,
+        src: &MetalTensor,
+        pool: &MetalTensor,
+        block_table: &MetalTensor,
+        positions: &MetalTensor,
+        batch_size: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) {
+        let params = PagedCopyKvBatchParams {
+            batch_size,
+            num_kv_heads,
+            head_dim,
+            block_size: crate::kv_cache::BLOCK_SIZE as u32,
+        };
+        let kv_dim = num_kv_heads * head_dim;
+        let total = batch_size as u64 * kv_dim as u64;
+        self.dispatch_async(
+            &self.pipeline_paged_copy_kv_batch,
+            &params,
+            &[
+                (&src.buffer, 1),
+                (&pool.buffer, 2),
+                (&block_table.buffer, 3),
+                (&positions.buffer, 4),
+            ],
+            MTLSize::new(total, 1, 1),
+            MTLSize::new(256.min(total), 1, 1),
+        );
+    }
+
+    /// Causal prefill attention on dense Q/K/V tensors.
+    fn prefill_attention(
+        &self,
+        q: &MetalTensor,
+        k: &MetalTensor,
+        v: &MetalTensor,
+        out: &MetalTensor,
+        chunk_size: u32,
+        start_pos: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) {
+        let params = PrefillAttentionParams {
+            chunk_size,
+            start_pos,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        };
+        let threads_per_group: u64 = 256;
+        let num_threadgroups = chunk_size as u64 * num_heads as u64;
+        self.dispatch_async(
+            &self.pipeline_prefill_attention,
+            &params,
+            &[
+                (&q.buffer, 1),
+                (&k.buffer, 2),
+                (&v.buffer, 3),
+                (&out.buffer, 4),
+            ],
+            MTLSize::new(num_threadgroups * threads_per_group, 1, 1),
+            MTLSize::new(threads_per_group, 1, 1),
         );
     }
 }

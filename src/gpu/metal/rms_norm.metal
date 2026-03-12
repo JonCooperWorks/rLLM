@@ -143,3 +143,86 @@ kernel void rms_norm(
         output[i] = bfloat(val * scale * float(weight[i]));
     }
 }
+
+// ===========================================================================
+// Batched RMSNorm kernel.
+//
+// LEARNING OVERVIEW
+//
+// What this kernel does:
+//   Normalises each row of [batch_size, hidden_size] independently using the
+//   same shared weight vector [hidden_size].  One threadgroup of 256 threads
+//   per row — same algorithm as the single-vector version above.
+//
+// Why a separate kernel instead of calling rms_norm in a loop?
+//   A loop would serialise the normalisation of each row: launch kernel,
+//   wait for threadgroup sync, write result, launch next kernel.  The
+//   batched version launches ALL threadgroups at once — the GPU processes
+//   batch_size rows in parallel, one threadgroup per row.  For a 100-token
+//   prefill, that's 100 threadgroups running simultaneously.
+//
+//   The weight vector [hidden_size] is broadcast (read-only, same for all
+//   rows), so it gets loaded into cache once and reused across threadgroups.
+//
+// Dispatch model:
+//   Grid: batch_size * 256 total threads.
+//   Threadgroup: 256.
+//   Each threadgroup handles one row (identified by threadgroup_position_in_grid).
+// ===========================================================================
+
+struct RmsNormBatchParams {
+    uint hidden_size;
+    float eps;
+    uint batch_size;
+};
+
+kernel void rms_norm_batch(
+    constant RmsNormBatchParams& params [[buffer(0)]],
+    device const bfloat* input          [[buffer(1)]],  // [batch_size, hidden_size]
+    device const bfloat* weight         [[buffer(2)]],  // [hidden_size]
+    device bfloat* output               [[buffer(3)]],  // [batch_size, hidden_size]
+    uint row_id                         [[threadgroup_position_in_grid]],
+    uint tid                            [[thread_position_in_threadgroup]],
+    uint tg_size                        [[threads_per_threadgroup]]
+) {
+    if (row_id >= params.batch_size) return;
+
+    const uint hidden = params.hidden_size;
+    device const bfloat* row_in  = input  + row_id * hidden;
+    device bfloat*       row_out = output + row_id * hidden;
+
+    // Phase 1: sum of squares.
+    float sum_sq = 0.0f;
+    for (uint i = tid; i < hidden; i += tg_size) {
+        float val = float(row_in[i]);
+        sum_sq += val * val;
+    }
+
+    // Phase 2: SIMD reduction.
+    sum_sq = simd_sum(sum_sq);
+
+    // Phase 3: cross-SIMD reduction.
+    threadgroup float shared[32];
+    uint simd_group_id = tid / 32;
+    uint simd_lane_id = tid % 32;
+
+    if (simd_lane_id == 0) shared[simd_group_id] = sum_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group_id == 0) {
+        uint num_simd_groups = (tg_size + 31) / 32;
+        float val = (simd_lane_id < num_simd_groups) ? shared[simd_lane_id] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane_id == 0) shared[0] = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float mean_sq = shared[0] / float(hidden);
+    float scale = rsqrt(mean_sq + params.eps);
+
+    // Phase 4: normalise and scale.
+    for (uint i = tid; i < hidden; i += tg_size) {
+        float val = float(row_in[i]);
+        row_out[i] = bfloat(val * scale * float(weight[i]));
+    }
+}

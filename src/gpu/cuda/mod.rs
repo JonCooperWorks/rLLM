@@ -26,7 +26,16 @@ impl super::GpuBackend for CudaBackend {
     fn silu_mul(&self, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: u32) { unreachable!() }
     fn add(&self, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: u32) { unreachable!() }
     fn embed_lookup(&self, _: &CudaTensor, _: u32, _: &CudaTensor, _: u32) { unreachable!() }
+    fn copy_to_tensor(&self, _: &CudaTensor, _: &[u8]) { unreachable!() }
     fn copy_to_kv_cache(&self, _: &CudaTensor, _: &CudaTensor, _: u32, _: u32, _: u32) { unreachable!() }
+    fn matmul_batch(&self, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: u32, _: u32, _: u32) { unreachable!() }
+    fn rms_norm_batch(&self, _: &CudaTensor, _: &CudaTensor, _: f32, _: &CudaTensor, _: u32) { unreachable!() }
+    fn embed_lookup_batch(&self, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: u32, _: u32) { unreachable!() }
+    fn rope_batch(&self, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: f32, _: u32, _: u32, _: u32, _: u32) { unreachable!() }
+    fn copy_to_paged_kv_cache_batch(&self, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: u32, _: u32, _: u32) { unreachable!() }
+    fn prefill_attention(&self, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: u32, _: u32, _: u32, _: u32, _: u32) { unreachable!() }
+    fn copy_to_paged_kv_cache(&self, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: u32, _: u32, _: u32) { unreachable!() }
+    fn paged_attention(&self, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: u32, _: u32, _: u32, _: u32) { unreachable!() }
 }
 
 pub(crate) struct CudaTensor;

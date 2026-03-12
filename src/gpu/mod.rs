@@ -160,6 +160,10 @@ pub(crate) trait GpuBackend: Send + Sync {
     /// Used by the sampler to read logits back to the CPU for argmax.
     fn copy_to_host(&self, tensor: &Self::Tensor, dst: &mut [u8]);
 
+    /// Copy raw bytes from the host into an existing GPU tensor.
+    /// Used to update the block table for paged KV cache.
+    fn copy_to_tensor(&self, tensor: &Self::Tensor, src: &[u8]);
+
     /// Return the total byte count of a tensor's data.
     fn tensor_byte_count(&self, tensor: &Self::Tensor) -> usize;
 
@@ -232,6 +236,123 @@ pub(crate) trait GpuBackend: Send + Sync {
         src: &Self::Tensor,
         cache: &Self::Tensor,
         pos: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    );
+
+    // --- Paged KV cache operations ---
+    //
+    // These methods work with a block-paged KV cache instead of the flat
+    // cache above.  The pool is a large buffer [num_blocks * BLOCK_SIZE, kv_dim]
+    // and each sequence has a block table mapping logical blocks to physical ones.
+
+    /// Write a new K or V vector into a PAGED KV cache pool.
+    /// The kernel reads the block table to find the physical block for `pos`,
+    /// then writes src into pool[physical_block * BLOCK_SIZE + offset].
+    fn copy_to_paged_kv_cache(
+        &self,
+        src: &Self::Tensor,
+        pool: &Self::Tensor,
+        block_table: &Self::Tensor,
+        pos: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    );
+
+    // --- Batched / prefill operations ---
+    //
+    // These methods process multiple tokens at once.  The projections become
+    // GEMM (mat-mat) instead of mat-vec.  Used for batched prefill in Phase 3.
+
+    /// Batched matrix multiply (GEMM): out = input @ weight^T
+    /// input: [batch_size, k], weight: [m, k], out: [batch_size, m].
+    fn matmul_batch(
+        &self,
+        weight: &Self::Tensor,
+        input: &Self::Tensor,
+        out: &Self::Tensor,
+        batch_size: u32,
+        m: u32,
+        k: u32,
+    );
+
+    /// Batched RMSNorm: normalise each row of [batch_size, hidden_dim] independently.
+    fn rms_norm_batch(
+        &self,
+        input: &Self::Tensor,
+        weight: &Self::Tensor,
+        eps: f32,
+        out: &Self::Tensor,
+        batch_size: u32,
+    );
+
+    /// Batched embedding lookup: look up N token IDs, write to [batch_size, hidden_dim].
+    fn embed_lookup_batch(
+        &self,
+        table: &Self::Tensor,
+        token_ids: &Self::Tensor,
+        out: &Self::Tensor,
+        batch_size: u32,
+        hidden_dim: u32,
+    );
+
+    /// Batched RoPE: apply rotary embeddings to [batch_size, num_heads, head_dim]
+    /// Q and K tensors, with per-token positions.
+    fn rope_batch(
+        &self,
+        q: &Self::Tensor,
+        k: &Self::Tensor,
+        positions: &Self::Tensor,
+        rope_theta: f32,
+        batch_size: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    );
+
+    /// Write N K/V vectors into a paged KV cache pool at different positions.
+    fn copy_to_paged_kv_cache_batch(
+        &self,
+        src: &Self::Tensor,
+        pool: &Self::Tensor,
+        block_table: &Self::Tensor,
+        positions: &Self::Tensor,
+        batch_size: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    );
+
+    /// Causal prefill attention: compute causal self-attention for a chunk
+    /// of tokens.  Token at position i attends only to positions 0..=i.
+    ///
+    /// q: [chunk_size, num_heads * head_dim]
+    /// k: [chunk_size, num_kv_heads * head_dim]
+    /// v: [chunk_size, num_kv_heads * head_dim]
+    /// out: [chunk_size, num_heads * head_dim]
+    fn prefill_attention(
+        &self,
+        q: &Self::Tensor,
+        k: &Self::Tensor,
+        v: &Self::Tensor,
+        out: &Self::Tensor,
+        chunk_size: u32,
+        start_pos: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    );
+
+    /// Paged attention: compute softmax(Q·K^T / √d) · V using a paged KV pool.
+    /// Same algorithm as attention() but reads K/V through block table indirection.
+    fn paged_attention(
+        &self,
+        q: &Self::Tensor,
+        k_pool: &Self::Tensor,
+        v_pool: &Self::Tensor,
+        block_table: &Self::Tensor,
+        out: &Self::Tensor,
+        seq_len: u32,
+        num_heads: u32,
         num_kv_heads: u32,
         head_dim: u32,
     );

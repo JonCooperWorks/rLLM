@@ -127,3 +127,89 @@ kernel void rotary_embedding(
     data[idx_a] = bfloat(a * cos_val - b * sin_val);
     data[idx_b] = bfloat(a * sin_val + b * cos_val);
 }
+
+// ===========================================================================
+// Batched RoPE kernel.
+//
+// LEARNING OVERVIEW
+//
+// What this kernel does:
+//   Applies rotary embeddings to [batch_size, num_heads, head_dim] Q and K
+//   tensors, with per-token positions from a positions buffer.  Each token
+//   in the batch gets a DIFFERENT rotation angle corresponding to its
+//   sequence position.
+//
+// Key difference from single-token RoPE:
+//   Single-token RoPE takes `pos` as a scalar in the params struct — all
+//   threads rotate by the same position.  The batched version takes a
+//   `positions[batch_size]` buffer where positions[i] = start_pos + i.
+//   This is essential for prefill: token 0 of the prompt is at position 0,
+//   token 1 at position 1, etc.  Each must get its own rotation.
+//
+// Dispatch model:
+//   One thread per (batch, head, pair) combination.
+//   Grid: batch_size * (num_heads + num_kv_heads) * (head_dim / 2).
+//   Same rotation logic as the single-token version, but each batch
+//   element reads its own position from positions[batch_idx].
+// ===========================================================================
+
+struct RopeBatchParams {
+    uint batch_size;
+    float rope_theta;
+    uint num_heads;
+    uint num_kv_heads;
+    uint head_dim;
+};
+
+kernel void rotary_embedding_batch(
+    constant RopeBatchParams& params [[buffer(0)]],
+    device bfloat* q                 [[buffer(1)]],  // [batch_size, num_heads * head_dim]
+    device bfloat* k                 [[buffer(2)]],  // [batch_size, num_kv_heads * head_dim]
+    device const uint* positions     [[buffer(3)]],  // [batch_size]
+    uint gid                         [[thread_position_in_grid]]
+) {
+    const uint half_dim = params.head_dim / 2;
+    const uint q_pairs = params.num_heads * half_dim;
+    const uint k_pairs = params.num_kv_heads * half_dim;
+    const uint pairs_per_token = q_pairs + k_pairs;
+    const uint total = params.batch_size * pairs_per_token;
+
+    if (gid >= total) return;
+
+    // Decompose: which batch element, and which (Q or K, head, pair).
+    uint batch = gid / pairs_per_token;
+    uint within = gid % pairs_per_token;
+
+    uint pos = positions[batch];
+
+    // Select Q or K tensor and compute head/pair indices.
+    device bfloat* data;
+    uint pair_within;
+    uint q_dim = params.num_heads * params.head_dim;
+    uint k_dim = params.num_kv_heads * params.head_dim;
+
+    if (within < q_pairs) {
+        data = q + batch * q_dim;
+        pair_within = within;
+    } else {
+        data = k + batch * k_dim;
+        pair_within = within - q_pairs;
+    }
+
+    uint head_idx = pair_within / half_dim;
+    uint pair_in_head = pair_within % half_dim;
+
+    float freq_exp = 2.0f * float(pair_in_head) / float(params.head_dim);
+    float inv_freq = 1.0f / pow(params.rope_theta, freq_exp);
+    float angle = float(pos) * inv_freq;
+    float cos_val = cos(angle);
+    float sin_val = sin(angle);
+
+    uint head_offset = head_idx * params.head_dim;
+    uint idx_a = head_offset + pair_in_head;
+    uint idx_b = head_offset + pair_in_head + half_dim;
+    float a = float(data[idx_a]);
+    float b = float(data[idx_b]);
+    data[idx_a] = bfloat(a * cos_val - b * sin_val);
+    data[idx_b] = bfloat(a * sin_val + b * cos_val);
+}

@@ -47,3 +47,50 @@ kernel void embed_lookup(
     // Simple table lookup: output[gid] = table[token_id * hidden_dim + gid]
     output[gid] = table[params.token_id * params.hidden_dim + gid];
 }
+
+// ===========================================================================
+// Batched embedding lookup.
+//
+// LEARNING OVERVIEW
+//
+// What this kernel does:
+//   Looks up N token IDs in parallel, writing to [batch_size, hidden_dim].
+//   Each thread copies one element from the embedding table — trivially
+//   parallel, no inter-thread communication needed.
+//
+// Why batch?
+//   The single-token version encodes token_id as a kernel parameter (constant
+//   buffer).  That means one kernel dispatch per token during prefill.  The
+//   batched version takes a buffer of N token IDs and looks them all up in
+//   one dispatch.  For a 100-token prompt, that's 1 dispatch instead of 100.
+//
+//   Embedding lookup is memory-bound (just copying rows), so the speedup
+//   is modest — but eliminating 99 kernel dispatch round-trips still helps.
+//
+// Dispatch model:
+//   Grid: batch_size * hidden_dim total threads.
+//   Threadgroup: 256.
+// ===========================================================================
+
+struct EmbedBatchParams {
+    uint batch_size;
+    uint hidden_dim;
+};
+
+kernel void embed_lookup_batch(
+    constant EmbedBatchParams& params [[buffer(0)]],
+    device const bfloat* table        [[buffer(1)]],  // [vocab_size, hidden_dim]
+    device const uint* token_ids      [[buffer(2)]],  // [batch_size]
+    device bfloat* output             [[buffer(3)]],  // [batch_size, hidden_dim]
+    uint gid                          [[thread_position_in_grid]]
+) {
+    const uint hidden_dim = params.hidden_dim;
+    const uint total = params.batch_size * hidden_dim;
+    if (gid >= total) return;
+
+    uint batch = gid / hidden_dim;
+    uint d     = gid % hidden_dim;
+    uint token_id = token_ids[batch];
+
+    output[batch * hidden_dim + d] = table[token_id * hidden_dim + d];
+}
