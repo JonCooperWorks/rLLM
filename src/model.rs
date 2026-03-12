@@ -566,8 +566,23 @@ impl<'a, B: GpuBackend> Model<'a, B> {
             self.backend.matmul_batch(&layer.k_proj, &bufs.norm_buf, &bufs.k_buf, bs, kv_dim, hidden_size);
             self.backend.matmul_batch(&layer.v_proj, &bufs.norm_buf, &bufs.v_buf, bs, kv_dim, hidden_size);
 
-            // TODO: batched bias-add for Qwen would need a broadcast-add kernel.
-            // For now, Llama models have no QKV bias so this is fine.
+            // Qwen 2.5 QKV bias: broadcast-add [dim] bias across [batch_size, dim].
+            //
+            // This was the cause of Qwen producing gibberish/repetitive output.
+            // Without these biases during prefill, the KV cache is built with
+            // wrong Q/K/V values for every prompt token.  The decode phase then
+            // attends to corrupted cache entries, producing incoherent output.
+            // Llama models have no QKV bias (q_bias/k_bias/v_bias are None),
+            // so these branches are skipped for Llama at zero cost.
+            if let Some(ref q_bias) = layer.q_bias {
+                self.backend.bias_add_batch(&bufs.q_buf, q_bias, &bufs.q_buf, bs, hidden_size);
+            }
+            if let Some(ref k_bias) = layer.k_bias {
+                self.backend.bias_add_batch(&bufs.k_buf, k_bias, &bufs.k_buf, bs, kv_dim);
+            }
+            if let Some(ref v_bias) = layer.v_bias {
+                self.backend.bias_add_batch(&bufs.v_buf, v_bias, &bufs.v_buf, bs, kv_dim);
+            }
 
             // Batched RoPE with per-token positions.
             self.backend.rope_batch(

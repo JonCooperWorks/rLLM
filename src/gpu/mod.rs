@@ -220,6 +220,18 @@ pub(crate) trait GpuBackend: Send + Sync {
     /// Used for residual connections after attention and FFN.
     fn add(&self, a: &Self::Tensor, b: &Self::Tensor, out: &Self::Tensor, size: u32);
 
+    /// Broadcast bias-add: out[i] = input[i] + bias[i % dim]
+    /// Adds a [dim] bias vector to each row of a [batch_size, dim] tensor.
+    /// Used in batched prefill for Qwen 2.5's QKV bias.
+    fn bias_add_batch(
+        &self,
+        input: &Self::Tensor,
+        bias: &Self::Tensor,
+        out: &Self::Tensor,
+        batch_size: u32,
+        dim: u32,
+    );
+
     /// Embedding lookup: copy row `token_id` from the embedding table to `out`.
     /// Converts a discrete token ID into a continuous vector representation.
     fn embed_lookup(

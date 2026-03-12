@@ -129,6 +129,7 @@ pub(crate) struct MetalBackend {
     pipeline_attention: metal::ComputePipelineState,
     pipeline_silu_mul: metal::ComputePipelineState,
     pipeline_add: metal::ComputePipelineState,
+    pipeline_bias_add: metal::ComputePipelineState,
     pipeline_embed_lookup: metal::ComputePipelineState,
     #[allow(dead_code)]
     pipeline_copy_kv: metal::ComputePipelineState,
@@ -173,6 +174,8 @@ impl MetalBackend {
             Self::make_pipeline(&device, METAL_SOURCE_ELEMENTWISE, "silu_mul", &compile_opts)?;
         let pipeline_add =
             Self::make_pipeline(&device, METAL_SOURCE_ELEMENTWISE, "add_tensors", &compile_opts)?;
+        let pipeline_bias_add =
+            Self::make_pipeline(&device, METAL_SOURCE_ELEMENTWISE, "bias_add", &compile_opts)?;
         let pipeline_embed_lookup =
             Self::make_pipeline(&device, METAL_SOURCE_EMBED, "embed_lookup", &compile_opts)?;
         let pipeline_copy_kv =
@@ -209,6 +212,7 @@ impl MetalBackend {
             pipeline_attention,
             pipeline_silu_mul,
             pipeline_add,
+            pipeline_bias_add,
             pipeline_embed_lookup,
             pipeline_copy_kv,
             pipeline_paged_copy_kv,
@@ -367,6 +371,14 @@ struct AttentionParams {
 #[derive(Clone, Copy)]
 struct ElemParams {
     size: u32,
+}
+
+/// Params for broadcast bias-add kernel. Must match Metal `BiasAddParams`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BiasAddParams {
+    total: u32,  // batch_size * dim
+    dim: u32,    // bias vector length
 }
 
 #[repr(C)]
@@ -692,6 +704,31 @@ impl GpuBackend for MetalBackend {
             ],
             MTLSize::new(size as u64, 1, 1),
             MTLSize::new(256.min(size as u64), 1, 1),
+        );
+    }
+
+    /// Broadcast bias-add: out[i] = input[i] + bias[i % dim].
+    /// Adds a [dim] bias to each row of [batch_size, dim].
+    fn bias_add_batch(
+        &self,
+        input: &MetalTensor,
+        bias: &MetalTensor,
+        out: &MetalTensor,
+        batch_size: u32,
+        dim: u32,
+    ) {
+        let total = batch_size * dim;
+        let params = BiasAddParams { total, dim };
+        self.dispatch_async(
+            &self.pipeline_bias_add,
+            &params,
+            &[
+                (&input.buffer, 1),
+                (&bias.buffer, 2),
+                (&out.buffer, 3),
+            ],
+            MTLSize::new(total as u64, 1, 1),
+            MTLSize::new(256.min(total as u64), 1, 1),
         );
     }
 
