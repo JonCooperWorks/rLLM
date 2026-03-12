@@ -12,19 +12,29 @@
 //
 // How RoPE works:
 //   Each head's vector is treated as a sequence of 2D pairs.  For a head
-//   of dimension D=64, there are D/2=32 pairs: (v[0], v[1]), (v[2], v[3]),
-//   ..., (v[62], v[63]).  Each pair is rotated by an angle that depends
-//   on both the token's position in the sequence AND the pair's index:
+//   of dimension D, there are D/2 pairs.  Each pair is rotated by an angle
+//   that depends on both the token's position AND the pair's index:
 //
 //     angle = position * (1 / theta^(2*pair_index / D))
 //
-//   where theta is a base frequency (500000.0 for Llama 3.2).  Higher-
-//   indexed pairs rotate faster, encoding fine-grained position info,
-//   while lower-indexed pairs rotate slowly, encoding coarse position.
+//   where theta is a base frequency (500000 for Llama 3, 1000000 for Qwen).
+//   Lower-indexed pairs rotate slowly (coarse position encoding), while
+//   higher-indexed pairs rotate faster (fine-grained position info).
 //
 //   The rotation formula (standard 2D rotation matrix):
-//     v[2i]'   = v[2i]   * cos(angle) - v[2i+1] * sin(angle)
-//     v[2i+1]' = v[2i]   * sin(angle) + v[2i+1] * cos(angle)
+//     v[i]'       = v[i]       * cos(angle) - v[i+D/2] * sin(angle)
+//     v[i+D/2]'   = v[i]       * sin(angle) + v[i+D/2] * cos(angle)
+//
+// Halved vs. interleaved pairing:
+//   There are two common conventions for which elements form rotation pairs:
+//     - Interleaved: (v[0], v[1]), (v[2], v[3]), ..., (v[D-2], v[D-1])
+//     - Halved:      (v[0], v[D/2]), (v[1], v[D/2+1]), ..., (v[D/2-1], v[D-1])
+//
+//   HuggingFace transformers uses the HALVED convention via `rotate_half()`.
+//   Since we load HF-format checkpoints (both Llama and Qwen), we use
+//   halved pairing to match how the model was trained.  Using the wrong
+//   convention would pair different Q/K elements at different frequencies,
+//   corrupting the attention scores.
 //
 // Why RoPE instead of learned embeddings?
 //   RoPE has a key property: the dot product of two rotated vectors
@@ -35,7 +45,7 @@
 // Dispatch model:
 //   One thread per (head, pair).  Threads 0..(num_heads * head_dim/2 - 1)
 //   handle Q heads, the remaining threads handle K heads.  Total threads:
-//   (num_heads + num_kv_heads) * (head_dim / 2) = (32 + 8) * 32 = 1280.
+//   (num_heads + num_kv_heads) * (head_dim / 2).
 //
 // Precision:
 //   sin/cos computation and rotation are done in float32 to avoid
@@ -49,10 +59,10 @@ using namespace metal;
 // Host → GPU parameter block.  Must match Rust `RopeParams`.
 struct RopeParams {
     uint pos;           // Token position in the sequence (0-indexed).
-    float rope_theta;   // Base frequency (500000.0 for Llama 3.2).
-    uint num_heads;     // Number of query heads (32).
-    uint num_kv_heads;  // Number of KV heads (8).
-    uint head_dim;      // Dimension per head (64).
+    float rope_theta;   // Base frequency (500000 for Llama 3, 1000000 for Qwen).
+    uint num_heads;     // Number of query heads.
+    uint num_kv_heads;  // Number of KV heads.
+    uint head_dim;      // Dimension per head.
 };
 
 kernel void rotary_embedding(
@@ -81,7 +91,8 @@ kernel void rotary_embedding(
         pair_within = gid - q_pairs;
     }
 
-    // Which pair within the head (0..31 for head_dim=64).
+    // Decompose flat pair index into (head_index, pair_within_head).
+    uint head_idx = pair_within / half_dim;
     uint pair_in_head = pair_within % half_dim;
 
     // Compute the rotation angle for this (position, pair) combination.
@@ -90,7 +101,7 @@ kernel void rotary_embedding(
     //
     // Learning note: the exponent 2*i/D creates a geometric progression of
     // frequencies.  Pair 0 has the lowest frequency (slowest rotation), pair
-    // 31 has the highest (fastest rotation).  This is analogous to the
+    // D/2-1 has the highest (fastest rotation).  This is analogous to the
     // different frequencies in sinusoidal positional encodings from the
     // original Transformer paper, but applied as rotations rather than additions.
     float freq_exp = 2.0f * float(pair_in_head) / float(params.head_dim);
@@ -99,12 +110,20 @@ kernel void rotary_embedding(
     float cos_val = cos(angle);
     float sin_val = sin(angle);
 
-    // Apply the 2D rotation to the pair.
-    //   [a']   [cos  -sin] [a]
-    //   [b'] = [sin   cos] [b]
-    uint idx = pair_within * 2;
-    float a = float(data[idx]);
-    float b = float(data[idx + 1]);
-    data[idx]     = bfloat(a * cos_val - b * sin_val);
-    data[idx + 1] = bfloat(a * sin_val + b * cos_val);
+    // Apply the 2D rotation using HALVED pairing.
+    //
+    // Halved convention: element i pairs with element i + D/2 within each head.
+    //   [a']   [cos  -sin] [a]       where a = data[head_start + i]
+    //   [b'] = [sin   cos] [b]             b = data[head_start + i + D/2]
+    //
+    // This matches HuggingFace's `rotate_half()`:
+    //   out[i]       = x[i] * cos - x[i + D/2] * sin
+    //   out[i + D/2] = x[i] * sin + x[i + D/2] * cos
+    uint head_offset = head_idx * params.head_dim;
+    uint idx_a = head_offset + pair_in_head;           // element i within head
+    uint idx_b = head_offset + pair_in_head + half_dim; // element i + D/2 within head
+    float a = float(data[idx_a]);
+    float b = float(data[idx_b]);
+    data[idx_a] = bfloat(a * cos_val - b * sin_val);
+    data[idx_b] = bfloat(a * sin_val + b * cos_val);
 }

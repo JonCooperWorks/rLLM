@@ -78,8 +78,8 @@ struct Args {
     #[arg(long, default_value = "0.9")]
     top_p: f32,
 
-    /// Enable chat mode for instruct models.  Wraps --prompt in the Llama 3
-    /// chat template with role markers and a generation prompt.
+    /// Enable chat mode for instruct models.  Wraps --prompt in the model's
+    /// chat template (auto-detected: Llama 3 or ChatML for Qwen 2.5).
     #[arg(long)]
     chat: bool,
 
@@ -101,11 +101,12 @@ fn main() -> ExitCode {
 /// Main inference pipeline.  Separated from main() for clean error propagation
 /// via anyhow (main() returns ExitCode, not Result).
 fn run(args: Args) -> anyhow::Result<()> {
-    // --- Step 1: Load model configuration ---
-    let config = config::LlamaConfig::from_file(&args.model.join("config.json"))?;
+    // --- Step 1: Load model configuration + detect architecture ---
+    let config = config::ModelConfig::from_file(&args.model.join("config.json"))?;
+    let arch = config.arch()?;
     eprintln!(
-        "loaded config: {} layers, {} heads, hidden_size={}",
-        config.num_hidden_layers, config.num_attention_heads, config.hidden_size
+        "loaded config: {:?}, {} layers, {} heads, hidden_size={}",
+        arch, config.num_hidden_layers, config.num_attention_heads, config.hidden_size
     );
 
     // --- Step 2: Initialise GPU backend ---
@@ -113,8 +114,8 @@ fn run(args: Args) -> anyhow::Result<()> {
     let backend = gpu::create_backend()?;
     eprintln!("gpu: {}", backend.device_name());
 
-    // --- Step 3: Load tokenizer ---
-    let tokenizer = tokenizer::Tokenizer::from_file(&args.model.join("tokenizer.json"))?;
+    // --- Step 3: Load tokenizer (model-aware for BOS/EOS tokens) ---
+    let tokenizer = tokenizer::Tokenizer::from_file(&args.model.join("tokenizer.json"), arch)?;
     eprintln!("tokenizer loaded");
 
     // --- Step 4: Load model weights ---
@@ -133,20 +134,20 @@ fn run(args: Args) -> anyhow::Result<()> {
     }
 
     // --- Step 5: Create model (allocates KV cache + scratch buffers) ---
-    let mut llama = model::LlamaModel::new(config, weights, &backend)?;
+    let mut model = model::Model::new(config, weights, &backend)?;
 
     // --- Step 6: Encode prompt ---
-    // In chat mode, wrap the user's prompt in the Llama 3 chat template
-    // before tokenising.  This adds role markers and special tokens that
-    // instruct models expect.  Without --chat, the raw prompt is used
-    // (suitable for base/completion models).
+    // In chat mode, wrap the user's prompt in the model's chat template
+    // before tokenising.  The template is auto-detected from the architecture
+    // (Llama 3 format or ChatML for Qwen 2.5).  Without --chat, the raw
+    // prompt is used (suitable for base/completion models).
     let prompt_tokens = if args.chat {
         let messages = vec![
             chat::Message { role: "system".into(), content: args.system.clone() },
             chat::Message { role: "user".into(), content: args.prompt.clone() },
         ];
-        let formatted = chat::format_llama3(&messages);
-        eprintln!("chat template applied");
+        let formatted = chat::format_chat(arch, &messages);
+        eprintln!("chat template applied ({:?})", arch);
         tokenizer.encode_chat(&formatted)?
     } else {
         tokenizer.encode(&args.prompt)?
@@ -159,7 +160,7 @@ fn run(args: Args) -> anyhow::Result<()> {
     // prompt token are used (they predict the first generated token).
     let prefill_start = std::time::Instant::now();
     for &token_id in &prompt_tokens {
-        llama.forward(token_id)?;
+        model.forward(token_id)?;
     }
     let prefill_elapsed = prefill_start.elapsed();
     let prefill_tps = prompt_tokens.len() as f64 / prefill_elapsed.as_secs_f64();
@@ -175,7 +176,7 @@ fn run(args: Args) -> anyhow::Result<()> {
     let mut gen_count: usize = 0;
     let mut rng = rand::rng();
     let mut next_token = sampler::sample(
-        &backend, llama.logits(), args.temperature, args.top_p, &mut rng,
+        &backend, model.logits(), args.temperature, args.top_p, &mut rng,
     )?;
     for _ in 0..args.max_tokens {
         if tokenizer.is_eos(next_token) {
@@ -188,10 +189,10 @@ fn run(args: Args) -> anyhow::Result<()> {
         io::stdout().flush()?;
 
         // Forward pass for the new token (updates KV cache).
-        llama.forward(next_token)?;
+        model.forward(next_token)?;
         // Sample the next token from the updated logits.
         next_token = sampler::sample(
-            &backend, llama.logits(), args.temperature, args.top_p, &mut rng,
+            &backend, model.logits(), args.temperature, args.top_p, &mut rng,
         )?;
     }
     println!();

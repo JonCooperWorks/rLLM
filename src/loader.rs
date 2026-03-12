@@ -32,7 +32,7 @@
 //   on demand.  This means near-instant startup and no memory duplication
 //   (shared with the OS page cache).
 //
-// Weight naming convention (HuggingFace Llama):
+// Weight naming convention (shared by Llama and Qwen):
 //   model.embed_tokens.weight                          → [vocab_size, hidden_size]
 //   model.layers.{i}.input_layernorm.weight            → [hidden_size]
 //   model.layers.{i}.self_attn.q_proj.weight           → [hidden_size, hidden_size]
@@ -45,10 +45,16 @@
 //   model.layers.{i}.mlp.down_proj.weight              → [hidden_size, inter_size]
 //   model.norm.weight                                  → [hidden_size]
 //
+// QKV bias (Qwen 2.5 only — Llama has no biases):
+//   model.layers.{i}.self_attn.q_proj.bias             → [hidden_size]
+//   model.layers.{i}.self_attn.k_proj.bias             → [kv_dim]
+//   model.layers.{i}.self_attn.v_proj.bias             → [kv_dim]
+//   (O projection and FFN projections have NO bias in either family.)
+//
 // Tied embeddings:
 //   Llama 3.2 1B has `tie_word_embeddings=true`, meaning there is no separate
-//   `lm_head.weight` tensor.  The final output projection reuses the embedding
-//   table.  This saves parameters (vocab_size × hidden_size × 2 bytes).
+//   `lm_head.weight` tensor.  Qwen 2.5 always has `tie_word_embeddings=false`.
+//   The final output projection reuses the embedding table when tied.
 //
 // Q4 quantisation (on-load):
 //   When `quantize=true`, linear projection weights are converted from bf16 to
@@ -64,7 +70,7 @@ use half::bf16;
 use memmap2::Mmap;
 use safetensors::SafeTensors;
 
-use crate::config::LlamaConfig;
+use crate::config::ModelConfig;
 use crate::gpu::{self, GpuBackend, TensorDtype};
 
 // ---------------------------------------------------------------------------
@@ -198,6 +204,21 @@ pub(crate) struct LayerWeights<B: GpuBackend> {
     pub v_proj: B::Tensor,           // Value projection [kv_dim, hidden_size]
     pub o_proj: B::Tensor,           // Output projection [hidden_size, hidden_size]
 
+    // --- QKV bias (Qwen 2.5 only, None for Llama) ---
+    //
+    // Learning note: bias in a linear layer means output = W @ x + b.
+    // After computing Q = W_q @ hidden, Qwen adds: Q = Q + b_q.
+    //
+    // For single-token inference, the bias vector has the same length as
+    // the matmul output — so bias-add is just an element-wise vector add.
+    // No new GPU kernel needed: reuses the existing `backend.add()`.
+    //
+    // Bias tensors are always bf16 (1D, small) and never quantised.
+    // O projection has NO bias in either Llama or Qwen.
+    pub q_bias: Option<B::Tensor>,   // [hidden_size], or None for Llama
+    pub k_bias: Option<B::Tensor>,   // [kv_dim], or None for Llama
+    pub v_bias: Option<B::Tensor>,   // [kv_dim], or None for Llama
+
     // --- FFN sub-block ---
     pub post_attention_layernorm: B::Tensor, // RMSNorm weight [hidden_size]
     pub gate_proj: B::Tensor,        // Gate projection [inter_size, hidden_size]
@@ -214,7 +235,7 @@ pub(crate) struct LayerWeights<B: GpuBackend> {
 pub(crate) fn load_weights<B: GpuBackend>(
     backend: &B,
     model_dir: &Path,
-    config: &LlamaConfig,
+    config: &ModelConfig,
     quantize: bool,
 ) -> anyhow::Result<ModelWeights<B>> {
     // Load safetensors file(s) — handles both single-file and sharded models.
@@ -248,9 +269,32 @@ pub(crate) fn load_weights<B: GpuBackend>(
     };
 
     // Load per-layer weights.  Projection weights are optionally quantised to Q4.
+    let arch = config.arch()?;
+    let has_qkv_bias = arch.has_qkv_bias();
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for i in 0..config.num_hidden_layers {
         let prefix = format!("model.layers.{i}");
+
+        // Load QKV bias vectors if the architecture has them (Qwen 2.5).
+        // Bias tensors are always bf16, never quantised — they're 1D and tiny.
+        let (q_bias, k_bias, v_bias) = if has_qkv_bias {
+            (
+                Some(upload_tensor(
+                    &store, backend,
+                    &format!("{prefix}.self_attn.q_proj.bias"), &[hidden],
+                )?),
+                Some(upload_tensor(
+                    &store, backend,
+                    &format!("{prefix}.self_attn.k_proj.bias"), &[kv_dim],
+                )?),
+                Some(upload_tensor(
+                    &store, backend,
+                    &format!("{prefix}.self_attn.v_proj.bias"), &[kv_dim],
+                )?),
+            )
+        } else {
+            (None, None, None)
+        };
 
         layers.push(LayerWeights {
             // Norm weights stay bf16 (1D, tiny, used for RMSNorm not matmul).
@@ -273,6 +317,9 @@ pub(crate) fn load_weights<B: GpuBackend>(
                 &store, backend, &format!("{prefix}.self_attn.o_proj.weight"),
                 &[hidden, hidden], quantize,
             )?,
+            q_bias,
+            k_bias,
+            v_bias,
             post_attention_layernorm: upload_tensor(
                 &store, backend, &format!("{prefix}.post_attention_layernorm.weight"), &[hidden],
             )?,

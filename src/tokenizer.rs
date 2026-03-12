@@ -13,82 +13,99 @@
 //   split into multiple pieces: "unfamiliar" → ["un", "familiar"].  This
 //   gives a good balance between vocabulary size and sequence length.
 //
-//   Llama 3.2 uses a vocabulary of 128256 tokens, including:
-//     - ~128000 regular text tokens (subwords, characters, bytes)
-//     - ~256 special tokens (BOS, EOS, tool markers, etc.)
+// Model-specific special tokens:
+//   Different model families use different vocabularies and special token IDs.
+//   The tokenizer is configured per-architecture at construction time:
 //
-// Special tokens:
-//   BOS (Beginning of Sequence, ID 128000):
-//     Prepended to every prompt.  Tells the model "this is the start of a
-//     new sequence".  Without BOS, the model would treat the first token as
-//     a continuation of some unknown previous context.
+//   Llama 3.x (vocab_size=128256):
+//     BOS = 128000  <|begin_of_text|>   — prepended to every sequence
+//     EOS = 128001  <|end_of_text|>     — signals sequence completion
+//     EOT = 128009  <|eot_id|>          — end of turn (chat mode)
 //
-//   EOS (End of Sequence, ID 128001):
-//     The model generates this when it considers the sequence complete.
-//     We stop generation when we see this token.
-//
-//   EOT (End of Turn, ID 128009):
-//     Used in chat-formatted sequences to mark the end of one speaker's turn.
-//     We also treat this as a stop signal for the base model.
+//   Qwen 2.5 (vocab_size=152064):
+//     BOS = 151643  <|endoftext|>       — both BOS and EOS (GPT convention)
+//     EOT = 151645  <|im_end|>          — end of turn (ChatML mode)
 //
 // Why wrap the HF tokenizer?
 //   The `tokenizers` crate provides the core BPE implementation.  Our wrapper
 //   adds: (1) automatic BOS prepending, (2) EOS detection for generation
-//   stopping.  This keeps tokenizer details out of main.rs.
+//   stopping, (3) model-specific special token configuration.  This keeps
+//   tokenizer details out of main.rs.
 // ===========================================================================
 
 use std::path::Path;
 use tokenizers::Tokenizer as HfTokenizer;
+
+use crate::config::ModelArch;
 
 pub(crate) struct Tokenizer {
     /// The HuggingFace tokenizer (BPE model + merge rules + vocabulary).
     inner: HfTokenizer,
     /// Token IDs that signal the model wants to stop generating.
     eos_token_ids: Vec<u32>,
+    /// Beginning-of-sequence token ID, prepended to every prompt.
+    /// None for models that don't use BOS (e.g. Qwen 2.5).
+    bos_token_id: Option<u32>,
 }
 
-// Llama 3.x special token IDs (defined in the tokenizer config).
-const BOS_TOKEN_ID: u32 = 128000; // <|begin_of_text|>
-const EOS_TOKEN_ID: u32 = 128001; // <|end_of_text|>
-const EOT_TOKEN_ID: u32 = 128009; // <|eot_id|>
-
 impl Tokenizer {
-    /// Load a tokenizer from a `tokenizer.json` file.
+    /// Load a tokenizer and configure special tokens for the model architecture.
     ///
-    /// The tokenizer.json contains the full BPE model: vocabulary, merge rules,
-    /// pre/post-processing steps, and special token definitions.
-    pub fn from_file(path: &Path) -> anyhow::Result<Self> {
+    /// Different model families use different special token IDs because they
+    /// have different vocabularies.  Llama 3 has 128256 tokens; Qwen 2.5 has
+    /// 152064.  Using the wrong BOS/EOS would produce garbage or fail to stop.
+    pub fn from_file(path: &Path, arch: ModelArch) -> anyhow::Result<Self> {
         let inner = HfTokenizer::from_file(path)
             .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?;
+
+        let (bos_token_id, eos_token_ids) = match arch {
+            // Llama 3.x: BOS=128000, stop on EOS (128001) or EOT (128009).
+            ModelArch::Llama => (Some(128000), vec![128001, 128009]),
+
+            // Qwen 2.5: no BOS token.  Stop on <|endoftext|> or <|im_end|>.
+            //
+            // Learning note: unlike Llama, Qwen doesn't prepend a BOS token.
+            // The model was trained without one — adding BOS would shift all
+            // positions by 1 and degrade output quality.  In chat mode,
+            // <|im_end|> (151645) is the primary stop token.
+            ModelArch::Qwen2 => (None, vec![151643, 151645]),
+        };
+
         Ok(Self {
             inner,
-            eos_token_ids: vec![EOS_TOKEN_ID, EOT_TOKEN_ID],
+            eos_token_ids,
+            bos_token_id,
         })
     }
 
-    /// Encode text into token IDs, prepending the BOS token.
+    /// Encode text into token IDs, prepending BOS if the model uses one.
     ///
-    /// Example: "Hello" → [128000, 9906]  (BOS + "Hello")
+    /// Example (Llama): "Hello" → [128000, 9906]  (BOS + "Hello")
+    /// Example (Qwen):  "Hello" → [9707]          (no BOS)
     ///
     /// Learning note: the `false` argument to `encode()` disables the
     /// tokenizer's built-in special-token handling — we prepend BOS manually
-    /// because the base model expects exactly one BOS at the start.
+    /// (when needed) to ensure exactly one BOS at the start.
     pub fn encode(&self, text: &str) -> anyhow::Result<Vec<u32>> {
         let encoding = self
             .inner
             .encode(text, false)
             .map_err(|e| anyhow::anyhow!("tokenizer encode failed: {e}"))?;
-        let mut ids = vec![BOS_TOKEN_ID];
+        let mut ids = Vec::new();
+        if let Some(bos) = self.bos_token_id {
+            ids.push(bos);
+        }
         ids.extend_from_slice(encoding.get_ids());
         Ok(ids)
     }
 
     /// Encode a chat-template-formatted string into token IDs.
     ///
-    /// Unlike `encode()`, this does NOT prepend BOS — the chat template string
-    /// already starts with `<|begin_of_text|>`.  The `true` flag tells the HF
-    /// tokenizer to parse special token syntax (e.g. `<|start_header_id|>`)
-    /// into their actual token IDs instead of treating them as literal text.
+    /// Unlike `encode()`, this does NOT prepend BOS — the HF tokenizer's
+    /// `encode(text, add_special_tokens=true)` handles that automatically.
+    /// The `true` flag also tells the tokenizer to parse special token syntax
+    /// (e.g. `<|start_header_id|>`, `<|im_start|>`) into their actual token
+    /// IDs instead of treating them as literal text.
     pub fn encode_chat(&self, text: &str) -> anyhow::Result<Vec<u32>> {
         let encoding = self
             .inner

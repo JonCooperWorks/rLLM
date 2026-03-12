@@ -1,24 +1,30 @@
 // ===========================================================================
-// Llama transformer model — forward pass and KV cache management.
+// Transformer forward pass and KV cache management.
 //
 // LEARNING OVERVIEW
 //
 // What this file does:
-//   Implements the complete Llama transformer forward pass: given a single
-//   token ID, produce logits (unnormalised probabilities) over the vocabulary.
-//   This is the "hot path" of inference — every generated token requires one
-//   full forward pass through all 16 transformer layers.
+//   Implements the transformer forward pass for Llama 3 and Qwen 2.5 models:
+//   given a single token ID, produce logits (unnormalised probabilities) over
+//   the vocabulary.  This is the "hot path" of inference — every generated
+//   token requires one full forward pass through all transformer layers.
 //
-// Architecture (Llama 3.2 1B):
-//   The forward pass for one token follows this pipeline:
+// Multi-architecture support:
+//   Llama 3 and Qwen 2.5 share the same forward pass structure: RMSNorm,
+//   GQA attention, SwiGLU FFN, RoPE.  The ONLY structural difference is that
+//   Qwen adds bias to Q/K/V projections (output = W @ x + b instead of W @ x).
+//   This is handled with a simple `if let Some(bias)` check — no branching
+//   on an architecture enum needed in the hot path.
 //
-//     token_id → embed_lookup → hidden[2048]
-//     for each of 16 layers:
-//       hidden → RMSNorm → Q/K/V projections → RoPE → KV cache store
-//             → attention → O projection → residual add
+// Forward pass pipeline (one token):
+//
+//     token_id → embed_lookup → hidden
+//     for each layer:
+//       hidden → RMSNorm → Q/K/V projections [+ bias if Qwen] → RoPE
+//             → KV cache store → attention → O projection → residual add
 //       hidden → RMSNorm → gate/up projections → SwiGLU → down projection
 //             → residual add
-//     hidden → final RMSNorm → lm_head projection → logits[128256]
+//     hidden → final RMSNorm → lm_head projection → logits
 //
 // Key design: backend abstraction.
 //   This file NEVER imports Metal (or CUDA) types.  Every GPU operation goes
@@ -53,7 +59,7 @@
 //   deep networks and prevent the vanishing gradient problem.
 // ===========================================================================
 
-use crate::config::LlamaConfig;
+use crate::config::ModelConfig;
 use crate::gpu::{GpuBackend, TensorDtype};
 use crate::loader::ModelWeights;
 
@@ -63,13 +69,14 @@ use crate::loader::ModelWeights;
 /// GPU memory for the cache buffers.
 const MAX_SEQ_LEN: usize = 4096;
 
-/// The Llama model: weights, KV cache, scratch buffers, and a backend reference.
+/// The transformer model: weights, KV cache, scratch buffers, and a backend reference.
 ///
+/// Supports Llama 3 and Qwen 2.5 (same architecture, differs only in QKV bias).
 /// Generic over `B: GpuBackend` — the model doesn't know (or care) whether
 /// it's running on Metal or CUDA.  The lifetime `'a` ties the model to
 /// the backend that owns the GPU device.
-pub(crate) struct LlamaModel<'a, B: GpuBackend> {
-    config: LlamaConfig,
+pub(crate) struct Model<'a, B: GpuBackend> {
+    config: ModelConfig,
     weights: ModelWeights<B>,
     backend: &'a B,
 
@@ -109,10 +116,10 @@ pub(crate) struct LlamaModel<'a, B: GpuBackend> {
     logits_buf: B::Tensor,
 }
 
-impl<'a, B: GpuBackend> LlamaModel<'a, B> {
+impl<'a, B: GpuBackend> Model<'a, B> {
     /// Create a new model, allocating KV caches and scratch buffers.
     pub fn new(
-        config: LlamaConfig,
+        config: ModelConfig,
         weights: ModelWeights<B>,
         backend: &'a B,
     ) -> anyhow::Result<Self> {
@@ -240,6 +247,28 @@ impl<'a, B: GpuBackend> LlamaModel<'a, B> {
             self.backend.matmul(&layer.k_proj, &self.norm_buf, &self.k_buf, kv_dim, hidden_size);
             self.backend.matmul(&layer.v_proj, &self.norm_buf, &self.v_buf, kv_dim, hidden_size);
 
+            // Bias-add for models with QKV bias (Qwen 2.5).
+            //
+            // In a linear layer with bias, the full operation is:
+            //   output = W @ input + bias
+            // The matmul above computed W @ input.  Now add the bias vector.
+            // This reuses the existing `add` kernel — the bias is the same
+            // size as the matmul output, so element-wise add works directly.
+            //
+            // In-place: add(q_buf, bias, q_buf) is safe because each element
+            // is independent — reads from both inputs finish before the write.
+            //
+            // For Llama, these Options are None, so the bias-add is skipped.
+            if let Some(ref q_bias) = layer.q_bias {
+                self.backend.add(&self.q_buf, q_bias, &self.q_buf, hidden_size);
+            }
+            if let Some(ref k_bias) = layer.k_bias {
+                self.backend.add(&self.k_buf, k_bias, &self.k_buf, kv_dim);
+            }
+            if let Some(ref v_bias) = layer.v_bias {
+                self.backend.add(&self.v_buf, v_bias, &self.v_buf, kv_dim);
+            }
+
             // RoPE: apply rotary positional embeddings to Q and K.
             // This encodes the token's absolute position so the model can
             // distinguish "cat sat on mat" from "mat sat on cat".
@@ -341,8 +370,8 @@ impl<'a, B: GpuBackend> LlamaModel<'a, B> {
         );
 
         // LM head projection.  If tie_word_embeddings=true (Llama 3.2 1B/3B),
-        // the embedding table IS the lm_head weight.  Otherwise (Llama 3.1 8B+),
-        // there's a separate lm_head weight tensor.
+        // the embedding table IS the lm_head weight.  Otherwise (Llama 3.1 8B+,
+        // all Qwen 2.5), there's a separate lm_head weight tensor.
         let lm_head_weight = self.weights.lm_head.as_ref()
             .unwrap_or(&self.weights.embed_tokens);
         self.backend.matmul(
