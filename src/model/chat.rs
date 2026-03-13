@@ -77,7 +77,8 @@ pub(crate) struct Message {
 pub(crate) fn format_chat(arch: ModelArch, messages: &[Message]) -> String {
     match arch {
         ModelArch::Llama => format_llama3(messages),
-        ModelArch::Qwen2 => format_chatml(messages),
+        // Qwen 2.5 and Qwen 3 MoE both use ChatML format.
+        ModelArch::Qwen2 | ModelArch::Qwen3Moe => format_chatml(messages),
     }
 }
 

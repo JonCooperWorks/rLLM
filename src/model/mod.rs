@@ -122,10 +122,10 @@ pub(crate) struct Model<'a, B: GpuBackend> {
     // These avoid per-token GPU allocation.  The naming convention:
     //   hidden     — the residual stream [hidden_size=2048]
     //   norm_buf   — output of RMSNorm [hidden_size=2048]
-    //   q_buf      — query projection output [num_heads * head_dim = 2048]
-    //   k_buf      — key projection output [num_kv_heads * head_dim = 512]
-    //   v_buf      — value projection output [num_kv_heads * head_dim = 512]
-    //   attn_out   — attention output [num_heads * head_dim = 2048]
+    //   q_buf      — query projection output [num_heads * head_dim]
+    //   k_buf      — key projection output [num_kv_heads * head_dim]
+    //   v_buf      — value projection output [num_kv_heads * head_dim]
+    //   attn_out   — attention output [num_heads * head_dim]
     //   gate_buf   — gate projection for FFN [intermediate_size = 8192]
     //   up_buf     — up projection for FFN [intermediate_size = 8192]
     //   logits_buf — final vocabulary logits [vocab_size = 128256]
@@ -139,6 +139,20 @@ pub(crate) struct Model<'a, B: GpuBackend> {
     pub(crate) gate_buf: B::Tensor,
     pub(crate) up_buf: B::Tensor,
     pub(crate) logits_buf: B::Tensor,
+
+    // -----------------------------------------------------------------------
+    // MoE-specific scratch buffers (None for dense models).
+    //
+    // Learning note: MoE layers need separate buffers because expert FFNs
+    // have a different intermediate size (e.g. 768) than the dense FFN
+    // (e.g. 8192).  The router logits buffer holds per-expert scores for
+    // top-k selection.  The moe_output buffer accumulates the weighted
+    // sum of expert outputs before adding to the residual stream.
+    // -----------------------------------------------------------------------
+    pub(crate) router_logits: Option<B::Tensor>,  // [num_experts] f32
+    pub(crate) moe_gate_buf: Option<B::Tensor>,   // [moe_inter] bf16
+    pub(crate) moe_up_buf: Option<B::Tensor>,     // [moe_inter] bf16
+    pub(crate) moe_output: Option<B::Tensor>,     // [hidden_size] bf16
 }
 
 impl<'a, B: GpuBackend> Model<'a, B> {
@@ -196,6 +210,9 @@ impl<'a, B: GpuBackend> Model<'a, B> {
     ) -> anyhow::Result<Self> {
         let arch = config.arch()?;
         let hidden = config.hidden_size;
+        // Q dimension: num_heads × head_dim.  Usually equals hidden_size, but
+        // Qwen3 MoE has hidden=2048 with 32×128=4096 attention dimension.
+        let q_dim = config.num_attention_heads * config.head_dim;
         let kv_dim = config.num_key_value_heads * config.head_dim;
         let inter = config.intermediate_size;
         let vocab = config.vocab_size;
@@ -203,13 +220,27 @@ impl<'a, B: GpuBackend> Model<'a, B> {
         // Allocate scratch buffers — one of each, reused across all layers.
         let hidden_buf = backend.alloc_tensor(&[hidden], TensorDtype::BF16);
         let norm_buf = backend.alloc_tensor(&[hidden], TensorDtype::BF16);
-        let q_buf = backend.alloc_tensor(&[hidden], TensorDtype::BF16); // num_heads * head_dim = hidden_size
+        let q_buf = backend.alloc_tensor(&[q_dim], TensorDtype::BF16);
         let k_buf = backend.alloc_tensor(&[kv_dim], TensorDtype::BF16);
         let v_buf = backend.alloc_tensor(&[kv_dim], TensorDtype::BF16);
-        let attn_out = backend.alloc_tensor(&[hidden], TensorDtype::BF16);
+        let attn_out = backend.alloc_tensor(&[q_dim], TensorDtype::BF16);
         let gate_buf = backend.alloc_tensor(&[inter], TensorDtype::BF16);
         let up_buf = backend.alloc_tensor(&[inter], TensorDtype::BF16);
         let logits_buf = backend.alloc_tensor(&[vocab], TensorDtype::BF16);
+
+        // MoE buffers: only allocated for MoE models.
+        let (router_logits, moe_gate_buf, moe_up_buf, moe_output) = if config.is_moe() {
+            let moe_inter = config.moe_intermediate_size;
+            (
+                // Router logits are f32 for precision during top-k selection.
+                Some(backend.alloc_tensor(&[config.num_experts], TensorDtype::F32)),
+                Some(backend.alloc_tensor(&[moe_inter], TensorDtype::BF16)),
+                Some(backend.alloc_tensor(&[moe_inter], TensorDtype::BF16)),
+                Some(backend.alloc_tensor(&[hidden], TensorDtype::BF16)),
+            )
+        } else {
+            (None, None, None, None)
+        };
 
         Ok(Self {
             config,
@@ -226,6 +257,10 @@ impl<'a, B: GpuBackend> Model<'a, B> {
             gate_buf,
             up_buf,
             logits_buf,
+            router_logits,
+            moe_gate_buf,
+            moe_up_buf,
+            moe_output,
         })
     }
 
@@ -250,6 +285,7 @@ impl<'a, B: GpuBackend> Model<'a, B> {
         match self.arch {
             ModelArch::Llama => registry::llama::forward(self, token_id),
             ModelArch::Qwen2 => registry::qwen::forward(self, token_id),
+            ModelArch::Qwen3Moe => registry::qwen3_moe::forward(self, token_id),
         }
     }
 
@@ -267,6 +303,7 @@ impl<'a, B: GpuBackend> Model<'a, B> {
         match self.arch {
             ModelArch::Llama => registry::llama::forward_single_paged(self, token_id, pool, seq_state),
             ModelArch::Qwen2 => registry::qwen::forward_single_paged(self, token_id, pool, seq_state),
+            ModelArch::Qwen3Moe => registry::qwen3_moe::forward_single_paged(self, token_id, pool, seq_state),
         }
     }
 
@@ -290,6 +327,7 @@ impl<'a, B: GpuBackend> Model<'a, B> {
         match self.arch {
             ModelArch::Llama => registry::llama::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
             ModelArch::Qwen2 => registry::qwen::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
+            ModelArch::Qwen3Moe => registry::qwen3_moe::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
         }
     }
 
@@ -342,16 +380,17 @@ pub(crate) struct PrefillBuffers<B: GpuBackend> {
 impl<B: GpuBackend> PrefillBuffers<B> {
     pub fn new(backend: &B, config: &ModelConfig, max_chunk: usize) -> Self {
         let hidden = config.hidden_size;
+        let q_dim = config.num_attention_heads * config.head_dim;
         let kv_dim = config.num_key_value_heads * config.head_dim;
         let inter = config.intermediate_size;
 
         Self {
             hidden: backend.alloc_tensor(&[max_chunk, hidden], TensorDtype::BF16),
             norm_buf: backend.alloc_tensor(&[max_chunk, hidden], TensorDtype::BF16),
-            q_buf: backend.alloc_tensor(&[max_chunk, hidden], TensorDtype::BF16),
+            q_buf: backend.alloc_tensor(&[max_chunk, q_dim], TensorDtype::BF16),
             k_buf: backend.alloc_tensor(&[max_chunk, kv_dim], TensorDtype::BF16),
             v_buf: backend.alloc_tensor(&[max_chunk, kv_dim], TensorDtype::BF16),
-            attn_out: backend.alloc_tensor(&[max_chunk, hidden], TensorDtype::BF16),
+            attn_out: backend.alloc_tensor(&[max_chunk, q_dim], TensorDtype::BF16),
             gate_buf: backend.alloc_tensor(&[max_chunk, inter], TensorDtype::BF16),
             up_buf: backend.alloc_tensor(&[max_chunk, inter], TensorDtype::BF16),
             // u32 tensors stored as F32 (same byte size: 4 bytes per element).

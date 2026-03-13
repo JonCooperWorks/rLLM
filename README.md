@@ -1,6 +1,6 @@
 # rLLM
 
-Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf16 and Q4 quantization, multi-architecture support (Llama 3 + Qwen 2.5). Paged KV cache, batched prefill (GEMM), continuous batching. No frameworks, no GGML — just raw GPU compute.
+Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf16 and Q4 quantization, multi-architecture support (Llama 3, Qwen 2.5, Qwen3 MoE). Paged KV cache, batched prefill (GEMM), continuous batching. No frameworks, no GGML — just raw GPU compute.
 
 ## Performance
 
@@ -13,12 +13,13 @@ Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf
 | Qwen 2.5 3B Instruct | 3.1B | 28 tok/s | 37 tok/s | 139 ms | 53 ms |
 | Qwen 2.5 7B Instruct | 7.6B | 21 tok/s | 35 tok/s | 380 ms | 123 ms |
 | Llama 3.1 8B Instruct | 8.0B | 19 tok/s | 32 tok/s | 453 ms | 141 ms |
+| Qwen3 Coder 30B-A3B Instruct | 30.5B (3.3B active) | — | 9 tok/s | — | 2,600 ms |
 
-Q4 quantization (`--quantize`) gives ~1.3-1.7x faster decode and ~3x faster prefill by reducing memory bandwidth.
+Q4 quantization (`--quantize`) gives ~1.3-1.7x faster decode and ~3x faster prefill by reducing memory bandwidth. The Qwen3 MoE model uses Mixture of Experts (128 experts, 8 active per token); bf16 skipped since the full 61 GB model leaves no room for KV cache.
 
 ## Features
 
-- **Multi-architecture** — Llama 3 and Qwen 2.5 from the same codebase
+- **Multi-architecture** — Llama 3, Qwen 2.5, and Qwen3 MoE from the same codebase
 - **Metal GPU backend** — SIMD-cooperative matmul, async command buffer dispatch
 - **Batched prefill** — GEMM-based prompt processing (3-10x faster than token-by-token)
 - **Paged KV cache** — on-demand block allocation, shared across sequences
@@ -27,6 +28,7 @@ Q4 quantization (`--quantize`) gives ~1.3-1.7x faster decode and ~3x faster pref
 - **bf16 inference** — native half-precision on Apple Silicon
 - **Safetensors loading** — single and multi-shard weight files
 - **BPE tokenizer** — HuggingFace-compatible tokenizer.json
+- **Mixture of Experts** — top-k expert routing with per-token dispatch (Qwen3 MoE)
 - **Chat templates** — Llama 3 and ChatML (Qwen) instruct formats with `--chat`
 - **Temperature + top-p sampling** — configurable via `--temperature` and `--top-p`
 - **Streaming output** — tokens printed as generated
@@ -51,6 +53,7 @@ Chat mode (instruct models — auto-detects Llama 3 or ChatML template):
 ```
 cargo run --release -- run --model models/llama-3.2-3b-instruct --prompt "Write a Python program that adds 4 numbers" --chat --temperature 0
 cargo run --release -- run --model models/qwen-2.5-7b-instruct --prompt "Explain hash maps" --chat --temperature 0
+cargo run --release -- run --model models/qwen3-coder-30b-a3b-instruct --prompt "Write a fibonacci function" --chat --quantize --temperature 0
 ```
 
 Continuous batching (multiple prompts from a file):
@@ -275,8 +278,11 @@ hf download meta-llama/Llama-3.1-8B-Instruct --local-dir models/llama-3.1-8b-ins
 # Qwen 2.5 — instruct models
 hf download Qwen/Qwen2.5-3B-Instruct --local-dir models/qwen-2.5-3b-instruct
 hf download Qwen/Qwen2.5-7B-Instruct --local-dir models/qwen-2.5-7b-instruct
+
+# Qwen3 MoE — 30.5B total, 3.3B active per token (~61 GB download)
+hf download Qwen/Qwen3-Coder-30B-A3B-Instruct --local-dir models/qwen3-coder-30b-a3b-instruct
 ```
 
-> **Note:** Llama models are gated — you'll need to [accept the license](https://huggingface.co/meta-llama/Llama-3.2-1B) on Hugging Face and authenticate with `hf auth login` before downloading. Qwen models are open access.
+> **Note:** Llama models are gated — you'll need to [accept the license](https://huggingface.co/meta-llama/Llama-3.2-1B) on Hugging Face and authenticate with `hf auth login` before downloading. Qwen models are open access (Apache-2.0).
 
 Each model directory should contain `config.json`, `tokenizer.json`, and one or more `.safetensors` weight files.

@@ -130,6 +130,8 @@ pub(crate) struct MetalBackend {
     pipeline_silu_mul: metal::ComputePipelineState,
     pipeline_add: metal::ComputePipelineState,
     pipeline_bias_add: metal::ComputePipelineState,
+    pipeline_scale_add: metal::ComputePipelineState,
+    pipeline_fill_zero: metal::ComputePipelineState,
     pipeline_embed_lookup: metal::ComputePipelineState,
     #[allow(dead_code)]
     pipeline_copy_kv: metal::ComputePipelineState,
@@ -184,6 +186,10 @@ impl MetalBackend {
         )?;
         let pipeline_bias_add =
             Self::make_pipeline(&device, METAL_SOURCE_ELEMENTWISE, "bias_add", &compile_opts)?;
+        let pipeline_scale_add =
+            Self::make_pipeline(&device, METAL_SOURCE_ELEMENTWISE, "scale_add", &compile_opts)?;
+        let pipeline_fill_zero =
+            Self::make_pipeline(&device, METAL_SOURCE_ELEMENTWISE, "fill_zero", &compile_opts)?;
         let pipeline_embed_lookup =
             Self::make_pipeline(&device, METAL_SOURCE_EMBED, "embed_lookup", &compile_opts)?;
         let pipeline_copy_kv = Self::make_pipeline(
@@ -253,6 +259,8 @@ impl MetalBackend {
             pipeline_silu_mul,
             pipeline_add,
             pipeline_bias_add,
+            pipeline_scale_add,
+            pipeline_fill_zero,
             pipeline_embed_lookup,
             pipeline_copy_kv,
             pipeline_paged_copy_kv,
@@ -411,6 +419,14 @@ struct AttentionParams {
 #[derive(Clone, Copy)]
 struct ElemParams {
     size: u32,
+}
+
+/// Params for scaled accumulate kernel.  Must match Metal `ScaleAddParams`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ScaleAddParams {
+    size: u32,
+    scale: f32,
 }
 
 /// Params for broadcast bias-add kernel. Must match Metal `BiasAddParams`.
@@ -725,6 +741,30 @@ impl GpuBackend for MetalBackend {
             &self.pipeline_add,
             &params,
             &[(&a.buffer, 1), (&b.buffer, 2), (&out.buffer, 3)],
+            MTLSize::new(size as u64, 1, 1),
+            MTLSize::new(256.min(size as u64), 1, 1),
+        );
+    }
+
+    /// Scaled accumulate: dst[i] += scale * src[i].  One thread per element.
+    fn scale_add(&self, dst: &MetalTensor, src: &MetalTensor, scale: f32, size: u32) {
+        let params = ScaleAddParams { size, scale };
+        self.dispatch_async(
+            &self.pipeline_scale_add,
+            &params,
+            &[(&dst.buffer, 1), (&src.buffer, 2)],
+            MTLSize::new(size as u64, 1, 1),
+            MTLSize::new(256.min(size as u64), 1, 1),
+        );
+    }
+
+    /// Fill tensor with zeros.  One thread per element.
+    fn fill_zero(&self, dst: &MetalTensor, size: u32) {
+        let params = ElemParams { size };
+        self.dispatch_async(
+            &self.pipeline_fill_zero,
+            &params,
+            &[(&dst.buffer, 1)],
             MTLSize::new(size as u64, 1, 1),
             MTLSize::new(256.min(size as u64), 1, 1),
         );

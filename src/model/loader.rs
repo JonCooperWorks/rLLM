@@ -35,10 +35,10 @@
 // Weight naming convention (shared by Llama and Qwen):
 //   model.embed_tokens.weight                          → [vocab_size, hidden_size]
 //   model.layers.{i}.input_layernorm.weight            → [hidden_size]
-//   model.layers.{i}.self_attn.q_proj.weight           → [hidden_size, hidden_size]
+//   model.layers.{i}.self_attn.q_proj.weight           → [q_dim, hidden_size]
 //   model.layers.{i}.self_attn.k_proj.weight           → [kv_dim, hidden_size]
 //   model.layers.{i}.self_attn.v_proj.weight           → [kv_dim, hidden_size]
-//   model.layers.{i}.self_attn.o_proj.weight           → [hidden_size, hidden_size]
+//   model.layers.{i}.self_attn.o_proj.weight           → [hidden_size, q_dim]
 //   model.layers.{i}.post_attention_layernorm.weight   → [hidden_size]
 //   model.layers.{i}.mlp.gate_proj.weight              → [inter_size, hidden_size]
 //   model.layers.{i}.mlp.up_proj.weight                → [inter_size, hidden_size]
@@ -46,7 +46,7 @@
 //   model.norm.weight                                  → [hidden_size]
 //
 // QKV bias (Qwen 2.5 only — Llama has no biases):
-//   model.layers.{i}.self_attn.q_proj.bias             → [hidden_size]
+//   model.layers.{i}.self_attn.q_proj.bias             → [q_dim]
 //   model.layers.{i}.self_attn.k_proj.bias             → [kv_dim]
 //   model.layers.{i}.self_attn.v_proj.bias             → [kv_dim]
 //   (O projection and FFN projections have NO bias in either family.)
@@ -190,16 +190,41 @@ pub(crate) struct ModelWeights<B: GpuBackend> {
     pub lm_head: Option<B::Tensor>,
 }
 
+// ---------------------------------------------------------------------------
+// MoE (Mixture of Experts) weight structures.
+//
+// Learning note: in a dense model, each layer has one FFN with gate/up/down
+// projections of size [intermediate_size, hidden_size].  In MoE, each layer
+// has MANY smaller expert FFNs (e.g. 128 experts of size [768, 2048]).
+// A learned router picks the top-k experts per token.
+//
+// The weight structure reflects this: per layer, there's one router gate
+// matrix [num_experts, hidden_size] that produces routing logits, plus
+// num_experts copies of the gate/up/down projections at a smaller size.
+//
+// Memory: despite having 128 experts, only 8 are used per token, so the
+// active compute cost is similar to a small dense model.  But ALL expert
+// weights must be stored in GPU memory — that's where the 30B total params
+// come from (vs. 3B active params).
+// ---------------------------------------------------------------------------
+
+/// Weights for a single expert FFN sub-network.
+pub(crate) struct ExpertWeights<B: GpuBackend> {
+    pub gate_proj: B::Tensor, // [moe_inter, hidden_size]
+    pub up_proj: B::Tensor,   // [moe_inter, hidden_size]
+    pub down_proj: B::Tensor, // [hidden_size, moe_inter]
+}
+
 /// Weights for a single transformer layer.
 pub(crate) struct LayerWeights<B: GpuBackend> {
     // --- Attention sub-block ---
     pub input_layernorm: B::Tensor, // RMSNorm weight [hidden_size]
-    pub q_proj: B::Tensor,          // Query projection [hidden_size, hidden_size]
+    pub q_proj: B::Tensor,          // Query projection [q_dim, hidden_size]
     pub k_proj: B::Tensor,          // Key projection [kv_dim, hidden_size]
     pub v_proj: B::Tensor,          // Value projection [kv_dim, hidden_size]
-    pub o_proj: B::Tensor,          // Output projection [hidden_size, hidden_size]
+    pub o_proj: B::Tensor,          // Output projection [hidden_size, q_dim]
 
-    // --- QKV bias (Qwen 2.5 only, None for Llama) ---
+    // --- QKV bias (Qwen 2.5 only, None for Llama and Qwen3Moe) ---
     //
     // Learning note: bias in a linear layer means output = W @ x + b.
     // After computing Q = W_q @ hidden, Qwen adds: Q = Q + b_q.
@@ -214,11 +239,28 @@ pub(crate) struct LayerWeights<B: GpuBackend> {
     pub k_bias: Option<B::Tensor>, // [kv_dim], or None for Llama
     pub v_bias: Option<B::Tensor>, // [kv_dim], or None for Llama
 
-    // --- FFN sub-block ---
+    // --- QK-norm (Qwen 3 MoE only) ---
+    //
+    // Learning note: QK-norm applies per-head RMSNorm to Q and K projections
+    // after the linear projection but before RoPE.  The norm weight is
+    // [head_dim] and is shared across all heads (applied independently to
+    // each head's vector).  This stabilises attention by preventing Q·K
+    // dot products from growing too large in deep networks.
+    pub q_norm: Option<B::Tensor>, // [head_dim], or None for non-QK-norm models
+    pub k_norm: Option<B::Tensor>, // [head_dim], or None for non-QK-norm models
+
+    // --- FFN sub-block (dense models) ---
     pub post_attention_layernorm: B::Tensor, // RMSNorm weight [hidden_size]
     pub gate_proj: B::Tensor,                // Gate projection [inter_size, hidden_size]
     pub up_proj: B::Tensor,                  // Up projection [inter_size, hidden_size]
     pub down_proj: B::Tensor,                // Down projection [hidden_size, inter_size]
+
+    // --- MoE FFN sub-block (MoE models only) ---
+    //
+    // When present, the dense gate/up/down fields above are unused dummy
+    // tensors.  The forward pass dispatches to MoE routing instead.
+    pub router_gate: Option<B::Tensor>,            // [num_experts, hidden_size]
+    pub experts: Option<Vec<ExpertWeights<B>>>,     // num_experts expert FFNs
 }
 
 /// Load all model weights from safetensors file(s) into GPU memory.
@@ -246,6 +288,9 @@ pub(crate) fn load_weights<B: GpuBackend>(
     let store = TensorStore { shards, weight_map };
 
     let hidden = config.hidden_size;
+    // Q dimension = num_attention_heads × head_dim.  For most models this equals
+    // hidden_size, but Qwen3 MoE has hidden=2048 with 32 heads × 128 head_dim = 4096.
+    let q_dim = config.num_attention_heads * config.head_dim;
     let kv_dim = config.num_key_value_heads * config.head_dim;
     let inter = config.intermediate_size;
 
@@ -272,6 +317,11 @@ pub(crate) fn load_weights<B: GpuBackend>(
     // Load per-layer weights.  Projection weights are optionally quantised to Q4.
     let arch = config.arch()?;
     let has_qkv_bias = arch.has_qkv_bias();
+    let has_qk_norm = arch.has_qk_norm();
+    let is_moe = config.is_moe();
+    let moe_inter = config.moe_intermediate_size;
+    let num_experts = config.num_experts;
+    let head_dim = config.head_dim;
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for i in 0..config.num_hidden_layers {
         let prefix = format!("model.layers.{i}");
@@ -284,7 +334,7 @@ pub(crate) fn load_weights<B: GpuBackend>(
                     &store,
                     backend,
                     &format!("{prefix}.self_attn.q_proj.bias"),
-                    &[hidden],
+                    &[q_dim],
                 )?),
                 Some(upload_tensor(
                     &store,
@@ -303,6 +353,108 @@ pub(crate) fn load_weights<B: GpuBackend>(
             (None, None, None)
         };
 
+        // Load QK-norm weights if the architecture has them (Qwen 3 MoE).
+        // These are per-head RMSNorm weights [head_dim], applied to Q and K
+        // after projection but before RoPE.
+        let (q_norm, k_norm) = if has_qk_norm {
+            (
+                Some(upload_tensor(
+                    &store,
+                    backend,
+                    &format!("{prefix}.self_attn.q_norm.weight"),
+                    &[head_dim],
+                )?),
+                Some(upload_tensor(
+                    &store,
+                    backend,
+                    &format!("{prefix}.self_attn.k_norm.weight"),
+                    &[head_dim],
+                )?),
+            )
+        } else {
+            (None, None)
+        };
+
+        // Load FFN weights: either dense (gate/up/down) or MoE (router + experts).
+        //
+        // For MoE models, the dense FFN fields get dummy zero-element tensors
+        // (never used — the forward pass dispatches to MoE routing instead).
+        // This avoids making the fields Optional and cascading changes everywhere.
+        let (gate_proj, up_proj, down_proj, router_gate, experts) = if is_moe {
+            // Dummy tensors for the dense FFN fields (never accessed by MoE forward pass).
+            let dummy = backend.alloc_tensor(&[1], TensorDtype::BF16);
+            let dummy2 = backend.alloc_tensor(&[1], TensorDtype::BF16);
+            let dummy3 = backend.alloc_tensor(&[1], TensorDtype::BF16);
+
+            // Router gate: [num_experts, hidden_size].  Stays bf16 — routing
+            // accuracy matters more than speed here (it's a single small matmul).
+            let router = upload_tensor(
+                &store,
+                backend,
+                &format!("{prefix}.mlp.gate.weight"),
+                &[num_experts, hidden],
+            )?;
+
+            // Load all expert weights.  Each expert has gate/up/down projections
+            // at the smaller moe_intermediate_size.
+            let mut expert_vec = Vec::with_capacity(num_experts);
+            for j in 0..num_experts {
+                let ep = format!("{prefix}.mlp.experts.{j}");
+                expert_vec.push(ExpertWeights {
+                    gate_proj: upload_maybe_q4(
+                        &store,
+                        backend,
+                        &format!("{ep}.gate_proj.weight"),
+                        &[moe_inter, hidden],
+                        quantize,
+                    )?,
+                    up_proj: upload_maybe_q4(
+                        &store,
+                        backend,
+                        &format!("{ep}.up_proj.weight"),
+                        &[moe_inter, hidden],
+                        quantize,
+                    )?,
+                    down_proj: upload_maybe_q4(
+                        &store,
+                        backend,
+                        &format!("{ep}.down_proj.weight"),
+                        &[hidden, moe_inter],
+                        quantize,
+                    )?,
+                });
+            }
+            if i == 0 {
+                eprintln!("  loading {} experts per layer (moe_inter={})", num_experts, moe_inter);
+            }
+
+            (dummy, dummy2, dummy3, Some(router), Some(expert_vec))
+        } else {
+            // Dense FFN: standard gate/up/down projections.
+            let gate = upload_maybe_q4(
+                &store,
+                backend,
+                &format!("{prefix}.mlp.gate_proj.weight"),
+                &[inter, hidden],
+                quantize,
+            )?;
+            let up = upload_maybe_q4(
+                &store,
+                backend,
+                &format!("{prefix}.mlp.up_proj.weight"),
+                &[inter, hidden],
+                quantize,
+            )?;
+            let down = upload_maybe_q4(
+                &store,
+                backend,
+                &format!("{prefix}.mlp.down_proj.weight"),
+                &[hidden, inter],
+                quantize,
+            )?;
+            (gate, up, down, None, None)
+        };
+
         layers.push(LayerWeights {
             // Norm weights stay bf16 (1D, tiny, used for RMSNorm not matmul).
             input_layernorm: upload_tensor(
@@ -315,7 +467,7 @@ pub(crate) fn load_weights<B: GpuBackend>(
                 &store,
                 backend,
                 &format!("{prefix}.self_attn.q_proj.weight"),
-                &[hidden, hidden],
+                &[q_dim, hidden],
                 quantize,
             )?,
             k_proj: upload_maybe_q4(
@@ -336,39 +488,25 @@ pub(crate) fn load_weights<B: GpuBackend>(
                 &store,
                 backend,
                 &format!("{prefix}.self_attn.o_proj.weight"),
-                &[hidden, hidden],
+                &[hidden, q_dim],
                 quantize,
             )?,
             q_bias,
             k_bias,
             v_bias,
+            q_norm,
+            k_norm,
             post_attention_layernorm: upload_tensor(
                 &store,
                 backend,
                 &format!("{prefix}.post_attention_layernorm.weight"),
                 &[hidden],
             )?,
-            gate_proj: upload_maybe_q4(
-                &store,
-                backend,
-                &format!("{prefix}.mlp.gate_proj.weight"),
-                &[inter, hidden],
-                quantize,
-            )?,
-            up_proj: upload_maybe_q4(
-                &store,
-                backend,
-                &format!("{prefix}.mlp.up_proj.weight"),
-                &[inter, hidden],
-                quantize,
-            )?,
-            down_proj: upload_maybe_q4(
-                &store,
-                backend,
-                &format!("{prefix}.mlp.down_proj.weight"),
-                &[hidden, inter],
-                quantize,
-            )?,
+            gate_proj,
+            up_proj,
+            down_proj,
+            router_gate,
+            experts,
         });
     }
 

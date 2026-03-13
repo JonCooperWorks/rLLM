@@ -227,6 +227,14 @@ pub(crate) trait GpuBackend: Send + Sync {
     /// Used for residual connections after attention and FFN.
     fn add(&self, a: &Self::Tensor, b: &Self::Tensor, out: &Self::Tensor, size: u32);
 
+    /// Scaled accumulate: dst[i] += scale * src[i]
+    /// Used in MoE to accumulate weighted expert outputs into a running sum.
+    fn scale_add(&self, dst: &Self::Tensor, src: &Self::Tensor, scale: f32, size: u32);
+
+    /// Fill tensor with zeros.  Used to clear the MoE accumulator buffer
+    /// before summing expert outputs.
+    fn fill_zero(&self, dst: &Self::Tensor, size: u32);
+
     /// Broadcast bias-add: out[i] = input[i] + bias[i % dim]
     /// Adds a [dim] bias vector to each row of a [batch_size, dim] tensor.
     /// Used in batched prefill for Qwen 2.5's QKV bias.

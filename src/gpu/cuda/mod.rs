@@ -57,6 +57,12 @@ impl super::GpuBackend for CudaBackend {
     fn add(&self, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: u32) {
         unreachable!()
     }
+    fn scale_add(&self, _: &CudaTensor, _: &CudaTensor, _: f32, _: u32) {
+        unreachable!()
+    }
+    fn fill_zero(&self, _: &CudaTensor, _: u32) {
+        unreachable!()
+    }
     fn bias_add_batch(&self, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: u32, _: u32) {
         unreachable!()
     }

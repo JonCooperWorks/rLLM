@@ -70,6 +70,16 @@ pub enum ModelArch {
     /// Qwen 2.5 family (0.5B, 1.5B, 3B, 7B, 14B, 32B, 72B).
     /// QKV projections have bias (NOT O projection or FFN).  Chat uses ChatML.
     Qwen2,
+    /// Qwen 3 Mixture-of-Experts family (e.g. Qwen3-Coder-30B-A3B).
+    ///
+    /// Learning note: MoE models have many "expert" FFN sub-networks per layer
+    /// but only activate a small subset (top-k) for each token.  This gives the
+    /// model capacity of a large dense model (30B total params) with the compute
+    /// cost of a small one (3B active params per token).
+    ///
+    /// Attention is identical to Llama (no QKV bias), but adds QK-norm (RMSNorm
+    /// on Q and K after projection, before RoPE) and uses ChatML chat template.
+    Qwen3Moe,
 }
 
 impl ModelArch {
@@ -84,6 +94,21 @@ impl ModelArch {
         match self {
             ModelArch::Llama => false,
             ModelArch::Qwen2 => true,
+            ModelArch::Qwen3Moe => false,
+        }
+    }
+
+    /// Whether Q and K projections have per-head RMSNorm applied before RoPE.
+    ///
+    /// Learning note: QK-norm stabilises attention by normalising Q and K
+    /// vectors before computing dot products.  Without it, attention logits
+    /// can grow large in deeper layers, causing sharp softmax distributions
+    /// that hurt training stability.  Qwen 3 adds this; Llama and Qwen 2.5
+    /// rely on the implicit normalisation from RMSNorm on the hidden state.
+    pub fn has_qk_norm(&self) -> bool {
+        match self {
+            ModelArch::Llama | ModelArch::Qwen2 => false,
+            ModelArch::Qwen3Moe => true,
         }
     }
 
@@ -92,8 +117,9 @@ impl ModelArch {
         match model_type {
             "llama" => Ok(ModelArch::Llama),
             "qwen2" => Ok(ModelArch::Qwen2),
+            "qwen3_moe" => Ok(ModelArch::Qwen3Moe),
             other => anyhow::bail!(
-                "unsupported model_type '{}' (expected 'llama' or 'qwen2')",
+                "unsupported model_type '{}' (expected 'llama', 'qwen2', or 'qwen3_moe')",
                 other
             ),
         }
@@ -147,6 +173,31 @@ pub struct ModelConfig {
     pub tie_word_embeddings: bool,
     /// Optional RoPE frequency scaling for long contexts (Llama 3.2 only).
     pub rope_scaling: Option<RopeScaling>,
+
+    // --- MoE (Mixture of Experts) fields ---
+    //
+    // Learning note: MoE replaces the single dense FFN per layer with many
+    // small "expert" FFNs.  A learned router picks the top-k experts per
+    // token.  Only activated experts consume compute, so a 30B-parameter
+    // model can run at the cost of a ~3B model — the key insight behind
+    // efficient scaling.
+    //
+    // These fields are only present in MoE configs (e.g. qwen3_moe).
+    // For dense models they default to 0.
+
+    /// Total number of expert FFN sub-networks per layer.
+    /// Qwen3-Coder-30B-A3B: 128 experts per layer.
+    #[serde(default)]
+    pub num_experts: usize,
+    /// How many experts are activated (routed to) per token.
+    /// Qwen3-Coder-30B-A3B: top-8 experts selected per token.
+    #[serde(default)]
+    pub num_experts_per_tok: usize,
+    /// Hidden dimension of each expert's FFN (gate/up/down projections).
+    /// Much smaller than `intermediate_size` because there are many experts.
+    /// Qwen3-Coder-30B-A3B: 768 per expert (vs 6144 dense intermediate_size).
+    #[serde(default)]
+    pub moe_intermediate_size: usize,
 }
 
 /// RoPE frequency scaling parameters for extended context lengths.
@@ -194,5 +245,10 @@ impl ModelConfig {
     #[allow(dead_code)]
     pub fn num_heads_per_kv_group(&self) -> usize {
         self.num_attention_heads / self.num_key_value_heads
+    }
+
+    /// Whether this model uses Mixture of Experts instead of dense FFN.
+    pub fn is_moe(&self) -> bool {
+        self.num_experts > 0
     }
 }

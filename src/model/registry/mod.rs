@@ -12,3 +12,4 @@
 
 pub(crate) mod llama;
 pub(crate) mod qwen;
+pub(crate) mod qwen3_moe;

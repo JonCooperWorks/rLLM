@@ -63,7 +63,29 @@ pub(crate) fn qkv_projection<B: GpuBackend>(
     hidden_size: u32,
     kv_dim: u32,
 ) {
+    // Q projection: [q_dim, hidden_size] × [hidden_size] → [q_dim].
+    // For most models q_dim == hidden_size, so callers pass hidden_size for both.
+    // Models with q_dim ≠ hidden_size (e.g. Qwen3 MoE) should use
+    // qkv_projection_qdim() instead.
     backend.matmul(&layer.q_proj, norm_buf, q_buf, hidden_size, hidden_size);
+    backend.matmul(&layer.k_proj, norm_buf, k_buf, kv_dim, hidden_size);
+    backend.matmul(&layer.v_proj, norm_buf, v_buf, kv_dim, hidden_size);
+}
+
+/// Like qkv_projection but with explicit q_dim for models where
+/// num_heads × head_dim ≠ hidden_size (e.g. Qwen3 MoE: 4096 vs 2048).
+pub(crate) fn qkv_projection_qdim<B: GpuBackend>(
+    backend: &B,
+    layer: &LayerWeights<B>,
+    norm_buf: &B::Tensor,
+    q_buf: &B::Tensor,
+    k_buf: &B::Tensor,
+    v_buf: &B::Tensor,
+    q_dim: u32,
+    hidden_size: u32,
+    kv_dim: u32,
+) {
+    backend.matmul(&layer.q_proj, norm_buf, q_buf, q_dim, hidden_size);
     backend.matmul(&layer.k_proj, norm_buf, k_buf, kv_dim, hidden_size);
     backend.matmul(&layer.v_proj, norm_buf, v_buf, kv_dim, hidden_size);
 }
@@ -134,6 +156,9 @@ pub(crate) fn paged_kv_and_attention<B: GpuBackend>(
 }
 
 /// O projection + residual add.
+///
+/// For models where q_dim == hidden_size, pass hidden_size for both args.
+/// For models where q_dim ≠ hidden_size (Qwen3 MoE), use o_proj_residual_qdim.
 pub(crate) fn o_proj_residual<B: GpuBackend>(
     backend: &B,
     layer: &LayerWeights<B>,
@@ -143,6 +168,21 @@ pub(crate) fn o_proj_residual<B: GpuBackend>(
     hidden_size: u32,
 ) {
     backend.matmul(&layer.o_proj, attn_out, norm_buf, hidden_size, hidden_size);
+    backend.add(hidden, norm_buf, hidden, hidden_size);
+}
+
+/// O projection + residual for models where q_dim ≠ hidden_size.
+/// o_proj weight is [hidden_size, q_dim], input attn_out is [q_dim].
+pub(crate) fn o_proj_residual_qdim<B: GpuBackend>(
+    backend: &B,
+    layer: &LayerWeights<B>,
+    attn_out: &B::Tensor,
+    norm_buf: &B::Tensor,
+    hidden: &B::Tensor,
+    hidden_size: u32,
+    q_dim: u32,
+) {
+    backend.matmul(&layer.o_proj, attn_out, norm_buf, hidden_size, q_dim);
     backend.add(hidden, norm_buf, hidden, hidden_size);
 }
 
@@ -213,6 +253,21 @@ pub(crate) fn qkv_projection_batch<B: GpuBackend>(
     kv_dim: u32,
 ) {
     backend.matmul_batch(&layer.q_proj, &bufs.norm_buf, &bufs.q_buf, bs, hidden_size, hidden_size);
+    backend.matmul_batch(&layer.k_proj, &bufs.norm_buf, &bufs.k_buf, bs, kv_dim, hidden_size);
+    backend.matmul_batch(&layer.v_proj, &bufs.norm_buf, &bufs.v_buf, bs, kv_dim, hidden_size);
+}
+
+/// Batched QKV projection with explicit q_dim (for q_dim ≠ hidden_size).
+pub(crate) fn qkv_projection_batch_qdim<B: GpuBackend>(
+    backend: &B,
+    layer: &LayerWeights<B>,
+    bufs: &PrefillBuffers<B>,
+    bs: u32,
+    q_dim: u32,
+    hidden_size: u32,
+    kv_dim: u32,
+) {
+    backend.matmul_batch(&layer.q_proj, &bufs.norm_buf, &bufs.q_buf, bs, q_dim, hidden_size);
     backend.matmul_batch(&layer.k_proj, &bufs.norm_buf, &bufs.k_buf, bs, kv_dim, hidden_size);
     backend.matmul_batch(&layer.v_proj, &bufs.norm_buf, &bufs.v_buf, bs, kv_dim, hidden_size);
 }
@@ -289,6 +344,19 @@ pub(crate) fn o_proj_residual_batch<B: GpuBackend>(
     hidden_size: u32,
 ) {
     backend.matmul_batch(&layer.o_proj, &bufs.attn_out, &bufs.norm_buf, bs, hidden_size, hidden_size);
+    backend.add(&bufs.hidden, &bufs.norm_buf, &bufs.hidden, bs * hidden_size);
+}
+
+/// Batched O projection + residual with explicit q_dim.
+pub(crate) fn o_proj_residual_batch_qdim<B: GpuBackend>(
+    backend: &B,
+    layer: &LayerWeights<B>,
+    bufs: &PrefillBuffers<B>,
+    bs: u32,
+    hidden_size: u32,
+    q_dim: u32,
+) {
+    backend.matmul_batch(&layer.o_proj, &bufs.attn_out, &bufs.norm_buf, bs, hidden_size, q_dim);
     backend.add(&bufs.hidden, &bufs.norm_buf, &bufs.hidden, bs * hidden_size);
 }
 

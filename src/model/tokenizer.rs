@@ -70,6 +70,11 @@ impl Tokenizer {
             // positions by 1 and degrade output quality.  In chat mode,
             // <|im_end|> (151645) is the primary stop token.
             ModelArch::Qwen2 => (None, vec![151643, 151645]),
+
+            // Qwen 3 MoE: same convention as Qwen 2.5 — no BOS, ChatML stops.
+            // Vocab size differs (151936 vs 152064) but special token IDs are
+            // in the same range.
+            ModelArch::Qwen3Moe => (None, vec![151643, 151645]),
         };
 
         Ok(Self {

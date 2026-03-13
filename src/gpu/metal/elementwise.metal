@@ -112,3 +112,49 @@ kernel void bias_add(
     if (gid >= params.total) return;
     output[gid] = bfloat(float(input[gid]) + float(bias[gid % params.dim]));
 }
+
+// ---------------------------------------------------------------------------
+// Scaled accumulate: dst[i] += scale * src[i]
+//
+// Used in MoE (Mixture of Experts) to accumulate weighted expert FFN outputs.
+// Each expert's output is multiplied by its routing weight and added to the
+// running sum.  After all top-k experts are processed, dst contains the
+// weighted combination of their outputs.
+//
+// Learning note: this is the "axpy" operation from BLAS (a*x + y).  In MoE
+// with top-k=8 routing, this is called 8 times per layer (once per activated
+// expert), so it's not performance-critical — the expert matmuls dominate.
+//
+// Aliasing note: dst is both read and written (accumulate), which is safe
+// because each thread handles exactly one index.
+// ---------------------------------------------------------------------------
+
+struct ScaleAddParams {
+    uint size;    // number of elements
+    float scale;  // multiplier for src
+};
+
+kernel void scale_add(
+    constant ScaleAddParams& params [[buffer(0)]],
+    device bfloat* dst              [[buffer(1)]],
+    device const bfloat* src        [[buffer(2)]],
+    uint gid                        [[thread_position_in_grid]]
+) {
+    if (gid >= params.size) return;
+    dst[gid] = bfloat(float(dst[gid]) + params.scale * float(src[gid]));
+}
+
+// ---------------------------------------------------------------------------
+// Fill tensor with zeros: dst[i] = 0
+//
+// Used to clear the MoE accumulator buffer before summing expert outputs.
+// ---------------------------------------------------------------------------
+
+kernel void fill_zero(
+    constant ElemParams& params [[buffer(0)]],
+    device bfloat* dst          [[buffer(1)]],
+    uint gid                    [[thread_position_in_grid]]
+) {
+    if (gid >= params.size) return;
+    dst[gid] = bfloat(0.0f);
+}
