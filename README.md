@@ -4,17 +4,17 @@ Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf
 
 ## Performance
 
-**Apple M4 Max** — 16-core CPU, 40-core GPU, 64 GB unified memory, 546 GB/s bandwidth. bf16 precision. Measured via the `/v1/chat/completions` streaming endpoint, averaged over 3 runs.
+**Apple M4 Max** — 16-core CPU, 40-core GPU, 64 GB unified memory, 546 GB/s bandwidth. Measured via the `/v1/chat/completions` streaming endpoint, averaged over 3 runs.
 
-| Model | Params | Decode | TTFT |
-|---|---|---|---|
-| Llama 3.2 1B Instruct | 1.2B | 90 tok/s | 45 ms |
-| Llama 3.2 3B Instruct | 3.2B | 32 tok/s | 160 ms |
-| Qwen 2.5 3B Instruct | 3.1B | 28 tok/s | 139 ms |
-| Qwen 2.5 7B Instruct | 7.6B | 21 tok/s | 380 ms |
-| Llama 3.1 8B Instruct | 8.0B | 19 tok/s | 453 ms |
+| Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
+|---|---|---|---|---|---|
+| Llama 3.2 1B Instruct | 1.2B | 90 tok/s | 119 tok/s | 45 ms | 21 ms |
+| Llama 3.2 3B Instruct | 3.2B | 32 tok/s | 44 tok/s | 160 ms | 58 ms |
+| Qwen 2.5 3B Instruct | 3.1B | 28 tok/s | 37 tok/s | 139 ms | 53 ms |
+| Qwen 2.5 7B Instruct | 7.6B | 21 tok/s | 35 tok/s | 380 ms | 123 ms |
+| Llama 3.1 8B Instruct | 8.0B | 19 tok/s | 32 tok/s | 453 ms | 141 ms |
 
-Q4 quantization (`--quantize`) reduces memory ~3.2x and speeds up generation ~1.5x.
+Q4 quantization (`--quantize`) gives ~1.3-1.7x faster decode and ~3x faster prefill by reducing memory bandwidth.
 
 ## Features
 
