@@ -45,7 +45,8 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 
-use super::{ChatMessage, InferenceEvent, InferenceRequest, ServerState, StopReason};
+use crate::chat::Message;
+use super::{InferenceEvent, InferenceRequest, ServerState, StopReason};
 
 // ---------------------------------------------------------------------------
 // Request types.
@@ -55,7 +56,7 @@ use super::{ChatMessage, InferenceEvent, InferenceRequest, ServerState, StopReas
 pub(crate) struct MessagesRequest {
     #[allow(dead_code)]
     pub model: Option<String>,
-    pub messages: Vec<ChatMessage>,
+    pub messages: Vec<Message>,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
     #[serde(default)]
@@ -129,7 +130,7 @@ pub(crate) async fn messages(
     // Build message list: prepend system prompt if provided.
     let mut messages = Vec::new();
     if let Some(ref system) = req.system {
-        messages.push(ChatMessage {
+        messages.push(Message {
             role: "system".into(),
             content: system.clone(),
         });

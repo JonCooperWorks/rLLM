@@ -36,6 +36,7 @@
 use std::path::Path;
 use tokenizers::Tokenizer as HfTokenizer;
 
+use crate::chat;
 use crate::config::ModelArch;
 
 pub(crate) struct Tokenizer {
@@ -122,6 +123,43 @@ impl Tokenizer {
         self.inner
             .decode(ids, true)
             .map_err(|e| anyhow::anyhow!("tokenizer decode failed: {e}"))
+    }
+
+    /// Encode a user prompt, optionally wrapping it in a chat template.
+    ///
+    /// In chat mode (`system` is Some), builds a [system, user] message list,
+    /// formats it with the model's chat template, and encodes with special
+    /// tokens.  In raw mode (`system` is None), encodes the prompt directly.
+    pub fn encode_prompt(
+        &self,
+        prompt: &str,
+        arch: ModelArch,
+        system: Option<&str>,
+    ) -> anyhow::Result<Vec<u32>> {
+        match system {
+            Some(sys) => {
+                let messages = vec![
+                    chat::Message { role: "system".into(), content: sys.to_string() },
+                    chat::Message { role: "user".into(), content: prompt.to_string() },
+                ];
+                let formatted = chat::format_chat(arch, &messages);
+                self.encode_chat(&formatted)
+            }
+            None => self.encode(prompt),
+        }
+    }
+
+    /// Encode pre-structured chat messages into token IDs.
+    ///
+    /// Used by the API server where messages arrive already structured
+    /// (system/user/assistant roles from the HTTP request).
+    pub fn encode_messages(
+        &self,
+        messages: &[chat::Message],
+        arch: ModelArch,
+    ) -> anyhow::Result<Vec<u32>> {
+        let formatted = chat::format_chat(arch, messages);
+        self.encode_chat(&formatted)
     }
 
     /// Check if a token ID is an end-of-sequence signal.

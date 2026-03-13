@@ -36,7 +36,8 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 
-use super::{ChatMessage, InferenceEvent, InferenceRequest, ServerState, StopReason};
+use crate::chat::Message;
+use super::{InferenceEvent, InferenceRequest, ServerState, StopReason};
 
 // ---------------------------------------------------------------------------
 // Request types (deserialized from JSON).
@@ -46,7 +47,7 @@ use super::{ChatMessage, InferenceEvent, InferenceRequest, ServerState, StopReas
 pub(crate) struct ChatCompletionRequest {
     #[allow(dead_code)]
     pub model: Option<String>,
-    pub messages: Vec<ChatMessage>,
+    pub messages: Vec<Message>,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
     #[serde(default = "default_temperature")]
@@ -93,7 +94,7 @@ struct ChatCompletionResponse {
 #[derive(serde::Serialize)]
 struct ChatChoice {
     index: u32,
-    message: ChatMessage,
+    message: Message,
     finish_reason: Option<String>,
 }
 
@@ -197,7 +198,7 @@ async fn chat_completions_blocking(
         model: state.model_name.clone(),
         choices: vec![ChatChoice {
             index: 0,
-            message: ChatMessage { role: "assistant".into(), content: text },
+            message: Message { role: "assistant".into(), content: text },
             finish_reason: Some(finish_reason.to_string()),
         }],
         usage: Usage {

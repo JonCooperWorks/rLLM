@@ -63,6 +63,7 @@ use crate::config::ModelArch;
 ///   - "system":    instructions for the model's behaviour
 ///   - "user":      the human's message
 ///   - "assistant": the model's response (for multi-turn conversations)
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Message {
     pub role: String,
     pub content: String,

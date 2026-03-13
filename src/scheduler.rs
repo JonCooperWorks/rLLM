@@ -44,8 +44,6 @@ pub(crate) struct SequenceRequest {
 
 /// State of a single active sequence.
 pub(crate) struct Sequence<B: GpuBackend> {
-    #[allow(dead_code)]
-    pub id: SeqId,
     /// Tokens remaining to prefill (drained as prefill progresses).
     pub pending_prefill: VecDeque<u32>,
     /// KV cache state for this sequence.
@@ -56,21 +54,6 @@ pub(crate) struct Sequence<B: GpuBackend> {
     pub max_gen_tokens: usize,
     /// Whether this sequence has finished (EOS or max_tokens reached).
     pub finished: bool,
-}
-
-/// A batch of tokens to process in one forward pass.
-#[allow(dead_code)]
-pub(crate) struct Batch {
-    /// Token IDs to process.
-    pub token_ids: Vec<u32>,
-    /// Sequence ID for each token.
-    pub seq_ids: Vec<SeqId>,
-    /// Position in each sequence's KV cache (where to write the new KV).
-    pub positions: Vec<u32>,
-    /// KV cache length per sequence (positions to attend over, including new token).
-    pub seq_lens: Vec<u32>,
-    /// Number of tokens in this batch.
-    pub batch_size: usize,
 }
 
 /// The continuous batching scheduler.
@@ -120,7 +103,6 @@ impl<B: GpuBackend> Scheduler<B> {
 
             let seq_state = self.kv_pool.new_sequence(backend);
             let seq = Sequence {
-                id,
                 pending_prefill: req.prompt_tokens.into(),
                 kv_state: seq_state,
                 generated_tokens: Vec::new(),
@@ -156,9 +138,4 @@ impl<B: GpuBackend> Scheduler<B> {
         !self.waiting.is_empty() || !self.active.is_empty()
     }
 
-    /// Number of active sequences.
-    #[allow(dead_code)]
-    pub fn active_count(&self) -> usize {
-        self.active.len()
-    }
 }

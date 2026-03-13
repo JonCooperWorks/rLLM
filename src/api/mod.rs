@@ -49,74 +49,20 @@ use crate::chat;
 use crate::config;
 use crate::gpu::{self, GpuBackend};
 use crate::kv_cache;
-use crate::loader;
 use crate::model;
 use crate::sampler;
+use crate::setup;
 use crate::tokenizer;
-
-// ---------------------------------------------------------------------------
-// CLI arguments for the `serve` subcommand.
-// ---------------------------------------------------------------------------
-
-/// Arguments for the `serve` subcommand.
-#[derive(clap::Args)]
-pub(crate) struct ServeArgs {
-    /// Path to model directory (contains config.json, tokenizer.json, *.safetensors).
-    #[arg(long)]
-    pub model: PathBuf,
-
-    /// Port to listen on.
-    #[arg(long, default_value = "8080")]
-    pub port: u16,
-
-    /// Host to bind to.
-    #[arg(long, default_value = "0.0.0.0")]
-    pub host: String,
-
-    /// Quantise weights to Q4 on load.
-    #[arg(long)]
-    pub quantize: bool,
-
-    /// Domain name (for Let's Encrypt certificate provisioning).
-    #[arg(long)]
-    pub domain: Option<String>,
-
-    /// Use Let's Encrypt for automatic TLS certificates (TLS-ALPN-01 challenge).
-    #[arg(long, requires = "domain")]
-    pub letsencrypt: bool,
-
-    /// Path to TLS certificate chain (PEM format).  Use with --private-key.
-    #[arg(long, requires = "private_key", conflicts_with = "letsencrypt")]
-    pub cert: Option<PathBuf>,
-
-    /// Path to TLS private key (PEM format).  Use with --cert.
-    #[arg(long, requires = "cert", conflicts_with = "letsencrypt")]
-    pub private_key: Option<PathBuf>,
-
-    /// Contact email for Let's Encrypt registration.
-    #[arg(long, requires = "letsencrypt")]
-    pub letsencrypt_email: Option<String>,
-
-    /// Directory to cache Let's Encrypt certificates.
-    #[arg(long, requires = "letsencrypt", default_value = ".rllm-certs")]
-    pub cert_cache_dir: PathBuf,
-}
+use crate::ServeArgs;
 
 // ---------------------------------------------------------------------------
 // Shared types: the bridge between HTTP handlers and the inference worker.
 // ---------------------------------------------------------------------------
 
-/// A chat message in the API request (role + content).
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct ChatMessage {
-    pub role: String,
-    pub content: String,
-}
-
 /// Request sent from an HTTP handler to the inference worker thread.
 pub(crate) struct InferenceRequest {
     /// Chat messages (for chat/messages endpoints).
-    pub messages: Vec<ChatMessage>,
+    pub messages: Vec<chat::Message>,
     /// Raw prompt text (for completions endpoint — bypasses chat template).
     pub raw_prompt: Option<String>,
     /// Maximum tokens to generate.
@@ -189,14 +135,6 @@ pub(crate) fn unix_timestamp() -> u64 {
 /// tokio runtime.  This function blocks until the server shuts down.
 pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     eprintln!("loading model from {}...", args.model.display());
-
-    // Load config and detect architecture (needed by handlers for chat templates).
-    let config = config::ModelConfig::from_file(&args.model.join("config.json"))?;
-    let arch = config.arch()?;
-    eprintln!(
-        "loaded config: {:?}, {} layers, hidden_size={}",
-        arch, config.num_hidden_layers, config.hidden_size
-    );
 
     let model_name = args.model
         .file_name()
@@ -301,21 +239,11 @@ fn spawn_worker(
         // The backend is on the stack, model borrows it — both live until
         // the thread exits (which is when the request channel closes).
         let result = (|| -> anyhow::Result<()> {
-            let config = config::ModelConfig::from_file(&model_dir.join("config.json"))?;
-            let arch = config.arch()?;
             let backend = gpu::create_backend()?;
             eprintln!("gpu: {}", backend.device_name());
 
-            let tokenizer = tokenizer::Tokenizer::from_file(
-                &model_dir.join("tokenizer.json"), arch,
-            )?;
-            eprintln!("tokenizer loaded");
-
-            let weights = loader::load_weights(&backend, &model_dir, &config, quantize)?;
-            eprintln!(
-                "weights loaded{}",
-                if quantize { " (Q4 quantised)" } else { "" }
-            );
+            let setup::LoadedModel { config, arch, tokenizer, weights } =
+                setup::load_model(&backend, &model_dir, quantize)?;
 
             let mut model = model::Model::new(config.clone(), weights, &backend)?;
 
@@ -391,11 +319,7 @@ fn process_request<B: GpuBackend>(
     let prompt_tokens = if let Some(ref raw) = req.raw_prompt {
         tokenizer.encode(raw)?
     } else {
-        let messages: Vec<chat::Message> = req.messages.iter()
-            .map(|m| chat::Message { role: m.role.clone(), content: m.content.clone() })
-            .collect();
-        let formatted = chat::format_chat(arch, &messages);
-        tokenizer.encode_chat(&formatted)?
+        tokenizer.encode_messages(&req.messages, arch)?
     };
     let prompt_token_count = prompt_tokens.len();
 
