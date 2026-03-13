@@ -40,6 +40,7 @@
 
 pub(crate) mod anthropic;
 pub(crate) mod openai;
+pub(crate) mod tls;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -75,6 +76,30 @@ pub(crate) struct ServeArgs {
     /// Quantise weights to Q4 on load.
     #[arg(long)]
     pub quantize: bool,
+
+    /// Domain name (for Let's Encrypt certificate provisioning).
+    #[arg(long)]
+    pub domain: Option<String>,
+
+    /// Use Let's Encrypt for automatic TLS certificates (TLS-ALPN-01 challenge).
+    #[arg(long, requires = "domain")]
+    pub letsencrypt: bool,
+
+    /// Path to TLS certificate chain (PEM format).  Use with --private-key.
+    #[arg(long, requires = "private_key", conflicts_with = "letsencrypt")]
+    pub cert: Option<PathBuf>,
+
+    /// Path to TLS private key (PEM format).  Use with --cert.
+    #[arg(long, requires = "cert", conflicts_with = "letsencrypt")]
+    pub private_key: Option<PathBuf>,
+
+    /// Contact email for Let's Encrypt registration.
+    #[arg(long, requires = "letsencrypt")]
+    pub letsencrypt_email: Option<String>,
+
+    /// Directory to cache Let's Encrypt certificates.
+    #[arg(long, requires = "letsencrypt", default_value = ".rllm-certs")]
+    pub cert_cache_dir: PathBuf,
 }
 
 // ---------------------------------------------------------------------------
@@ -204,15 +229,46 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .with_state(state);
 
     let addr = format!("{}:{}", args.host, args.port);
-    eprintln!("serving on http://{}", addr);
+
+    // Determine TLS mode from CLI args.
+    let tls_mode = if args.letsencrypt {
+        let domain = args.domain.clone().unwrap(); // guaranteed by clap `requires`
+        eprintln!("TLS: Let's Encrypt for {domain} (cache: {})", args.cert_cache_dir.display());
+        tls::TlsMode::LetsEncrypt {
+            domain,
+            email: args.letsencrypt_email.clone(),
+            cache_dir: args.cert_cache_dir.clone(),
+        }
+    } else if let (Some(cert), Some(key)) = (&args.cert, &args.private_key) {
+        eprintln!("TLS: manual certs ({}, {})", cert.display(), key.display());
+        tls::TlsMode::Manual {
+            cert: cert.clone(),
+            key: key.clone(),
+        }
+    } else {
+        tls::TlsMode::None
+    };
+
+    let scheme = if matches!(tls_mode, tls::TlsMode::None) { "http" } else { "https" };
+    eprintln!("serving on {scheme}://{addr}");
 
     // Build the tokio runtime here (not in main) so the rest of the binary
     // stays synchronous.  The inference worker is a plain std::thread —
     // it never needs async I/O.
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let listener = tokio::net::TcpListener::bind(&addr).await?;
-        axum::serve(listener, app).await?;
+        match tls_mode {
+            tls::TlsMode::None => {
+                let listener = tokio::net::TcpListener::bind(&addr).await?;
+                axum::serve(listener, app).await?;
+            }
+            tls::TlsMode::Manual { cert, key } => {
+                tls::serve_manual_tls(app, &addr, &cert, &key).await?;
+            }
+            tls::TlsMode::LetsEncrypt { domain, email, cache_dir } => {
+                tls::serve_letsencrypt(app, &addr, &domain, email.as_deref(), &cache_dir).await?;
+            }
+        }
         Ok::<(), anyhow::Error>(())
     })?;
 
