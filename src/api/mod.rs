@@ -45,15 +45,11 @@ pub(crate) mod tls;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::chat;
-use crate::config;
-use crate::gpu::{self, GpuBackend};
-use crate::kv_cache;
-use crate::model;
-use crate::sampler;
-use crate::setup;
-use crate::tokenizer;
 use crate::ServeArgs;
+use crate::gpu::{self, GpuBackend};
+use crate::model;
+use crate::model::loader;
+use crate::model::{chat, config, kv_cache, sampler, tokenizer};
 
 // ---------------------------------------------------------------------------
 // Shared types: the bridge between HTTP handlers and the inference worker.
@@ -136,7 +132,8 @@ pub(crate) fn unix_timestamp() -> u64 {
 pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     eprintln!("loading model from {}...", args.model.display());
 
-    let model_name = args.model
+    let model_name = args
+        .model
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "rllm-model".into());
@@ -156,7 +153,10 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // Build axum router with all API endpoints.
     let app = axum::Router::new()
         // OpenAI-compatible endpoints.
-        .route("/v1/chat/completions", axum::routing::post(openai::chat_completions))
+        .route(
+            "/v1/chat/completions",
+            axum::routing::post(openai::chat_completions),
+        )
         .route("/v1/completions", axum::routing::post(openai::completions))
         .route("/v1/models", axum::routing::get(openai::list_models))
         // Anthropic-compatible endpoint.
@@ -171,7 +171,10 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // Determine TLS mode from CLI args.
     let tls_mode = if args.letsencrypt {
         let domain = args.domain.clone().unwrap(); // guaranteed by clap `requires`
-        eprintln!("TLS: Let's Encrypt for {domain} (cache: {})", args.cert_cache_dir.display());
+        eprintln!(
+            "TLS: Let's Encrypt for {domain} (cache: {})",
+            args.cert_cache_dir.display()
+        );
         tls::TlsMode::LetsEncrypt {
             domain,
             email: args.letsencrypt_email.clone(),
@@ -187,7 +190,11 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         tls::TlsMode::None
     };
 
-    let scheme = if matches!(tls_mode, tls::TlsMode::None) { "http" } else { "https" };
+    let scheme = if matches!(tls_mode, tls::TlsMode::None) {
+        "http"
+    } else {
+        "https"
+    };
     eprintln!("serving on {scheme}://{addr}");
 
     // Build the tokio runtime here (not in main) so the rest of the binary
@@ -203,7 +210,11 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
             tls::TlsMode::Manual { cert, key } => {
                 tls::serve_manual_tls(app, &addr, &cert, &key).await?;
             }
-            tls::TlsMode::LetsEncrypt { domain, email, cache_dir } => {
+            tls::TlsMode::LetsEncrypt {
+                domain,
+                email,
+                cache_dir,
+            } => {
                 tls::serve_letsencrypt(app, &addr, &domain, email.as_deref(), &cache_dir).await?;
             }
         }
@@ -242,8 +253,12 @@ fn spawn_worker(
             let backend = gpu::create_backend()?;
             eprintln!("gpu: {}", backend.device_name());
 
-            let setup::LoadedModel { config, arch, tokenizer, weights } =
-                setup::load_model(&backend, &model_dir, quantize)?;
+            let loader::LoadedModel {
+                config,
+                arch,
+                tokenizer,
+                weights,
+            } = loader::load_model(&backend, &model_dir, quantize)?;
 
             let mut model = model::Model::new(config.clone(), weights, &backend)?;
 
@@ -252,15 +267,16 @@ fn spawn_worker(
             // For Llama 3.1 8B (kv_dim=1024, 32 layers): 8192 * 16 * 1024 * 2 * 2 * 32 = ~16 GB.
             let num_blocks = 8192;
             let kv_dim = config.num_key_value_heads * config.head_dim;
-            let mut kv_pool = kv_cache::KvPool::new(
-                &backend, num_blocks, kv_dim, config.num_hidden_layers,
-            );
+            let mut kv_pool =
+                kv_cache::KvPool::new(&backend, num_blocks, kv_dim, config.num_hidden_layers);
             let max_prefill = 4096;
             let prefill_bufs = model::PrefillBuffers::new(&backend, &config, max_prefill);
 
             eprintln!(
                 "KV cache: {} blocks ({} max tokens), prefill up to {} tokens",
-                num_blocks, num_blocks * kv_cache::BLOCK_SIZE, max_prefill
+                num_blocks,
+                num_blocks * kv_cache::BLOCK_SIZE,
+                max_prefill
             );
 
             // Signal success to the main thread.
@@ -271,13 +287,19 @@ fn spawn_worker(
             // Blocking request loop — runs until the channel closes (server shutdown).
             while let Ok(req) = request_rx.recv() {
                 let result = process_request(
-                    &req, &mut model, &mut kv_pool, &prefill_bufs,
-                    &tokenizer, &backend, arch, &mut rng,
+                    &req,
+                    &mut model,
+                    &mut kv_pool,
+                    &prefill_bufs,
+                    &tokenizer,
+                    &backend,
+                    arch,
+                    &mut rng,
                 );
                 if let Err(e) = result {
-                    let _ = req.response_tx.blocking_send(InferenceEvent::Error(
-                        format!("{e:#}"),
-                    ));
+                    let _ = req
+                        .response_tx
+                        .blocking_send(InferenceEvent::Error(format!("{e:#}")));
                 }
             }
 
@@ -334,9 +356,7 @@ fn process_request<B: GpuBackend>(
 
     // 4. Generation loop: sample → send token → forward → repeat.
     let mut gen_count: usize = 0;
-    let mut next_token = sampler::sample(
-        backend, model.logits(), req.temperature, req.top_p, rng,
-    )?;
+    let mut next_token = sampler::sample(backend, model.logits(), req.temperature, req.top_p, rng)?;
 
     let mut stop_reason = StopReason::MaxTokens;
 
@@ -351,7 +371,11 @@ fn process_request<B: GpuBackend>(
 
         // Send token to the HTTP handler.  If the handler dropped its
         // receiver (client disconnected), stop generating immediately.
-        if req.response_tx.blocking_send(InferenceEvent::Token { text }).is_err() {
+        if req
+            .response_tx
+            .blocking_send(InferenceEvent::Token { text })
+            .is_err()
+        {
             // Client disconnected — clean up and return.
             kv_pool.free_sequence(&seq_state);
             return Ok(());
@@ -363,9 +387,7 @@ fn process_request<B: GpuBackend>(
         model.forward_single_paged(next_token, kv_pool, &seq_state)?;
         seq_state.advance();
 
-        next_token = sampler::sample(
-            backend, model.logits(), req.temperature, req.top_p, rng,
-        )?;
+        next_token = sampler::sample(backend, model.logits(), req.temperature, req.top_p, rng)?;
     }
 
     // 5. Send completion event.

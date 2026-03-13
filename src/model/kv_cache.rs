@@ -87,12 +87,7 @@ impl<B: GpuBackend> KvPool<B> {
     /// Total GPU memory = num_blocks * BLOCK_SIZE * kv_dim * 2 bytes * 2 (K+V)
     ///                     * num_layers.
     /// For 256 blocks, 16 layers, kv_dim=512: 256 * 16 * 512 * 2 * 2 * 16 = 128 MB.
-    pub fn new(
-        backend: &B,
-        num_blocks: usize,
-        kv_dim: usize,
-        num_layers: usize,
-    ) -> Self {
+    pub fn new(backend: &B, num_blocks: usize, kv_dim: usize, num_layers: usize) -> Self {
         let total_positions = num_blocks * BLOCK_SIZE;
         let mut k_pool = Vec::with_capacity(num_layers);
         let mut v_pool = Vec::with_capacity(num_layers);
@@ -177,7 +172,8 @@ impl<B: GpuBackend> SeqKvState<B> {
         let needed_blocks = (self.seq_len + BLOCK_SIZE) / BLOCK_SIZE; // ceil((seq_len+1)/BLOCK_SIZE)
         if needed_blocks > self.block_table_cpu.len() {
             // Need a new block.
-            let block_idx = pool.alloc_block()
+            let block_idx = pool
+                .alloc_block()
                 .ok_or_else(|| anyhow::anyhow!("KV cache out of memory: no free blocks"))?;
             self.block_table_cpu.push(block_idx);
             self.dirty = true;
@@ -230,7 +226,8 @@ impl<B: GpuBackend> SeqKvState<B> {
         let new_len = self.seq_len + count;
         let needed_blocks = (new_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
         while self.block_table_cpu.len() < needed_blocks {
-            let block_idx = pool.alloc_block()
+            let block_idx = pool
+                .alloc_block()
                 .ok_or_else(|| anyhow::anyhow!("KV cache out of memory: no free blocks"))?;
             self.block_table_cpu.push(block_idx);
             self.dirty = true;
@@ -244,4 +241,3 @@ impl<B: GpuBackend> SeqKvState<B> {
         self.block_table_cpu.len()
     }
 }
-

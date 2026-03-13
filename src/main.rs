@@ -10,24 +10,16 @@
 // ===========================================================================
 
 mod api;
-mod chat;
 mod commands;
-mod config;
 mod engine;
 mod gpu;
-mod kv_cache;
-mod loader;
 mod model;
-mod sampler;
-mod scheduler;
-mod setup;
-mod tokenizer;
 
 // Re-export for use by api module.
 pub(crate) use commands::ServeArgs;
 
-use std::process::ExitCode;
 use clap::Parser;
+use std::process::ExitCode;
 
 #[derive(Parser)]
 #[command(name = "rllm", about = "Rust LLM inference engine")]

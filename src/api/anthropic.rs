@@ -45,8 +45,8 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 
-use crate::chat::Message;
 use super::{InferenceEvent, InferenceRequest, ServerState, StopReason};
+use crate::model::chat::Message;
 
 // ---------------------------------------------------------------------------
 // Request types.
@@ -70,7 +70,9 @@ pub(crate) struct MessagesRequest {
     pub system: Option<String>,
 }
 
-fn default_max_tokens() -> usize { 4096 }
+fn default_max_tokens() -> usize {
+    4096
+}
 
 // ---------------------------------------------------------------------------
 // Response types.
@@ -146,10 +148,13 @@ pub(crate) async fn messages(
         response_tx,
     };
 
-    state.request_tx.try_send(inference_req).map_err(|e| match e {
-        std::sync::mpsc::TrySendError::Full(_) => StatusCode::SERVICE_UNAVAILABLE,
-        std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    })?;
+    state
+        .request_tx
+        .try_send(inference_req)
+        .map_err(|e| match e {
+            std::sync::mpsc::TrySendError::Full(_) => StatusCode::SERVICE_UNAVAILABLE,
+            std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
 
     if req.stream {
         Ok(messages_stream(state, response_rx).await)
@@ -171,7 +176,11 @@ async fn messages_blocking(
     while let Some(event) = response_rx.recv().await {
         match event {
             InferenceEvent::Token { text: t } => text.push_str(&t),
-            InferenceEvent::Done { stop_reason: sr, prompt_tokens, completion_tokens } => {
+            InferenceEvent::Done {
+                stop_reason: sr,
+                prompt_tokens,
+                completion_tokens,
+            } => {
                 input_tokens = prompt_tokens;
                 output_tokens = completion_tokens;
                 stop_reason = stop_reason_str(sr);
@@ -196,7 +205,8 @@ async fn messages_blocking(
             input_tokens,
             output_tokens,
         },
-    }).into_response()
+    })
+    .into_response()
 }
 
 /// Streaming: return SSE events using Anthropic's event protocol.

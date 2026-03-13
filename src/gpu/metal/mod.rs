@@ -153,8 +153,8 @@ pub(crate) struct MetalBackend {
 
 impl MetalBackend {
     pub fn new() -> anyhow::Result<Self> {
-        let device = metal::Device::system_default()
-            .ok_or_else(|| anyhow!("no Metal device found"))?;
+        let device =
+            metal::Device::system_default().ok_or_else(|| anyhow!("no Metal device found"))?;
         let queue = device.new_command_queue();
         let name = device.name().to_string();
 
@@ -166,40 +166,80 @@ impl MetalBackend {
             Self::make_pipeline(&device, METAL_SOURCE_MATMUL, "matvec_bf16", &compile_opts)?;
         let pipeline_matvec_q4 =
             Self::make_pipeline(&device, METAL_SOURCE_MATMUL, "matvec_q4", &compile_opts)?;
-        let pipeline_rope =
-            Self::make_pipeline(&device, METAL_SOURCE_ROPE, "rotary_embedding", &compile_opts)?;
+        let pipeline_rope = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_ROPE,
+            "rotary_embedding",
+            &compile_opts,
+        )?;
         let pipeline_attention =
             Self::make_pipeline(&device, METAL_SOURCE_ATTENTION, "attention", &compile_opts)?;
         let pipeline_silu_mul =
             Self::make_pipeline(&device, METAL_SOURCE_ELEMENTWISE, "silu_mul", &compile_opts)?;
-        let pipeline_add =
-            Self::make_pipeline(&device, METAL_SOURCE_ELEMENTWISE, "add_tensors", &compile_opts)?;
+        let pipeline_add = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_ELEMENTWISE,
+            "add_tensors",
+            &compile_opts,
+        )?;
         let pipeline_bias_add =
             Self::make_pipeline(&device, METAL_SOURCE_ELEMENTWISE, "bias_add", &compile_opts)?;
         let pipeline_embed_lookup =
             Self::make_pipeline(&device, METAL_SOURCE_EMBED, "embed_lookup", &compile_opts)?;
-        let pipeline_copy_kv =
-            Self::make_pipeline(&device, METAL_SOURCE_ATTENTION, "copy_to_kv_cache", &compile_opts)?;
-        let pipeline_paged_copy_kv =
-            Self::make_pipeline(&device, METAL_SOURCE_ATTENTION, "copy_to_paged_kv_cache", &compile_opts)?;
-        let pipeline_paged_attention =
-            Self::make_pipeline(&device, METAL_SOURCE_ATTENTION, "paged_attention", &compile_opts)?;
+        let pipeline_copy_kv = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_ATTENTION,
+            "copy_to_kv_cache",
+            &compile_opts,
+        )?;
+        let pipeline_paged_copy_kv = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_ATTENTION,
+            "copy_to_paged_kv_cache",
+            &compile_opts,
+        )?;
+        let pipeline_paged_attention = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_ATTENTION,
+            "paged_attention",
+            &compile_opts,
+        )?;
 
         // Phase 3: batched prefill pipelines.
         let pipeline_gemm_bf16 =
             Self::make_pipeline(&device, METAL_SOURCE_MATMUL, "gemm_bf16", &compile_opts)?;
         let pipeline_gemm_q4 =
             Self::make_pipeline(&device, METAL_SOURCE_MATMUL, "gemm_q4", &compile_opts)?;
-        let pipeline_rms_norm_batch =
-            Self::make_pipeline(&device, METAL_SOURCE_RMS_NORM, "rms_norm_batch", &compile_opts)?;
-        let pipeline_embed_lookup_batch =
-            Self::make_pipeline(&device, METAL_SOURCE_EMBED, "embed_lookup_batch", &compile_opts)?;
-        let pipeline_rope_batch =
-            Self::make_pipeline(&device, METAL_SOURCE_ROPE, "rotary_embedding_batch", &compile_opts)?;
-        let pipeline_paged_copy_kv_batch =
-            Self::make_pipeline(&device, METAL_SOURCE_ATTENTION, "copy_to_paged_kv_cache_batch", &compile_opts)?;
-        let pipeline_prefill_attention =
-            Self::make_pipeline(&device, METAL_SOURCE_ATTENTION, "prefill_attention", &compile_opts)?;
+        let pipeline_rms_norm_batch = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_RMS_NORM,
+            "rms_norm_batch",
+            &compile_opts,
+        )?;
+        let pipeline_embed_lookup_batch = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_EMBED,
+            "embed_lookup_batch",
+            &compile_opts,
+        )?;
+        let pipeline_rope_batch = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_ROPE,
+            "rotary_embedding_batch",
+            &compile_opts,
+        )?;
+        let pipeline_paged_copy_kv_batch = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_ATTENTION,
+            "copy_to_paged_kv_cache_batch",
+            &compile_opts,
+        )?;
+        let pipeline_prefill_attention = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_ATTENTION,
+            "prefill_attention",
+            &compile_opts,
+        )?;
 
         Ok(Self {
             device,
@@ -377,8 +417,8 @@ struct ElemParams {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct BiasAddParams {
-    total: u32,  // batch_size * dim
-    dim: u32,    // bias vector length
+    total: u32, // batch_size * dim
+    dim: u32,   // bias vector length
 }
 
 #[repr(C)]
@@ -492,10 +532,9 @@ impl GpuBackend for MetalBackend {
             }
             _ => shape.iter().product::<usize>() * dtype.byte_size(),
         };
-        let buffer = self.device.new_buffer(
-            byte_count as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let buffer = self
+            .device
+            .new_buffer(byte_count as u64, MTLResourceOptions::StorageModeShared);
         MetalTensor {
             buffer,
             shape: shape.to_vec(),
@@ -583,11 +622,7 @@ impl GpuBackend for MetalBackend {
         self.dispatch_async(
             &self.pipeline_rms_norm,
             &params,
-            &[
-                (&input.buffer, 1),
-                (&weight.buffer, 2),
-                (&out.buffer, 3),
-            ],
+            &[(&input.buffer, 1), (&weight.buffer, 2), (&out.buffer, 3)],
             MTLSize::new(256, 1, 1),
             MTLSize::new(256, 1, 1),
         );
@@ -604,11 +639,7 @@ impl GpuBackend for MetalBackend {
         self.dispatch_async(
             pipeline,
             &params,
-            &[
-                (&weight.buffer, 1),
-                (&input.buffer, 2),
-                (&out.buffer, 3),
-            ],
+            &[(&weight.buffer, 1), (&input.buffer, 2), (&out.buffer, 3)],
             MTLSize::new(m as u64 * 32, 1, 1),
             MTLSize::new(256, 1, 1),
         );
@@ -681,11 +712,7 @@ impl GpuBackend for MetalBackend {
         self.dispatch_async(
             &self.pipeline_silu_mul,
             &params,
-            &[
-                (&gate.buffer, 1),
-                (&up.buffer, 2),
-                (&out.buffer, 3),
-            ],
+            &[(&gate.buffer, 1), (&up.buffer, 2), (&out.buffer, 3)],
             MTLSize::new(size as u64, 1, 1),
             MTLSize::new(256.min(size as u64), 1, 1),
         );
@@ -697,11 +724,7 @@ impl GpuBackend for MetalBackend {
         self.dispatch_async(
             &self.pipeline_add,
             &params,
-            &[
-                (&a.buffer, 1),
-                (&b.buffer, 2),
-                (&out.buffer, 3),
-            ],
+            &[(&a.buffer, 1), (&b.buffer, 2), (&out.buffer, 3)],
             MTLSize::new(size as u64, 1, 1),
             MTLSize::new(256.min(size as u64), 1, 1),
         );
@@ -722,24 +745,14 @@ impl GpuBackend for MetalBackend {
         self.dispatch_async(
             &self.pipeline_bias_add,
             &params,
-            &[
-                (&input.buffer, 1),
-                (&bias.buffer, 2),
-                (&out.buffer, 3),
-            ],
+            &[(&input.buffer, 1), (&bias.buffer, 2), (&out.buffer, 3)],
             MTLSize::new(total as u64, 1, 1),
             MTLSize::new(256.min(total as u64), 1, 1),
         );
     }
 
     /// Embedding lookup: copy one row from the embedding table.
-    fn embed_lookup(
-        &self,
-        table: &MetalTensor,
-        token_id: u32,
-        out: &MetalTensor,
-        hidden_dim: u32,
-    ) {
+    fn embed_lookup(&self, table: &MetalTensor, token_id: u32, out: &MetalTensor, hidden_dim: u32) {
         let params = EmbedParams {
             token_id,
             hidden_dim,
@@ -791,7 +804,7 @@ impl GpuBackend for MetalBackend {
             pos,
             num_kv_heads,
             head_dim,
-            block_size: crate::kv_cache::BLOCK_SIZE as u32,
+            block_size: crate::model::kv_cache::BLOCK_SIZE as u32,
         };
         let size = num_kv_heads * head_dim;
         self.dispatch_async(
@@ -825,7 +838,7 @@ impl GpuBackend for MetalBackend {
             num_heads,
             num_kv_heads,
             head_dim,
-            block_size: crate::kv_cache::BLOCK_SIZE as u32,
+            block_size: crate::model::kv_cache::BLOCK_SIZE as u32,
         };
         let threads_per_group: u64 = 256;
         self.dispatch_async(
@@ -877,11 +890,7 @@ impl GpuBackend for MetalBackend {
         self.dispatch_async(
             pipeline,
             &params,
-            &[
-                (&weight.buffer, 1),
-                (&input.buffer, 2),
-                (&out.buffer, 3),
-            ],
+            &[(&weight.buffer, 1), (&input.buffer, 2), (&out.buffer, 3)],
             MTLSize::new(batch_size as u64 * m as u64 * 32, 1, 1),
             MTLSize::new(256, 1, 1),
         );
@@ -897,15 +906,15 @@ impl GpuBackend for MetalBackend {
         batch_size: u32,
     ) {
         let hidden_size = weight.shape[0] as u32;
-        let params = RmsNormBatchParams { hidden_size, eps, batch_size };
+        let params = RmsNormBatchParams {
+            hidden_size,
+            eps,
+            batch_size,
+        };
         self.dispatch_async(
             &self.pipeline_rms_norm_batch,
             &params,
-            &[
-                (&input.buffer, 1),
-                (&weight.buffer, 2),
-                (&out.buffer, 3),
-            ],
+            &[(&input.buffer, 1), (&weight.buffer, 2), (&out.buffer, 3)],
             MTLSize::new(batch_size as u64 * 256, 1, 1),
             MTLSize::new(256, 1, 1),
         );
@@ -920,16 +929,15 @@ impl GpuBackend for MetalBackend {
         batch_size: u32,
         hidden_dim: u32,
     ) {
-        let params = EmbedBatchParams { batch_size, hidden_dim };
+        let params = EmbedBatchParams {
+            batch_size,
+            hidden_dim,
+        };
         let total = batch_size as u64 * hidden_dim as u64;
         self.dispatch_async(
             &self.pipeline_embed_lookup_batch,
             &params,
-            &[
-                (&table.buffer, 1),
-                (&token_ids.buffer, 2),
-                (&out.buffer, 3),
-            ],
+            &[(&table.buffer, 1), (&token_ids.buffer, 2), (&out.buffer, 3)],
             MTLSize::new(total, 1, 1),
             MTLSize::new(256.min(total), 1, 1),
         );
@@ -959,11 +967,7 @@ impl GpuBackend for MetalBackend {
         self.dispatch_async(
             &self.pipeline_rope_batch,
             &params,
-            &[
-                (&q.buffer, 1),
-                (&k.buffer, 2),
-                (&positions.buffer, 3),
-            ],
+            &[(&q.buffer, 1), (&k.buffer, 2), (&positions.buffer, 3)],
             MTLSize::new(total, 1, 1),
             MTLSize::new(256.min(total), 1, 1),
         );
@@ -984,7 +988,7 @@ impl GpuBackend for MetalBackend {
             batch_size,
             num_kv_heads,
             head_dim,
-            block_size: crate::kv_cache::BLOCK_SIZE as u32,
+            block_size: crate::model::kv_cache::BLOCK_SIZE as u32,
         };
         let kv_dim = num_kv_heads * head_dim;
         let total = batch_size as u64 * kv_dim as u64;

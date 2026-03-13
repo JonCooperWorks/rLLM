@@ -180,7 +180,14 @@ pub(crate) trait GpuBackend: Send + Sync {
     /// `m` = number of output rows, `k` = input dimension.
     /// Called 9 times per layer (Q/K/V/O projections + gate/up/down FFN)
     /// plus once for the final vocabulary projection = 145 calls per token.
-    fn matmul(&self, weight: &Self::Tensor, input: &Self::Tensor, out: &Self::Tensor, m: u32, k: u32);
+    fn matmul(
+        &self,
+        weight: &Self::Tensor,
+        input: &Self::Tensor,
+        out: &Self::Tensor,
+        m: u32,
+        k: u32,
+    );
 
     /// Rotary Positional Embeddings (RoPE): rotate Q and K vectors in-place.
     /// Applies position-dependent sin/cos rotations to pairs of elements,

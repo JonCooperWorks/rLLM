@@ -36,8 +36,8 @@
 use std::path::Path;
 use tokenizers::Tokenizer as HfTokenizer;
 
-use crate::chat;
-use crate::config::ModelArch;
+use super::chat;
+use super::config::ModelArch;
 
 pub(crate) struct Tokenizer {
     /// The HuggingFace tokenizer (BPE model + merge rules + vocabulary).
@@ -139,8 +139,14 @@ impl Tokenizer {
         match system {
             Some(sys) => {
                 let messages = vec![
-                    chat::Message { role: "system".into(), content: sys.to_string() },
-                    chat::Message { role: "user".into(), content: prompt.to_string() },
+                    chat::Message {
+                        role: "system".into(),
+                        content: sys.to_string(),
+                    },
+                    chat::Message {
+                        role: "user".into(),
+                        content: prompt.to_string(),
+                    },
                 ];
                 let formatted = chat::format_chat(arch, &messages);
                 self.encode_chat(&formatted)

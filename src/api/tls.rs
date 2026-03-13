@@ -49,8 +49,7 @@ pub(crate) async fn serve_manual_tls(
     // Load certificate chain from PEM file.
     let cert_file = std::fs::File::open(cert_path)?;
     let mut cert_reader = std::io::BufReader::new(cert_file);
-    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
-        .collect::<Result<_, _>>()?;
+    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader).collect::<Result<_, _>>()?;
     anyhow::ensure!(
         !certs.is_empty(),
         "no certificates found in {}",
@@ -91,8 +90,8 @@ pub(crate) async fn serve_letsencrypt(
     email: Option<&str>,
     cache_dir: &Path,
 ) -> anyhow::Result<()> {
-    use rustls_acme::caches::DirCache;
     use rustls_acme::AcmeConfig;
+    use rustls_acme::caches::DirCache;
     use tokio_stream::StreamExt;
 
     let mut acme = AcmeConfig::new([domain])
@@ -124,11 +123,8 @@ pub(crate) async fn serve_letsencrypt(
     let mut server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(resolver);
-    server_config.alpn_protocols = vec![
-        b"h2".to_vec(),
-        b"http/1.1".to_vec(),
-        b"acme-tls/1".to_vec(),
-    ];
+    server_config.alpn_protocols =
+        vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"acme-tls/1".to_vec()];
 
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
     let listener = TcpListener::bind(addr).await?;
@@ -176,10 +172,9 @@ async fn serve_tls_loop(
                 },
             );
 
-            if let Err(err) =
-                hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-                    .serve_connection(stream, hyper_service)
-                    .await
+            if let Err(err) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                .serve_connection(stream, hyper_service)
+                .await
             {
                 eprintln!("error serving {remote_addr}: {err}");
             }

@@ -31,7 +31,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::gpu::GpuBackend;
-use crate::kv_cache::{KvPool, SeqKvState, BLOCK_SIZE};
+use crate::model::kv_cache::{BLOCK_SIZE, KvPool, SeqKvState};
 
 /// Unique identifier for a sequence request.
 pub(crate) type SeqId = u64;
@@ -118,7 +118,9 @@ impl<B: GpuBackend> Scheduler<B> {
 
     /// Collect and remove finished sequences, freeing their KV blocks.
     pub fn collect_finished(&mut self) -> Vec<(SeqId, Vec<u32>)> {
-        let finished_ids: Vec<SeqId> = self.active.iter()
+        let finished_ids: Vec<SeqId> = self
+            .active
+            .iter()
             .filter(|(_, seq)| seq.finished)
             .map(|(&id, _)| id)
             .collect();
@@ -137,5 +139,4 @@ impl<B: GpuBackend> Scheduler<B> {
     pub fn has_work(&self) -> bool {
         !self.waiting.is_empty() || !self.active.is_empty()
     }
-
 }

@@ -36,8 +36,8 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 
-use crate::chat::Message;
 use super::{InferenceEvent, InferenceRequest, ServerState, StopReason};
+use crate::model::chat::Message;
 
 // ---------------------------------------------------------------------------
 // Request types (deserialized from JSON).
@@ -73,9 +73,15 @@ pub(crate) struct CompletionRequest {
     pub stream: bool,
 }
 
-fn default_max_tokens() -> usize { 4096 }
-fn default_temperature() -> f32 { 1.0 }
-fn default_top_p() -> f32 { 0.9 }
+fn default_max_tokens() -> usize {
+    4096
+}
+fn default_temperature() -> f32 {
+    1.0
+}
+fn default_top_p() -> f32 {
+    0.9
+}
 
 // ---------------------------------------------------------------------------
 // Response types (serialized to JSON).
@@ -155,10 +161,13 @@ pub(crate) async fn chat_completions(
         response_tx,
     };
 
-    state.request_tx.try_send(inference_req).map_err(|e| match e {
-        std::sync::mpsc::TrySendError::Full(_) => StatusCode::SERVICE_UNAVAILABLE,
-        std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    })?;
+    state
+        .request_tx
+        .try_send(inference_req)
+        .map_err(|e| match e {
+            std::sync::mpsc::TrySendError::Full(_) => StatusCode::SERVICE_UNAVAILABLE,
+            std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
 
     if req.stream {
         Ok(chat_completions_stream(state, response_rx).await)
@@ -180,7 +189,11 @@ async fn chat_completions_blocking(
     while let Some(event) = response_rx.recv().await {
         match event {
             InferenceEvent::Token { text: t } => text.push_str(&t),
-            InferenceEvent::Done { stop_reason, prompt_tokens: pt, completion_tokens: ct } => {
+            InferenceEvent::Done {
+                stop_reason,
+                prompt_tokens: pt,
+                completion_tokens: ct,
+            } => {
                 prompt_tokens = pt;
                 completion_tokens = ct;
                 finish_reason = finish_reason_str(stop_reason);
@@ -198,7 +211,10 @@ async fn chat_completions_blocking(
         model: state.model_name.clone(),
         choices: vec![ChatChoice {
             index: 0,
-            message: Message { role: "assistant".into(), content: text },
+            message: Message {
+                role: "assistant".into(),
+                content: text,
+            },
             finish_reason: Some(finish_reason.to_string()),
         }],
         usage: Usage {
@@ -206,7 +222,8 @@ async fn chat_completions_blocking(
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
         },
-    }).into_response()
+    })
+    .into_response()
 }
 
 /// Streaming: return SSE events with one token per chunk.
@@ -291,10 +308,13 @@ pub(crate) async fn completions(
         response_tx,
     };
 
-    state.request_tx.try_send(inference_req).map_err(|e| match e {
-        std::sync::mpsc::TrySendError::Full(_) => StatusCode::SERVICE_UNAVAILABLE,
-        std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    })?;
+    state
+        .request_tx
+        .try_send(inference_req)
+        .map_err(|e| match e {
+            std::sync::mpsc::TrySendError::Full(_) => StatusCode::SERVICE_UNAVAILABLE,
+            std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
 
     if req.stream {
         Ok(completions_stream(state, response_rx).await)
@@ -316,7 +336,11 @@ async fn completions_blocking(
     while let Some(event) = response_rx.recv().await {
         match event {
             InferenceEvent::Token { text: t } => text.push_str(&t),
-            InferenceEvent::Done { stop_reason, prompt_tokens: pt, completion_tokens: ct } => {
+            InferenceEvent::Done {
+                stop_reason,
+                prompt_tokens: pt,
+                completion_tokens: ct,
+            } => {
                 prompt_tokens = pt;
                 completion_tokens = ct;
                 finish_reason = finish_reason_str(stop_reason);
@@ -342,7 +366,8 @@ async fn completions_blocking(
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
         },
-    }).into_response()
+    })
+    .into_response()
 }
 
 /// Streaming text completions (SSE).
@@ -410,9 +435,7 @@ async fn completions_stream(
 
 /// List available models.  Since rLLM serves a single model, this returns
 /// a one-element list.
-pub(crate) async fn list_models(
-    State(state): State<Arc<ServerState>>,
-) -> Json<serde_json::Value> {
+pub(crate) async fn list_models(State(state): State<Arc<ServerState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "object": "list",
         "data": [{

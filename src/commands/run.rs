@@ -10,10 +10,8 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use crate::gpu::{self, GpuBackend};
-use crate::kv_cache;
 use crate::model;
-use crate::sampler;
-use crate::setup;
+use crate::model::{kv_cache, loader, sampler};
 
 #[derive(clap::Args)]
 pub(crate) struct RunArgs {
@@ -49,7 +47,11 @@ pub(crate) struct RunArgs {
     chat: bool,
 
     /// System prompt for chat mode (requires --chat).
-    #[arg(long, default_value = "You are a helpful assistant.", requires = "chat")]
+    #[arg(
+        long,
+        default_value = "You are a helpful assistant.",
+        requires = "chat"
+    )]
     system: String,
 }
 
@@ -58,14 +60,21 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
     let backend = gpu::create_backend()?;
     eprintln!("gpu: {}", backend.device_name());
 
-    let setup::LoadedModel { config, arch, tokenizer, weights } =
-        setup::load_model(&backend, &args.model, args.quantize)?;
+    let loader::LoadedModel {
+        config,
+        arch,
+        tokenizer,
+        weights,
+    } = loader::load_model(&backend, &args.model, args.quantize)?;
 
     // Log sampling strategy so the user knows what to expect.
     if args.temperature == 0.0 {
         eprintln!("sampling: greedy (temperature=0)");
     } else {
-        eprintln!("sampling: temperature={}, top_p={}", args.temperature, args.top_p);
+        eprintln!(
+            "sampling: temperature={}, top_p={}",
+            args.temperature, args.top_p
+        );
     }
 
     // --- Create model + paged KV cache + prefill buffers ---
@@ -86,7 +95,9 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
     let prefill_bufs = model::PrefillBuffers::new(&backend, &config, max_prefill);
     eprintln!(
         "KV cache: {} blocks ({} max tokens), prefill up to {} tokens",
-        num_blocks, num_blocks * kv_cache::BLOCK_SIZE, max_prefill
+        num_blocks,
+        num_blocks * kv_cache::BLOCK_SIZE,
+        max_prefill
     );
 
     // --- Encode prompt ---
@@ -97,7 +108,11 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
     if args.chat {
         eprintln!("chat template applied ({:?})", arch);
     }
-    eprintln!("prompt tokens: {:?} ({})", &prompt_tokens, prompt_tokens.len());
+    eprintln!(
+        "prompt tokens: {:?} ({})",
+        &prompt_tokens,
+        prompt_tokens.len()
+    );
 
     // --- Prefill ---
     // Process the entire prompt in one batched forward pass using GEMM.
@@ -119,7 +134,9 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
     let prefill_tps = prompt_tokens.len() as f64 / prefill_elapsed.as_secs_f64();
     eprintln!(
         "prefill: {} tokens in {:.1?} ({:.1} tok/s)",
-        prompt_tokens.len(), prefill_elapsed, prefill_tps
+        prompt_tokens.len(),
+        prefill_elapsed,
+        prefill_tps
     );
 
     // --- Generation loop ---
@@ -133,7 +150,11 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
     let mut gen_count: usize = 0;
     let mut rng = rand::rng();
     let mut next_token = sampler::sample(
-        &backend, model.logits(), args.temperature, args.top_p, &mut rng,
+        &backend,
+        model.logits(),
+        args.temperature,
+        args.top_p,
+        &mut rng,
     )?;
     for _ in 0..args.max_tokens {
         if tokenizer.is_eos(next_token) {
@@ -153,7 +174,11 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
 
         // Sample the next token from the updated logits.
         next_token = sampler::sample(
-            &backend, model.logits(), args.temperature, args.top_p, &mut rng,
+            &backend,
+            model.logits(),
+            args.temperature,
+            args.top_p,
+            &mut rng,
         )?;
     }
     println!();

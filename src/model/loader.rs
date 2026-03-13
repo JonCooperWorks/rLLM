@@ -70,7 +70,8 @@ use half::bf16;
 use memmap2::Mmap;
 use safetensors::SafeTensors;
 
-use crate::config::ModelConfig;
+use super::config::{ModelArch, ModelConfig};
+use super::tokenizer::Tokenizer;
 use crate::gpu::{self, GpuBackend, TensorDtype};
 
 // ---------------------------------------------------------------------------
@@ -90,10 +91,7 @@ struct TensorStore<'a> {
 }
 
 impl<'a> TensorStore<'a> {
-    fn tensor(
-        &self,
-        name: &str,
-    ) -> anyhow::Result<safetensors::tensor::TensorView<'a>> {
+    fn tensor(&self, name: &str) -> anyhow::Result<safetensors::tensor::TensorView<'a>> {
         if let Some(&idx) = self.weight_map.get(name) {
             self.shards[idx]
                 .tensor(name)
@@ -111,9 +109,7 @@ impl<'a> TensorStore<'a> {
 ///
 /// Returns the mmaps (kept alive for the SafeTensors references) and a weight
 /// map for sharded models.
-fn load_safetensors_files(
-    model_dir: &Path,
-) -> anyhow::Result<(Vec<Mmap>, HashMap<String, usize>)> {
+fn load_safetensors_files(model_dir: &Path) -> anyhow::Result<(Vec<Mmap>, HashMap<String, usize>)> {
     // Case 1: single model.safetensors file.
     let single = model_dir.join("model.safetensors");
     if single.exists() {
@@ -168,8 +164,7 @@ fn load_safetensors_files(
             let path = model_dir.join(f);
             let file = std::fs::File::open(&path)
                 .map_err(|e| anyhow::anyhow!("failed to open {f}: {e}"))?;
-            unsafe { Mmap::map(&file) }
-                .map_err(|e| anyhow::anyhow!("failed to mmap {f}: {e}"))
+            unsafe { Mmap::map(&file) }.map_err(|e| anyhow::anyhow!("failed to mmap {f}: {e}"))
         })
         .collect::<anyhow::Result<_>>()?;
 
@@ -198,11 +193,11 @@ pub(crate) struct ModelWeights<B: GpuBackend> {
 /// Weights for a single transformer layer.
 pub(crate) struct LayerWeights<B: GpuBackend> {
     // --- Attention sub-block ---
-    pub input_layernorm: B::Tensor,  // RMSNorm weight [hidden_size]
-    pub q_proj: B::Tensor,           // Query projection [hidden_size, hidden_size]
-    pub k_proj: B::Tensor,           // Key projection [kv_dim, hidden_size]
-    pub v_proj: B::Tensor,           // Value projection [kv_dim, hidden_size]
-    pub o_proj: B::Tensor,           // Output projection [hidden_size, hidden_size]
+    pub input_layernorm: B::Tensor, // RMSNorm weight [hidden_size]
+    pub q_proj: B::Tensor,          // Query projection [hidden_size, hidden_size]
+    pub k_proj: B::Tensor,          // Key projection [kv_dim, hidden_size]
+    pub v_proj: B::Tensor,          // Value projection [kv_dim, hidden_size]
+    pub o_proj: B::Tensor,          // Output projection [hidden_size, hidden_size]
 
     // --- QKV bias (Qwen 2.5 only, None for Llama) ---
     //
@@ -215,15 +210,15 @@ pub(crate) struct LayerWeights<B: GpuBackend> {
     //
     // Bias tensors are always bf16 (1D, small) and never quantised.
     // O projection has NO bias in either Llama or Qwen.
-    pub q_bias: Option<B::Tensor>,   // [hidden_size], or None for Llama
-    pub k_bias: Option<B::Tensor>,   // [kv_dim], or None for Llama
-    pub v_bias: Option<B::Tensor>,   // [kv_dim], or None for Llama
+    pub q_bias: Option<B::Tensor>, // [hidden_size], or None for Llama
+    pub k_bias: Option<B::Tensor>, // [kv_dim], or None for Llama
+    pub v_bias: Option<B::Tensor>, // [kv_dim], or None for Llama
 
     // --- FFN sub-block ---
     pub post_attention_layernorm: B::Tensor, // RMSNorm weight [hidden_size]
-    pub gate_proj: B::Tensor,        // Gate projection [inter_size, hidden_size]
-    pub up_proj: B::Tensor,          // Up projection [inter_size, hidden_size]
-    pub down_proj: B::Tensor,        // Down projection [hidden_size, inter_size]
+    pub gate_proj: B::Tensor,                // Gate projection [inter_size, hidden_size]
+    pub up_proj: B::Tensor,                  // Up projection [inter_size, hidden_size]
+    pub down_proj: B::Tensor,                // Down projection [hidden_size, inter_size]
 }
 
 /// Load all model weights from safetensors file(s) into GPU memory.
@@ -256,13 +251,19 @@ pub(crate) fn load_weights<B: GpuBackend>(
 
     // Load the embedding table.
     let embed_tokens = upload_tensor(
-        &store, backend, "model.embed_tokens.weight", &[config.vocab_size, hidden],
+        &store,
+        backend,
+        "model.embed_tokens.weight",
+        &[config.vocab_size, hidden],
     )?;
 
     // Check for separate lm_head (untied embeddings, e.g. Llama 3.1 8B+).
     let lm_head = if !config.tie_word_embeddings {
         Some(upload_tensor(
-            &store, backend, "lm_head.weight", &[config.vocab_size, hidden],
+            &store,
+            backend,
+            "lm_head.weight",
+            &[config.vocab_size, hidden],
         )?)
     } else {
         None
@@ -280,16 +281,22 @@ pub(crate) fn load_weights<B: GpuBackend>(
         let (q_bias, k_bias, v_bias) = if has_qkv_bias {
             (
                 Some(upload_tensor(
-                    &store, backend,
-                    &format!("{prefix}.self_attn.q_proj.bias"), &[hidden],
+                    &store,
+                    backend,
+                    &format!("{prefix}.self_attn.q_proj.bias"),
+                    &[hidden],
                 )?),
                 Some(upload_tensor(
-                    &store, backend,
-                    &format!("{prefix}.self_attn.k_proj.bias"), &[kv_dim],
+                    &store,
+                    backend,
+                    &format!("{prefix}.self_attn.k_proj.bias"),
+                    &[kv_dim],
                 )?),
                 Some(upload_tensor(
-                    &store, backend,
-                    &format!("{prefix}.self_attn.v_proj.bias"), &[kv_dim],
+                    &store,
+                    backend,
+                    &format!("{prefix}.self_attn.v_proj.bias"),
+                    &[kv_dim],
                 )?),
             )
         } else {
@@ -299,41 +306,68 @@ pub(crate) fn load_weights<B: GpuBackend>(
         layers.push(LayerWeights {
             // Norm weights stay bf16 (1D, tiny, used for RMSNorm not matmul).
             input_layernorm: upload_tensor(
-                &store, backend, &format!("{prefix}.input_layernorm.weight"), &[hidden],
+                &store,
+                backend,
+                &format!("{prefix}.input_layernorm.weight"),
+                &[hidden],
             )?,
             q_proj: upload_maybe_q4(
-                &store, backend, &format!("{prefix}.self_attn.q_proj.weight"),
-                &[hidden, hidden], quantize,
+                &store,
+                backend,
+                &format!("{prefix}.self_attn.q_proj.weight"),
+                &[hidden, hidden],
+                quantize,
             )?,
             k_proj: upload_maybe_q4(
-                &store, backend, &format!("{prefix}.self_attn.k_proj.weight"),
-                &[kv_dim, hidden], quantize,
+                &store,
+                backend,
+                &format!("{prefix}.self_attn.k_proj.weight"),
+                &[kv_dim, hidden],
+                quantize,
             )?,
             v_proj: upload_maybe_q4(
-                &store, backend, &format!("{prefix}.self_attn.v_proj.weight"),
-                &[kv_dim, hidden], quantize,
+                &store,
+                backend,
+                &format!("{prefix}.self_attn.v_proj.weight"),
+                &[kv_dim, hidden],
+                quantize,
             )?,
             o_proj: upload_maybe_q4(
-                &store, backend, &format!("{prefix}.self_attn.o_proj.weight"),
-                &[hidden, hidden], quantize,
+                &store,
+                backend,
+                &format!("{prefix}.self_attn.o_proj.weight"),
+                &[hidden, hidden],
+                quantize,
             )?,
             q_bias,
             k_bias,
             v_bias,
             post_attention_layernorm: upload_tensor(
-                &store, backend, &format!("{prefix}.post_attention_layernorm.weight"), &[hidden],
+                &store,
+                backend,
+                &format!("{prefix}.post_attention_layernorm.weight"),
+                &[hidden],
             )?,
             gate_proj: upload_maybe_q4(
-                &store, backend, &format!("{prefix}.mlp.gate_proj.weight"),
-                &[inter, hidden], quantize,
+                &store,
+                backend,
+                &format!("{prefix}.mlp.gate_proj.weight"),
+                &[inter, hidden],
+                quantize,
             )?,
             up_proj: upload_maybe_q4(
-                &store, backend, &format!("{prefix}.mlp.up_proj.weight"),
-                &[inter, hidden], quantize,
+                &store,
+                backend,
+                &format!("{prefix}.mlp.up_proj.weight"),
+                &[inter, hidden],
+                quantize,
             )?,
             down_proj: upload_maybe_q4(
-                &store, backend, &format!("{prefix}.mlp.down_proj.weight"),
-                &[hidden, inter], quantize,
+                &store,
+                backend,
+                &format!("{prefix}.mlp.down_proj.weight"),
+                &[hidden, inter],
+                quantize,
             )?,
         });
     }
@@ -462,4 +496,54 @@ fn quantize_bf16_to_q4(bf16_data: &[u8], m: usize, k: usize) -> Vec<u8> {
     }
 
     out
+}
+
+// ---------------------------------------------------------------------------
+// Shared model loading — eliminates duplication across run, batch, and serve.
+//
+// Every inference path needs the same four things: model config, architecture
+// tag, tokenizer, and GPU-resident weights.  This function loads all four.
+//
+// The backend isn't included because Model<'a, B> borrows it — the caller
+// must own the backend's lifetime.
+// ---------------------------------------------------------------------------
+
+/// Everything needed to run inference, loaded from a model directory.
+pub(crate) struct LoadedModel<B: GpuBackend> {
+    pub config: ModelConfig,
+    pub arch: ModelArch,
+    pub tokenizer: Tokenizer,
+    pub weights: ModelWeights<B>,
+}
+
+/// Load config, tokenizer, and weights from a model directory.
+///
+/// Logs progress to stderr so the user sees what's happening.
+pub(crate) fn load_model<B: GpuBackend>(
+    backend: &B,
+    model_dir: &Path,
+    quantize: bool,
+) -> anyhow::Result<LoadedModel<B>> {
+    let config = ModelConfig::from_file(&model_dir.join("config.json"))?;
+    let arch = config.arch()?;
+    eprintln!(
+        "loaded config: {:?}, {} layers, {} heads, hidden_size={}",
+        arch, config.num_hidden_layers, config.num_attention_heads, config.hidden_size
+    );
+
+    let tokenizer = Tokenizer::from_file(&model_dir.join("tokenizer.json"), arch)?;
+    eprintln!("tokenizer loaded");
+
+    let weights = load_weights(backend, model_dir, &config, quantize)?;
+    eprintln!(
+        "weights loaded{}",
+        if quantize { " (Q4 quantised)" } else { "" }
+    );
+
+    Ok(LoadedModel {
+        config,
+        arch,
+        tokenizer,
+        weights,
+    })
 }

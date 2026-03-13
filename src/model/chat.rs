@@ -55,7 +55,7 @@
 //   concatenation does the job — no template engine dependency needed.
 // ===========================================================================
 
-use crate::config::ModelArch;
+use super::config::ModelArch;
 
 /// A single message in a chat conversation.
 ///

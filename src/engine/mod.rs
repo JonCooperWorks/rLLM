@@ -34,10 +34,12 @@
 //   the free list for reuse.
 // ===========================================================================
 
+pub(crate) mod scheduler;
+
+use self::scheduler::{Scheduler, SeqId, SequenceRequest};
 use crate::gpu::GpuBackend;
+use crate::model::tokenizer::Tokenizer;
 use crate::model::{Model, PrefillBuffers};
-use crate::scheduler::{Scheduler, SeqId, SequenceRequest};
-use crate::tokenizer::Tokenizer;
 
 /// A finished sequence with its generated text.
 pub(crate) struct FinishedSequence {
@@ -70,7 +72,15 @@ impl<'a, B: GpuBackend> Engine<'a, B> {
         // Max chunk of 1024 supports prompts up to 1024 tokens in one pass.
         let prefill_bufs = PrefillBuffers::new(backend, model.config(), 1024);
 
-        Self { model, scheduler, tokenizer, backend, temperature, top_p, prefill_bufs }
+        Self {
+            model,
+            scheduler,
+            tokenizer,
+            backend,
+            temperature,
+            top_p,
+            prefill_bufs,
+        }
     }
 
     /// Submit a new completion request.
@@ -101,7 +111,10 @@ impl<'a, B: GpuBackend> Engine<'a, B> {
         //    Why collect IDs first?  We need mutable access to seq.kv_state and
         //    seq.pending_prefill, but immutable access to self.scheduler.kv_pool
         //    and self.model.  Collecting IDs avoids borrow-checker conflicts.
-        let prefilling_ids: Vec<SeqId> = self.scheduler.active.iter()
+        let prefilling_ids: Vec<SeqId> = self
+            .scheduler
+            .active
+            .iter()
             .filter(|(_, seq)| !seq.pending_prefill.is_empty() && !seq.finished)
             .map(|(&id, _)| id)
             .collect();
@@ -115,7 +128,8 @@ impl<'a, B: GpuBackend> Engine<'a, B> {
 
             // Pre-allocate all KV blocks needed for this prompt.
             // For a 100-token prompt: ceil(100/16) = 7 blocks from the pool.
-            seq.kv_state.ensure_slots(&mut self.scheduler.kv_pool, chunk_size)?;
+            seq.kv_state
+                .ensure_slots(&mut self.scheduler.kv_pool, chunk_size)?;
             seq.kv_state.sync_block_table(self.backend);
 
             // Run batched GEMM forward pass — the entire prompt in one call.
@@ -129,7 +143,7 @@ impl<'a, B: GpuBackend> Engine<'a, B> {
             seq.kv_state.advance_by(chunk_size);
 
             // Sample the first generated token from the last token's logits.
-            let next_token = crate::sampler::sample(
+            let next_token = crate::model::sampler::sample(
                 self.backend,
                 self.model.logits(),
                 self.temperature,
@@ -138,15 +152,17 @@ impl<'a, B: GpuBackend> Engine<'a, B> {
             )?;
             seq.generated_tokens.push(next_token);
 
-            if self.tokenizer.is_eos(next_token)
-                || seq.generated_tokens.len() >= seq.max_gen_tokens
+            if self.tokenizer.is_eos(next_token) || seq.generated_tokens.len() >= seq.max_gen_tokens
             {
                 seq.finished = true;
             }
         }
 
         // 3. Decode: run one token per decoding sequence.
-        let decoding_ids: Vec<SeqId> = self.scheduler.active.iter()
+        let decoding_ids: Vec<SeqId> = self
+            .scheduler
+            .active
+            .iter()
             .filter(|(_, seq)| seq.pending_prefill.is_empty() && !seq.finished)
             .map(|(&id, _)| id)
             .collect();
@@ -158,14 +174,11 @@ impl<'a, B: GpuBackend> Engine<'a, B> {
             seq.kv_state.ensure_slot(&mut self.scheduler.kv_pool)?;
             seq.kv_state.sync_block_table(self.backend);
 
-            self.model.forward_single_paged(
-                token,
-                &self.scheduler.kv_pool,
-                &seq.kv_state,
-            )?;
+            self.model
+                .forward_single_paged(token, &self.scheduler.kv_pool, &seq.kv_state)?;
             seq.kv_state.advance();
 
-            let next_token = crate::sampler::sample(
+            let next_token = crate::model::sampler::sample(
                 self.backend,
                 self.model.logits(),
                 self.temperature,
@@ -174,8 +187,7 @@ impl<'a, B: GpuBackend> Engine<'a, B> {
             )?;
             seq.generated_tokens.push(next_token);
 
-            if self.tokenizer.is_eos(next_token)
-                || seq.generated_tokens.len() >= seq.max_gen_tokens
+            if self.tokenizer.is_eos(next_token) || seq.generated_tokens.len() >= seq.max_gen_tokens
             {
                 seq.finished = true;
             }

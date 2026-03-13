@@ -59,10 +59,17 @@
 //   deep networks and prevent the vanishing gradient problem.
 // ===========================================================================
 
-use crate::config::ModelConfig;
+pub(crate) mod chat;
+pub(crate) mod config;
+pub(crate) mod kv_cache;
+pub(crate) mod loader;
+pub(crate) mod sampler;
+pub(crate) mod tokenizer;
+
+use self::config::ModelConfig;
+use self::kv_cache::{KvPool, SeqKvState};
+use self::loader::ModelWeights;
 use crate::gpu::{GpuBackend, TensorDtype};
-use crate::kv_cache::{KvPool, SeqKvState};
-use crate::loader::ModelWeights;
 
 /// Maximum sequence length supported by the flat KV cache.
 /// Llama 3.2 supports up to 131072 with RoPE scaling, but we cap at 4096
@@ -151,7 +158,11 @@ impl<'a, B: GpuBackend> Model<'a, B> {
             v_cache.push(backend.alloc_tensor(&[MAX_SEQ_LEN, kv_dim], TensorDtype::BF16));
         }
 
-        let kv_mode = KvMode::Flat { k_cache, v_cache, pos: 0 };
+        let kv_mode = KvMode::Flat {
+            k_cache,
+            v_cache,
+            pos: 0,
+        };
         Self::new_with_kv_mode(config, weights, backend, kv_mode)
     }
 
@@ -275,21 +286,36 @@ impl<'a, B: GpuBackend> Model<'a, B> {
             // Attention sub-block.
             // ---------------------------------------------------------------
 
-            self.backend.rms_norm(
-                &self.hidden,
-                &layer.input_layernorm,
-                eps,
-                &self.norm_buf,
-            );
+            self.backend
+                .rms_norm(&self.hidden, &layer.input_layernorm, eps, &self.norm_buf);
 
             // Q, K, V linear projections.
-            self.backend.matmul(&layer.q_proj, &self.norm_buf, &self.q_buf, hidden_size, hidden_size);
-            self.backend.matmul(&layer.k_proj, &self.norm_buf, &self.k_buf, kv_dim, hidden_size);
-            self.backend.matmul(&layer.v_proj, &self.norm_buf, &self.v_buf, kv_dim, hidden_size);
+            self.backend.matmul(
+                &layer.q_proj,
+                &self.norm_buf,
+                &self.q_buf,
+                hidden_size,
+                hidden_size,
+            );
+            self.backend.matmul(
+                &layer.k_proj,
+                &self.norm_buf,
+                &self.k_buf,
+                kv_dim,
+                hidden_size,
+            );
+            self.backend.matmul(
+                &layer.v_proj,
+                &self.norm_buf,
+                &self.v_buf,
+                kv_dim,
+                hidden_size,
+            );
 
             // Bias-add for Qwen 2.5.
             if let Some(ref q_bias) = layer.q_bias {
-                self.backend.add(&self.q_buf, q_bias, &self.q_buf, hidden_size);
+                self.backend
+                    .add(&self.q_buf, q_bias, &self.q_buf, hidden_size);
             }
             if let Some(ref k_bias) = layer.k_bias {
                 self.backend.add(&self.k_buf, k_bias, &self.k_buf, kv_dim);
@@ -311,38 +337,75 @@ impl<'a, B: GpuBackend> Model<'a, B> {
 
             // Store K/V and compute attention — dispatch based on KV mode.
             match &self.kv_mode {
-                KvMode::Flat { k_cache, v_cache, .. } => {
+                KvMode::Flat {
+                    k_cache, v_cache, ..
+                } => {
                     self.backend.copy_to_kv_cache(
-                        &self.k_buf, &k_cache[layer_idx], pos, num_kv_heads, head_dim,
+                        &self.k_buf,
+                        &k_cache[layer_idx],
+                        pos,
+                        num_kv_heads,
+                        head_dim,
                     );
                     self.backend.copy_to_kv_cache(
-                        &self.v_buf, &v_cache[layer_idx], pos, num_kv_heads, head_dim,
+                        &self.v_buf,
+                        &v_cache[layer_idx],
+                        pos,
+                        num_kv_heads,
+                        head_dim,
                     );
                     self.backend.attention(
-                        &self.q_buf, &k_cache[layer_idx], &v_cache[layer_idx],
-                        &self.attn_out, pos + 1, num_heads, num_kv_heads, head_dim,
+                        &self.q_buf,
+                        &k_cache[layer_idx],
+                        &v_cache[layer_idx],
+                        &self.attn_out,
+                        pos + 1,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
                     );
                 }
                 KvMode::Paged { pool, seq_state } => {
                     self.backend.copy_to_paged_kv_cache(
-                        &self.k_buf, &pool.k_pool[layer_idx],
-                        &seq_state.block_table_gpu, pos, num_kv_heads, head_dim,
+                        &self.k_buf,
+                        &pool.k_pool[layer_idx],
+                        &seq_state.block_table_gpu,
+                        pos,
+                        num_kv_heads,
+                        head_dim,
                     );
                     self.backend.copy_to_paged_kv_cache(
-                        &self.v_buf, &pool.v_pool[layer_idx],
-                        &seq_state.block_table_gpu, pos, num_kv_heads, head_dim,
+                        &self.v_buf,
+                        &pool.v_pool[layer_idx],
+                        &seq_state.block_table_gpu,
+                        pos,
+                        num_kv_heads,
+                        head_dim,
                     );
                     self.backend.paged_attention(
-                        &self.q_buf, &pool.k_pool[layer_idx], &pool.v_pool[layer_idx],
-                        &seq_state.block_table_gpu, &self.attn_out,
-                        pos + 1, num_heads, num_kv_heads, head_dim,
+                        &self.q_buf,
+                        &pool.k_pool[layer_idx],
+                        &pool.v_pool[layer_idx],
+                        &seq_state.block_table_gpu,
+                        &self.attn_out,
+                        pos + 1,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
                     );
                 }
             }
 
             // O projection + residual.
-            self.backend.matmul(&layer.o_proj, &self.attn_out, &self.norm_buf, hidden_size, hidden_size);
-            self.backend.add(&self.hidden, &self.norm_buf, &self.hidden, hidden_size);
+            self.backend.matmul(
+                &layer.o_proj,
+                &self.attn_out,
+                &self.norm_buf,
+                hidden_size,
+                hidden_size,
+            );
+            self.backend
+                .add(&self.hidden, &self.norm_buf, &self.hidden, hidden_size);
 
             // ---------------------------------------------------------------
             // FFN sub-block.
@@ -355,24 +418,43 @@ impl<'a, B: GpuBackend> Model<'a, B> {
                 &self.norm_buf,
             );
 
-            self.backend.matmul(&layer.gate_proj, &self.norm_buf, &self.gate_buf, inter_size, hidden_size);
-            self.backend.matmul(&layer.up_proj, &self.norm_buf, &self.up_buf, inter_size, hidden_size);
-            self.backend.silu_mul(&self.gate_buf, &self.up_buf, &self.gate_buf, inter_size);
-            self.backend.matmul(&layer.down_proj, &self.gate_buf, &self.norm_buf, hidden_size, inter_size);
-            self.backend.add(&self.hidden, &self.norm_buf, &self.hidden, hidden_size);
+            self.backend.matmul(
+                &layer.gate_proj,
+                &self.norm_buf,
+                &self.gate_buf,
+                inter_size,
+                hidden_size,
+            );
+            self.backend.matmul(
+                &layer.up_proj,
+                &self.norm_buf,
+                &self.up_buf,
+                inter_size,
+                hidden_size,
+            );
+            self.backend
+                .silu_mul(&self.gate_buf, &self.up_buf, &self.gate_buf, inter_size);
+            self.backend.matmul(
+                &layer.down_proj,
+                &self.gate_buf,
+                &self.norm_buf,
+                hidden_size,
+                inter_size,
+            );
+            self.backend
+                .add(&self.hidden, &self.norm_buf, &self.hidden, hidden_size);
         }
 
         // -------------------------------------------------------------------
         // Step 3: Final normalisation + LM head projection.
         // -------------------------------------------------------------------
-        self.backend.rms_norm(
-            &self.hidden,
-            &self.weights.norm_weight,
-            eps,
-            &self.norm_buf,
-        );
+        self.backend
+            .rms_norm(&self.hidden, &self.weights.norm_weight, eps, &self.norm_buf);
 
-        let lm_head_weight = self.weights.lm_head.as_ref()
+        let lm_head_weight = self
+            .weights
+            .lm_head
+            .as_ref()
             .unwrap_or(&self.weights.embed_tokens);
         self.backend.matmul(
             lm_head_weight,
@@ -413,19 +495,42 @@ impl<'a, B: GpuBackend> Model<'a, B> {
         let pos = seq_state.seq_len as u32;
 
         self.backend.embed_lookup(
-            &self.weights.embed_tokens, token_id, &self.hidden, hidden_size,
+            &self.weights.embed_tokens,
+            token_id,
+            &self.hidden,
+            hidden_size,
         );
 
         for layer_idx in 0..self.config.num_hidden_layers {
             let layer = &self.weights.layers[layer_idx];
 
-            self.backend.rms_norm(&self.hidden, &layer.input_layernorm, eps, &self.norm_buf);
-            self.backend.matmul(&layer.q_proj, &self.norm_buf, &self.q_buf, hidden_size, hidden_size);
-            self.backend.matmul(&layer.k_proj, &self.norm_buf, &self.k_buf, kv_dim, hidden_size);
-            self.backend.matmul(&layer.v_proj, &self.norm_buf, &self.v_buf, kv_dim, hidden_size);
+            self.backend
+                .rms_norm(&self.hidden, &layer.input_layernorm, eps, &self.norm_buf);
+            self.backend.matmul(
+                &layer.q_proj,
+                &self.norm_buf,
+                &self.q_buf,
+                hidden_size,
+                hidden_size,
+            );
+            self.backend.matmul(
+                &layer.k_proj,
+                &self.norm_buf,
+                &self.k_buf,
+                kv_dim,
+                hidden_size,
+            );
+            self.backend.matmul(
+                &layer.v_proj,
+                &self.norm_buf,
+                &self.v_buf,
+                kv_dim,
+                hidden_size,
+            );
 
             if let Some(ref q_bias) = layer.q_bias {
-                self.backend.add(&self.q_buf, q_bias, &self.q_buf, hidden_size);
+                self.backend
+                    .add(&self.q_buf, q_bias, &self.q_buf, hidden_size);
             }
             if let Some(ref k_bias) = layer.k_bias {
                 self.backend.add(&self.k_buf, k_bias, &self.k_buf, kv_dim);
@@ -434,37 +539,101 @@ impl<'a, B: GpuBackend> Model<'a, B> {
                 self.backend.add(&self.v_buf, v_bias, &self.v_buf, kv_dim);
             }
 
-            self.backend.rope(&self.q_buf, &self.k_buf, pos, rope_theta, num_heads, num_kv_heads, head_dim);
+            self.backend.rope(
+                &self.q_buf,
+                &self.k_buf,
+                pos,
+                rope_theta,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            );
 
             self.backend.copy_to_paged_kv_cache(
-                &self.k_buf, &pool.k_pool[layer_idx],
-                &seq_state.block_table_gpu, pos, num_kv_heads, head_dim,
+                &self.k_buf,
+                &pool.k_pool[layer_idx],
+                &seq_state.block_table_gpu,
+                pos,
+                num_kv_heads,
+                head_dim,
             );
             self.backend.copy_to_paged_kv_cache(
-                &self.v_buf, &pool.v_pool[layer_idx],
-                &seq_state.block_table_gpu, pos, num_kv_heads, head_dim,
+                &self.v_buf,
+                &pool.v_pool[layer_idx],
+                &seq_state.block_table_gpu,
+                pos,
+                num_kv_heads,
+                head_dim,
             );
             self.backend.paged_attention(
-                &self.q_buf, &pool.k_pool[layer_idx], &pool.v_pool[layer_idx],
-                &seq_state.block_table_gpu, &self.attn_out,
-                pos + 1, num_heads, num_kv_heads, head_dim,
+                &self.q_buf,
+                &pool.k_pool[layer_idx],
+                &pool.v_pool[layer_idx],
+                &seq_state.block_table_gpu,
+                &self.attn_out,
+                pos + 1,
+                num_heads,
+                num_kv_heads,
+                head_dim,
             );
 
-            self.backend.matmul(&layer.o_proj, &self.attn_out, &self.norm_buf, hidden_size, hidden_size);
-            self.backend.add(&self.hidden, &self.norm_buf, &self.hidden, hidden_size);
+            self.backend.matmul(
+                &layer.o_proj,
+                &self.attn_out,
+                &self.norm_buf,
+                hidden_size,
+                hidden_size,
+            );
+            self.backend
+                .add(&self.hidden, &self.norm_buf, &self.hidden, hidden_size);
 
-            self.backend.rms_norm(&self.hidden, &layer.post_attention_layernorm, eps, &self.norm_buf);
-            self.backend.matmul(&layer.gate_proj, &self.norm_buf, &self.gate_buf, inter_size, hidden_size);
-            self.backend.matmul(&layer.up_proj, &self.norm_buf, &self.up_buf, inter_size, hidden_size);
-            self.backend.silu_mul(&self.gate_buf, &self.up_buf, &self.gate_buf, inter_size);
-            self.backend.matmul(&layer.down_proj, &self.gate_buf, &self.norm_buf, hidden_size, inter_size);
-            self.backend.add(&self.hidden, &self.norm_buf, &self.hidden, hidden_size);
+            self.backend.rms_norm(
+                &self.hidden,
+                &layer.post_attention_layernorm,
+                eps,
+                &self.norm_buf,
+            );
+            self.backend.matmul(
+                &layer.gate_proj,
+                &self.norm_buf,
+                &self.gate_buf,
+                inter_size,
+                hidden_size,
+            );
+            self.backend.matmul(
+                &layer.up_proj,
+                &self.norm_buf,
+                &self.up_buf,
+                inter_size,
+                hidden_size,
+            );
+            self.backend
+                .silu_mul(&self.gate_buf, &self.up_buf, &self.gate_buf, inter_size);
+            self.backend.matmul(
+                &layer.down_proj,
+                &self.gate_buf,
+                &self.norm_buf,
+                hidden_size,
+                inter_size,
+            );
+            self.backend
+                .add(&self.hidden, &self.norm_buf, &self.hidden, hidden_size);
         }
 
-        self.backend.rms_norm(&self.hidden, &self.weights.norm_weight, eps, &self.norm_buf);
-        let lm_head_weight = self.weights.lm_head.as_ref()
+        self.backend
+            .rms_norm(&self.hidden, &self.weights.norm_weight, eps, &self.norm_buf);
+        let lm_head_weight = self
+            .weights
+            .lm_head
+            .as_ref()
             .unwrap_or(&self.weights.embed_tokens);
-        self.backend.matmul(lm_head_weight, &self.norm_buf, &self.logits_buf, self.config.vocab_size as u32, hidden_size);
+        self.backend.matmul(
+            lm_head_weight,
+            &self.norm_buf,
+            &self.logits_buf,
+            self.config.vocab_size as u32,
+            hidden_size,
+        );
 
         Ok(())
     }
@@ -550,8 +719,11 @@ impl<'a, B: GpuBackend> Model<'a, B> {
 
         // Step 1: Batched embedding lookup.
         self.backend.embed_lookup_batch(
-            &self.weights.embed_tokens, &bufs.token_ids, &bufs.hidden,
-            bs, hidden_size,
+            &self.weights.embed_tokens,
+            &bufs.token_ids,
+            &bufs.hidden,
+            bs,
+            hidden_size,
         );
 
         // Step 2: Transformer layers.
@@ -559,12 +731,39 @@ impl<'a, B: GpuBackend> Model<'a, B> {
             let layer = &self.weights.layers[layer_idx];
 
             // Attention sub-block.
-            self.backend.rms_norm_batch(&bufs.hidden, &layer.input_layernorm, eps, &bufs.norm_buf, bs);
+            self.backend.rms_norm_batch(
+                &bufs.hidden,
+                &layer.input_layernorm,
+                eps,
+                &bufs.norm_buf,
+                bs,
+            );
 
             // Q/K/V GEMM projections — the core speedup.
-            self.backend.matmul_batch(&layer.q_proj, &bufs.norm_buf, &bufs.q_buf, bs, hidden_size, hidden_size);
-            self.backend.matmul_batch(&layer.k_proj, &bufs.norm_buf, &bufs.k_buf, bs, kv_dim, hidden_size);
-            self.backend.matmul_batch(&layer.v_proj, &bufs.norm_buf, &bufs.v_buf, bs, kv_dim, hidden_size);
+            self.backend.matmul_batch(
+                &layer.q_proj,
+                &bufs.norm_buf,
+                &bufs.q_buf,
+                bs,
+                hidden_size,
+                hidden_size,
+            );
+            self.backend.matmul_batch(
+                &layer.k_proj,
+                &bufs.norm_buf,
+                &bufs.k_buf,
+                bs,
+                kv_dim,
+                hidden_size,
+            );
+            self.backend.matmul_batch(
+                &layer.v_proj,
+                &bufs.norm_buf,
+                &bufs.v_buf,
+                bs,
+                kv_dim,
+                hidden_size,
+            );
 
             // Qwen 2.5 QKV bias: broadcast-add [dim] bias across [batch_size, dim].
             //
@@ -575,50 +774,115 @@ impl<'a, B: GpuBackend> Model<'a, B> {
             // Llama models have no QKV bias (q_bias/k_bias/v_bias are None),
             // so these branches are skipped for Llama at zero cost.
             if let Some(ref q_bias) = layer.q_bias {
-                self.backend.bias_add_batch(&bufs.q_buf, q_bias, &bufs.q_buf, bs, hidden_size);
+                self.backend
+                    .bias_add_batch(&bufs.q_buf, q_bias, &bufs.q_buf, bs, hidden_size);
             }
             if let Some(ref k_bias) = layer.k_bias {
-                self.backend.bias_add_batch(&bufs.k_buf, k_bias, &bufs.k_buf, bs, kv_dim);
+                self.backend
+                    .bias_add_batch(&bufs.k_buf, k_bias, &bufs.k_buf, bs, kv_dim);
             }
             if let Some(ref v_bias) = layer.v_bias {
-                self.backend.bias_add_batch(&bufs.v_buf, v_bias, &bufs.v_buf, bs, kv_dim);
+                self.backend
+                    .bias_add_batch(&bufs.v_buf, v_bias, &bufs.v_buf, bs, kv_dim);
             }
 
             // Batched RoPE with per-token positions.
             self.backend.rope_batch(
-                &bufs.q_buf, &bufs.k_buf, &bufs.positions,
-                rope_theta, bs, num_heads, num_kv_heads, head_dim,
+                &bufs.q_buf,
+                &bufs.k_buf,
+                &bufs.positions,
+                rope_theta,
+                bs,
+                num_heads,
+                num_kv_heads,
+                head_dim,
             );
 
             // Write K/V into paged cache for future decode steps.
             self.backend.copy_to_paged_kv_cache_batch(
-                &bufs.k_buf, &pool.k_pool[layer_idx],
-                &seq_state.block_table_gpu, &bufs.positions,
-                bs, num_kv_heads, head_dim,
+                &bufs.k_buf,
+                &pool.k_pool[layer_idx],
+                &seq_state.block_table_gpu,
+                &bufs.positions,
+                bs,
+                num_kv_heads,
+                head_dim,
             );
             self.backend.copy_to_paged_kv_cache_batch(
-                &bufs.v_buf, &pool.v_pool[layer_idx],
-                &seq_state.block_table_gpu, &bufs.positions,
-                bs, num_kv_heads, head_dim,
+                &bufs.v_buf,
+                &pool.v_pool[layer_idx],
+                &seq_state.block_table_gpu,
+                &bufs.positions,
+                bs,
+                num_kv_heads,
+                head_dim,
             );
 
             // Causal prefill attention on dense Q/K/V.
             self.backend.prefill_attention(
-                &bufs.q_buf, &bufs.k_buf, &bufs.v_buf, &bufs.attn_out,
-                bs, start_pos, num_heads, num_kv_heads, head_dim,
+                &bufs.q_buf,
+                &bufs.k_buf,
+                &bufs.v_buf,
+                &bufs.attn_out,
+                bs,
+                start_pos,
+                num_heads,
+                num_kv_heads,
+                head_dim,
             );
 
             // O projection (GEMM) + residual.
-            self.backend.matmul_batch(&layer.o_proj, &bufs.attn_out, &bufs.norm_buf, bs, hidden_size, hidden_size);
-            self.backend.add(&bufs.hidden, &bufs.norm_buf, &bufs.hidden, bs * hidden_size);
+            self.backend.matmul_batch(
+                &layer.o_proj,
+                &bufs.attn_out,
+                &bufs.norm_buf,
+                bs,
+                hidden_size,
+                hidden_size,
+            );
+            self.backend
+                .add(&bufs.hidden, &bufs.norm_buf, &bufs.hidden, bs * hidden_size);
 
             // FFN sub-block.
-            self.backend.rms_norm_batch(&bufs.hidden, &layer.post_attention_layernorm, eps, &bufs.norm_buf, bs);
-            self.backend.matmul_batch(&layer.gate_proj, &bufs.norm_buf, &bufs.gate_buf, bs, inter_size, hidden_size);
-            self.backend.matmul_batch(&layer.up_proj, &bufs.norm_buf, &bufs.up_buf, bs, inter_size, hidden_size);
-            self.backend.silu_mul(&bufs.gate_buf, &bufs.up_buf, &bufs.gate_buf, bs * inter_size);
-            self.backend.matmul_batch(&layer.down_proj, &bufs.gate_buf, &bufs.norm_buf, bs, hidden_size, inter_size);
-            self.backend.add(&bufs.hidden, &bufs.norm_buf, &bufs.hidden, bs * hidden_size);
+            self.backend.rms_norm_batch(
+                &bufs.hidden,
+                &layer.post_attention_layernorm,
+                eps,
+                &bufs.norm_buf,
+                bs,
+            );
+            self.backend.matmul_batch(
+                &layer.gate_proj,
+                &bufs.norm_buf,
+                &bufs.gate_buf,
+                bs,
+                inter_size,
+                hidden_size,
+            );
+            self.backend.matmul_batch(
+                &layer.up_proj,
+                &bufs.norm_buf,
+                &bufs.up_buf,
+                bs,
+                inter_size,
+                hidden_size,
+            );
+            self.backend.silu_mul(
+                &bufs.gate_buf,
+                &bufs.up_buf,
+                &bufs.gate_buf,
+                bs * inter_size,
+            );
+            self.backend.matmul_batch(
+                &layer.down_proj,
+                &bufs.gate_buf,
+                &bufs.norm_buf,
+                bs,
+                hidden_size,
+                inter_size,
+            );
+            self.backend
+                .add(&bufs.hidden, &bufs.norm_buf, &bufs.hidden, bs * hidden_size);
         }
 
         // Step 3: Final norm + LM head on LAST token only.
@@ -631,7 +895,13 @@ impl<'a, B: GpuBackend> Model<'a, B> {
         // The extraction uses copy_to_host + copy_to_tensor, which triggers
         // a GPU flush.  This is a one-time cost at the end of prefill —
         // negligible compared to the GEMM savings in the layer loop.
-        self.backend.rms_norm_batch(&bufs.hidden, &self.weights.norm_weight, eps, &bufs.norm_buf, bs);
+        self.backend.rms_norm_batch(
+            &bufs.hidden,
+            &self.weights.norm_weight,
+            eps,
+            &bufs.norm_buf,
+            bs,
+        );
 
         let hidden_byte_size = self.config.hidden_size * 2; // bf16
         let full_tensor_bytes = self.backend.tensor_byte_count(&bufs.norm_buf);
@@ -643,11 +913,17 @@ impl<'a, B: GpuBackend> Model<'a, B> {
             &host_buf[last_row_start..last_row_start + hidden_byte_size],
         );
 
-        let lm_head_weight = self.weights.lm_head.as_ref()
+        let lm_head_weight = self
+            .weights
+            .lm_head
+            .as_ref()
             .unwrap_or(&self.weights.embed_tokens);
         self.backend.matmul(
-            lm_head_weight, &self.norm_buf, &self.logits_buf,
-            self.config.vocab_size as u32, hidden_size,
+            lm_head_weight,
+            &self.norm_buf,
+            &self.logits_buf,
+            self.config.vocab_size as u32,
+            hidden_size,
         );
 
         Ok(())
@@ -685,16 +961,16 @@ impl<'a, B: GpuBackend> Model<'a, B> {
 // ===========================================================================
 
 pub(crate) struct PrefillBuffers<B: GpuBackend> {
-    pub hidden: B::Tensor,      // [max_chunk, hidden_size]
-    pub norm_buf: B::Tensor,    // [max_chunk, hidden_size]
-    pub q_buf: B::Tensor,       // [max_chunk, num_heads * head_dim]
-    pub k_buf: B::Tensor,       // [max_chunk, kv_dim]
-    pub v_buf: B::Tensor,       // [max_chunk, kv_dim]
-    pub attn_out: B::Tensor,    // [max_chunk, num_heads * head_dim]
-    pub gate_buf: B::Tensor,    // [max_chunk, intermediate_size]
-    pub up_buf: B::Tensor,      // [max_chunk, intermediate_size]
-    pub positions: B::Tensor,   // [max_chunk] u32 (stored as F32 for byte compat)
-    pub token_ids: B::Tensor,   // [max_chunk] u32 (stored as F32 for byte compat)
+    pub hidden: B::Tensor,    // [max_chunk, hidden_size]
+    pub norm_buf: B::Tensor,  // [max_chunk, hidden_size]
+    pub q_buf: B::Tensor,     // [max_chunk, num_heads * head_dim]
+    pub k_buf: B::Tensor,     // [max_chunk, kv_dim]
+    pub v_buf: B::Tensor,     // [max_chunk, kv_dim]
+    pub attn_out: B::Tensor,  // [max_chunk, num_heads * head_dim]
+    pub gate_buf: B::Tensor,  // [max_chunk, intermediate_size]
+    pub up_buf: B::Tensor,    // [max_chunk, intermediate_size]
+    pub positions: B::Tensor, // [max_chunk] u32 (stored as F32 for byte compat)
+    pub token_ids: B::Tensor, // [max_chunk] u32 (stored as F32 for byte compat)
     #[allow(dead_code)]
     pub max_chunk: usize,
 }
