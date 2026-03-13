@@ -4,53 +4,17 @@ Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf
 
 ## Performance
 
-**Apple M4 Max** — 16-core CPU, 40-core GPU, 64 GB unified memory, 546 GB/s bandwidth.
+**Apple M4 Max** — 16-core CPU, 40-core GPU, 64 GB unified memory, 546 GB/s bandwidth. bf16 precision. Measured via the `/v1/chat/completions` streaming endpoint, averaged over 3 runs.
 
-### API server throughput (bf16)
-
-Benchmarked via the OpenAI-compatible `/v1/chat/completions` endpoint with streaming. TTFT = time to first token (includes prefill). Decode = sustained generation throughput. All measurements are averages over 3 runs with `temperature=0`.
-
-| Model | Params | Decode (tok/s) | TTFT (ms) |
+| Model | Params | Decode | TTFT |
 |---|---|---|---|
-| Llama 3.2 1B Instruct | 1.2B | 90 | 45 |
-| Llama 3.2 3B Instruct | 3.2B | 32 | 160 |
-| Qwen 2.5 3B Instruct | 3.1B | 28 | 139 |
-| Qwen 2.5 7B Instruct | 7.6B | 21 | 380 |
-| Llama 3.1 8B Instruct | 8.0B | 19 | 453 |
+| Llama 3.2 1B Instruct | 1.2B | 90 tok/s | 45 ms |
+| Llama 3.2 3B Instruct | 3.2B | 32 tok/s | 160 ms |
+| Qwen 2.5 3B Instruct | 3.1B | 28 tok/s | 139 ms |
+| Qwen 2.5 7B Instruct | 7.6B | 21 tok/s | 380 ms |
+| Llama 3.1 8B Instruct | 8.0B | 19 tok/s | 453 ms |
 
-### Generation (tok/s)
-
-Generation is memory-bound (mat-vec): each token loads the full weight matrix for a single dot product per row. Q4 reduces data loaded ~3.2x, giving ~1.5x speedup.
-
-| Model | Params | bf16 | Q4 |
-|---|---|---|---|
-| Llama 3.2 1B | 1.2B | 86 | 114 |
-| Llama 3.2 3B | 3.2B | 33 | 46 |
-| Qwen 2.5 3B Instruct | 3.1B | 26 | 33 |
-| Qwen 2.5 7B Instruct | 7.6B | 20 | 32 |
-| Llama 3.1 8B | 8.0B | 20 | 33 |
-| Llama 3.1 8B Instruct | 8.0B | 18 | 29 |
-
-### Prefill (tok/s)
-
-Batched prefill uses GEMM (mat-mat) to process the entire prompt in one forward pass. The weight matrix is loaded once and reused across all prompt tokens — shifting from bandwidth-bound to compute-bound.
-
-| Model | bf16 | Q4 | Prompt length |
-|---|---|---|---|
-| Llama 3.2 1B | 366 | 664 | 76 tokens |
-| Llama 3.2 3B | 99 | 266 | 76 tokens |
-| Qwen 2.5 3B Instruct | 105 | 268 | 96 tokens |
-| Qwen 2.5 7B Instruct | 39 | 116 | 96 tokens |
-| Llama 3.1 8B | 32 | 114 | 76 tokens |
-| Llama 3.1 8B Instruct | 37 | 114 | 96 tokens |
-
-Prefill throughput increases with prompt length (higher arithmetic intensity — more FLOPs per byte of weight data loaded). Q4 prefill is 3-4x faster than bf16 for larger models due to the combined effect of batching + quantization.
-
-### Continuous batching
-
-| Sequences | Tokens | Total throughput |
-|---|---|---|
-| 3 (Llama 3.2 1B, bf16) | 96 | 107 tok/s |
+Q4 quantization (`--quantize`) reduces memory ~3.2x and speeds up generation ~1.5x.
 
 ## Features
 
@@ -264,30 +228,34 @@ Server mode (rllm serve):
 
 ## Model Setup
 
-Models are downloaded from [Hugging Face](https://huggingface.co) in safetensors format. Install the [Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/en/guides/cli):
+Models are downloaded from [Hugging Face](https://huggingface.co) in safetensors format. Install the [`hf` CLI](https://huggingface.co/docs/huggingface_hub/en/guides/cli):
 
-```
-pip install huggingface-cli
+```bash
+# macOS / Linux
+curl -LsSf https://hf.co/cli/install.sh | bash
+
+# or via pip
+pip install huggingface_hub
 ```
 
 Then download models into a `models/` directory:
 
-```
+```bash
 # Llama 3 — base models (text completion)
-huggingface-cli download meta-llama/Llama-3.2-1B --local-dir models/llama-3.2-1b
-huggingface-cli download meta-llama/Llama-3.2-3B --local-dir models/llama-3.2-3b
-huggingface-cli download meta-llama/Llama-3.1-8B --local-dir models/llama-3.1-8b
+hf download meta-llama/Llama-3.2-1B --local-dir models/llama-3.2-1b
+hf download meta-llama/Llama-3.2-3B --local-dir models/llama-3.2-3b
+hf download meta-llama/Llama-3.1-8B --local-dir models/llama-3.1-8b
 
 # Llama 3 — instruct models (chat / instruction following)
-huggingface-cli download meta-llama/Llama-3.2-1B-Instruct --local-dir models/llama-3.2-1b-instruct
-huggingface-cli download meta-llama/Llama-3.2-3B-Instruct --local-dir models/llama-3.2-3b-instruct
-huggingface-cli download meta-llama/Llama-3.1-8B-Instruct --local-dir models/llama-3.1-8b-instruct
+hf download meta-llama/Llama-3.2-1B-Instruct --local-dir models/llama-3.2-1b-instruct
+hf download meta-llama/Llama-3.2-3B-Instruct --local-dir models/llama-3.2-3b-instruct
+hf download meta-llama/Llama-3.1-8B-Instruct --local-dir models/llama-3.1-8b-instruct
 
 # Qwen 2.5 — instruct models
-huggingface-cli download Qwen/Qwen2.5-3B-Instruct --local-dir models/qwen-2.5-3b-instruct
-huggingface-cli download Qwen/Qwen2.5-7B-Instruct --local-dir models/qwen-2.5-7b-instruct
+hf download Qwen/Qwen2.5-3B-Instruct --local-dir models/qwen-2.5-3b-instruct
+hf download Qwen/Qwen2.5-7B-Instruct --local-dir models/qwen-2.5-7b-instruct
 ```
 
-> **Note:** Llama models are gated — you'll need to [accept the license](https://huggingface.co/meta-llama/Llama-3.2-1B) on Hugging Face and authenticate with `huggingface-cli login` before downloading. Qwen models are open access.
+> **Note:** Llama models are gated — you'll need to [accept the license](https://huggingface.co/meta-llama/Llama-3.2-1B) on Hugging Face and authenticate with `hf auth login` before downloading. Qwen models are open access.
 
 Each model directory should contain `config.json`, `tokenizer.json`, and one or more `.safetensors` weight files.
