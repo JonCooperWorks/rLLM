@@ -186,8 +186,14 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
             cert: cert.clone(),
             key: key.clone(),
         }
-    } else {
+    } else if args.dangerous_no_tls {
+        eprintln!("WARNING: running without TLS — traffic is unencrypted");
         tls::TlsMode::None
+    } else {
+        anyhow::bail!(
+            "no TLS configuration provided. Use --cert/--private-key or --letsencrypt \
+             to enable TLS, or pass --dangerous-no-tls to serve over plain HTTP."
+        );
     };
 
     let scheme = if matches!(tls_mode, tls::TlsMode::None) {

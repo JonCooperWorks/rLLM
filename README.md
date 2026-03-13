@@ -61,10 +61,10 @@ cargo run --release -- batch --model models/llama-3.2-1b --batch-file test_promp
 
 ### API server
 
-Start an OpenAI/Anthropic-compatible API server:
+Start an OpenAI/Anthropic-compatible API server (TLS required by default — see [TLS](#tls) section):
 
 ```
-cargo run --release -- serve --model models/llama-3.2-1b-instruct --port 8080
+cargo run --release -- serve --model models/llama-3.2-1b-instruct --port 8080 --dangerous-no-tls
 ```
 
 The server exposes these endpoints:
@@ -139,7 +139,13 @@ The server works as a drop-in backend for any tool that speaks the OpenAI or Ant
 
 ### TLS
 
-The server supports HTTPS via two modes:
+The server requires TLS by default. To run without TLS (e.g. local development), pass `--dangerous-no-tls`:
+
+```
+cargo run --release -- serve --model models/llama-3.2-1b-instruct --port 8080 --dangerous-no-tls
+```
+
+HTTPS is supported via two modes:
 
 **Manual certificates:**
 

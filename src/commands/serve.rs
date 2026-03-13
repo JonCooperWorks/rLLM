@@ -52,6 +52,10 @@ pub(crate) struct ServeArgs {
     /// Directory to cache Let's Encrypt certificates.
     #[arg(long, requires = "letsencrypt", default_value = ".rllm-certs")]
     pub cert_cache_dir: PathBuf,
+
+    /// Allow running without TLS (plain HTTP).  Required when no TLS config is set.
+    #[arg(long)]
+    pub dangerous_no_tls: bool,
 }
 
 pub(crate) fn exec(args: ServeArgs) -> anyhow::Result<()> {
