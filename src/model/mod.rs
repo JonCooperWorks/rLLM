@@ -1,30 +1,27 @@
 // ===========================================================================
-// Transformer forward pass and KV cache management.
+// Transformer model: weights, KV cache, scratch buffers, and forward pass
+// dispatch.
 //
 // LEARNING OVERVIEW
 //
 // What this file does:
-//   Implements the transformer forward pass for Llama 3 and Qwen 2.5 models:
-//   given a single token ID, produce logits (unnormalised probabilities) over
-//   the vocabulary.  This is the "hot path" of inference — every generated
-//   token requires one full forward pass through all transformer layers.
+//   Defines the `Model` struct that holds all inference state (weights,
+//   scratch buffers, KV cache) and dispatches the forward pass to the
+//   appropriate architecture-specific module.
 //
-// Multi-architecture support:
-//   Llama 3 and Qwen 2.5 share the same forward pass structure: RMSNorm,
-//   GQA attention, SwiGLU FFN, RoPE.  The ONLY structural difference is that
-//   Qwen adds bias to Q/K/V projections (output = W @ x + b instead of W @ x).
-//   This is handled with a simple `if let Some(bias)` check — no branching
-//   on an architecture enum needed in the hot path.
+// Architecture dispatch (registry pattern, similar to vLLM):
+//   Each model family lives in its own file under model/registry/:
+//     - model/registry/llama.rs  — Llama 3.x family (no QKV bias)
+//     - model/registry/qwen.rs   — Qwen 2.5 family (QKV bias)
 //
-// Forward pass pipeline (one token):
+//   Model families compose shared primitives from model/primitives.rs, which
+//   build on top of the GpuBackend trait.  The dispatch chain is:
+//     Model::forward() → registry::llama/qwen → primitives → GpuBackend
 //
-//     token_id → embed_lookup → hidden
-//     for each layer:
-//       hidden → RMSNorm → Q/K/V projections [+ bias if Qwen] → RoPE
-//             → KV cache store → attention → O projection → residual add
-//       hidden → RMSNorm → gate/up projections → SwiGLU → down projection
-//             → residual add
-//     hidden → final RMSNorm → lm_head projection → logits
+//   Adding a new architecture means:
+//     1. Create a new file in model/registry/ (e.g. deepseek.rs)
+//     2. Add a variant to ModelArch in config.rs
+//     3. Add dispatch arms in this file
 //
 // Key design: backend abstraction.
 //   This file NEVER imports Metal (or CUDA) types.  Every GPU operation goes
@@ -41,7 +38,7 @@
 //   Each layer has its own K cache and V cache.  Position `pos` is written
 //   once when that token is processed, then read by all future tokens.
 //
-//   Memory: 2 (K+V) × 16 layers × 4096 positions × 8 heads × 64 dim × 2 bytes
+//   Memory: 2 (K+V) x 16 layers x 4096 positions x 8 heads x 64 dim x 2 bytes
 //         = ~64 MB for the full cache.
 //
 // Buffer reuse:
@@ -63,10 +60,12 @@ pub(crate) mod chat;
 pub(crate) mod config;
 pub(crate) mod kv_cache;
 pub(crate) mod loader;
+pub(crate) mod primitives;
+pub(crate) mod registry;
 pub(crate) mod sampler;
 pub(crate) mod tokenizer;
 
-use self::config::ModelConfig;
+use self::config::{ModelArch, ModelConfig};
 use self::kv_cache::{KvPool, SeqKvState};
 use self::loader::ModelWeights;
 use crate::gpu::{GpuBackend, TensorDtype};
@@ -74,15 +73,15 @@ use crate::gpu::{GpuBackend, TensorDtype};
 /// Maximum sequence length supported by the flat KV cache.
 /// Llama 3.2 supports up to 131072 with RoPE scaling, but we cap at 4096
 /// for the flat cache mode.  The paged cache mode supports the same limit
-/// (256 blocks × 16 positions = 4096) but allocates memory on demand.
+/// (256 blocks x 16 positions = 4096) but allocates memory on demand.
 const MAX_SEQ_LEN: usize = 4096;
 
 /// The transformer model: weights, KV cache, scratch buffers, and a backend reference.
 ///
-/// Supports Llama 3 and Qwen 2.5 (same architecture, differs only in QKV bias).
 /// Generic over `B: GpuBackend` — the model doesn't know (or care) whether
 /// it's running on Metal or CUDA.  The lifetime `'a` ties the model to
 /// the backend that owns the GPU device.
+///
 /// KV cache mode: either flat (original) or paged (new).
 ///
 /// Flat mode pre-allocates [MAX_SEQ_LEN, kv_dim] per layer — simple but
@@ -104,15 +103,18 @@ pub(crate) enum KvMode<B: GpuBackend> {
 }
 
 pub(crate) struct Model<'a, B: GpuBackend> {
-    config: ModelConfig,
-    weights: ModelWeights<B>,
-    backend: &'a B,
+    pub(crate) config: ModelConfig,
+    pub(crate) weights: ModelWeights<B>,
+    pub(crate) backend: &'a B,
+
+    /// Which architecture's forward pass to use.
+    arch: ModelArch,
 
     // -----------------------------------------------------------------------
     // KV cache: either flat or paged.
     // -----------------------------------------------------------------------
     #[allow(dead_code)]
-    kv_mode: KvMode<B>,
+    pub(crate) kv_mode: KvMode<B>,
 
     // -----------------------------------------------------------------------
     // Pre-allocated scratch buffers (reused every forward pass).
@@ -128,15 +130,15 @@ pub(crate) struct Model<'a, B: GpuBackend> {
     //   up_buf     — up projection for FFN [intermediate_size = 8192]
     //   logits_buf — final vocabulary logits [vocab_size = 128256]
     // -----------------------------------------------------------------------
-    hidden: B::Tensor,
-    norm_buf: B::Tensor,
-    q_buf: B::Tensor,
-    k_buf: B::Tensor,
-    v_buf: B::Tensor,
-    attn_out: B::Tensor,
-    gate_buf: B::Tensor,
-    up_buf: B::Tensor,
-    logits_buf: B::Tensor,
+    pub(crate) hidden: B::Tensor,
+    pub(crate) norm_buf: B::Tensor,
+    pub(crate) q_buf: B::Tensor,
+    pub(crate) k_buf: B::Tensor,
+    pub(crate) v_buf: B::Tensor,
+    pub(crate) attn_out: B::Tensor,
+    pub(crate) gate_buf: B::Tensor,
+    pub(crate) up_buf: B::Tensor,
+    pub(crate) logits_buf: B::Tensor,
 }
 
 impl<'a, B: GpuBackend> Model<'a, B> {
@@ -150,7 +152,7 @@ impl<'a, B: GpuBackend> Model<'a, B> {
 
         // Allocate per-layer KV caches.
         // Each cache is [MAX_SEQ_LEN, kv_dim] — flattened to a 1D buffer.
-        // For Llama 3.2 1B: kv_dim = 8 heads × 64 dim = 512 elements per position.
+        // For Llama 3.2 1B: kv_dim = 8 heads x 64 dim = 512 elements per position.
         let mut k_cache = Vec::with_capacity(config.num_hidden_layers);
         let mut v_cache = Vec::with_capacity(config.num_hidden_layers);
         for _ in 0..config.num_hidden_layers {
@@ -192,6 +194,7 @@ impl<'a, B: GpuBackend> Model<'a, B> {
         backend: &'a B,
         kv_mode: KvMode<B>,
     ) -> anyhow::Result<Self> {
+        let arch = config.arch()?;
         let hidden = config.hidden_size;
         let kv_dim = config.num_key_value_heads * config.head_dim;
         let inter = config.intermediate_size;
@@ -212,6 +215,7 @@ impl<'a, B: GpuBackend> Model<'a, B> {
             config,
             weights,
             backend,
+            arch,
             kv_mode,
             hidden: hidden_buf,
             norm_buf,
@@ -232,453 +236,39 @@ impl<'a, B: GpuBackend> Model<'a, B> {
     }
 
     // =======================================================================
-    // Forward pass: one token in, logits out.
+    // Forward pass dispatch — model registry.
     //
-    // This is the core of the inference engine.  Each call:
-    //   1. Looks up the token's embedding vector
-    //   2. Passes it through 16 transformer layers
-    //   3. Projects to vocabulary logits
-    //   4. Advances the KV cache position
-    //
-    // Learning note: during prefill (processing the prompt), this is called
-    // once per prompt token, sequentially.  During generation, it's called
-    // once per generated token.  The KV cache accumulates across all calls,
-    // so each new token attends to the full history.
+    // Each model family lives in its own file under registry/ and composes
+    // shared primitives from primitives.rs.  The dispatch pattern is similar
+    // to vLLM's model registry: the Model struct routes to the right family
+    // based on ModelArch.
     // =======================================================================
+
+    /// Forward pass with flat/paged KV cache (original mode).
     #[allow(dead_code)]
     pub fn forward(&mut self, token_id: u32) -> anyhow::Result<()> {
-        let hidden_size = self.config.hidden_size as u32;
-        let num_heads = self.config.num_attention_heads as u32;
-        let num_kv_heads = self.config.num_key_value_heads as u32;
-        let head_dim = self.config.head_dim as u32;
-        let inter_size = self.config.intermediate_size as u32;
-        let kv_dim = (self.config.num_key_value_heads * self.config.head_dim) as u32;
-        let eps = self.config.rms_norm_eps as f32;
-        let rope_theta = self.config.rope_theta as f32;
-
-        // Get position and prepare paged state if needed.
-        let pos = match &mut self.kv_mode {
-            KvMode::Flat { pos, .. } => *pos as u32,
-            KvMode::Paged { pool, seq_state } => {
-                seq_state.ensure_slot(pool)?;
-                seq_state.sync_block_table(self.backend);
-                seq_state.seq_len as u32
-            }
-        };
-
-        // -------------------------------------------------------------------
-        // Step 1: Embedding lookup.
-        // -------------------------------------------------------------------
-        self.backend.embed_lookup(
-            &self.weights.embed_tokens,
-            token_id,
-            &self.hidden,
-            hidden_size,
-        );
-
-        // -------------------------------------------------------------------
-        // Step 2: Transformer layers.
-        // -------------------------------------------------------------------
-        for layer_idx in 0..self.config.num_hidden_layers {
-            let layer = &self.weights.layers[layer_idx];
-
-            // ---------------------------------------------------------------
-            // Attention sub-block.
-            // ---------------------------------------------------------------
-
-            self.backend
-                .rms_norm(&self.hidden, &layer.input_layernorm, eps, &self.norm_buf);
-
-            // Q, K, V linear projections.
-            self.backend.matmul(
-                &layer.q_proj,
-                &self.norm_buf,
-                &self.q_buf,
-                hidden_size,
-                hidden_size,
-            );
-            self.backend.matmul(
-                &layer.k_proj,
-                &self.norm_buf,
-                &self.k_buf,
-                kv_dim,
-                hidden_size,
-            );
-            self.backend.matmul(
-                &layer.v_proj,
-                &self.norm_buf,
-                &self.v_buf,
-                kv_dim,
-                hidden_size,
-            );
-
-            // Bias-add for Qwen 2.5.
-            if let Some(ref q_bias) = layer.q_bias {
-                self.backend
-                    .add(&self.q_buf, q_bias, &self.q_buf, hidden_size);
-            }
-            if let Some(ref k_bias) = layer.k_bias {
-                self.backend.add(&self.k_buf, k_bias, &self.k_buf, kv_dim);
-            }
-            if let Some(ref v_bias) = layer.v_bias {
-                self.backend.add(&self.v_buf, v_bias, &self.v_buf, kv_dim);
-            }
-
-            // RoPE.
-            self.backend.rope(
-                &self.q_buf,
-                &self.k_buf,
-                pos,
-                rope_theta,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-            );
-
-            // Store K/V and compute attention — dispatch based on KV mode.
-            match &self.kv_mode {
-                KvMode::Flat {
-                    k_cache, v_cache, ..
-                } => {
-                    self.backend.copy_to_kv_cache(
-                        &self.k_buf,
-                        &k_cache[layer_idx],
-                        pos,
-                        num_kv_heads,
-                        head_dim,
-                    );
-                    self.backend.copy_to_kv_cache(
-                        &self.v_buf,
-                        &v_cache[layer_idx],
-                        pos,
-                        num_kv_heads,
-                        head_dim,
-                    );
-                    self.backend.attention(
-                        &self.q_buf,
-                        &k_cache[layer_idx],
-                        &v_cache[layer_idx],
-                        &self.attn_out,
-                        pos + 1,
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                    );
-                }
-                KvMode::Paged { pool, seq_state } => {
-                    self.backend.copy_to_paged_kv_cache(
-                        &self.k_buf,
-                        &pool.k_pool[layer_idx],
-                        &seq_state.block_table_gpu,
-                        pos,
-                        num_kv_heads,
-                        head_dim,
-                    );
-                    self.backend.copy_to_paged_kv_cache(
-                        &self.v_buf,
-                        &pool.v_pool[layer_idx],
-                        &seq_state.block_table_gpu,
-                        pos,
-                        num_kv_heads,
-                        head_dim,
-                    );
-                    self.backend.paged_attention(
-                        &self.q_buf,
-                        &pool.k_pool[layer_idx],
-                        &pool.v_pool[layer_idx],
-                        &seq_state.block_table_gpu,
-                        &self.attn_out,
-                        pos + 1,
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                    );
-                }
-            }
-
-            // O projection + residual.
-            self.backend.matmul(
-                &layer.o_proj,
-                &self.attn_out,
-                &self.norm_buf,
-                hidden_size,
-                hidden_size,
-            );
-            self.backend
-                .add(&self.hidden, &self.norm_buf, &self.hidden, hidden_size);
-
-            // ---------------------------------------------------------------
-            // FFN sub-block.
-            // ---------------------------------------------------------------
-
-            self.backend.rms_norm(
-                &self.hidden,
-                &layer.post_attention_layernorm,
-                eps,
-                &self.norm_buf,
-            );
-
-            self.backend.matmul(
-                &layer.gate_proj,
-                &self.norm_buf,
-                &self.gate_buf,
-                inter_size,
-                hidden_size,
-            );
-            self.backend.matmul(
-                &layer.up_proj,
-                &self.norm_buf,
-                &self.up_buf,
-                inter_size,
-                hidden_size,
-            );
-            self.backend
-                .silu_mul(&self.gate_buf, &self.up_buf, &self.gate_buf, inter_size);
-            self.backend.matmul(
-                &layer.down_proj,
-                &self.gate_buf,
-                &self.norm_buf,
-                hidden_size,
-                inter_size,
-            );
-            self.backend
-                .add(&self.hidden, &self.norm_buf, &self.hidden, hidden_size);
+        match self.arch {
+            ModelArch::Llama => registry::llama::forward(self, token_id),
+            ModelArch::Qwen2 => registry::qwen::forward(self, token_id),
         }
-
-        // -------------------------------------------------------------------
-        // Step 3: Final normalisation + LM head projection.
-        // -------------------------------------------------------------------
-        self.backend
-            .rms_norm(&self.hidden, &self.weights.norm_weight, eps, &self.norm_buf);
-
-        let lm_head_weight = self
-            .weights
-            .lm_head
-            .as_ref()
-            .unwrap_or(&self.weights.embed_tokens);
-        self.backend.matmul(
-            lm_head_weight,
-            &self.norm_buf,
-            &self.logits_buf,
-            self.config.vocab_size as u32,
-            hidden_size,
-        );
-
-        // Advance KV cache position.
-        match &mut self.kv_mode {
-            KvMode::Flat { pos, .. } => *pos += 1,
-            KvMode::Paged { seq_state, .. } => seq_state.advance(),
-        }
-        Ok(())
     }
 
     /// Forward pass using an EXTERNAL paged KV pool and sequence state.
     ///
     /// This is used by the engine for continuous batching: the model's own
     /// kv_mode is ignored, and the caller provides the pool and sequence state
-    /// for the specific sequence being processed.  The sequence state is NOT
-    /// advanced here — the caller (engine) handles that.
+    /// for the specific sequence being processed.
     pub fn forward_single_paged(
         &mut self,
         token_id: u32,
         pool: &KvPool<B>,
         seq_state: &SeqKvState<B>,
     ) -> anyhow::Result<()> {
-        let hidden_size = self.config.hidden_size as u32;
-        let num_heads = self.config.num_attention_heads as u32;
-        let num_kv_heads = self.config.num_key_value_heads as u32;
-        let head_dim = self.config.head_dim as u32;
-        let inter_size = self.config.intermediate_size as u32;
-        let kv_dim = (self.config.num_key_value_heads * self.config.head_dim) as u32;
-        let eps = self.config.rms_norm_eps as f32;
-        let rope_theta = self.config.rope_theta as f32;
-        let pos = seq_state.seq_len as u32;
-
-        self.backend.embed_lookup(
-            &self.weights.embed_tokens,
-            token_id,
-            &self.hidden,
-            hidden_size,
-        );
-
-        for layer_idx in 0..self.config.num_hidden_layers {
-            let layer = &self.weights.layers[layer_idx];
-
-            self.backend
-                .rms_norm(&self.hidden, &layer.input_layernorm, eps, &self.norm_buf);
-            self.backend.matmul(
-                &layer.q_proj,
-                &self.norm_buf,
-                &self.q_buf,
-                hidden_size,
-                hidden_size,
-            );
-            self.backend.matmul(
-                &layer.k_proj,
-                &self.norm_buf,
-                &self.k_buf,
-                kv_dim,
-                hidden_size,
-            );
-            self.backend.matmul(
-                &layer.v_proj,
-                &self.norm_buf,
-                &self.v_buf,
-                kv_dim,
-                hidden_size,
-            );
-
-            if let Some(ref q_bias) = layer.q_bias {
-                self.backend
-                    .add(&self.q_buf, q_bias, &self.q_buf, hidden_size);
-            }
-            if let Some(ref k_bias) = layer.k_bias {
-                self.backend.add(&self.k_buf, k_bias, &self.k_buf, kv_dim);
-            }
-            if let Some(ref v_bias) = layer.v_bias {
-                self.backend.add(&self.v_buf, v_bias, &self.v_buf, kv_dim);
-            }
-
-            self.backend.rope(
-                &self.q_buf,
-                &self.k_buf,
-                pos,
-                rope_theta,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-            );
-
-            self.backend.copy_to_paged_kv_cache(
-                &self.k_buf,
-                &pool.k_pool[layer_idx],
-                &seq_state.block_table_gpu,
-                pos,
-                num_kv_heads,
-                head_dim,
-            );
-            self.backend.copy_to_paged_kv_cache(
-                &self.v_buf,
-                &pool.v_pool[layer_idx],
-                &seq_state.block_table_gpu,
-                pos,
-                num_kv_heads,
-                head_dim,
-            );
-            self.backend.paged_attention(
-                &self.q_buf,
-                &pool.k_pool[layer_idx],
-                &pool.v_pool[layer_idx],
-                &seq_state.block_table_gpu,
-                &self.attn_out,
-                pos + 1,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-            );
-
-            self.backend.matmul(
-                &layer.o_proj,
-                &self.attn_out,
-                &self.norm_buf,
-                hidden_size,
-                hidden_size,
-            );
-            self.backend
-                .add(&self.hidden, &self.norm_buf, &self.hidden, hidden_size);
-
-            self.backend.rms_norm(
-                &self.hidden,
-                &layer.post_attention_layernorm,
-                eps,
-                &self.norm_buf,
-            );
-            self.backend.matmul(
-                &layer.gate_proj,
-                &self.norm_buf,
-                &self.gate_buf,
-                inter_size,
-                hidden_size,
-            );
-            self.backend.matmul(
-                &layer.up_proj,
-                &self.norm_buf,
-                &self.up_buf,
-                inter_size,
-                hidden_size,
-            );
-            self.backend
-                .silu_mul(&self.gate_buf, &self.up_buf, &self.gate_buf, inter_size);
-            self.backend.matmul(
-                &layer.down_proj,
-                &self.gate_buf,
-                &self.norm_buf,
-                hidden_size,
-                inter_size,
-            );
-            self.backend
-                .add(&self.hidden, &self.norm_buf, &self.hidden, hidden_size);
+        match self.arch {
+            ModelArch::Llama => registry::llama::forward_single_paged(self, token_id, pool, seq_state),
+            ModelArch::Qwen2 => registry::qwen::forward_single_paged(self, token_id, pool, seq_state),
         }
-
-        self.backend
-            .rms_norm(&self.hidden, &self.weights.norm_weight, eps, &self.norm_buf);
-        let lm_head_weight = self
-            .weights
-            .lm_head
-            .as_ref()
-            .unwrap_or(&self.weights.embed_tokens);
-        self.backend.matmul(
-            lm_head_weight,
-            &self.norm_buf,
-            &self.logits_buf,
-            self.config.vocab_size as u32,
-            hidden_size,
-        );
-
-        Ok(())
     }
-
-    // =======================================================================
-    // Batched prefill forward pass.
-    //
-    // LEARNING OVERVIEW
-    //
-    // What this does:
-    //   Processes an entire prompt in ONE forward pass using GEMM (mat-mat)
-    //   instead of mat-vec for all projections.  This shifts from bandwidth-
-    //   bound to compute-bound, giving 3-10x prefill speedup.
-    //
-    // The key insight — GEMM vs. mat-vec:
-    //   Token-by-token: for 100 tokens, loads the weight matrix 100 times.
-    //     Each load does only 1 dot product per row → wasted bandwidth.
-    //   Batched: loads the weight matrix ONCE, does 100 dot products per row.
-    //     Same memory traffic, 100× more compute → GPU actually busy.
-    //
-    // How the pipeline works:
-    //   1. Upload token IDs and positions to GPU buffers.
-    //   2. Batched embedding lookup: [chunk_size] → [chunk_size, hidden_size]
-    //   3. For each transformer layer (16 layers for 1B):
-    //      a. RMSNorm (batched): normalise each row independently
-    //      b. Q/K/V GEMM projections: the big win (mat-mat, not mat-vec)
-    //      c. Batched RoPE: position-dependent rotations per token
-    //      d. Write K/V to paged cache (for future decode steps)
-    //      e. Causal prefill attention: Q @ K^T with triangular mask
-    //      f. O projection GEMM + residual add
-    //      g. FFN: RMSNorm + gate/up GEMM + SwiGLU + down GEMM + residual
-    //   4. Final RMSNorm + LM head projection (LAST token only → single matmul)
-    //
-    // Element-wise ops (add, silu_mul) need NO new batch kernels:
-    //   They operate on flat memory — passing size = batch * dim handles
-    //   batched tensors without any kernel changes.  [100, 2048] is just
-    //   204800 contiguous bf16 values to the add kernel.
-    //
-    // LM head optimisation:
-    //   Only the LAST token's logits are needed for sampling.  Instead of
-    //   computing [chunk_size, vocab_size] (e.g. [100, 128256] — 25M elements!),
-    //   we extract just the last hidden state and do a single mat-vec.
-    //   This is done via copy_to_host → slice → copy_to_tensor, which
-    //   triggers one GPU flush.  Negligible cost at end of prefill.
-    // =======================================================================
 
     /// Batched prefill: process `tokens` through the entire model in one pass.
     ///
@@ -697,236 +287,10 @@ impl<'a, B: GpuBackend> Model<'a, B> {
         seq_state: &SeqKvState<B>,
         bufs: &PrefillBuffers<B>,
     ) -> anyhow::Result<()> {
-        let chunk_size = tokens.len();
-        let bs = chunk_size as u32;
-        let hidden_size = self.config.hidden_size as u32;
-        let num_heads = self.config.num_attention_heads as u32;
-        let num_kv_heads = self.config.num_key_value_heads as u32;
-        let head_dim = self.config.head_dim as u32;
-        let inter_size = self.config.intermediate_size as u32;
-        let kv_dim = (self.config.num_key_value_heads * self.config.head_dim) as u32;
-        let eps = self.config.rms_norm_eps as f32;
-        let rope_theta = self.config.rope_theta as f32;
-        let start_pos = seq_state.seq_len as u32;
-
-        // Upload token IDs and positions to GPU.
-        let token_bytes: &[u8] = bytemuck::cast_slice(tokens);
-        self.backend.copy_to_tensor(&bufs.token_ids, token_bytes);
-
-        let positions: Vec<u32> = (start_pos..start_pos + bs).collect();
-        let pos_bytes: &[u8] = bytemuck::cast_slice(&positions);
-        self.backend.copy_to_tensor(&bufs.positions, pos_bytes);
-
-        // Step 1: Batched embedding lookup.
-        self.backend.embed_lookup_batch(
-            &self.weights.embed_tokens,
-            &bufs.token_ids,
-            &bufs.hidden,
-            bs,
-            hidden_size,
-        );
-
-        // Step 2: Transformer layers.
-        for layer_idx in 0..self.config.num_hidden_layers {
-            let layer = &self.weights.layers[layer_idx];
-
-            // Attention sub-block.
-            self.backend.rms_norm_batch(
-                &bufs.hidden,
-                &layer.input_layernorm,
-                eps,
-                &bufs.norm_buf,
-                bs,
-            );
-
-            // Q/K/V GEMM projections — the core speedup.
-            self.backend.matmul_batch(
-                &layer.q_proj,
-                &bufs.norm_buf,
-                &bufs.q_buf,
-                bs,
-                hidden_size,
-                hidden_size,
-            );
-            self.backend.matmul_batch(
-                &layer.k_proj,
-                &bufs.norm_buf,
-                &bufs.k_buf,
-                bs,
-                kv_dim,
-                hidden_size,
-            );
-            self.backend.matmul_batch(
-                &layer.v_proj,
-                &bufs.norm_buf,
-                &bufs.v_buf,
-                bs,
-                kv_dim,
-                hidden_size,
-            );
-
-            // Qwen 2.5 QKV bias: broadcast-add [dim] bias across [batch_size, dim].
-            //
-            // This was the cause of Qwen producing gibberish/repetitive output.
-            // Without these biases during prefill, the KV cache is built with
-            // wrong Q/K/V values for every prompt token.  The decode phase then
-            // attends to corrupted cache entries, producing incoherent output.
-            // Llama models have no QKV bias (q_bias/k_bias/v_bias are None),
-            // so these branches are skipped for Llama at zero cost.
-            if let Some(ref q_bias) = layer.q_bias {
-                self.backend
-                    .bias_add_batch(&bufs.q_buf, q_bias, &bufs.q_buf, bs, hidden_size);
-            }
-            if let Some(ref k_bias) = layer.k_bias {
-                self.backend
-                    .bias_add_batch(&bufs.k_buf, k_bias, &bufs.k_buf, bs, kv_dim);
-            }
-            if let Some(ref v_bias) = layer.v_bias {
-                self.backend
-                    .bias_add_batch(&bufs.v_buf, v_bias, &bufs.v_buf, bs, kv_dim);
-            }
-
-            // Batched RoPE with per-token positions.
-            self.backend.rope_batch(
-                &bufs.q_buf,
-                &bufs.k_buf,
-                &bufs.positions,
-                rope_theta,
-                bs,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-            );
-
-            // Write K/V into paged cache for future decode steps.
-            self.backend.copy_to_paged_kv_cache_batch(
-                &bufs.k_buf,
-                &pool.k_pool[layer_idx],
-                &seq_state.block_table_gpu,
-                &bufs.positions,
-                bs,
-                num_kv_heads,
-                head_dim,
-            );
-            self.backend.copy_to_paged_kv_cache_batch(
-                &bufs.v_buf,
-                &pool.v_pool[layer_idx],
-                &seq_state.block_table_gpu,
-                &bufs.positions,
-                bs,
-                num_kv_heads,
-                head_dim,
-            );
-
-            // Causal prefill attention on dense Q/K/V.
-            self.backend.prefill_attention(
-                &bufs.q_buf,
-                &bufs.k_buf,
-                &bufs.v_buf,
-                &bufs.attn_out,
-                bs,
-                start_pos,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-            );
-
-            // O projection (GEMM) + residual.
-            self.backend.matmul_batch(
-                &layer.o_proj,
-                &bufs.attn_out,
-                &bufs.norm_buf,
-                bs,
-                hidden_size,
-                hidden_size,
-            );
-            self.backend
-                .add(&bufs.hidden, &bufs.norm_buf, &bufs.hidden, bs * hidden_size);
-
-            // FFN sub-block.
-            self.backend.rms_norm_batch(
-                &bufs.hidden,
-                &layer.post_attention_layernorm,
-                eps,
-                &bufs.norm_buf,
-                bs,
-            );
-            self.backend.matmul_batch(
-                &layer.gate_proj,
-                &bufs.norm_buf,
-                &bufs.gate_buf,
-                bs,
-                inter_size,
-                hidden_size,
-            );
-            self.backend.matmul_batch(
-                &layer.up_proj,
-                &bufs.norm_buf,
-                &bufs.up_buf,
-                bs,
-                inter_size,
-                hidden_size,
-            );
-            self.backend.silu_mul(
-                &bufs.gate_buf,
-                &bufs.up_buf,
-                &bufs.gate_buf,
-                bs * inter_size,
-            );
-            self.backend.matmul_batch(
-                &layer.down_proj,
-                &bufs.gate_buf,
-                &bufs.norm_buf,
-                bs,
-                hidden_size,
-                inter_size,
-            );
-            self.backend
-                .add(&bufs.hidden, &bufs.norm_buf, &bufs.hidden, bs * hidden_size);
+        match self.arch {
+            ModelArch::Llama => registry::llama::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
+            ModelArch::Qwen2 => registry::qwen::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
         }
-
-        // Step 3: Final norm + LM head on LAST token only.
-        //
-        // Only the last token's logits matter for sampling.  We run batched
-        // rms_norm on the full batch, then extract the last row to the
-        // single-token norm_buf for the vocab projection (single matmul).
-        // This avoids a wasteful [chunk_size, 128K] GEMM.
-        //
-        // The extraction uses copy_to_host + copy_to_tensor, which triggers
-        // a GPU flush.  This is a one-time cost at the end of prefill —
-        // negligible compared to the GEMM savings in the layer loop.
-        self.backend.rms_norm_batch(
-            &bufs.hidden,
-            &self.weights.norm_weight,
-            eps,
-            &bufs.norm_buf,
-            bs,
-        );
-
-        let hidden_byte_size = self.config.hidden_size * 2; // bf16
-        let full_tensor_bytes = self.backend.tensor_byte_count(&bufs.norm_buf);
-        let mut host_buf = vec![0u8; full_tensor_bytes];
-        self.backend.copy_to_host(&bufs.norm_buf, &mut host_buf);
-        let last_row_start = (chunk_size - 1) * hidden_byte_size;
-        self.backend.copy_to_tensor(
-            &self.norm_buf,
-            &host_buf[last_row_start..last_row_start + hidden_byte_size],
-        );
-
-        let lm_head_weight = self
-            .weights
-            .lm_head
-            .as_ref()
-            .unwrap_or(&self.weights.embed_tokens);
-        self.backend.matmul(
-            lm_head_weight,
-            &self.norm_buf,
-            &self.logits_buf,
-            self.config.vocab_size as u32,
-            hidden_size,
-        );
-
-        Ok(())
     }
 
     /// Accessor for config (needed by engine for buffer allocation).
@@ -950,9 +314,9 @@ impl<'a, B: GpuBackend> Model<'a, B> {
 //
 // Memory cost:
 //   For max_chunk=1024, Llama 3.2 1B (hidden=2048, kv_dim=512, inter=8192):
-//     hidden + norm + q + attn_out: 4 × 1024 × 2048 × 2 bytes = 16 MB
-//     k + v:                         2 × 1024 × 512 × 2 bytes  =  2 MB
-//     gate + up:                     2 × 1024 × 8192 × 2 bytes = 32 MB
+//     hidden + norm + q + attn_out: 4 x 1024 x 2048 x 2 bytes = 16 MB
+//     k + v:                         2 x 1024 x 512 x 2 bytes  =  2 MB
+//     gate + up:                     2 x 1024 x 8192 x 2 bytes = 32 MB
 //     Total: ~50 MB (one-time allocation, reused for every prefill).
 //
 // The buffers act as a "scratchpad" — the GEMM kernels write to them, the

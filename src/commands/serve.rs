@@ -22,7 +22,7 @@ pub(crate) struct ServeArgs {
     pub port: u16,
 
     /// Host to bind to.
-    #[arg(long, default_value = "0.0.0.0")]
+    #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
 
     /// Quantise weights to Q4 on load.

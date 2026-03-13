@@ -67,6 +67,21 @@ Start an OpenAI/Anthropic-compatible API server (TLS required by default — see
 cargo run --release -- serve --model models/llama-3.2-1b-instruct --port 8080 --dangerous-no-tls
 ```
 
+**Server options:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--model` | *(required)* | Path to model directory |
+| `--port` | `8080` | Port to listen on |
+| `--host` | `127.0.0.1` | Host to bind to (use `0.0.0.0` for all interfaces) |
+| `--quantize` | off | Quantize weights to Q4 on load |
+| `--cert` / `--private-key` | — | TLS certificate and key (PEM) |
+| `--letsencrypt` | off | Automatic TLS via Let's Encrypt (requires `--domain`) |
+| `--domain` | — | Domain name for Let's Encrypt |
+| `--letsencrypt-email` | — | Contact email for Let's Encrypt |
+| `--cert-cache-dir` | `.rllm-certs` | Cache directory for Let's Encrypt certs |
+| `--dangerous-no-tls` | off | Allow serving over plain HTTP |
+
 The server exposes these endpoints:
 
 | Endpoint | Method | Description |
