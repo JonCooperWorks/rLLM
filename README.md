@@ -6,6 +6,18 @@ Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf
 
 **Apple M4 Max** — 16-core CPU, 40-core GPU, 64 GB unified memory, 546 GB/s bandwidth.
 
+### API server throughput (bf16)
+
+Benchmarked via the OpenAI-compatible `/v1/chat/completions` endpoint with streaming. TTFT = time to first token (includes prefill). Decode = sustained generation throughput. All measurements are averages over 3 runs with `temperature=0`.
+
+| Model | Params | Decode (tok/s) | TTFT (ms) |
+|---|---|---|---|
+| Llama 3.2 1B Instruct | 1.2B | 90 | 45 |
+| Llama 3.2 3B Instruct | 3.2B | 32 | 160 |
+| Qwen 2.5 3B Instruct | 3.1B | 28 | 139 |
+| Qwen 2.5 7B Instruct | 7.6B | 21 | 380 |
+| Llama 3.1 8B Instruct | 8.0B | 19 | 453 |
+
 ### Generation (tok/s)
 
 Generation is memory-bound (mat-vec): each token loads the full weight matrix for a single dot product per row. Q4 reduces data loaded ~3.2x, giving ~1.5x speedup.
@@ -80,7 +92,7 @@ cargo run --release -- run --model models/qwen-2.5-7b-instruct --prompt "Explain
 Continuous batching (multiple prompts from a file):
 
 ```
-cargo run --release -- run --model models/llama-3.2-1b --batch-file test_prompts.txt --max-tokens 64
+cargo run --release -- batch --model models/llama-3.2-1b --batch-file test_prompts.txt --max-tokens 64
 ```
 
 ### API server
@@ -161,27 +173,55 @@ curl -N http://localhost:8080/v1/messages \
 
 The server works as a drop-in backend for any tool that speaks the OpenAI or Anthropic API — just change the base URL to `http://localhost:8080`.
 
+### TLS
+
+The server supports HTTPS via two modes:
+
+**Manual certificates:**
+
+```
+cargo run --release -- serve --model models/llama-3.2-1b-instruct \
+  --cert /path/to/cert.pem --private-key /path/to/key.pem --port 443
+```
+
+**Let's Encrypt (automatic):**
+
+```
+cargo run --release -- serve --model models/llama-3.2-1b-instruct \
+  --letsencrypt --domain example.com --port 443
+```
+
+Let's Encrypt uses TLS-ALPN-01 challenge validation — no separate port 80 needed. Certificates are automatically provisioned and renewed, cached to `.rllm-certs/` by default (configurable via `--cert-cache-dir`). Optionally pass `--letsencrypt-email` for expiry notifications.
+
 ## Architecture
 
 ```
 src/
-├── main.rs        — CLI entry point (run / serve subcommands)
-├── config.rs      — HuggingFace config.json parsing, ModelArch detection
-├── model.rs       — Transformer forward pass (single-token + batched prefill)
-├── engine.rs      — Continuous batching loop (scheduler + model)
-├── scheduler.rs   — Sequence management, FCFS admission
-├── kv_cache.rs    — Paged KV cache (block pool + per-sequence state)
-├── loader.rs      — Safetensors loading, Q4 on-load quantization
-├── tokenizer.rs   — BPE tokenizer with per-model special tokens
-├── chat.rs        — Chat template formatter (Llama 3 + ChatML)
-├── sampler.rs     — Temperature + top-p sampling
+├── main.rs              — CLI entry point (parse args, dispatch)
+├── commands/
+│   ├── mod.rs           — Command enum (Run | Batch | Serve)
+│   ├── run.rs           — Single-prompt inference
+│   ├── batch.rs         — Batched inference from file
+│   └── serve.rs         — API server CLI args + launch
+├── model/
+│   ├── mod.rs           — Transformer forward pass (single-token + batched prefill)
+│   ├── config.rs        — HuggingFace config.json parsing, ModelArch detection
+│   ├── loader.rs        — Safetensors loading, Q4 on-load quantization
+│   ├── tokenizer.rs     — BPE tokenizer with per-model special tokens
+│   ├── chat.rs          — Chat template formatter (Llama 3 + ChatML)
+│   ├── kv_cache.rs      — Paged KV cache (block pool + per-sequence state)
+│   └── sampler.rs       — Temperature + top-p sampling
+├── engine/
+│   ├── mod.rs           — Continuous batching loop (scheduler + model)
+│   └── scheduler.rs     — Sequence management, FCFS admission
 ├── api/
-│   ├── mod.rs     — HTTP server setup, inference worker thread
-│   ├── openai.rs  — OpenAI-compatible handlers (chat/completions/models)
-│   └── anthropic.rs — Anthropic-compatible handler (messages)
+│   ├── mod.rs           — HTTP server setup, inference worker thread
+│   ├── openai.rs        — OpenAI-compatible handlers (chat/completions/models)
+│   ├── anthropic.rs     — Anthropic-compatible handler (messages)
+│   └── tls.rs           — TLS support (manual certs + Let's Encrypt)
 └── gpu/
-    ├── mod.rs     — GpuBackend trait (platform-generic interface)
-    ├── metal/     — Metal backend + compute shaders
+    ├── mod.rs           — GpuBackend trait (platform-generic interface)
+    ├── metal/           — Metal backend + compute shaders
     │   ├── mod.rs         — dispatch, pipeline management
     │   ├── matmul.metal   — SIMD-cooperative matvec + GEMM (bf16 + Q4)
     │   ├── attention.metal — flat, paged, and causal prefill attention
@@ -189,7 +229,7 @@ src/
     │   ├── rope.metal      — single + batched RoPE
     │   ├── embed.metal     — single + batched embedding lookup
     │   └── elementwise.metal — add, SwiGLU
-    └── cuda/      — CUDA backend (stub)
+    └── cuda/            — CUDA backend
 ```
 
 Model code is generic over a `GpuBackend` trait with an associated `Tensor` type. Platform selection uses OS-conditional compilation — Metal on macOS, CUDA on Linux. Llama and Qwen share the same forward pass; the only difference is Qwen adds bias to Q/K/V attention projections (handled by a simple `if let Some(bias)` check).
@@ -198,13 +238,11 @@ Model code is generic over a `GpuBackend` trait with an associated `Tensor` type
 
 ```
 Single-sequence mode (rllm run):
-  load config → create backend → load tokenizer → load weights → create model
-  → create paged KV pool + prefill buffers
+  load model → create paged KV pool + prefill buffers
   → encode prompt → batched GEMM prefill → decode loop (stream tokens)
 
-Batch mode (rllm run --batch-file):
-  load config → create backend → load tokenizer → load weights → create model
-  → create KV pool + scheduler + engine
+Batch mode (rllm batch):
+  load model → create KV pool + scheduler + engine
   → submit all prompts → engine.step() loop until all sequences complete
 
 Server mode (rllm serve):
