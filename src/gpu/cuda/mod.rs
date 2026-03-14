@@ -160,6 +160,18 @@ impl super::GpuBackend for CudaBackend {
     fn top_k_softmax(&self, _: &CudaTensor, _: &CudaTensor, _: u32, _: u32) {
         unreachable!()
     }
+    // DeltaNet stubs
+    fn conv1d_depthwise_single(&self, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: u32, _: u32) { unreachable!() }
+    fn conv1d_shift_history(&self, _: &CudaTensor, _: &CudaTensor, _: u32, _: u32) { unreachable!() }
+    fn l2_normalize_heads(&self, _: &CudaTensor, _: u32, _: u32, _: u32) { unreachable!() }
+    fn sigmoid(&self, _: &CudaTensor, _: &CudaTensor, _: u32) { unreachable!() }
+    fn sigmoid_bf16(&self, _: &CudaTensor, _: &CudaTensor, _: u32) { unreachable!() }
+    fn deltanet_decay_gate(&self, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: u32) { unreachable!() }
+    fn silu(&self, _: &CudaTensor, _: &CudaTensor, _: u32) { unreachable!() }
+    fn mul(&self, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: u32) { unreachable!() }
+    fn deltanet_step(&self, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: &CudaTensor, _: u32, _: u32, _: u32, _: u32, _: u32, _: u32) { unreachable!() }
+    fn rms_norm_no_weight(&self, _: &CudaTensor, _: &CudaTensor, _: u32, _: f32) { unreachable!() }
+    fn rope_partial(&self, _: &CudaTensor, _: &CudaTensor, _: u32, _: f32, _: u32, _: u32, _: u32, _: u32) { unreachable!() }
 }
 
 pub(crate) struct CudaTensor;

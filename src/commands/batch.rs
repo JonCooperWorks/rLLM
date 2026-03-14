@@ -93,7 +93,7 @@ pub(crate) fn exec(args: BatchArgs) -> anyhow::Result<()> {
     );
 
     let kv_dim = config.num_key_value_heads * config.head_dim;
-    let kv_pool = kv_cache::KvPool::new(&backend, num_blocks, kv_dim, config.num_hidden_layers);
+    let kv_pool = kv_cache::KvPool::new(&backend, num_blocks, kv_dim, config.num_kv_layers());
 
     let model = model::Model::new(config, weights, &backend)?;
 

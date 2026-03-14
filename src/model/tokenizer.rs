@@ -76,6 +76,10 @@ impl Tokenizer {
             // Vocab size differs (151936 vs 152064) but special token IDs are
             // in the same range.
             ModelArch::Qwen3Moe => (None, vec![151643, 151645]),
+
+            // Qwen 3.5: no BOS, eos_token_id=248044 from config.  ChatML format
+            // with <|im_end|> as the primary stop token.  Vocab size is 248320.
+            ModelArch::Qwen3_5 => (None, vec![248044]),
         };
 
         Ok(Self {

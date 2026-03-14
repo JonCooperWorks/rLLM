@@ -77,6 +77,7 @@ const METAL_SOURCE_ROPE: &str = include_str!("rope.metal");
 const METAL_SOURCE_ATTENTION: &str = include_str!("attention.metal");
 const METAL_SOURCE_ELEMENTWISE: &str = include_str!("elementwise.metal");
 const METAL_SOURCE_EMBED: &str = include_str!("embed.metal");
+const METAL_SOURCE_DELTANET: &str = include_str!("deltanet.metal");
 
 // ---------------------------------------------------------------------------
 // MetalTensor — the backend's opaque tensor type.
@@ -148,6 +149,19 @@ pub(crate) struct MetalBackend {
 
     // MoE routing kernel.
     pipeline_top_k_softmax: metal::ComputePipelineState,
+
+    // DeltaNet kernels (Qwen 3.5 hybrid attention).
+    pipeline_conv1d_depthwise: metal::ComputePipelineState,
+    pipeline_conv1d_shift: metal::ComputePipelineState,
+    pipeline_l2_normalize: metal::ComputePipelineState,
+    pipeline_sigmoid: metal::ComputePipelineState,
+    pipeline_sigmoid_bf16: metal::ComputePipelineState,
+    pipeline_decay_gate: metal::ComputePipelineState,
+    pipeline_silu_elem: metal::ComputePipelineState,
+    pipeline_mul_elem: metal::ComputePipelineState,
+    pipeline_deltanet_step: metal::ComputePipelineState,
+    pipeline_rms_norm_no_weight: metal::ComputePipelineState,
+    pipeline_rope_partial: metal::ComputePipelineState,
 
     // Batched command encoding state.
     //
@@ -262,6 +276,62 @@ impl MetalBackend {
             &compile_opts,
         )?;
 
+        // DeltaNet kernels.
+        let pipeline_conv1d_depthwise = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_DELTANET,
+            "conv1d_depthwise_single",
+            &compile_opts,
+        )?;
+        let pipeline_conv1d_shift = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_DELTANET,
+            "conv1d_shift_history",
+            &compile_opts,
+        )?;
+        let pipeline_l2_normalize = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_DELTANET,
+            "l2_normalize_heads",
+            &compile_opts,
+        )?;
+        let pipeline_sigmoid =
+            Self::make_pipeline(&device, METAL_SOURCE_DELTANET, "sigmoid_kernel", &compile_opts)?;
+        let pipeline_sigmoid_bf16 =
+            Self::make_pipeline(&device, METAL_SOURCE_DELTANET, "sigmoid_bf16", &compile_opts)?;
+        let pipeline_decay_gate =
+            Self::make_pipeline(&device, METAL_SOURCE_DELTANET, "deltanet_decay_gate", &compile_opts)?;
+        let pipeline_silu_elem = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_DELTANET,
+            "silu_elementwise",
+            &compile_opts,
+        )?;
+        let pipeline_mul_elem = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_DELTANET,
+            "mul_elementwise",
+            &compile_opts,
+        )?;
+        let pipeline_deltanet_step = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_DELTANET,
+            "deltanet_step",
+            &compile_opts,
+        )?;
+        let pipeline_rms_norm_no_weight = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_DELTANET,
+            "rms_norm_no_weight",
+            &compile_opts,
+        )?;
+        let pipeline_rope_partial = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_ROPE,
+            "rotary_embedding_partial",
+            &compile_opts,
+        )?;
+
         Ok(Self {
             device,
             queue,
@@ -288,6 +358,17 @@ impl MetalBackend {
             pipeline_paged_copy_kv_batch,
             pipeline_prefill_attention,
             pipeline_top_k_softmax,
+            pipeline_conv1d_depthwise,
+            pipeline_conv1d_shift,
+            pipeline_l2_normalize,
+            pipeline_sigmoid,
+            pipeline_sigmoid_bf16,
+            pipeline_decay_gate,
+            pipeline_silu_elem,
+            pipeline_mul_elem,
+            pipeline_deltanet_step,
+            pipeline_rms_norm_no_weight,
+            pipeline_rope_partial,
             current_cmd: std::sync::Mutex::new(None),
         })
     }
@@ -561,6 +642,64 @@ struct PrefillAttentionParams {
 struct TopKParams {
     num_experts: u32,
     k: u32,
+}
+
+// DeltaNet param structs.
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DnConv1dParams {
+    dim: u32,
+    kernel_size: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DnL2NormParams {
+    num_heads: u32,
+    head_dim: u32,
+    elem_offset: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DnSigmoidParams {
+    size: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DnDecayGateParams {
+    size: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DnDeltaNetStepParams {
+    num_qk_heads: u32,
+    num_v_heads: u32,
+    head_dim: u32,
+    q_elem_offset: u32,
+    k_elem_offset: u32,
+    v_elem_offset: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DnRmsNormNoWeightParams {
+    size: u32,
+    eps: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RopePartialParams {
+    pos: u32,
+    rope_theta: f32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -1146,6 +1285,232 @@ impl GpuBackend for MetalBackend {
             ],
             MTLSize::new(num_threadgroups * threads_per_group, 1, 1),
             MTLSize::new(threads_per_group, 1, 1),
+        );
+    }
+
+    // --- DeltaNet operations (Qwen 3.5 hybrid attention) ---
+
+    /// Causal depthwise Conv1D with SiLU: one thread per dimension element.
+    fn conv1d_depthwise_single(
+        &self,
+        input: &MetalTensor,
+        history: &MetalTensor,
+        weight: &MetalTensor,
+        out: &MetalTensor,
+        dim: u32,
+        kernel_size: u32,
+    ) {
+        let params = DnConv1dParams { dim, kernel_size };
+        self.dispatch_async(
+            &self.pipeline_conv1d_depthwise,
+            &params,
+            &[
+                (&input.buffer, 1),
+                (&history.buffer, 2),
+                (&weight.buffer, 3),
+                (&out.buffer, 4),
+            ],
+            MTLSize::new(dim as u64, 1, 1),
+            MTLSize::new(256.min(dim as u64), 1, 1),
+        );
+    }
+
+    /// Shift Conv1D history buffer: one thread per dimension element.
+    fn conv1d_shift_history(
+        &self,
+        history: &MetalTensor,
+        input: &MetalTensor,
+        dim: u32,
+        kernel_size: u32,
+    ) {
+        let params = DnConv1dParams { dim, kernel_size };
+        self.dispatch_async(
+            &self.pipeline_conv1d_shift,
+            &params,
+            &[(&history.buffer, 1), (&input.buffer, 2)],
+            MTLSize::new(dim as u64, 1, 1),
+            MTLSize::new(256.min(dim as u64), 1, 1),
+        );
+    }
+
+    /// L2-normalize heads: one threadgroup of 256 per head.
+    fn l2_normalize_heads(
+        &self,
+        data: &MetalTensor,
+        num_heads: u32,
+        head_dim: u32,
+        elem_offset: u32,
+    ) {
+        let params = DnL2NormParams {
+            num_heads,
+            head_dim,
+            elem_offset,
+        };
+        let threads_per_group: u64 = 256;
+        self.dispatch_async(
+            &self.pipeline_l2_normalize,
+            &params,
+            &[(&data.buffer, 1)],
+            MTLSize::new(num_heads as u64 * threads_per_group, 1, 1),
+            MTLSize::new(threads_per_group, 1, 1),
+        );
+    }
+
+    /// Element-wise sigmoid (f32): one thread per element.
+    fn sigmoid(&self, input: &MetalTensor, out: &MetalTensor, size: u32) {
+        let params = DnSigmoidParams { size };
+        self.dispatch_async(
+            &self.pipeline_sigmoid,
+            &params,
+            &[(&input.buffer, 1), (&out.buffer, 2)],
+            MTLSize::new(size as u64, 1, 1),
+            MTLSize::new(256.min(size as u64), 1, 1),
+        );
+    }
+
+    /// Element-wise sigmoid (bf16→bf16): one thread per element.
+    fn sigmoid_bf16(&self, input: &MetalTensor, out: &MetalTensor, size: u32) {
+        let params = DnSigmoidParams { size };
+        self.dispatch_async(
+            &self.pipeline_sigmoid_bf16,
+            &params,
+            &[(&input.buffer, 1), (&out.buffer, 2)],
+            MTLSize::new(size as u64, 1, 1),
+            MTLSize::new(256.min(size as u64), 1, 1),
+        );
+    }
+
+    /// Mamba-style decay gate: g = exp(softplus(x + dt_bias) * (-exp(A_log))).
+    fn deltanet_decay_gate(
+        &self,
+        x: &MetalTensor,
+        dt_bias: &MetalTensor,
+        a_log: &MetalTensor,
+        out: &MetalTensor,
+        size: u32,
+    ) {
+        let params = DnDecayGateParams { size };
+        self.dispatch_async(
+            &self.pipeline_decay_gate,
+            &params,
+            &[
+                (&x.buffer, 1),
+                (&dt_bias.buffer, 2),
+                (&a_log.buffer, 3),
+                (&out.buffer, 4),
+            ],
+            MTLSize::new(size as u64, 1, 1),
+            MTLSize::new(256.min(size as u64), 1, 1),
+        );
+    }
+
+    /// Element-wise SiLU (bf16): one thread per element.
+    fn silu(&self, input: &MetalTensor, out: &MetalTensor, size: u32) {
+        let params = ElemParams { size };
+        self.dispatch_async(
+            &self.pipeline_silu_elem,
+            &params,
+            &[(&input.buffer, 1), (&out.buffer, 2)],
+            MTLSize::new(size as u64, 1, 1),
+            MTLSize::new(256.min(size as u64), 1, 1),
+        );
+    }
+
+    /// Element-wise multiply (bf16): one thread per element.
+    fn mul(&self, a: &MetalTensor, b: &MetalTensor, out: &MetalTensor, size: u32) {
+        let params = ElemParams { size };
+        self.dispatch_async(
+            &self.pipeline_mul_elem,
+            &params,
+            &[(&a.buffer, 1), (&b.buffer, 2), (&out.buffer, 3)],
+            MTLSize::new(size as u64, 1, 1),
+            MTLSize::new(256.min(size as u64), 1, 1),
+        );
+    }
+
+    /// DeltaNet state update + output: one threadgroup of 256 per QK-head.
+    fn deltanet_step(
+        &self,
+        state: &MetalTensor,
+        q: &MetalTensor,
+        k: &MetalTensor,
+        v: &MetalTensor,
+        alpha: &MetalTensor,
+        beta: &MetalTensor,
+        out: &MetalTensor,
+        num_qk_heads: u32,
+        num_v_heads: u32,
+        head_dim: u32,
+        q_offset: u32,
+        k_offset: u32,
+        v_offset: u32,
+    ) {
+        let params = DnDeltaNetStepParams {
+            num_qk_heads,
+            num_v_heads,
+            head_dim,
+            q_elem_offset: q_offset,
+            k_elem_offset: k_offset,
+            v_elem_offset: v_offset,
+        };
+        let threads_per_group: u64 = 256;
+        self.dispatch_async(
+            &self.pipeline_deltanet_step,
+            &params,
+            &[
+                (&state.buffer, 1),
+                (&q.buffer, 2),
+                (&k.buffer, 3),
+                (&v.buffer, 4),
+                (&alpha.buffer, 5),
+                (&beta.buffer, 6),
+                (&out.buffer, 7),
+            ],
+            MTLSize::new(num_qk_heads as u64 * threads_per_group, 1, 1),
+            MTLSize::new(threads_per_group, 1, 1),
+        );
+    }
+
+    /// RMSNorm without learned weight: one threadgroup of 256.
+    fn rms_norm_no_weight(&self, input: &MetalTensor, out: &MetalTensor, size: u32, eps: f32) {
+        let params = DnRmsNormNoWeightParams { size, eps };
+        self.dispatch_async(
+            &self.pipeline_rms_norm_no_weight,
+            &params,
+            &[(&input.buffer, 1), (&out.buffer, 2)],
+            MTLSize::new(256, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+    }
+
+    /// Partial RoPE: rotate only the first `rotary_dim` dims of each head.
+    fn rope_partial(
+        &self,
+        q: &MetalTensor,
+        k: &MetalTensor,
+        pos: u32,
+        rope_theta: f32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        rotary_dim: u32,
+    ) {
+        let params = RopePartialParams {
+            pos,
+            rope_theta,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+        };
+        let half_rotary = rotary_dim / 2;
+        let total_pairs = (num_heads + num_kv_heads) * half_rotary;
+        self.dispatch_async(
+            &self.pipeline_rope_partial,
+            &params,
+            &[(&q.buffer, 1), (&k.buffer, 2)],
+            MTLSize::new(total_pairs as u64, 1, 1),
+            MTLSize::new(256.min(total_pairs as u64), 1, 1),
         );
     }
 }

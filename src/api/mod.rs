@@ -325,7 +325,7 @@ fn spawn_worker(model_dir: PathBuf, quantize: bool) -> anyhow::Result<WorkerHand
             let num_blocks = config.recommended_kv_blocks(gpu_budget, quantize);
             let kv_dim = config.num_key_value_heads * config.head_dim;
             let kv_pool =
-                kv_cache::KvPool::new(&backend, num_blocks, kv_dim, config.num_hidden_layers);
+                kv_cache::KvPool::new(&backend, num_blocks, kv_dim, config.num_kv_layers());
 
             // Maximum 32 concurrent sequences (can tune based on memory).
             let max_active = 32;
