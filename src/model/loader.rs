@@ -581,8 +581,21 @@ pub(crate) fn load_weights<B: GpuBackend>(
             (dummy, dummy2, dummy3, Some(router), Some(expert_vec),
              se_gate_proj, se_up_proj, se_down_proj, se_gate)
         } else if has_fused_qkv {
-            // Phi: fused gate_up_proj [2*inter, hidden] → split into gate [inter, hidden]
-            // and up [inter, hidden].  First inter rows are gate, next inter rows are up.
+            // -----------------------------------------------------------------
+            // Phi FFN: fused gate_up_proj → split into separate gate and up.
+            //
+            // Phi stores gate and up projections as a single tensor:
+            //   gate_up_proj shape = [2 * inter_size, hidden_size]
+            //
+            // Layout (row-major): first inter_size rows are gate, next inter_size
+            // rows are up.  We slice the raw bytes and upload separately so the
+            // forward pass can call gate and up as individual matvecs.
+            //
+            // Why fused in the first place?  Microsoft's original implementation
+            // does `gate_up = gate_up_proj(x)` then splits the output, saving one
+            // kernel launch vs two separate matmuls.  We split on load instead so
+            // our forward pass stays architecture-generic.
+            // -----------------------------------------------------------------
             let view = store.tensor(&format!("{prefix}.mlp.gate_up_proj.weight"))?;
             let raw = view.data();
             anyhow::ensure!(
@@ -738,8 +751,21 @@ pub(crate) fn load_weights<B: GpuBackend>(
                  Some(qkv), Some(a), Some(b), Some(z), Some(conv), Some(out),
                  Some(a_log_tensor), Some(dt_bias_tensor), Some(norm_weight), None)
             } else if has_fused_qkv {
-                // Phi: fused qkv_proj [q_dim + 2*kv_dim, hidden] → split into
-                // q [q_dim, hidden], k [kv_dim, hidden], v [kv_dim, hidden].
+                // -----------------------------------------------------------------
+                // Phi attention: fused qkv_proj → split into separate Q, K, V.
+                //
+                // Phi stores all three projections as a single tensor:
+                //   qkv_proj shape = [q_dim + 2*kv_dim, hidden_size]
+                //
+                // For Phi-4 (40Q/10KV heads, head_dim=128):
+                //   q_dim  = 40 * 128 = 5120
+                //   kv_dim = 10 * 128 = 1280
+                //   fused  = 5120 + 1280 + 1280 = 7680 rows
+                //
+                // Layout (row-major): first q_dim rows = Q, next kv_dim = K,
+                // next kv_dim = V.  We slice the raw bytes at the correct
+                // offsets and upload as three separate GPU tensors.
+                // -----------------------------------------------------------------
                 let fused_dim = q_dim + 2 * kv_dim;
                 let view = store.tensor(&format!("{prefix}.self_attn.qkv_proj.weight"))?;
                 let raw = view.data();

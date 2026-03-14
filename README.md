@@ -1,6 +1,6 @@
 # rLLM
 
-Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf16 and Q4 quantization, multi-architecture support (Llama 3, Qwen 2.5, Qwen3 MoE, Qwen3.5, DeepSeek-R1-Distill). Paged KV cache, batched prefill (GEMM), continuous batching. No frameworks, no GGML — just raw GPU compute.
+Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf16 and Q4 quantization, multi-architecture support (Llama 3, Qwen 2.5, Qwen3 MoE, Qwen3.5, Phi-4, DeepSeek-R1-Distill). Paged KV cache, batched prefill (GEMM), continuous batching. No frameworks, no GGML — just raw GPU compute.
 
 ## Performance
 
@@ -15,13 +15,14 @@ Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf
 | Llama 3.1 8B Instruct | 8.0B | 21 tok/s | 36 tok/s | 782 ms | 393 ms |
 | Qwen3 Coder 30B-A3B Instruct | 30.5B (3.3B active) | — | 11 tok/s | — | 2,900 ms |
 | Qwen3.5 35B-A3B | 35.1B (3.3B active) | — | 16 tok/s | — | 2,000 ms |
+| Phi-4 | 14.7B | 8 tok/s | 15 tok/s | 5,300 ms | 813 ms |
 | DeepSeek-R1-Distill-Qwen-32B | 32.8B | — | 5 tok/s | — | 4,700 ms |
 
-Q4 quantization (`--quantize`) gives ~1.3-1.5x faster decode by reducing memory bandwidth. The Qwen3 and Qwen3.5 MoE models use Mixture of Experts with sparse activation (only ~3B params active per token). Qwen3.5 also uses DeltaNet linear attention layers. For models over ~30B dense params, bf16 is skipped since the full weights leave no room for KV cache on 64 GB. Dynamic KV cache sizing automatically adjusts block count based on available GPU memory.
+Q4 quantization (`--quantize`) gives ~1.3-1.9x faster decode by reducing memory bandwidth. The Qwen3 and Qwen3.5 MoE models use Mixture of Experts with sparse activation (only ~3B params active per token). Qwen3.5 also uses DeltaNet linear attention layers. Phi-4 bf16 TTFT is high because the 14.7B model uses ~28 GB in bf16, leaving limited headroom for KV cache on 64 GB. For models over ~30B dense params, bf16 is skipped since the full weights leave no room for KV cache. Dynamic KV cache sizing automatically adjusts block count based on available GPU memory.
 
 ## Features
 
-- **Multi-architecture** — Llama 3, Qwen 2.5, Qwen3 MoE, and Qwen3.5 from the same codebase
+- **Multi-architecture** — Llama 3, Qwen 2.5, Qwen3 MoE, Qwen3.5, and Phi-4 from the same codebase
 - **Metal GPU backend** — SIMD-cooperative matmul, async command buffer dispatch
 - **Batched prefill** — GEMM-based prompt processing (3-10x faster than token-by-token)
 - **Paged KV cache** — on-demand block allocation, shared across sequences
@@ -31,7 +32,7 @@ Q4 quantization (`--quantize`) gives ~1.3-1.5x faster decode by reducing memory 
 - **Safetensors loading** — single and multi-shard weight files
 - **BPE tokenizer** — HuggingFace-compatible tokenizer.json
 - **Mixture of Experts** — top-k expert routing with per-token dispatch (Qwen3 MoE)
-- **Chat templates** — Llama 3 and ChatML (Qwen) instruct formats with `--chat`
+- **Chat templates** — Llama 3, ChatML (Qwen), and Phi instruct formats with `--chat`
 - **Temperature + top-p sampling** — configurable via `--temperature` and `--top-p`
 - **Streaming output** — tokens printed as generated
 - **API server** — OpenAI and Anthropic compatible HTTP endpoints with SSE streaming
@@ -198,7 +199,7 @@ src/
 │   ├── config.rs        — HuggingFace config.json parsing, ModelArch detection
 │   ├── loader.rs        — Safetensors loading, Q4 on-load quantization
 │   ├── tokenizer.rs     — BPE tokenizer with per-model special tokens
-│   ├── chat.rs          — Chat template formatter (Llama 3 + ChatML)
+│   ├── chat.rs          — Chat template formatter (Llama 3 + ChatML + Phi)
 │   ├── kv_cache.rs      — Paged KV cache (block pool + per-sequence state)
 │   └── sampler.rs       — Temperature + top-p sampling
 ├── engine/
@@ -222,7 +223,7 @@ src/
     └── cuda/            — CUDA backend
 ```
 
-Model code is generic over a `GpuBackend` trait with an associated `Tensor` type. Platform selection uses OS-conditional compilation — Metal on macOS, CUDA on Linux. Llama and Qwen share the same forward pass; the only difference is Qwen adds bias to Q/K/V attention projections (handled by a simple `if let Some(bias)` check).
+Model code is generic over a `GpuBackend` trait with an associated `Tensor` type. Platform selection uses OS-conditional compilation — Metal on macOS, CUDA on Linux. Llama, Qwen, and Phi share the same forward pass primitives; differences are in weight loading (Phi uses fused qkv/gate_up tensors split on load) and QKV bias (Qwen 2.5 only).
 
 ### Inference pipeline
 
@@ -283,6 +284,9 @@ hf download Qwen/Qwen2.5-7B-Instruct --local-dir models/qwen-2.5-7b-instruct
 
 # Qwen3 MoE — 30.5B total, 3.3B active per token (~61 GB download)
 hf download Qwen/Qwen3-Coder-30B-A3B-Instruct --local-dir models/qwen3-coder-30b-a3b-instruct
+
+# Phi-4 — 14.7B dense (~28 GB download)
+hf download microsoft/phi-4 --local-dir models/phi-4
 
 # DeepSeek R1 distilled — 32.8B dense (~61 GB download)
 hf download deepseek-ai/DeepSeek-R1-Distill-Qwen-32B --local-dir models/DeepSeek-R1-Distill-Qwen-32B
