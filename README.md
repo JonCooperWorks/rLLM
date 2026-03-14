@@ -1,6 +1,6 @@
 # rLLM
 
-Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf16 and Q4 quantization, multi-architecture support (Llama 3, Qwen 2.5, Qwen3 MoE, DeepSeek-R1-Distill). Paged KV cache, batched prefill (GEMM), continuous batching. No frameworks, no GGML — just raw GPU compute.
+Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf16 and Q4 quantization, multi-architecture support (Llama 3, Qwen 2.5, Qwen3 MoE, Qwen3.5, DeepSeek-R1-Distill). Paged KV cache, batched prefill (GEMM), continuous batching. No frameworks, no GGML — just raw GPU compute.
 
 ## Performance
 
@@ -14,13 +14,14 @@ Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf
 | Qwen 2.5 7B Instruct | 7.6B | 23 tok/s | 39 tok/s | 662 ms | 240 ms |
 | Llama 3.1 8B Instruct | 8.0B | 21 tok/s | 36 tok/s | 782 ms | 393 ms |
 | Qwen3 Coder 30B-A3B Instruct | 30.5B (3.3B active) | — | 11 tok/s | — | 2,900 ms |
+| Qwen3.5 35B-A3B | 35.1B (3.3B active) | — | 16 tok/s | — | 2,000 ms |
 | DeepSeek-R1-Distill-Qwen-32B | 32.8B | — | 5 tok/s | — | 4,700 ms |
 
-Q4 quantization (`--quantize`) gives ~1.3-1.5x faster decode by reducing memory bandwidth. The Qwen3 MoE model uses Mixture of Experts (128 experts, 8 active per token). For models over ~30B dense params, bf16 is skipped since the full weights leave no room for KV cache on 64 GB. Dynamic KV cache sizing automatically adjusts block count based on available GPU memory.
+Q4 quantization (`--quantize`) gives ~1.3-1.5x faster decode by reducing memory bandwidth. The Qwen3 and Qwen3.5 MoE models use Mixture of Experts with sparse activation (only ~3B params active per token). Qwen3.5 also uses DeltaNet linear attention layers. For models over ~30B dense params, bf16 is skipped since the full weights leave no room for KV cache on 64 GB. Dynamic KV cache sizing automatically adjusts block count based on available GPU memory.
 
 ## Features
 
-- **Multi-architecture** — Llama 3, Qwen 2.5, and Qwen3 MoE from the same codebase
+- **Multi-architecture** — Llama 3, Qwen 2.5, Qwen3 MoE, and Qwen3.5 from the same codebase
 - **Metal GPU backend** — SIMD-cooperative matmul, async command buffer dispatch
 - **Batched prefill** — GEMM-based prompt processing (3-10x faster than token-by-token)
 - **Paged KV cache** — on-demand block allocation, shared across sequences
