@@ -95,16 +95,6 @@ pub(crate) fn sample<B: GpuBackend>(
     let bf16_values: &[bf16] = bytemuck::cast_slice(&buf);
     let mut logits_f32: Vec<f32> = bf16_values.iter().map(|v| v.to_f32()).collect();
 
-    // DEBUG: print top-5 logits
-    {
-        let mut indexed: Vec<(usize, f32)> = logits_f32.iter().copied().enumerate().collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        let top5: Vec<_> = indexed.iter().take(5).collect();
-        let has_nan = logits_f32.iter().any(|v| v.is_nan());
-        let has_inf = logits_f32.iter().any(|v| v.is_infinite());
-        eprintln!("DEBUG logits: top5={:?} nan={} inf={}", top5, has_nan, has_inf);
-    }
-
     // --- Step 3: Temperature scaling ---
     // Divide every logit by T.  This is equivalent to raising the softmax
     // distribution to the power 1/T — high T flattens, low T sharpens.

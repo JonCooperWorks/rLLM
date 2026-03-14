@@ -247,6 +247,15 @@ fn moe_ffn_block<B: GpuBackend>(
 
 // ---------------------------------------------------------------------------
 // FFN dispatch — MoE or dense SwiGLU depending on model config.
+//
+// The Qwen 3.5 family has two variants:
+//   - MoE models (e.g. 35B-A3B): router → top-k experts + shared expert
+//   - Dense models (e.g. 27B): standard SwiGLU FFN (gate/up/down projections)
+//
+// Both share the same hybrid DeltaNet+GQA attention architecture, so this
+// single forward pass file handles both.  The only difference is the FFN:
+// MoE models have router_gate/expert weights, dense models have the usual
+// gate_proj/up_proj/down_proj per layer.
 // ---------------------------------------------------------------------------
 
 fn ffn_block<B: GpuBackend>(m: &Model<'_, B>, layer_idx: usize, hidden_size: u32) {
@@ -655,7 +664,9 @@ pub(crate) fn forward_prefill_paged<B: GpuBackend>(
                 m.backend, layer, bufs, bs, hidden_size, q_dim,
             );
 
-            // FFN sub-block: MoE (token-by-token) or dense (batched).
+            // FFN sub-block: MoE requires token-by-token routing (each token
+            // picks different experts), so we round-trip through host memory.
+            // Dense models can use batched GEMM for the entire prefill chunk.
             if m.config.is_moe() {
                 let hidden_byte_size = m.config.hidden_size * 2; // bf16
                 let full_bytes = m.backend.tensor_byte_count(&bufs.hidden);

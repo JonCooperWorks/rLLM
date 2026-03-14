@@ -242,7 +242,7 @@ impl<'a, B: GpuBackend> Model<'a, B> {
         // Qwen3 MoE has hidden=2048 with 32×128=4096 attention dimension.
         let q_dim = config.num_attention_heads * config.head_dim;
         let kv_dim = config.num_key_value_heads * config.head_dim;
-        let inter = config.intermediate_size;
+        let inter = config.effective_intermediate_size();
         let vocab = config.vocab_size;
         let is_hybrid = config.is_hybrid_deltanet();
 
@@ -494,7 +494,7 @@ impl<B: GpuBackend> PrefillBuffers<B> {
         let hidden = config.hidden_size;
         let q_dim = config.num_attention_heads * config.head_dim;
         let kv_dim = config.num_key_value_heads * config.head_dim;
-        let inter = config.intermediate_size;
+        let inter = config.effective_intermediate_size();
 
         Self {
             hidden: backend.alloc_tensor(&[max_chunk, hidden], TensorDtype::BF16),

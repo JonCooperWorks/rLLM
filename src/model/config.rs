@@ -137,7 +137,7 @@ impl ModelArch {
             "llama" => Ok(ModelArch::Llama),
             "qwen2" => Ok(ModelArch::Qwen2),
             "qwen3_moe" => Ok(ModelArch::Qwen3Moe),
-            "qwen3_5" | "qwen3_5_text" => Ok(ModelArch::Qwen3_5),
+            "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => Ok(ModelArch::Qwen3_5),
             other => anyhow::bail!(
                 "unsupported model_type '{}' (expected 'llama', 'qwen2', 'qwen3_moe', or 'qwen3_5')",
                 other
@@ -174,8 +174,10 @@ pub struct ModelConfig {
     /// Some models (Qwen 2.5) omit this — computed from hidden_size / num_heads.
     #[serde(default)]
     pub head_dim: usize,
-    /// FFN hidden dimension.
+    /// FFN hidden dimension (dense models).
     /// The FFN expands to this size then contracts back to hidden_size.
+    /// MoE-only models (e.g. Qwen3.5) have no dense FFN — this is 0.
+    #[serde(default)]
     pub intermediate_size: usize,
     /// Number of tokens in the vocabulary.
     pub vocab_size: usize,
@@ -218,6 +220,10 @@ pub struct ModelConfig {
     /// Qwen3-Coder-30B-A3B: 768 per expert (vs 6144 dense intermediate_size).
     #[serde(default)]
     pub moe_intermediate_size: usize,
+    /// Hidden dimension of the shared (always-active) expert's FFN.
+    /// Qwen3.5-35B-A3B: 512.  Only present in models with a shared expert.
+    #[serde(default)]
+    pub shared_expert_intermediate_size: usize,
 
     // --- Qwen 3.5 hybrid DeltaNet + GQA fields ---
     //
@@ -400,6 +406,29 @@ impl ModelConfig {
         self.num_experts > 0
     }
 
+    /// Whether this model has a shared expert alongside routed experts.
+    pub fn has_shared_expert(&self) -> bool {
+        self.shared_expert_intermediate_size > 0
+    }
+
+    /// Effective intermediate size for buffer allocation.
+    ///
+    /// Dense models use `intermediate_size`.  MoE-only models have no dense FFN
+    /// (intermediate_size=0), but still need scratch buffers sized for the
+    /// largest operation — the output gate Z projection uses q_dim, and the
+    /// shared expert uses shared_expert_intermediate_size.
+    pub fn effective_intermediate_size(&self) -> usize {
+        if self.intermediate_size > 0 {
+            self.intermediate_size
+        } else {
+            let q_dim = self.num_attention_heads * self.head_dim;
+            q_dim
+                .max(self.hidden_size)
+                .max(self.shared_expert_intermediate_size)
+                .max(self.moe_intermediate_size)
+        }
+    }
+
     /// Estimate total GPU memory for model weights in bytes.
     ///
     /// Matches the loading logic in loader.rs: projection weights are Q4 when
@@ -465,6 +494,12 @@ impl ModelConfig {
                     + proj(moe_inter, hidden)             // up_proj
                     + proj(hidden, moe_inter);            // down_proj
                 layer += self.num_experts * per_expert;
+                // Shared expert (if present).
+                if self.has_shared_expert() {
+                    let se = self.shared_expert_intermediate_size;
+                    layer += proj(se, hidden) + proj(se, hidden) + proj(hidden, se);
+                    layer += 1 * hidden * 2; // shared_expert_gate [1, hidden] bf16
+                }
             } else {
                 // Dense FFN: gate/up/down projections.
                 layer += proj(inter, hidden); // gate_proj
