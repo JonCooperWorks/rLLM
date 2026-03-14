@@ -79,6 +79,8 @@ pub(crate) fn format_chat(arch: ModelArch, messages: &[Message]) -> String {
         ModelArch::Llama => format_llama3(messages),
         // Qwen 2.5, Qwen 3 MoE, and Qwen 3.5 all use ChatML format.
         ModelArch::Qwen2 | ModelArch::Qwen3Moe | ModelArch::Qwen3_5 => format_chatml(messages),
+        // Phi uses a ChatML-like format but with <|im_sep|> between role and content.
+        ModelArch::Phi => format_phi(messages),
     }
 }
 
@@ -140,6 +142,38 @@ fn format_chatml(messages: &[Message]) -> String {
 
     // Generation prompt — model fills in the assistant response.
     out.push_str("<|im_start|>assistant\n");
+
+    out
+}
+
+/// Format chat messages into the Phi instruct template string.
+///
+/// Phi-4 uses a ChatML-like format but with `<|im_sep|>` between the role
+/// name and message content (where ChatML uses a newline).
+///
+///   <|im_start|>system<|im_sep|>
+///   You are a helpful assistant.<|im_end|>
+///   <|im_start|>user<|im_sep|>
+///   What is 2+2?<|im_end|>
+///   <|im_start|>assistant<|im_sep|>
+///
+/// Special tokens:
+///   <|im_start|> → 100264
+///   <|im_sep|>   → 100266
+///   <|im_end|>   → 100265
+fn format_phi(messages: &[Message]) -> String {
+    let mut out = String::with_capacity(512);
+
+    for msg in messages {
+        out.push_str("<|im_start|>");
+        out.push_str(&msg.role);
+        out.push_str("<|im_sep|>\n");
+        out.push_str(&msg.content);
+        out.push_str("<|im_end|>\n");
+    }
+
+    // Generation prompt.
+    out.push_str("<|im_start|>assistant<|im_sep|>\n");
 
     out
 }

@@ -98,6 +98,17 @@ pub enum ModelArch {
     /// The config.json has text parameters nested under `text_config`.
     /// Weight tensors are prefixed with `model.language_model.` instead of `model.`.
     Qwen3_5,
+    /// Phi family (Microsoft Phi-3, Phi-4).
+    ///
+    /// Learning note: Phi models are architecturally near-identical to Llama
+    /// (RMSNorm, GQA, SwiGLU, RoPE) but use FUSED weight tensors:
+    ///   - `qkv_proj` instead of separate q/k/v projections
+    ///   - `gate_up_proj` instead of separate gate/up projections
+    /// These are split on-load into the standard separate tensors.
+    ///
+    /// No QKV bias, no QK-norm.  Chat template uses `<|im_start|>`/`<|im_sep|>`
+    /// markers (similar to ChatML but with a separator token).
+    Phi,
 }
 
 impl ModelArch {
@@ -110,7 +121,7 @@ impl ModelArch {
     /// this helps at smaller model sizes.
     pub fn has_qkv_bias(&self) -> bool {
         match self {
-            ModelArch::Llama => false,
+            ModelArch::Llama | ModelArch::Phi => false,
             ModelArch::Qwen2 => true,
             ModelArch::Qwen3Moe | ModelArch::Qwen3_5 => false,
         }
@@ -125,10 +136,21 @@ impl ModelArch {
     /// rely on the implicit normalisation from RMSNorm on the hidden state.
     pub fn has_qk_norm(&self) -> bool {
         match self {
-            ModelArch::Llama | ModelArch::Qwen2 => false,
+            ModelArch::Llama | ModelArch::Qwen2 | ModelArch::Phi => false,
             ModelArch::Qwen3_5 => true,  // GQA layers have QK-norm
             ModelArch::Qwen3Moe => true,
         }
+    }
+
+    /// Whether the model uses fused QKV and gate_up weight tensors.
+    ///
+    /// Learning note: Phi models store Q, K, V as a single concatenated tensor
+    /// `qkv_proj` of shape [q_dim + 2*kv_dim, hidden] and gate+up as a single
+    /// `gate_up_proj` of shape [2*inter_size, hidden].  This saves a tiny amount
+    /// of overhead in the original PyTorch implementation (one matmul instead
+    /// of three).  We split them on-load so the forward pass stays generic.
+    pub fn has_fused_qkv(&self) -> bool {
+        matches!(self, ModelArch::Phi)
     }
 
     /// Detect model architecture from config.json's `model_type` field.
@@ -138,8 +160,9 @@ impl ModelArch {
             "qwen2" => Ok(ModelArch::Qwen2),
             "qwen3_moe" => Ok(ModelArch::Qwen3Moe),
             "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => Ok(ModelArch::Qwen3_5),
+            "phi3" | "phi4" => Ok(ModelArch::Phi),
             other => anyhow::bail!(
-                "unsupported model_type '{}' (expected 'llama', 'qwen2', 'qwen3_moe', or 'qwen3_5')",
+                "unsupported model_type '{}' (expected 'llama', 'qwen2', 'qwen3_moe', 'qwen3_5', or 'phi3')",
                 other
             ),
         }

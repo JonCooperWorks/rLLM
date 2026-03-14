@@ -393,6 +393,7 @@ impl<'a, B: GpuBackend> Model<'a, B> {
     pub fn forward(&mut self, token_id: u32) -> anyhow::Result<()> {
         match self.arch {
             ModelArch::Llama => registry::llama::forward(self, token_id),
+            ModelArch::Phi => registry::phi::forward(self, token_id),
             ModelArch::Qwen2 => registry::qwen::forward(self, token_id),
             ModelArch::Qwen3Moe => registry::qwen3_moe::forward(self, token_id),
             ModelArch::Qwen3_5 => registry::qwen3_5::forward(self, token_id),
@@ -412,6 +413,7 @@ impl<'a, B: GpuBackend> Model<'a, B> {
     ) -> anyhow::Result<()> {
         match self.arch {
             ModelArch::Llama => registry::llama::forward_single_paged(self, token_id, pool, seq_state),
+            ModelArch::Phi => registry::phi::forward_single_paged(self, token_id, pool, seq_state),
             ModelArch::Qwen2 => registry::qwen::forward_single_paged(self, token_id, pool, seq_state),
             ModelArch::Qwen3Moe => registry::qwen3_moe::forward_single_paged(self, token_id, pool, seq_state),
             ModelArch::Qwen3_5 => registry::qwen3_5::forward_single_paged(self, token_id, pool, seq_state),
@@ -437,6 +439,7 @@ impl<'a, B: GpuBackend> Model<'a, B> {
     ) -> anyhow::Result<()> {
         match self.arch {
             ModelArch::Llama => registry::llama::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
+            ModelArch::Phi => registry::phi::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
             ModelArch::Qwen2 => registry::qwen::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
             ModelArch::Qwen3Moe => registry::qwen3_moe::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
             ModelArch::Qwen3_5 => registry::qwen3_5::forward_prefill_paged(self, tokens, pool, seq_state, bufs),

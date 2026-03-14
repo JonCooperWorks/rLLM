@@ -80,6 +80,10 @@ impl Tokenizer {
             // Qwen 3.5: no BOS, eos_token_id=248044 from config.  ChatML format
             // with <|im_end|> as the primary stop token.  Vocab size is 248320.
             ModelArch::Qwen3_5 => (None, vec![248044]),
+
+            // Phi (Microsoft): no BOS.  Stop on <|im_end|> (100265) or
+            // <|endoftext|> (100257).  Uses tiktoken-based 100352-token vocab.
+            ModelArch::Phi => (None, vec![100257, 100265]),
         };
 
         Ok(Self {

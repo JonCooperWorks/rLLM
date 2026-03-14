@@ -358,6 +358,7 @@ pub(crate) fn load_weights<B: GpuBackend>(
     let num_experts = config.num_experts;
     let head_dim = config.head_dim;
     let is_hybrid = config.is_hybrid_deltanet();
+    let has_fused_qkv = arch.has_fused_qkv();
     // Qwen 3.5 stores RMSNorm weights as residual offsets (effective = 1 + stored).
     let residual_norm = matches!(arch, ModelArch::Qwen3_5);
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -579,6 +580,41 @@ pub(crate) fn load_weights<B: GpuBackend>(
 
             (dummy, dummy2, dummy3, Some(router), Some(expert_vec),
              se_gate_proj, se_up_proj, se_down_proj, se_gate)
+        } else if has_fused_qkv {
+            // Phi: fused gate_up_proj [2*inter, hidden] → split into gate [inter, hidden]
+            // and up [inter, hidden].  First inter rows are gate, next inter rows are up.
+            let view = store.tensor(&format!("{prefix}.mlp.gate_up_proj.weight"))?;
+            let raw = view.data();
+            anyhow::ensure!(
+                view.shape() == [2 * inter, hidden],
+                "gate_up_proj shape mismatch: expected [{}, {}], got {:?}",
+                2 * inter, hidden, view.shape()
+            );
+            let row_bytes = hidden * 2; // bf16
+            let half = inter * row_bytes;
+            let gate_raw = &raw[..half];
+            let up_raw = &raw[half..2 * half];
+
+            let gate = if quantize {
+                let q4_data = quantize_bf16_to_q4(gate_raw, inter, hidden);
+                backend.upload_tensor(&q4_data, &[inter, hidden], TensorDtype::Q4)
+            } else {
+                backend.upload_tensor(gate_raw, &[inter, hidden], TensorDtype::BF16)
+            };
+            let up = if quantize {
+                let q4_data = quantize_bf16_to_q4(up_raw, inter, hidden);
+                backend.upload_tensor(&q4_data, &[inter, hidden], TensorDtype::Q4)
+            } else {
+                backend.upload_tensor(up_raw, &[inter, hidden], TensorDtype::BF16)
+            };
+            let down = upload_maybe_q4(
+                &store,
+                backend,
+                &format!("{prefix}.mlp.down_proj.weight"),
+                &[hidden, inter],
+                quantize,
+            )?;
+            (gate, up, down, None, None, None, None, None, None)
         } else {
             // Dense FFN: standard gate/up/down projections.
             let gate = upload_maybe_q4(
@@ -701,6 +737,49 @@ pub(crate) fn load_weights<B: GpuBackend>(
                 (dummy, dummy2, dummy3, dummy4,
                  Some(qkv), Some(a), Some(b), Some(z), Some(conv), Some(out),
                  Some(a_log_tensor), Some(dt_bias_tensor), Some(norm_weight), None)
+            } else if has_fused_qkv {
+                // Phi: fused qkv_proj [q_dim + 2*kv_dim, hidden] → split into
+                // q [q_dim, hidden], k [kv_dim, hidden], v [kv_dim, hidden].
+                let fused_dim = q_dim + 2 * kv_dim;
+                let view = store.tensor(&format!("{prefix}.self_attn.qkv_proj.weight"))?;
+                let raw = view.data();
+                anyhow::ensure!(
+                    view.shape() == [fused_dim, hidden],
+                    "qkv_proj shape mismatch: expected [{}, {}], got {:?}",
+                    fused_dim, hidden, view.shape()
+                );
+                let row_bytes = hidden * 2; // bf16
+                let q_bytes = q_dim * row_bytes;
+                let kv_bytes = kv_dim * row_bytes;
+                let q_raw = &raw[..q_bytes];
+                let k_raw = &raw[q_bytes..q_bytes + kv_bytes];
+                let v_raw = &raw[q_bytes + kv_bytes..q_bytes + 2 * kv_bytes];
+
+                let qp = if quantize {
+                    let q4 = quantize_bf16_to_q4(q_raw, q_dim, hidden);
+                    backend.upload_tensor(&q4, &[q_dim, hidden], TensorDtype::Q4)
+                } else {
+                    backend.upload_tensor(q_raw, &[q_dim, hidden], TensorDtype::BF16)
+                };
+                let kp = if quantize {
+                    let q4 = quantize_bf16_to_q4(k_raw, kv_dim, hidden);
+                    backend.upload_tensor(&q4, &[kv_dim, hidden], TensorDtype::Q4)
+                } else {
+                    backend.upload_tensor(k_raw, &[kv_dim, hidden], TensorDtype::BF16)
+                };
+                let vp = if quantize {
+                    let q4 = quantize_bf16_to_q4(v_raw, kv_dim, hidden);
+                    backend.upload_tensor(&q4, &[kv_dim, hidden], TensorDtype::Q4)
+                } else {
+                    backend.upload_tensor(v_raw, &[kv_dim, hidden], TensorDtype::BF16)
+                };
+                let op = upload_maybe_q4(
+                    &store, backend,
+                    &format!("{prefix}.self_attn.o_proj.weight"),
+                    &[hidden, q_dim], quantize,
+                )?;
+                (qp, kp, vp, op, None, None, None, None, None, None,
+                 None, None, None, None)
             } else {
                 // Standard GQA attention.
                 //
