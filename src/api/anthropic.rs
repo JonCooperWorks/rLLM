@@ -45,7 +45,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 
-use super::{InferenceEvent, InferenceRequest, ServerState, StopReason};
+use super::{InferenceEvent, ServerState, StopReason, WorkerRequest};
 use crate::model::chat::Message;
 
 // ---------------------------------------------------------------------------
@@ -127,8 +127,6 @@ pub(crate) async fn messages(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<MessagesRequest>,
 ) -> Result<Response, StatusCode> {
-    let (response_tx, response_rx) = tokio::sync::mpsc::channel(64);
-
     // Build message list: prepend system prompt if provided.
     let mut messages = Vec::new();
     if let Some(ref system) = req.system {
@@ -139,9 +137,16 @@ pub(crate) async fn messages(
     }
     messages.extend(req.messages);
 
-    let inference_req = InferenceRequest {
-        messages,
-        raw_prompt: None,
+    // Tokenize on the async handler thread (CPU-only, doesn't block GPU).
+    let prompt_tokens = state
+        .tokenizer
+        .encode_messages(&messages, state.arch)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let (response_tx, response_rx) = tokio::sync::mpsc::channel(64);
+
+    let worker_req = WorkerRequest {
+        prompt_tokens,
         max_tokens: req.max_tokens,
         temperature: req.temperature.unwrap_or(1.0),
         top_p: req.top_p.unwrap_or(0.9),
@@ -150,7 +155,7 @@ pub(crate) async fn messages(
 
     state
         .request_tx
-        .try_send(inference_req)
+        .try_send(worker_req)
         .map_err(|e| match e {
             std::sync::mpsc::TrySendError::Full(_) => StatusCode::SERVICE_UNAVAILABLE,
             std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,

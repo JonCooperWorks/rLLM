@@ -11,9 +11,16 @@
 //
 //   HTTP clients ←→ [tokio async runtime / axum handlers]
 //                         ↕ channels
-//                    [inference worker thread]
+//                    [inference worker thread (Engine + Scheduler)]
 //                         ↕ GPU
 //                    [Metal/CUDA backend]
+//
+// Continuous batching:
+//   Multiple concurrent HTTP requests are batched together through the model.
+//   The worker thread runs an Engine step loop that processes all active
+//   sequences each step — prefilling new prompts via GEMM and decoding one
+//   token per active sequence.  The decode phase is memory-bandwidth-bound,
+//   so batching N sequences costs almost nothing extra per token.
 //
 // Why a dedicated worker thread?
 //   The model (`Model<'a, B>`) borrows the GPU backend, has mutable scratch
@@ -28,39 +35,48 @@
 //   from synchronous code.  The handler calls `recv().await` on the async
 //   side.  This cleanly bridges sync GPU code and async HTTP serving.
 //
+// Tokenization:
+//   Tokenization (text → token IDs) is CPU-only work.  It happens on the
+//   async handler threads using the shared Arc<Tokenizer>, so the worker
+//   thread's step loop is never blocked by tokenization.
+//
 // Streaming:
 //   For SSE (Server-Sent Events), the handler reads token events from the
 //   response channel and yields them as SSE frames.  The worker sends one
 //   event per generated token, so the client sees output in real-time.
 //
 //   If the client disconnects mid-stream, the handler drops its receiver.
-//   The worker detects this when `blocking_send` returns Err, and immediately
-//   stops generating and frees KV cache blocks — no wasted GPU time.
+//   The worker detects this when `blocking_send` returns Err, and aborts
+//   the sequence via the Engine — KV cache blocks are freed immediately.
 // ===========================================================================
 
 pub(crate) mod anthropic;
 pub(crate) mod openai;
 pub(crate) mod tls;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::ServeArgs;
+use crate::engine;
+use crate::engine::scheduler::{self, SeqId};
 use crate::gpu::{self, GpuBackend};
 use crate::model;
 use crate::model::loader;
-use crate::model::{chat, config, kv_cache, sampler, tokenizer};
+use crate::model::{config, kv_cache, tokenizer};
 
 // ---------------------------------------------------------------------------
 // Shared types: the bridge between HTTP handlers and the inference worker.
 // ---------------------------------------------------------------------------
 
-/// Request sent from an HTTP handler to the inference worker thread.
-pub(crate) struct InferenceRequest {
-    /// Chat messages (for chat/messages endpoints).
-    pub messages: Vec<chat::Message>,
-    /// Raw prompt text (for completions endpoint — bypasses chat template).
-    pub raw_prompt: Option<String>,
+/// Pre-tokenized request sent from an HTTP handler to the inference worker.
+///
+/// Tokenization happens on the async handler thread (CPU-only work) so the
+/// worker's Engine step loop is never stalled by tokenization.
+pub(crate) struct WorkerRequest {
+    /// Pre-tokenized prompt (already includes BOS, chat template, etc.).
+    pub prompt_tokens: Vec<u32>,
     /// Maximum tokens to generate.
     pub max_tokens: usize,
     /// Sampling temperature.
@@ -96,10 +112,14 @@ pub(crate) enum StopReason {
 
 /// Shared state accessible by all axum handlers via `State(Arc<ServerState>)`.
 pub(crate) struct ServerState {
-    /// Channel to send requests to the inference worker.
-    pub request_tx: std::sync::mpsc::SyncSender<InferenceRequest>,
+    /// Channel to send pre-tokenized requests to the inference worker.
+    pub request_tx: std::sync::mpsc::SyncSender<WorkerRequest>,
     /// Model name for API responses (derived from directory name).
     pub model_name: String,
+    /// Shared tokenizer for handler-side tokenization.
+    pub tokenizer: Arc<tokenizer::Tokenizer>,
+    /// Model architecture (for chat template selection).
+    pub arch: config::ModelArch,
 }
 
 // ---------------------------------------------------------------------------
@@ -139,15 +159,22 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .unwrap_or_else(|| "rllm-model".into());
 
     // Spawn the inference worker thread.
-    // The worker loads backend/tokenizer/weights/model and runs the blocking
-    // inference loop.  We get back a channel sender to submit requests.
-    let request_tx = spawn_worker(args.model.clone(), args.quantize)?;
+    // The worker loads backend/tokenizer/weights/model and runs the Engine
+    // step loop.  We get back the request sender plus shared tokenizer/arch
+    // for handler-side tokenization.
+    let WorkerHandle {
+        request_tx,
+        tokenizer,
+        arch,
+    } = spawn_worker(args.model.clone(), args.quantize)?;
 
     eprintln!("model ready: {}", model_name);
 
     let state = Arc::new(ServerState {
         request_tx,
         model_name,
+        tokenizer,
+        arch,
     });
 
     // Build axum router with all API endpoints.
@@ -234,22 +261,35 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
 // Inference worker thread.
 // ---------------------------------------------------------------------------
 
+/// Result of spawning the worker thread: the request channel plus shared
+/// tokenizer and architecture for handler-side tokenization.
+struct WorkerHandle {
+    request_tx: std::sync::mpsc::SyncSender<WorkerRequest>,
+    tokenizer: Arc<tokenizer::Tokenizer>,
+    arch: config::ModelArch,
+}
+
+/// Per-request context tracked by the worker's request registry.
+/// Maps an Engine SeqId to the HTTP response channel.
+struct RequestContext {
+    response_tx: tokio::sync::mpsc::Sender<InferenceEvent>,
+    prompt_token_count: usize,
+    generated_count: usize,
+}
+
 /// Spawn the inference worker thread that owns all GPU state.
 ///
-/// Returns the request sender.  The worker loads the model inside the thread
-/// (so all GPU resources have the thread's lifetime) and blocks on the
-/// request channel.
-fn spawn_worker(
-    model_dir: PathBuf,
-    quantize: bool,
-) -> anyhow::Result<std::sync::mpsc::SyncSender<InferenceRequest>> {
+/// Returns the request sender, shared tokenizer, and model architecture.
+/// The worker loads the model inside the thread (so all GPU resources have
+/// the thread's lifetime) and runs the Engine continuous batching loop.
+fn spawn_worker(model_dir: PathBuf, quantize: bool) -> anyhow::Result<WorkerHandle> {
     // Channel for incoming requests.  Capacity 8 gives a small queue;
     // if full, handlers get backpressure (try_send returns Err → 503).
-    let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<InferenceRequest>(8);
+    let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
 
-    // We need to report load errors to the caller.  Use a oneshot channel
-    // so the worker can signal success/failure before we return.
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+    // Ready channel: worker sends back the tokenizer and arch (or an error).
+    let (ready_tx, ready_rx) =
+        std::sync::mpsc::sync_channel::<Result<(Arc<tokenizer::Tokenizer>, config::ModelArch), String>>(1);
 
     std::thread::spawn(move || {
         // All model state is created inside this thread so lifetimes work out.
@@ -266,46 +306,150 @@ fn spawn_worker(
                 weights,
             } = loader::load_model(&backend, &model_dir, quantize)?;
 
-            let mut model = model::Model::new(config.clone(), weights, &backend)?;
+            // Share the tokenizer with HTTP handlers for async tokenization.
+            let tokenizer = Arc::new(tokenizer);
+            let _ = ready_tx.send(Ok((Arc::clone(&tokenizer), arch)));
+
+            // Unwrap the Arc for the Engine — the worker thread keeps its own
+            // reference.  The Engine takes ownership of a Tokenizer, so we
+            // need to make a clone for it.
+            let engine_tokenizer = (*tokenizer).clone();
+
+            let model = model::Model::new(config.clone(), weights, &backend)?;
 
             // KV pool: 8192 blocks × 16 tokens/block = 131072 (128K) max context.
-            // Memory: num_blocks * BLOCK_SIZE * kv_dim * 2 bytes * 2 (K+V) * num_layers.
-            // For Llama 3.1 8B (kv_dim=1024, 32 layers): 8192 * 16 * 1024 * 2 * 2 * 32 = ~16 GB.
             let num_blocks = 8192;
             let kv_dim = config.num_key_value_heads * config.head_dim;
-            let mut kv_pool =
+            let kv_pool =
                 kv_cache::KvPool::new(&backend, num_blocks, kv_dim, config.num_hidden_layers);
-            let max_prefill = 4096;
-            let prefill_bufs = model::PrefillBuffers::new(&backend, &config, max_prefill);
+
+            // Maximum 32 concurrent sequences (can tune based on memory).
+            let max_active = 32;
+            let sched = scheduler::Scheduler::new(kv_pool, max_active);
 
             eprintln!(
-                "KV cache: {} blocks ({} max tokens), prefill up to {} tokens",
+                "KV cache: {} blocks ({} max tokens), max {} concurrent sequences",
                 num_blocks,
                 num_blocks * kv_cache::BLOCK_SIZE,
-                max_prefill
+                max_active
             );
 
-            // Signal success to the main thread.
-            let _ = ready_tx.send(Ok(()));
+            let mut eng = engine::Engine::new(
+                model,
+                sched,
+                engine_tokenizer,
+                &backend,
+            );
 
-            let mut rng = rand::rng();
+            // Request registry: maps Engine sequence IDs to HTTP response channels.
+            let mut registry: HashMap<SeqId, RequestContext> = HashMap::new();
 
-            // Blocking request loop — runs until the channel closes (server shutdown).
-            while let Ok(req) = request_rx.recv() {
-                let result = process_request(
-                    &req,
-                    &mut model,
-                    &mut kv_pool,
-                    &prefill_bufs,
-                    &tokenizer,
-                    &backend,
-                    arch,
-                    &mut rng,
-                );
-                if let Err(e) = result {
-                    let _ = req
-                        .response_tx
-                        .blocking_send(InferenceEvent::Error(format!("{e:#}")));
+            // ---------------------------------------------------------------------------
+            // Continuous batching loop.
+            //
+            // The loop has three phases:
+            //   1. Drain new requests from the channel (non-blocking).
+            //   2. If no work, block on recv() until a request arrives.
+            //   3. Run one Engine step, stream tokens, handle disconnects.
+            // ---------------------------------------------------------------------------
+            loop {
+                // 1. Drain all pending requests (non-blocking).
+                //    Batches up everything that arrived since the last step.
+                while let Ok(req) = request_rx.try_recv() {
+                    let prompt_token_count = req.prompt_tokens.len();
+                    let seq_id = eng.add_request(req.prompt_tokens, req.max_tokens, req.temperature, req.top_p);
+                    registry.insert(
+                        seq_id,
+                        RequestContext {
+                            response_tx: req.response_tx,
+                            prompt_token_count,
+                            generated_count: 0,
+                        },
+                    );
+                }
+
+                // 2. If no work, block until a new request arrives.
+                if !eng.has_work() {
+                    match request_rx.recv() {
+                        Ok(req) => {
+                            let prompt_token_count = req.prompt_tokens.len();
+                            let seq_id = eng.add_request(req.prompt_tokens, req.max_tokens, req.temperature, req.top_p);
+                            registry.insert(
+                                seq_id,
+                                RequestContext {
+                                    response_tx: req.response_tx,
+                                    prompt_token_count,
+                                    generated_count: 0,
+                                },
+                            );
+                        }
+                        Err(_) => break, // Channel closed — server shutting down.
+                    }
+                }
+
+                // 3. Run one Engine step (prefill + decode + sample).
+                let step_output = match eng.step() {
+                    Ok(output) => output,
+                    Err(e) => {
+                        // Engine error — notify all active requests and drain.
+                        let error_msg = format!("{e:#}");
+                        for (_, ctx) in registry.drain() {
+                            let _ = ctx
+                                .response_tx
+                                .blocking_send(InferenceEvent::Error(error_msg.clone()));
+                        }
+                        continue;
+                    }
+                };
+
+                // 4. Stream tokens to response channels.
+                //    Collect aborts separately to avoid borrowing registry while iterating.
+                let mut to_abort: Vec<SeqId> = Vec::new();
+
+                for &(seq_id, token_id) in &step_output.tokens {
+                    if let Some(ctx) = registry.get_mut(&seq_id) {
+                        let text = eng.tokenizer.decode(&[token_id]).unwrap_or_default();
+                        ctx.generated_count += 1;
+                        if ctx
+                            .response_tx
+                            .blocking_send(InferenceEvent::Token { text })
+                            .is_err()
+                        {
+                            // Client disconnected — schedule abort.
+                            to_abort.push(seq_id);
+                        }
+                    }
+                }
+
+                // 5. Handle finished sequences.
+                for finished in &step_output.finished {
+                    if let Some(ctx) = registry.remove(&finished.id) {
+                        let stop_reason = match finished.reason {
+                            engine::FinishReason::Eos => StopReason::EndOfSequence,
+                            engine::FinishReason::MaxTokens => StopReason::MaxTokens,
+                        };
+                        let _ = ctx.response_tx.blocking_send(InferenceEvent::Done {
+                            stop_reason,
+                            prompt_tokens: ctx.prompt_token_count,
+                            completion_tokens: ctx.generated_count,
+                        });
+                    }
+                }
+
+                // 6. Abort disconnected sequences + proactive disconnect check.
+                for &id in &to_abort {
+                    eng.abort_sequence(id);
+                    registry.remove(&id);
+                }
+
+                let disconnected: Vec<SeqId> = registry
+                    .iter()
+                    .filter(|(_, ctx)| ctx.response_tx.is_closed())
+                    .map(|(&id, _)| id)
+                    .collect();
+                for id in disconnected {
+                    eng.abort_sequence(id);
+                    registry.remove(&id);
                 }
             }
 
@@ -319,92 +463,12 @@ fn spawn_worker(
 
     // Wait for the worker to finish loading (or fail).
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok(request_tx),
+        Ok(Ok((tokenizer, arch))) => Ok(WorkerHandle {
+            request_tx,
+            tokenizer,
+            arch,
+        }),
         Ok(Err(e)) => anyhow::bail!("worker failed to start: {e}"),
         Err(_) => anyhow::bail!("worker thread died during startup"),
     }
-}
-
-/// Process a single inference request on the worker thread.
-///
-/// This mirrors the single-sequence path from `run()` in main.rs:
-///   1. Tokenize the prompt (chat template or raw).
-///   2. Allocate a KV sequence from the pool.
-///   3. Prefill the entire prompt via GEMM forward pass.
-///   4. Generate tokens one at a time, streaming each via the response channel.
-///   5. Free the KV sequence blocks back to the pool.
-fn process_request<B: GpuBackend>(
-    req: &InferenceRequest,
-    model: &mut model::Model<'_, B>,
-    kv_pool: &mut kv_cache::KvPool<B>,
-    prefill_bufs: &model::PrefillBuffers<B>,
-    tokenizer: &tokenizer::Tokenizer,
-    backend: &B,
-    arch: config::ModelArch,
-    rng: &mut impl rand::Rng,
-) -> anyhow::Result<()> {
-    // 1. Tokenize: raw prompt or chat-formatted messages.
-    let prompt_tokens = if let Some(ref raw) = req.raw_prompt {
-        tokenizer.encode(raw)?
-    } else {
-        tokenizer.encode_messages(&req.messages, arch)?
-    };
-    let prompt_token_count = prompt_tokens.len();
-
-    // 2. Allocate KV sequence from the shared pool.
-    let mut seq_state = kv_pool.new_sequence(backend);
-
-    // 3. Prefill: process entire prompt in one GEMM forward pass.
-    seq_state.ensure_slots(kv_pool, prompt_tokens.len())?;
-    seq_state.sync_block_table(backend);
-    model.forward_prefill_paged(&prompt_tokens, kv_pool, &seq_state, prefill_bufs)?;
-    seq_state.advance_by(prompt_tokens.len());
-
-    // 4. Generation loop: sample → send token → forward → repeat.
-    let mut gen_count: usize = 0;
-    let mut next_token = sampler::sample(backend, model.logits(), req.temperature, req.top_p, rng)?;
-
-    let mut stop_reason = StopReason::MaxTokens;
-
-    for _ in 0..req.max_tokens {
-        if tokenizer.is_eos(next_token) {
-            stop_reason = StopReason::EndOfSequence;
-            break;
-        }
-        gen_count += 1;
-
-        let text = tokenizer.decode(&[next_token])?;
-
-        // Send token to the HTTP handler.  If the handler dropped its
-        // receiver (client disconnected), stop generating immediately.
-        if req
-            .response_tx
-            .blocking_send(InferenceEvent::Token { text })
-            .is_err()
-        {
-            // Client disconnected — clean up and return.
-            kv_pool.free_sequence(&seq_state);
-            return Ok(());
-        }
-
-        // Forward pass for the next token.
-        seq_state.ensure_slot(kv_pool)?;
-        seq_state.sync_block_table(backend);
-        model.forward_single_paged(next_token, kv_pool, &seq_state)?;
-        seq_state.advance();
-
-        next_token = sampler::sample(backend, model.logits(), req.temperature, req.top_p, rng)?;
-    }
-
-    // 5. Send completion event.
-    let _ = req.response_tx.blocking_send(InferenceEvent::Done {
-        stop_reason,
-        prompt_tokens: prompt_token_count,
-        completion_tokens: gen_count,
-    });
-
-    // 6. Free KV blocks back to the pool for the next request.
-    kv_pool.free_sequence(&seq_state);
-
-    Ok(())
 }

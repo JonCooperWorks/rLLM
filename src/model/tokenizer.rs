@@ -39,6 +39,7 @@ use tokenizers::Tokenizer as HfTokenizer;
 use super::chat;
 use super::config::ModelArch;
 
+#[derive(Clone)]
 pub(crate) struct Tokenizer {
     /// The HuggingFace tokenizer (BPE model + merge rules + vocabulary).
     inner: HfTokenizer,

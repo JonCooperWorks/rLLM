@@ -40,6 +40,8 @@ pub(crate) type SeqId = u64;
 pub(crate) struct SequenceRequest {
     pub prompt_tokens: Vec<u32>,
     pub max_gen_tokens: usize,
+    pub temperature: f32,
+    pub top_p: f32,
 }
 
 /// State of a single active sequence.
@@ -52,14 +54,18 @@ pub(crate) struct Sequence<B: GpuBackend> {
     pub generated_tokens: Vec<u32>,
     /// Maximum tokens to generate after prefill.
     pub max_gen_tokens: usize,
+    /// Sampling temperature for this sequence.
+    pub temperature: f32,
+    /// Top-p (nucleus) sampling threshold for this sequence.
+    pub top_p: f32,
     /// Whether this sequence has finished (EOS or max_tokens reached).
     pub finished: bool,
 }
 
 /// The continuous batching scheduler.
 pub(crate) struct Scheduler<B: GpuBackend> {
-    /// Waiting queue of new requests.
-    waiting: VecDeque<SequenceRequest>,
+    /// Waiting queue of new requests (ID pre-assigned at submission time).
+    waiting: VecDeque<(SeqId, SequenceRequest)>,
     /// Active sequences currently being processed.
     pub active: HashMap<SeqId, Sequence<B>>,
     /// The shared KV block pool.
@@ -81,9 +87,13 @@ impl<B: GpuBackend> Scheduler<B> {
         }
     }
 
-    /// Submit a new sequence request.
-    pub fn add_request(&mut self, req: SequenceRequest) {
-        self.waiting.push_back(req);
+    /// Submit a new sequence request.  Returns the pre-assigned sequence ID
+    /// so the caller can track this request before it's admitted to the active set.
+    pub fn add_request(&mut self, req: SequenceRequest) -> SeqId {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.waiting.push_back((id, req));
+        id
     }
 
     /// Try to admit waiting requests into the active set.
@@ -91,15 +101,13 @@ impl<B: GpuBackend> Scheduler<B> {
         let mut admitted = Vec::new();
 
         while !self.waiting.is_empty() && self.active.len() < self.max_active {
-            let req = self.waiting.front().unwrap();
+            let (_, req) = self.waiting.front().unwrap();
             let prompt_blocks = (req.prompt_tokens.len() + BLOCK_SIZE - 1) / BLOCK_SIZE;
             if self.kv_pool.free_block_count() < prompt_blocks {
                 break;
             }
 
-            let req = self.waiting.pop_front().unwrap();
-            let id = self.next_id;
-            self.next_id += 1;
+            let (id, req) = self.waiting.pop_front().unwrap();
 
             let seq_state = self.kv_pool.new_sequence(backend);
             let seq = Sequence {
@@ -107,6 +115,8 @@ impl<B: GpuBackend> Scheduler<B> {
                 kv_state: seq_state,
                 generated_tokens: Vec::new(),
                 max_gen_tokens: req.max_gen_tokens,
+                temperature: req.temperature,
+                top_p: req.top_p,
                 finished: false,
             };
             self.active.insert(id, seq);
@@ -116,8 +126,21 @@ impl<B: GpuBackend> Scheduler<B> {
         admitted
     }
 
+    /// Abort a sequence, removing it from the waiting queue or active set.
+    /// Frees KV blocks if the sequence was active.
+    pub fn abort_sequence(&mut self, id: SeqId) {
+        // Remove from waiting queue if still queued.
+        self.waiting.retain(|(wid, _)| *wid != id);
+        // Remove from active set and free KV blocks.
+        if let Some(seq) = self.active.remove(&id) {
+            self.kv_pool.free_sequence(&seq.kv_state);
+        }
+    }
+
     /// Collect and remove finished sequences, freeing their KV blocks.
-    pub fn collect_finished(&mut self) -> Vec<(SeqId, Vec<u32>)> {
+    /// Returns the full `Sequence` so callers can inspect generated tokens
+    /// and determine the finish reason.
+    pub fn collect_finished(&mut self) -> Vec<(SeqId, Sequence<B>)> {
         let finished_ids: Vec<SeqId> = self
             .active
             .iter()
@@ -129,7 +152,7 @@ impl<B: GpuBackend> Scheduler<B> {
         for id in finished_ids {
             if let Some(seq) = self.active.remove(&id) {
                 self.kv_pool.free_sequence(&seq.kv_state);
-                results.push((id, seq.generated_tokens));
+                results.push((id, seq));
             }
         }
         results

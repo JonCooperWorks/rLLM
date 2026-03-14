@@ -104,15 +104,13 @@ pub(crate) fn exec(args: BatchArgs) -> anyhow::Result<()> {
         sched,
         tokenizer,
         &backend,
-        args.temperature,
-        args.top_p,
     );
 
     // Submit all prompts.
     let system = args.chat.then(|| args.system.as_str());
     for prompt_text in &prompts {
         let tokens = eng.tokenizer.encode_prompt(prompt_text, arch, system)?;
-        eng.add_request(tokens, args.max_tokens);
+        eng.add_request(tokens, args.max_tokens, args.temperature, args.top_p);
     }
 
     // Run engine loop.
@@ -120,8 +118,8 @@ pub(crate) fn exec(args: BatchArgs) -> anyhow::Result<()> {
     let mut total_generated = 0usize;
 
     while eng.has_work() {
-        let finished = eng.step()?;
-        for seq in &finished {
+        let output = eng.step()?;
+        for seq in &output.finished {
             total_generated += seq.tokens.len();
             println!("--- sequence {} ({} tokens) ---", seq.id, seq.tokens.len());
             println!("{}", seq.text);

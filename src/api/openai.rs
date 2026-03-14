@@ -36,7 +36,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 
-use super::{InferenceEvent, InferenceRequest, ServerState, StopReason};
+use super::{InferenceEvent, ServerState, StopReason, WorkerRequest};
 use crate::model::chat::Message;
 
 // ---------------------------------------------------------------------------
@@ -148,13 +148,16 @@ pub(crate) async fn chat_completions(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, StatusCode> {
+    // Tokenize on the async handler thread (CPU-only, doesn't block GPU).
+    let prompt_tokens = state
+        .tokenizer
+        .encode_messages(&req.messages, state.arch)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
     let (response_tx, response_rx) = tokio::sync::mpsc::channel(64);
 
-    // Convert messages for the worker.  The handler applies the chat template
-    // based on `state.arch` — this happens inside the worker via format_chat.
-    let inference_req = InferenceRequest {
-        messages: req.messages,
-        raw_prompt: None,
+    let worker_req = WorkerRequest {
+        prompt_tokens,
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         top_p: req.top_p,
@@ -163,7 +166,7 @@ pub(crate) async fn chat_completions(
 
     state
         .request_tx
-        .try_send(inference_req)
+        .try_send(worker_req)
         .map_err(|e| match e {
             std::sync::mpsc::TrySendError::Full(_) => StatusCode::SERVICE_UNAVAILABLE,
             std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -297,11 +300,16 @@ pub(crate) async fn completions(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<CompletionRequest>,
 ) -> Result<Response, StatusCode> {
+    // Tokenize raw prompt (no chat template) on the async handler thread.
+    let prompt_tokens = state
+        .tokenizer
+        .encode(&req.prompt)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
     let (response_tx, response_rx) = tokio::sync::mpsc::channel(64);
 
-    let inference_req = InferenceRequest {
-        messages: Vec::new(),
-        raw_prompt: Some(req.prompt),
+    let worker_req = WorkerRequest {
+        prompt_tokens,
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         top_p: req.top_p,
@@ -310,7 +318,7 @@ pub(crate) async fn completions(
 
     state
         .request_tx
-        .try_send(inference_req)
+        .try_send(worker_req)
         .map_err(|e| match e {
             std::sync::mpsc::TrySendError::Full(_) => StatusCode::SERVICE_UNAVAILABLE,
             std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
