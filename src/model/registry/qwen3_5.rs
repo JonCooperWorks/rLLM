@@ -70,29 +70,6 @@ fn dn_layer_index(config: &crate::model::config::ModelConfig, layer_idx: usize) 
         .count()
 }
 
-/// Debug helper: dump bf16 tensor values from GPU.
-fn dump_bf16<B: GpuBackend>(backend: &B, tensor: &B::Tensor, label: &str, count: usize) {
-    let bytes = backend.tensor_byte_count(tensor);
-    let mut buf = vec![0u8; bytes];
-    backend.copy_to_host(tensor, &mut buf);
-    let bf16s: &[half::bf16] = bytemuck::cast_slice(&buf);
-    let n = count.min(bf16s.len());
-    let vals: Vec<f32> = bf16s[..n].iter().map(|v| v.to_f32()).collect();
-    let rms: f64 = bf16s[..n].iter().map(|v| { let f = v.to_f64(); f * f }).sum::<f64>();
-    let rms = (rms / n as f64).sqrt();
-    eprintln!("  RUST {}: rms={:.6}, first 8: {:?}", label, rms, &vals[..8.min(n)]);
-}
-
-fn dump_f32<B: GpuBackend>(backend: &B, tensor: &B::Tensor, label: &str, count: usize) {
-    let bytes = backend.tensor_byte_count(tensor);
-    let mut buf = vec![0u8; bytes];
-    backend.copy_to_host(tensor, &mut buf);
-    let f32s: &[f32] = bytemuck::cast_slice(&buf);
-    let n = count.min(f32s.len());
-    let vals: Vec<f32> = f32s[..n].to_vec();
-    eprintln!("  RUST {}: first 8: {:?}", label, &vals[..8.min(n)]);
-}
-
 /// Run the DeltaNet attention sub-block for a single token.
 fn deltanet_attention_block<B: GpuBackend>(
     m: &Model<'_, B>,
@@ -101,15 +78,14 @@ fn deltanet_attention_block<B: GpuBackend>(
 ) {
     let layer = &m.weights.layers[layer_idx];
     let eps = m.config.rms_norm_eps as f32;
-    let debug_attn = std::env::var("DEBUG_ATTN").is_ok() && layer_idx == 0;
 
     // DeltaNet dimensions.
     let num_qk_heads = m.config.linear_num_key_heads as u32;
     let num_v_heads = m.config.linear_num_value_heads as u32;
     let hd = m.config.linear_key_head_dim as u32;
-    let qk_dim = num_qk_heads * hd;     // 16 * 128 = 2048
-    let v_dim = num_v_heads * m.config.linear_value_head_dim as u32;  // 48 * 128 = 6144
-    let conv_dim = qk_dim * 2 + v_dim;   // 2048 + 2048 + 6144 = 10240
+    let qk_dim = num_qk_heads * hd;
+    let v_dim = num_v_heads * m.config.linear_value_head_dim as u32;
+    let conv_dim = qk_dim * 2 + v_dim;
     let kernel_size = m.config.linear_conv_kernel_dim as u32;
 
     // Unwrap DeltaNet-specific buffers and state.
@@ -139,23 +115,17 @@ fn deltanet_attention_block<B: GpuBackend>(
 
     // Step 1: RMSNorm → norm_buf.
     m.backend.rms_norm(&m.hidden, &layer.input_layernorm, eps, &m.norm_buf);
-    if debug_attn { dump_bf16(m.backend, &m.hidden, "hidden (input)", hidden_size as usize); }
-    if debug_attn { dump_bf16(m.backend, &m.norm_buf, "after RMSNorm", hidden_size as usize); }
 
     // Step 2: Fused QKV matmul.
     m.backend.matmul(in_proj_qkv, &m.norm_buf, qkv_buf, conv_dim, hidden_size);
-    if debug_attn { dump_bf16(m.backend, qkv_buf, "QKV matmul", conv_dim as usize); }
 
     // Step 3: Gate projections.
     m.backend.matmul(in_proj_a, &m.norm_buf, &m.q_buf, num_v_heads, hidden_size);
     m.backend.matmul(in_proj_b, &m.norm_buf, &m.k_buf, num_v_heads, hidden_size);
     m.backend.matmul(in_proj_z, &m.norm_buf, z_buf, v_dim, hidden_size);
-    if debug_attn { dump_bf16(m.backend, &m.q_buf, "alpha_proj", num_v_heads as usize); }
-    if debug_attn { dump_bf16(m.backend, &m.k_buf, "beta_proj", num_v_heads as usize); }
 
     // Step 4: Causal depthwise Conv1D on concatenated QKV.
     m.backend.conv1d_depthwise_single(qkv_buf, conv_history, conv1d_weight, conv_out, conv_dim, kernel_size);
-    if debug_attn { dump_bf16(m.backend, conv_out, "conv+silu", conv_dim as usize); }
 
     // Update conv history: shift left and append current token's QKV.
     m.backend.conv1d_shift_history(conv_history, qkv_buf, conv_dim, kernel_size);
@@ -163,13 +133,10 @@ fn deltanet_attention_block<B: GpuBackend>(
     // Step 5: L2 normalize Q and K (per head, in-place on conv_out).
     m.backend.l2_normalize_heads(conv_out, num_qk_heads, hd, 0);
     m.backend.l2_normalize_heads(conv_out, num_qk_heads, hd, qk_dim);
-    if debug_attn { dump_bf16(m.backend, conv_out, "after L2 norm", conv_dim as usize); }
 
     // Step 6: Compute decay and update gates.
     m.backend.deltanet_decay_gate(&m.q_buf, dt_bias, a_log, alpha_buf, num_v_heads);
     m.backend.sigmoid(&m.k_buf, beta_buf, num_v_heads);
-    if debug_attn { dump_f32(m.backend, alpha_buf, "decay gates", num_v_heads as usize); }
-    if debug_attn { dump_f32(m.backend, beta_buf, "beta gates", num_v_heads as usize); }
 
     // Step 7-8: DeltaNet state update + output computation.
     m.backend.deltanet_step(
@@ -180,18 +147,120 @@ fn deltanet_attention_block<B: GpuBackend>(
         qk_dim,  // K offset
         qk_dim * 2,  // V offset
     );
-    if debug_attn { dump_bf16(m.backend, attn_out, "deltanet output", v_dim as usize); }
 
     // Step 9: Output gate — rmsnorm(attn_out, learned_norm) * silu(z).
     m.backend.rms_norm_batch(attn_out, linear_norm, eps, norm_out, num_v_heads);
     m.backend.silu(z_buf, z_buf, v_dim);
     m.backend.mul(norm_out, z_buf, attn_out, v_dim);
-    if debug_attn { dump_bf16(m.backend, attn_out, "gated output", v_dim as usize); }
 
     // Step 10: Output projection + residual add.
-    // out_proj [hidden_size, v_dim] × attn_out [v_dim] → norm_buf [hidden_size]
     m.backend.matmul(out_proj, attn_out, &m.norm_buf, hidden_size, v_dim);
     m.backend.add(&m.hidden, &m.norm_buf, &m.hidden, hidden_size);
+}
+
+// ---------------------------------------------------------------------------
+// MoE FFN block with shared expert — replaces dense FFN for Qwen 3.5.
+//
+// MoE: router → top-k experts → weighted sum
+// Shared expert: always-active FFN, gated by sigmoid(linear(hidden))
+// Final: hidden += moe_output + gate * shared_expert_output
+// ---------------------------------------------------------------------------
+
+fn moe_ffn_block<B: GpuBackend>(
+    m: &Model<'_, B>,
+    layer_idx: usize,
+    hidden_size: u32,
+) {
+    let layer = &m.weights.layers[layer_idx];
+    let eps = m.config.rms_norm_eps as f32;
+    let moe_inter = m.config.moe_intermediate_size as u32;
+    let num_experts = m.config.num_experts;
+    let num_experts_per_tok = m.config.num_experts_per_tok;
+
+    let router_gate = layer.router_gate.as_ref().unwrap();
+    let experts = layer.experts.as_ref().unwrap();
+    let moe_gate_buf = m.moe_gate_buf.as_ref().unwrap();
+    let moe_up_buf = m.moe_up_buf.as_ref().unwrap();
+    let moe_output = m.moe_output.as_ref().unwrap();
+    let routing_output = m.routing_output.as_ref().unwrap();
+
+    // Step 1: RMSNorm → norm_buf.
+    m.backend.rms_norm(&m.hidden, &layer.post_attention_layernorm, eps, &m.norm_buf);
+
+    // Step 2: Router matmul → per-expert scores.
+    m.backend.matmul(router_gate, &m.norm_buf, moe_gate_buf, num_experts as u32, hidden_size);
+
+    // Step 3: GPU top-k + softmax.
+    m.backend.top_k_softmax(moe_gate_buf, routing_output, num_experts as u32, num_experts_per_tok as u32);
+
+    // Step 4: Read routing results to CPU.
+    let k = num_experts_per_tok;
+    let routing_bytes = k * 2 * 4;
+    let buf_bytes = m.backend.tensor_byte_count(routing_output);
+    let mut routing_buf = vec![0u8; buf_bytes];
+    m.backend.copy_to_host(routing_output, &mut routing_buf);
+    let routing_data: &[f32] = bytemuck::cast_slice(&routing_buf[..routing_bytes]);
+    let selected: Vec<(usize, f32)> = (0..k)
+        .map(|i| (routing_data[2 * i] as usize, routing_data[2 * i + 1]))
+        .collect();
+
+    // Step 5: Run selected experts.
+    m.backend.fill_zero(moe_output, hidden_size);
+    for &(expert_idx, routing_weight) in &selected {
+        let expert = &experts[expert_idx];
+        m.backend.matmul(&expert.gate_proj, &m.norm_buf, moe_gate_buf, moe_inter, hidden_size);
+        m.backend.matmul(&expert.up_proj, &m.norm_buf, moe_up_buf, moe_inter, hidden_size);
+        m.backend.silu_mul(moe_gate_buf, moe_up_buf, moe_gate_buf, moe_inter);
+        m.backend.matmul(&expert.down_proj, moe_gate_buf, &m.gate_buf, hidden_size, moe_inter);
+        m.backend.scale_add(moe_output, &m.gate_buf, routing_weight, hidden_size);
+    }
+
+    // Step 6: Shared expert (always-active, gated by sigmoid scalar).
+    if let (Some(se_gate_proj), Some(se_up_proj), Some(se_down_proj), Some(se_gate)) = (
+        layer.shared_expert_gate_proj.as_ref(),
+        layer.shared_expert_up_proj.as_ref(),
+        layer.shared_expert_down_proj.as_ref(),
+        layer.shared_expert_gate.as_ref(),
+    ) {
+        let se_inter = m.config.shared_expert_intermediate_size as u32;
+
+        // Compute scalar gate: sigmoid(se_gate @ norm_buf) → single f32.
+        // Reuse up_buf (bf16) for the 1-element matmul result — up_buf isn't used yet.
+        m.backend.matmul(se_gate, &m.norm_buf, &m.up_buf, 1, hidden_size);
+        let mut gate_bytes = vec![0u8; m.backend.tensor_byte_count(&m.up_buf)];
+        m.backend.copy_to_host(&m.up_buf, &mut gate_bytes);
+        let gate_val: f32 = 1.0 / (1.0 + (-bytemuck::cast_slice::<u8, half::bf16>(&gate_bytes)[0].to_f32()).exp());
+
+        // Shared expert SwiGLU FFN.
+        m.backend.matmul(se_gate_proj, &m.norm_buf, moe_gate_buf, se_inter, hidden_size);
+        m.backend.matmul(se_up_proj, &m.norm_buf, moe_up_buf, se_inter, hidden_size);
+        m.backend.silu_mul(moe_gate_buf, moe_up_buf, moe_gate_buf, se_inter);
+        m.backend.matmul(se_down_proj, moe_gate_buf, &m.gate_buf, hidden_size, se_inter);
+
+        // Add gated shared expert output to MoE output.
+        m.backend.scale_add(moe_output, &m.gate_buf, gate_val, hidden_size);
+    }
+
+    // Step 7: Residual add.
+    m.backend.add(&m.hidden, moe_output, &m.hidden, hidden_size);
+}
+
+// ---------------------------------------------------------------------------
+// FFN dispatch — MoE or dense SwiGLU depending on model config.
+// ---------------------------------------------------------------------------
+
+fn ffn_block<B: GpuBackend>(m: &Model<'_, B>, layer_idx: usize, hidden_size: u32) {
+    if m.config.is_moe() {
+        moe_ffn_block(m, layer_idx, hidden_size);
+    } else {
+        let layer = &m.weights.layers[layer_idx];
+        let eps = m.config.rms_norm_eps as f32;
+        let inter_size = m.config.intermediate_size as u32;
+        primitives::ffn_block(
+            m.backend, layer, &m.hidden, &m.norm_buf, &m.gate_buf, &m.up_buf,
+            eps, hidden_size, inter_size,
+        );
+    }
 }
 
 // ===========================================================================
@@ -211,88 +280,42 @@ pub(crate) fn forward_single_paged<B: GpuBackend>(
     let head_dim = m.config.head_dim as u32;
     let q_dim = (m.config.num_attention_heads * m.config.head_dim) as u32;
     let kv_dim = (m.config.num_key_value_heads * m.config.head_dim) as u32;
-    let inter_size = m.config.intermediate_size as u32;
     let eps = m.config.rms_norm_eps as f32;
     let rope_theta = m.config.rope_theta as f32;
     let pos = seq_state.seq_len as u32;
     let rotary_dim = m.config.rotary_dim() as u32;
     let has_output_gate = m.config.attn_output_gate;
 
-    // DEBUG: check hidden state norm at key points (first decode call only).
-    fn debug_norm<B: GpuBackend>(backend: &B, tensor: &B::Tensor, label: &str, size: usize) {
-        let byte_count = backend.tensor_byte_count(tensor);
-        let mut buf = vec![0u8; byte_count];
-        backend.copy_to_host(tensor, &mut buf);
-        let bf16s: &[half::bf16] = bytemuck::cast_slice(&buf);
-        let mut sum_sq = 0.0f64;
-        let mut max_abs = 0.0f64;
-        for &v in &bf16s[..size] {
-            let f = v.to_f64();
-            sum_sq += f * f;
-            max_abs = max_abs.max(f.abs());
-        }
-        let rms = (sum_sq / size as f64).sqrt();
-        eprintln!("DEBUG {}: rms={:.6}, max_abs={:.6}", label, rms, max_abs);
-    }
-    static DEBUG_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let do_debug = !DEBUG_ONCE.swap(true, std::sync::atomic::Ordering::Relaxed);
-
     primitives::embed_token(m.backend, &m.weights, token_id, &m.hidden, hidden_size);
-    if do_debug { debug_norm(m.backend, &m.hidden, "after_embed", hidden_size as usize); }
-
-    // DEBUG: set to true to skip DeltaNet attention (isolate GQA issues).
-    let skip_deltanet = std::env::var("SKIP_DELTANET").is_ok();
-    // DEBUG: set to true to skip GQA output gate (isolate gate issues).
-    let skip_gate = std::env::var("SKIP_GATE").is_ok();
-    // DEBUG: set to true to skip ALL attention (test FFN only).
-    let skip_all_attn = std::env::var("SKIP_ALL_ATTN").is_ok();
-    // DEBUG: set to skip ALL layers (test embed → norm → lm_head only).
-    let skip_all_layers = std::env::var("SKIP_ALL_LAYERS").is_ok();
 
     for layer_idx in 0..m.config.num_hidden_layers {
-        if skip_all_layers { break; }
         if m.config.is_linear_attention_layer(layer_idx) {
-            // --- DeltaNet attention sub-block ---
-            if !skip_deltanet && !skip_all_attn {
-                deltanet_attention_block(m, layer_idx, hidden_size);
-            }
-        } else if !skip_all_attn {
-            // --- GQA attention sub-block (with QK-norm, partial RoPE, output gate) ---
+            deltanet_attention_block(m, layer_idx, hidden_size);
+        } else {
             let layer = &m.weights.layers[layer_idx];
 
             m.backend.rms_norm(&m.hidden, &layer.input_layernorm, eps, &m.norm_buf);
-            let debug_gqa = do_debug && layer_idx == 3;
-            if debug_gqa { dump_bf16(m.backend, &m.norm_buf, "GQA L3 after norm", hidden_size as usize); }
             primitives::qkv_projection_qdim(
                 m.backend, layer, &m.norm_buf, &m.q_buf, &m.k_buf, &m.v_buf,
                 q_dim, hidden_size, kv_dim,
             );
-            if debug_gqa { dump_bf16(m.backend, &m.q_buf, "GQA L3 Q proj", q_dim as usize); }
-            if debug_gqa { dump_bf16(m.backend, &m.k_buf, "GQA L3 K proj", kv_dim as usize); }
 
-            // QK-norm: per-head RMSNorm on Q and K before RoPE.
             if let (Some(q_norm), Some(k_norm)) = (&layer.q_norm, &layer.k_norm) {
                 m.backend.rms_norm_batch(&m.q_buf, q_norm, eps, &m.q_buf, num_heads);
                 m.backend.rms_norm_batch(&m.k_buf, k_norm, eps, &m.k_buf, num_kv_heads);
             }
-            if debug_gqa { dump_bf16(m.backend, &m.q_buf, "GQA L3 Q after QK-norm", q_dim as usize); }
 
-            // Partial RoPE: only rotate first rotary_dim dims of each head.
             m.backend.rope_partial(
                 &m.q_buf, &m.k_buf, pos, rope_theta,
                 num_heads, num_kv_heads, head_dim, rotary_dim,
             );
-            if debug_gqa { dump_bf16(m.backend, &m.q_buf, "GQA L3 Q after RoPE", q_dim as usize); }
 
-            // Output gate Z projection (if attn_output_gate).
-            // Done after Q projection but before attention to overlap with KV cache ops.
             let z_buf = m.dn_z_buf.as_ref();
             if has_output_gate {
                 let attn_z_proj = layer.attn_z_proj.as_ref().unwrap();
                 m.backend.matmul(attn_z_proj, &m.norm_buf, z_buf.unwrap(), q_dim, hidden_size);
             }
 
-            // KV cache uses kv_layer_map to index into the pool.
             let kv_idx = m.kv_layer_map[layer_idx].unwrap();
             m.backend.copy_to_paged_kv_cache(
                 &m.k_buf, &pool.k_pool[kv_idx], &seq_state.block_table_gpu,
@@ -307,35 +330,20 @@ pub(crate) fn forward_single_paged<B: GpuBackend>(
                 &seq_state.block_table_gpu, &m.attn_out,
                 pos + 1, num_heads, num_kv_heads, head_dim,
             );
-            if debug_gqa { dump_bf16(m.backend, &m.attn_out, "GQA L3 attn_out", q_dim as usize); }
 
-            if has_output_gate && !skip_gate {
-                // GQA output gate: attn_out = attn_out * sigmoid(z).
-                // Note: GQA uses sigmoid (not SiLU) and no RMSNorm,
-                // unlike DeltaNet which uses RMSNorm(attn) * SiLU(z).
+            if has_output_gate {
                 let z = z_buf.unwrap();
                 m.backend.sigmoid_bf16(z, z, q_dim);
                 m.backend.mul(&m.attn_out, z, &m.attn_out, q_dim);
             }
-            if debug_gqa { dump_bf16(m.backend, &m.attn_out, "GQA L3 gated_out", q_dim as usize); }
 
             primitives::o_proj_residual_qdim(
                 m.backend, layer, &m.attn_out, &m.norm_buf, &m.hidden,
                 hidden_size, q_dim,
             );
-            if debug_gqa { dump_bf16(m.backend, &m.norm_buf, "GQA L3 o_proj result", hidden_size as usize); }
         }
 
-        // FFN sub-block (shared for both layer types — standard dense SwiGLU).
-        let layer = &m.weights.layers[layer_idx];
-        primitives::ffn_block(
-            m.backend, layer, &m.hidden, &m.norm_buf,
-            &m.gate_buf, &m.up_buf, eps, hidden_size, inter_size,
-        );
-
-        if do_debug && (layer_idx < 4 || layer_idx == m.config.num_hidden_layers - 1) {
-            debug_norm(m.backend, &m.hidden, &format!("after_layer_{}", layer_idx), hidden_size as usize);
-        }
+        ffn_block(m, layer_idx, hidden_size);
     }
 
     primitives::final_norm_and_lm_head(
@@ -354,7 +362,6 @@ pub(crate) fn forward<B: GpuBackend>(m: &mut Model<'_, B>, token_id: u32) -> any
     let head_dim = m.config.head_dim as u32;
     let q_dim = (m.config.num_attention_heads * m.config.head_dim) as u32;
     let kv_dim = (m.config.num_key_value_heads * m.config.head_dim) as u32;
-    let inter_size = m.config.intermediate_size as u32;
     let eps = m.config.rms_norm_eps as f32;
     let rope_theta = m.config.rope_theta as f32;
     let rotary_dim = m.config.rotary_dim() as u32;
@@ -446,12 +453,8 @@ pub(crate) fn forward<B: GpuBackend>(m: &mut Model<'_, B>, token_id: u32) -> any
             );
         }
 
-        // FFN sub-block.
-        let layer = &m.weights.layers[layer_idx];
-        primitives::ffn_block(
-            m.backend, layer, &m.hidden, &m.norm_buf,
-            &m.gate_buf, &m.up_buf, eps, hidden_size, inter_size,
-        );
+        // FFN sub-block (MoE with shared expert, or dense SwiGLU).
+        ffn_block(m, layer_idx, hidden_size);
     }
 
     primitives::final_norm_and_lm_head(
@@ -497,20 +500,13 @@ pub(crate) fn forward_prefill_paged<B: GpuBackend>(
     let head_dim = m.config.head_dim as u32;
     let q_dim = (m.config.num_attention_heads * m.config.head_dim) as u32;
     let kv_dim = (m.config.num_key_value_heads * m.config.head_dim) as u32;
-    let inter_size = m.config.intermediate_size as u32;
     let eps = m.config.rms_norm_eps as f32;
     let rope_theta = m.config.rope_theta as f32;
     let start_pos = seq_state.seq_len as u32;
     let rotary_dim = m.config.rotary_dim() as u32;
 
-    let debug_prefill = std::env::var("DEBUG_ATTN").is_ok();
-
     primitives::upload_prefill_inputs(m.backend, bufs, tokens, start_pos, bs);
     primitives::embed_batch(m.backend, &m.weights, bufs, bs, hidden_size);
-
-    if debug_prefill && bs == 1 {
-        dump_bf16(m.backend, &bufs.hidden, "prefill embed", hidden_size as usize);
-    }
 
     for layer_idx in 0..m.config.num_hidden_layers {
         let layer = &m.weights.layers[layer_idx];
@@ -537,8 +533,9 @@ pub(crate) fn forward_prefill_paged<B: GpuBackend>(
                     &host_hidden[offset..offset + hidden_byte_size],
                 );
 
-                // Run DeltaNet attention on this single token.
+                // Run DeltaNet attention + FFN on this single token.
                 deltanet_attention_block(m, layer_idx, hidden_size);
+                ffn_block(m, layer_idx, hidden_size);
 
                 // Copy updated hidden back.
                 let mut token_hidden = vec![0u8; hidden_byte_size];
@@ -550,31 +547,17 @@ pub(crate) fn forward_prefill_paged<B: GpuBackend>(
             // Upload modified hidden states back to batch buffer.
             m.backend.copy_to_tensor(&bufs.hidden, &host_hidden);
 
-            // FFN sub-block (batched GEMM).
-            primitives::ffn_block_batch(
-                m.backend, layer, bufs, eps, bs, hidden_size, inter_size,
-            );
-            if debug_prefill && bs == 1 && layer_idx < 4 {
-                dump_bf16(m.backend, &bufs.hidden, &format!("prefill after layer {} (DN)", layer_idx), hidden_size as usize);
-            }
         } else {
             // --- GQA layer: fully batched (GEMM + prefill attention) ---
             let has_output_gate = m.config.attn_output_gate;
-            let debug_gqa = debug_prefill && bs == 1 && layer_idx == 3;
 
             m.backend.rms_norm_batch(
                 &bufs.hidden, &layer.input_layernorm, eps, &bufs.norm_buf, bs,
             );
-            if debug_gqa { dump_bf16(m.backend, &bufs.norm_buf, "GQA L3 norm", hidden_size as usize); }
 
             primitives::qkv_projection_batch_qdim(
                 m.backend, layer, bufs, bs, q_dim, hidden_size, kv_dim,
             );
-            if debug_gqa {
-                dump_bf16(m.backend, &bufs.q_buf, "GQA L3 Q proj", q_dim as usize);
-                dump_bf16(m.backend, &bufs.k_buf, "GQA L3 K proj", kv_dim as usize);
-                dump_bf16(m.backend, &bufs.v_buf, "GQA L3 V proj", kv_dim as usize);
-            }
 
             // QK-norm (batched): treat [batch_size * num_heads, head_dim] as batch.
             if let (Some(q_norm), Some(k_norm)) = (&layer.q_norm, &layer.k_norm) {
@@ -585,10 +568,6 @@ pub(crate) fn forward_prefill_paged<B: GpuBackend>(
                     &bufs.k_buf, k_norm, eps, &bufs.k_buf, bs * num_kv_heads,
                 );
             }
-            if debug_gqa {
-                dump_bf16(m.backend, &bufs.q_buf, "GQA L3 Q after QK-norm", q_dim as usize);
-                dump_bf16(m.backend, &bufs.k_buf, "GQA L3 K after QK-norm", kv_dim as usize);
-            }
 
             // Output gate Z projection (batched) — compute before RoPE/attention.
             if has_output_gate {
@@ -597,7 +576,6 @@ pub(crate) fn forward_prefill_paged<B: GpuBackend>(
                     attn_z_proj, &bufs.norm_buf, &bufs.gate_buf,
                     bs, q_dim, hidden_size,
                 );
-                if debug_gqa { dump_bf16(m.backend, &bufs.gate_buf, "GQA L3 Z proj", q_dim as usize); }
             }
 
             // Partial RoPE (batched).
@@ -653,11 +631,6 @@ pub(crate) fn forward_prefill_paged<B: GpuBackend>(
                 m.backend.copy_to_tensor(&bufs.q_buf, &host_q);
                 m.backend.copy_to_tensor(&bufs.k_buf, &host_k);
             }
-            if debug_gqa {
-                dump_bf16(m.backend, &bufs.q_buf, "GQA L3 Q after RoPE", q_dim as usize);
-                dump_bf16(m.backend, &bufs.k_buf, "GQA L3 K after RoPE", kv_dim as usize);
-            }
-
             let kv_idx = m.kv_layer_map[layer_idx].unwrap();
             m.backend.copy_to_paged_kv_cache_batch(
                 &bufs.k_buf, &pool.k_pool[kv_idx], &seq_state.block_table_gpu,
@@ -671,26 +644,41 @@ pub(crate) fn forward_prefill_paged<B: GpuBackend>(
                 &bufs.q_buf, &bufs.k_buf, &bufs.v_buf, &bufs.attn_out,
                 bs, start_pos, num_heads, num_kv_heads, head_dim,
             );
-            if debug_gqa { dump_bf16(m.backend, &bufs.attn_out, "GQA L3 attn_out", q_dim as usize); }
-
             // GQA output gate (batched): attn_out = attn_out * sigmoid(z).
             if has_output_gate {
                 let total_elems = bs * q_dim;
                 m.backend.sigmoid_bf16(&bufs.gate_buf, &bufs.gate_buf, total_elems);
                 m.backend.mul(&bufs.attn_out, &bufs.gate_buf, &bufs.attn_out, total_elems);
-                if debug_gqa { dump_bf16(m.backend, &bufs.attn_out, "GQA L3 gated_out", q_dim as usize); }
             }
 
             primitives::o_proj_residual_batch_qdim(
                 m.backend, layer, bufs, bs, hidden_size, q_dim,
             );
 
-            // FFN sub-block (batched).
-            primitives::ffn_block_batch(
-                m.backend, layer, bufs, eps, bs, hidden_size, inter_size,
-            );
-            if debug_prefill && bs == 1 && layer_idx <= 4 {
-                dump_bf16(m.backend, &bufs.hidden, &format!("prefill after layer {} (GQA)", layer_idx), hidden_size as usize);
+            // FFN sub-block: MoE (token-by-token) or dense (batched).
+            if m.config.is_moe() {
+                let hidden_byte_size = m.config.hidden_size * 2; // bf16
+                let full_bytes = m.backend.tensor_byte_count(&bufs.hidden);
+                let mut host_hidden = vec![0u8; full_bytes];
+                m.backend.copy_to_host(&bufs.hidden, &mut host_hidden);
+
+                for t in 0..tokens.len() {
+                    let offset = t * hidden_byte_size;
+                    m.backend.copy_to_tensor(
+                        &m.hidden,
+                        &host_hidden[offset..offset + hidden_byte_size],
+                    );
+                    moe_ffn_block(m, layer_idx, hidden_size);
+                    let mut token_hidden = vec![0u8; hidden_byte_size];
+                    m.backend.copy_to_host(&m.hidden, &mut token_hidden);
+                    host_hidden[offset..offset + hidden_byte_size]
+                        .copy_from_slice(&token_hidden);
+                }
+
+                m.backend.copy_to_tensor(&bufs.hidden, &host_hidden);
+            } else {
+                let inter_size = m.config.intermediate_size as u32;
+                primitives::ffn_block_batch(m.backend, layer, bufs, eps, bs, hidden_size, inter_size);
             }
         }
     }
