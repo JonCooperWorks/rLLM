@@ -261,6 +261,38 @@ pub(crate) struct LayerWeights<B: GpuBackend> {
     // tensors.  The forward pass dispatches to MoE routing instead.
     pub router_gate: Option<B::Tensor>,            // [num_experts, hidden_size]
     pub experts: Option<Vec<ExpertWeights<B>>>,     // num_experts expert FFNs
+
+    // --- DeltaNet attention (Qwen 3.5 linear attention layers only) ---
+    //
+    // DeltaNet layers use a fused QKV projection and separate gate projections
+    // instead of the standard q/k/v_proj.  When these fields are Some, the
+    // q_proj/k_proj/v_proj/o_proj fields above are dummy tensors.
+    //
+    // Learning note: DeltaNet has different head counts for QK (16) and V (48),
+    // with 3 V-heads sharing each QK-head's state matrix.  The fused QKV
+    // projection outputs [qk_dim, qk_dim, v_dim] = [2048, 2048, 6144] = [10240].
+    pub in_proj_qkv: Option<B::Tensor>,    // [qk_dim*2 + v_dim, hidden_size]
+    pub in_proj_a: Option<B::Tensor>,      // [num_v_heads, hidden_size] — decay gate
+    pub in_proj_b: Option<B::Tensor>,      // [num_v_heads, hidden_size] — update gate
+    pub in_proj_z: Option<B::Tensor>,      // [v_dim, hidden_size] — output gate
+    pub conv1d_weight: Option<B::Tensor>,  // [dim, 1, kernel_size] — depthwise Conv1D
+    pub linear_out_proj: Option<B::Tensor>, // [hidden_size, v_dim] — DeltaNet output projection
+    pub a_log: Option<B::Tensor>,          // [num_v_heads] f32 — log decay rates
+    pub dt_bias: Option<B::Tensor>,        // [num_v_heads] f32 — dt bias
+    pub linear_norm: Option<B::Tensor>,    // [value_head_dim] bf16 — output norm weight
+
+    // --- GQA output gate (Qwen 3.5 full-attention layers with attn_output_gate) ---
+    pub attn_z_proj: Option<B::Tensor>,    // [q_dim, hidden_size] — output gate projection
+
+    // --- Shared expert (Qwen 3.5 MoE models with always-active expert) ---
+    //
+    // The shared expert is a standard SwiGLU FFN that runs alongside the routed
+    // experts on every token.  Its output is gated by a learned scalar (sigmoid
+    // of a linear projection) before being added to the routed expert output.
+    pub shared_expert_gate_proj: Option<B::Tensor>,  // [shared_inter, hidden_size]
+    pub shared_expert_up_proj: Option<B::Tensor>,    // [shared_inter, hidden_size]
+    pub shared_expert_down_proj: Option<B::Tensor>,  // [hidden_size, shared_inter]
+    pub shared_expert_gate: Option<B::Tensor>,       // [1, hidden_size] — scalar gate weight
 }
 
 /// Load all model weights from safetensors file(s) into GPU memory.
@@ -293,16 +325,19 @@ pub(crate) fn load_weights<B: GpuBackend>(
     let q_dim = config.num_attention_heads * config.head_dim;
     let kv_dim = config.num_key_value_heads * config.head_dim;
     let inter = config.intermediate_size;
+    let wp = &config.weight_prefix; // "model." or "model.language_model."
 
     // Load the embedding table.
     let embed_tokens = upload_tensor(
         &store,
         backend,
-        "model.embed_tokens.weight",
+        &format!("{wp}embed_tokens.weight"),
         &[config.vocab_size, hidden],
     )?;
 
     // Check for separate lm_head (untied embeddings, e.g. Llama 3.1 8B+).
+    // Note: lm_head.weight is always at the top level (no weight prefix),
+    // even for Qwen 3.5 where other weights are under model.language_model.
     let lm_head = if !config.tie_word_embeddings {
         Some(upload_tensor(
             &store,
@@ -322,9 +357,13 @@ pub(crate) fn load_weights<B: GpuBackend>(
     let moe_inter = config.moe_intermediate_size;
     let num_experts = config.num_experts;
     let head_dim = config.head_dim;
+    let is_hybrid = config.is_hybrid_deltanet();
+    // Qwen 3.5 stores RMSNorm weights as residual offsets (effective = 1 + stored).
+    let residual_norm = matches!(arch, ModelArch::Qwen3_5);
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for i in 0..config.num_hidden_layers {
-        let prefix = format!("model.layers.{i}");
+        let prefix = format!("{wp}layers.{i}");
+        let is_deltanet_layer = is_hybrid && config.is_linear_attention_layer(i);
 
         // Load QKV bias vectors if the architecture has them (Qwen 2.5).
         // Bias tensors are always bf16, never quantised — they're 1D and tiny.
@@ -353,18 +392,25 @@ pub(crate) fn load_weights<B: GpuBackend>(
             (None, None, None)
         };
 
-        // Load QK-norm weights if the architecture has them (Qwen 3 MoE).
+        // Load QK-norm weights if the architecture has them (Qwen 3 MoE, Qwen 3.5 GQA).
         // These are per-head RMSNorm weights [head_dim], applied to Q and K
         // after projection but before RoPE.
-        let (q_norm, k_norm) = if has_qk_norm {
+        // For hybrid models, only GQA (full_attention) layers have QK-norm —
+        // DeltaNet layers use L2 normalization instead (no learned weights).
+        let layer_has_qk_norm = has_qk_norm && !is_deltanet_layer;
+        let (q_norm, k_norm) = if layer_has_qk_norm {
+            // Qwen 3.5 uses Qwen3_5RMSNorm for QK-norm, which has residual weights:
+            // effective_weight = 1.0 + stored_weight (stored ≈ 0, effective ≈ 1).
+            // Other models (Qwen3-MoE) use standard RMSNorm (weight used directly).
+            let upload_qk_norm = if residual_norm { upload_norm_residual } else { upload_tensor };
             (
-                Some(upload_tensor(
+                Some(upload_qk_norm(
                     &store,
                     backend,
                     &format!("{prefix}.self_attn.q_norm.weight"),
                     &[head_dim],
                 )?),
-                Some(upload_tensor(
+                Some(upload_qk_norm(
                     &store,
                     backend,
                     &format!("{prefix}.self_attn.k_norm.weight"),
@@ -380,7 +426,17 @@ pub(crate) fn load_weights<B: GpuBackend>(
         // For MoE models, the dense FFN fields get dummy zero-element tensors
         // (never used — the forward pass dispatches to MoE routing instead).
         // This avoids making the fields Optional and cascading changes everywhere.
-        let (gate_proj, up_proj, down_proj, router_gate, experts) = if is_moe {
+        //
+        // Two MoE weight formats exist:
+        //   1. Per-expert (Qwen3-MoE): mlp.experts.{j}.gate_proj.weight [moe_inter, hidden]
+        //   2. Fused (Qwen3.5): mlp.experts.gate_up_proj [num_experts, 2*moe_inter, hidden]
+        //      and mlp.experts.down_proj [num_experts, hidden, moe_inter]
+        //   Format 2 is detected by the presence of the fused tensor name.
+        let has_shared_expert = config.has_shared_expert();
+        let shared_inter = config.shared_expert_intermediate_size;
+        let (gate_proj, up_proj, down_proj, router_gate, experts,
+         shared_expert_gate_proj, shared_expert_up_proj, shared_expert_down_proj,
+         shared_expert_gate) = if is_moe {
             // Dummy tensors for the dense FFN fields (never accessed by MoE forward pass).
             let dummy = backend.alloc_tensor(&[1], TensorDtype::BF16);
             let dummy2 = backend.alloc_tensor(&[1], TensorDtype::BF16);
@@ -395,40 +451,134 @@ pub(crate) fn load_weights<B: GpuBackend>(
                 &[num_experts, hidden],
             )?;
 
-            // Load all expert weights.  Each expert has gate/up/down projections
-            // at the smaller moe_intermediate_size.
-            let mut expert_vec = Vec::with_capacity(num_experts);
-            for j in 0..num_experts {
-                let ep = format!("{prefix}.mlp.experts.{j}");
-                expert_vec.push(ExpertWeights {
-                    gate_proj: upload_maybe_q4(
-                        &store,
-                        backend,
-                        &format!("{ep}.gate_proj.weight"),
-                        &[moe_inter, hidden],
-                        quantize,
-                    )?,
-                    up_proj: upload_maybe_q4(
-                        &store,
-                        backend,
-                        &format!("{ep}.up_proj.weight"),
-                        &[moe_inter, hidden],
-                        quantize,
-                    )?,
-                    down_proj: upload_maybe_q4(
-                        &store,
-                        backend,
-                        &format!("{ep}.down_proj.weight"),
-                        &[hidden, moe_inter],
-                        quantize,
-                    )?,
-                });
-            }
+            // Detect fused vs per-expert format.
+            let fused_name = format!("{prefix}.mlp.experts.gate_up_proj");
+            let is_fused = store.tensor(&fused_name).is_ok();
+
+            let expert_vec = if is_fused {
+                // Fused format (Qwen3.5): gate_up_proj [num_experts, 2*moe_inter, hidden]
+                // and down_proj [num_experts, hidden, moe_inter].
+                // Split into per-expert tensors during loading.
+                let gate_up_view = store.tensor(&fused_name)?;
+                anyhow::ensure!(
+                    gate_up_view.shape() == [num_experts, moe_inter * 2, hidden],
+                    "fused gate_up_proj shape mismatch: expected [{}, {}, {}], got {:?}",
+                    num_experts, moe_inter * 2, hidden, gate_up_view.shape()
+                );
+                let down_view = store.tensor(
+                    &format!("{prefix}.mlp.experts.down_proj"),
+                )?;
+                anyhow::ensure!(
+                    down_view.shape() == [num_experts, hidden, moe_inter],
+                    "fused down_proj shape mismatch: expected [{}, {}, {}], got {:?}",
+                    num_experts, hidden, moe_inter, down_view.shape()
+                );
+
+                let gate_up_data = gate_up_view.data();
+                let down_data = down_view.data();
+                let gate_up_expert_bytes = moe_inter * 2 * hidden * 2; // bf16
+                let gate_bytes = moe_inter * hidden * 2;
+                let down_expert_bytes = hidden * moe_inter * 2;
+
+                let mut experts = Vec::with_capacity(num_experts);
+                for j in 0..num_experts {
+                    let gu_offset = j * gate_up_expert_bytes;
+                    let gate_raw = &gate_up_data[gu_offset..gu_offset + gate_bytes];
+                    let up_raw = &gate_up_data[gu_offset + gate_bytes..gu_offset + gate_up_expert_bytes];
+                    let d_offset = j * down_expert_bytes;
+                    let down_raw = &down_data[d_offset..d_offset + down_expert_bytes];
+
+                    let gate_t = if quantize {
+                        let q4 = quantize_bf16_to_q4(gate_raw, moe_inter, hidden);
+                        backend.upload_tensor(&q4, &[moe_inter, hidden], TensorDtype::Q4)
+                    } else {
+                        backend.upload_tensor(gate_raw, &[moe_inter, hidden], TensorDtype::BF16)
+                    };
+                    let up_t = if quantize {
+                        let q4 = quantize_bf16_to_q4(up_raw, moe_inter, hidden);
+                        backend.upload_tensor(&q4, &[moe_inter, hidden], TensorDtype::Q4)
+                    } else {
+                        backend.upload_tensor(up_raw, &[moe_inter, hidden], TensorDtype::BF16)
+                    };
+                    let down_t = if quantize {
+                        let q4 = quantize_bf16_to_q4(down_raw, hidden, moe_inter);
+                        backend.upload_tensor(&q4, &[hidden, moe_inter], TensorDtype::Q4)
+                    } else {
+                        backend.upload_tensor(down_raw, &[hidden, moe_inter], TensorDtype::BF16)
+                    };
+
+                    experts.push(ExpertWeights {
+                        gate_proj: gate_t,
+                        up_proj: up_t,
+                        down_proj: down_t,
+                    });
+                }
+                experts
+            } else {
+                // Per-expert format (Qwen3-MoE): separate tensors per expert.
+                let mut experts = Vec::with_capacity(num_experts);
+                for j in 0..num_experts {
+                    let ep = format!("{prefix}.mlp.experts.{j}");
+                    experts.push(ExpertWeights {
+                        gate_proj: upload_maybe_q4(
+                            &store, backend,
+                            &format!("{ep}.gate_proj.weight"),
+                            &[moe_inter, hidden], quantize,
+                        )?,
+                        up_proj: upload_maybe_q4(
+                            &store, backend,
+                            &format!("{ep}.up_proj.weight"),
+                            &[moe_inter, hidden], quantize,
+                        )?,
+                        down_proj: upload_maybe_q4(
+                            &store, backend,
+                            &format!("{ep}.down_proj.weight"),
+                            &[hidden, moe_inter], quantize,
+                        )?,
+                    });
+                }
+                experts
+            };
             if i == 0 {
-                eprintln!("  loading {} experts per layer (moe_inter={})", num_experts, moe_inter);
+                eprintln!(
+                    "  loading {} experts per layer (moe_inter={}){}",
+                    num_experts, moe_inter,
+                    if is_fused { " [fused format]" } else { "" },
+                );
             }
 
-            (dummy, dummy2, dummy3, Some(router), Some(expert_vec))
+            // Load shared expert weights if present.
+            let (se_gate_proj, se_up_proj, se_down_proj, se_gate) = if has_shared_expert {
+                let gp = upload_maybe_q4(
+                    &store, backend,
+                    &format!("{prefix}.mlp.shared_expert.gate_proj.weight"),
+                    &[shared_inter, hidden], quantize,
+                )?;
+                let up = upload_maybe_q4(
+                    &store, backend,
+                    &format!("{prefix}.mlp.shared_expert.up_proj.weight"),
+                    &[shared_inter, hidden], quantize,
+                )?;
+                let dp = upload_maybe_q4(
+                    &store, backend,
+                    &format!("{prefix}.mlp.shared_expert.down_proj.weight"),
+                    &[hidden, shared_inter], quantize,
+                )?;
+                let sg = upload_tensor(
+                    &store, backend,
+                    &format!("{prefix}.mlp.shared_expert_gate.weight"),
+                    &[1, hidden],
+                )?;
+                if i == 0 {
+                    eprintln!("  shared expert: inter={}", shared_inter);
+                }
+                (Some(gp), Some(up), Some(dp), Some(sg))
+            } else {
+                (None, None, None, None)
+            };
+
+            (dummy, dummy2, dummy3, Some(router), Some(expert_vec),
+             se_gate_proj, se_up_proj, se_down_proj, se_gate)
         } else {
             // Dense FFN: standard gate/up/down projections.
             let gate = upload_maybe_q4(
@@ -452,53 +602,206 @@ pub(crate) fn load_weights<B: GpuBackend>(
                 &[hidden, inter],
                 quantize,
             )?;
-            (gate, up, down, None, None)
+            (gate, up, down, None, None, None, None, None, None)
+        };
+
+        // Load attention weights: DeltaNet layers use linear_attn namespace,
+        // GQA layers use self_attn namespace.
+        let (q_proj, k_proj, v_proj, o_proj, in_proj_qkv, in_proj_a, in_proj_b, in_proj_z, conv1d_weight, linear_out_proj, a_log, dt_bias, linear_norm, attn_z_proj) =
+            if is_deltanet_layer {
+                let dummy = backend.alloc_tensor(&[1], TensorDtype::BF16);
+                let dummy2 = backend.alloc_tensor(&[1], TensorDtype::BF16);
+                let dummy3 = backend.alloc_tensor(&[1], TensorDtype::BF16);
+                let dummy4 = backend.alloc_tensor(&[1], TensorDtype::BF16);
+
+                let qk_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+                let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+                let fused_dim = qk_dim * 2 + v_dim; // Q + K + V fused
+                let conv_dim = fused_dim; // Conv1D applied to concatenated QKV
+                let kernel_size = config.linear_conv_kernel_dim;
+
+                let qkv = upload_maybe_q4(
+                    &store, backend,
+                    &format!("{prefix}.linear_attn.in_proj_qkv.weight"),
+                    &[fused_dim, hidden], quantize,
+                )?;
+                let a = upload_maybe_q4(
+                    &store, backend,
+                    &format!("{prefix}.linear_attn.in_proj_a.weight"),
+                    &[config.linear_num_value_heads, hidden], quantize,
+                )?;
+                let b = upload_maybe_q4(
+                    &store, backend,
+                    &format!("{prefix}.linear_attn.in_proj_b.weight"),
+                    &[config.linear_num_value_heads, hidden], quantize,
+                )?;
+                let z = upload_maybe_q4(
+                    &store, backend,
+                    &format!("{prefix}.linear_attn.in_proj_z.weight"),
+                    &[v_dim, hidden], quantize,
+                )?;
+                // Conv1D: depthwise, shape [channels, 1, kernel_size] in safetensors.
+                let conv = upload_tensor(
+                    &store, backend,
+                    &format!("{prefix}.linear_attn.conv1d.weight"),
+                    &[conv_dim, 1, kernel_size],
+                )?;
+                let out = upload_maybe_q4(
+                    &store, backend,
+                    &format!("{prefix}.linear_attn.out_proj.weight"),
+                    &[hidden, v_dim], quantize,
+                )?;
+
+                // DeltaNet-specific non-projection weights:
+                //   A_log [num_v_heads] — log decay rates (stored f32, kept f32)
+                //   dt_bias [num_v_heads] — timestep bias (stored bf16, converted to f32)
+                //   norm.weight [value_head_dim] — output norm weight (stored f32, converted to bf16)
+                let a_log_tensor = upload_tensor(
+                    &store, backend,
+                    &format!("{prefix}.linear_attn.A_log"),
+                    &[config.linear_num_value_heads],
+                )?;
+                // dt_bias: convert bf16 → f32 for precision in decay gate computation.
+                let dt_bias_view = store.tensor(
+                    &format!("{prefix}.linear_attn.dt_bias"),
+                )?;
+                let dt_bias_f32: Vec<f32> = bytemuck::cast_slice::<u8, half::bf16>(dt_bias_view.data())
+                    .iter()
+                    .map(|v| v.to_f32())
+                    .collect();
+                let dt_bias_tensor = backend.upload_tensor(
+                    bytemuck::cast_slice(&dt_bias_f32),
+                    &[config.linear_num_value_heads],
+                    TensorDtype::F32,
+                );
+                // norm.weight: convert f32 → bf16 for compatibility with rms_norm_batch.
+                // Note: linear_attn.norm uses Qwen3_5MoeRMSNormGated which does NOT
+                // use residual form — weights are initialized to ones, not zeros.
+                // Only the layer norms use (1 + weight) residual form.
+                let norm_view = store.tensor(
+                    &format!("{prefix}.linear_attn.norm.weight"),
+                )?;
+                let norm_bf16: Vec<half::bf16> = bytemuck::cast_slice::<u8, f32>(norm_view.data())
+                    .iter()
+                    .map(|v| half::bf16::from_f32(*v))
+                    .collect();
+                let norm_weight = backend.upload_tensor(
+                    bytemuck::cast_slice(&norm_bf16),
+                    &[config.linear_value_head_dim],
+                    TensorDtype::BF16,
+                );
+
+                if i == 0 {
+                    eprintln!(
+                        "  DeltaNet layers: qk_dim={}, v_dim={}, kernel_size={}",
+                        qk_dim, v_dim, kernel_size
+                    );
+                }
+
+                (dummy, dummy2, dummy3, dummy4,
+                 Some(qkv), Some(a), Some(b), Some(z), Some(conv), Some(out),
+                 Some(a_log_tensor), Some(dt_bias_tensor), Some(norm_weight), None)
+            } else {
+                // Standard GQA attention.
+                //
+                // When attn_output_gate is true (Qwen 3.5), q_proj is fused with an
+                // output gate projection: [2*q_dim, hidden].
+                //
+                // HF does: view(bsz, q_len, num_heads, head_dim*2).chunk(2, dim=-1)
+                // This means the weight rows are interleaved per head:
+                //   [head0_Q(head_dim rows), head0_gate(head_dim rows),
+                //    head1_Q(head_dim rows), head1_gate(head_dim rows), ...]
+                // We deinterleave into separate Q [q_dim, hidden] and Z [q_dim, hidden].
+                let attn_output_gate = config.attn_output_gate;
+                let (qp, z_proj) = if attn_output_gate {
+                    let view = store.tensor(
+                        &format!("{prefix}.self_attn.q_proj.weight"),
+                    )?;
+                    let raw = view.data();
+                    let fused_q_dim = q_dim * 2;
+                    anyhow::ensure!(
+                        view.shape() == [fused_q_dim, hidden],
+                        "q_proj fused shape mismatch: expected [{}, {}], got {:?}",
+                        fused_q_dim, hidden, view.shape()
+                    );
+                    let row_bytes = hidden * 2; // bf16
+                    let hd_bytes = head_dim * row_bytes;
+                    let num_heads = config.num_attention_heads;
+
+                    // Deinterleave: for each head, first head_dim rows are Q,
+                    // next head_dim rows are gate.
+                    let mut q_raw = Vec::with_capacity(q_dim * row_bytes);
+                    let mut z_raw = Vec::with_capacity(q_dim * row_bytes);
+                    for h in 0..num_heads {
+                        let base = h * 2 * hd_bytes;
+                        q_raw.extend_from_slice(&raw[base..base + hd_bytes]);
+                        z_raw.extend_from_slice(&raw[base + hd_bytes..base + 2 * hd_bytes]);
+                    }
+
+                    let q_tensor = if quantize {
+                        let q4_data = quantize_bf16_to_q4(&q_raw, q_dim, hidden);
+                        backend.upload_tensor(&q4_data, &[q_dim, hidden], TensorDtype::Q4)
+                    } else {
+                        backend.upload_tensor(&q_raw, &[q_dim, hidden], TensorDtype::BF16)
+                    };
+                    let z_tensor = if quantize {
+                        let q4_data = quantize_bf16_to_q4(&z_raw, q_dim, hidden);
+                        backend.upload_tensor(&q4_data, &[q_dim, hidden], TensorDtype::Q4)
+                    } else {
+                        backend.upload_tensor(&z_raw, &[q_dim, hidden], TensorDtype::BF16)
+                    };
+                    (q_tensor, Some(z_tensor))
+                } else {
+                    let qp = upload_maybe_q4(
+                        &store, backend,
+                        &format!("{prefix}.self_attn.q_proj.weight"),
+                        &[q_dim, hidden], quantize,
+                    )?;
+                    (qp, None)
+                };
+                let kp = upload_maybe_q4(
+                    &store, backend,
+                    &format!("{prefix}.self_attn.k_proj.weight"),
+                    &[kv_dim, hidden], quantize,
+                )?;
+                let vp = upload_maybe_q4(
+                    &store, backend,
+                    &format!("{prefix}.self_attn.v_proj.weight"),
+                    &[kv_dim, hidden], quantize,
+                )?;
+                let op = upload_maybe_q4(
+                    &store, backend,
+                    &format!("{prefix}.self_attn.o_proj.weight"),
+                    &[hidden, q_dim], quantize,
+                )?;
+                (qp, kp, vp, op, None, None, None, None, None, None,
+                 None, None, None, z_proj)
+            };
+
+        // Upload norm weight, adding 1.0 for Qwen 3.5 residual normalization.
+        let upload_norm = |name: &str, shape: &[usize]| -> anyhow::Result<B::Tensor> {
+            if residual_norm {
+                upload_norm_residual(&store, backend, name, shape)
+            } else {
+                upload_tensor(&store, backend, name, shape)
+            }
         };
 
         layers.push(LayerWeights {
-            // Norm weights stay bf16 (1D, tiny, used for RMSNorm not matmul).
-            input_layernorm: upload_tensor(
-                &store,
-                backend,
+            input_layernorm: upload_norm(
                 &format!("{prefix}.input_layernorm.weight"),
                 &[hidden],
             )?,
-            q_proj: upload_maybe_q4(
-                &store,
-                backend,
-                &format!("{prefix}.self_attn.q_proj.weight"),
-                &[q_dim, hidden],
-                quantize,
-            )?,
-            k_proj: upload_maybe_q4(
-                &store,
-                backend,
-                &format!("{prefix}.self_attn.k_proj.weight"),
-                &[kv_dim, hidden],
-                quantize,
-            )?,
-            v_proj: upload_maybe_q4(
-                &store,
-                backend,
-                &format!("{prefix}.self_attn.v_proj.weight"),
-                &[kv_dim, hidden],
-                quantize,
-            )?,
-            o_proj: upload_maybe_q4(
-                &store,
-                backend,
-                &format!("{prefix}.self_attn.o_proj.weight"),
-                &[hidden, q_dim],
-                quantize,
-            )?,
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
             q_bias,
             k_bias,
             v_bias,
             q_norm,
             k_norm,
-            post_attention_layernorm: upload_tensor(
-                &store,
-                backend,
+            post_attention_layernorm: upload_norm(
                 &format!("{prefix}.post_attention_layernorm.weight"),
                 &[hidden],
             )?,
@@ -507,11 +810,29 @@ pub(crate) fn load_weights<B: GpuBackend>(
             down_proj,
             router_gate,
             experts,
+            in_proj_qkv,
+            in_proj_a,
+            in_proj_b,
+            in_proj_z,
+            conv1d_weight,
+            linear_out_proj,
+            a_log,
+            dt_bias,
+            linear_norm,
+            attn_z_proj,
+            shared_expert_gate_proj,
+            shared_expert_up_proj,
+            shared_expert_down_proj,
+            shared_expert_gate,
         });
     }
 
     // Final RMSNorm weight (applied after all layers, before lm_head).
-    let norm_weight = upload_tensor(&store, backend, "model.norm.weight", &[hidden])?;
+    let norm_weight = if residual_norm {
+        upload_norm_residual(&store, backend, &format!("{wp}norm.weight"), &[hidden])?
+    } else {
+        upload_tensor(&store, backend, &format!("{wp}norm.weight"), &[hidden])?
+    };
 
     eprintln!("loaded {} layers", layers.len());
     Ok(ModelWeights {
@@ -548,6 +869,44 @@ fn upload_tensor<B: GpuBackend>(
     };
 
     Ok(backend.upload_tensor(view.data(), shape, dtype))
+}
+
+/// Upload a norm weight with residual form: effective_weight = 1.0 + stored_weight.
+///
+/// Qwen 3.5 stores RMSNorm weights as offsets from 1.0 (initialized to zeros, so
+/// effective weight starts at 1.0).  This differs from Llama/Qwen2 which store
+/// direct scale factors (initialized to ones).  We add 1.0 during loading so the
+/// existing rms_norm kernel works unchanged.
+fn upload_norm_residual<B: GpuBackend>(
+    store: &TensorStore,
+    backend: &B,
+    name: &str,
+    expected_shape: &[usize],
+) -> anyhow::Result<B::Tensor> {
+    let view = store.tensor(name)?;
+    let shape = view.shape();
+    anyhow::ensure!(
+        shape == expected_shape,
+        "tensor '{name}' shape mismatch: expected {expected_shape:?}, got {shape:?}"
+    );
+
+    let bf16_out: Vec<bf16> = match view.dtype() {
+        safetensors::Dtype::BF16 => {
+            bytemuck::cast_slice::<u8, bf16>(view.data())
+                .iter()
+                .map(|v| bf16::from_f32(v.to_f32() + 1.0))
+                .collect()
+        }
+        safetensors::Dtype::F32 => {
+            bytemuck::cast_slice::<u8, f32>(view.data())
+                .iter()
+                .map(|v| bf16::from_f32(v + 1.0))
+                .collect()
+        }
+        other => anyhow::bail!("unsupported dtype {:?} for tensor '{name}'", other),
+    };
+
+    Ok(backend.upload_tensor(bytemuck::cast_slice(&bf16_out), shape, TensorDtype::BF16))
 }
 
 /// Upload a tensor, optionally quantising to Q4.

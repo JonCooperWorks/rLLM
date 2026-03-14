@@ -392,6 +392,117 @@ pub(crate) trait GpuBackend: Send + Sync {
         head_dim: u32,
     );
 
+    // --- DeltaNet operations (Qwen 3.5 hybrid attention) ---
+    //
+    // These operations implement Gated DeltaNet linear attention, which replaces
+    // softmax attention with a recurrent state matrix in 75% of Qwen 3.5's layers.
+
+    /// Causal depthwise Conv1D for single-token decode.
+    /// Convolves the current input with the history buffer using depthwise weights,
+    /// then applies SiLU activation.  Provides local positional context for DeltaNet
+    /// layers (which don't use RoPE).
+    fn conv1d_depthwise_single(
+        &self,
+        input: &Self::Tensor,
+        history: &Self::Tensor,
+        weight: &Self::Tensor,
+        out: &Self::Tensor,
+        dim: u32,
+        kernel_size: u32,
+    );
+
+    /// Shift Conv1D history buffer: discard oldest entry, append current input.
+    fn conv1d_shift_history(
+        &self,
+        history: &Self::Tensor,
+        input: &Self::Tensor,
+        dim: u32,
+        kernel_size: u32,
+    );
+
+    /// L2-normalize each head's vector in place (no learned weights).
+    /// After normalization, each head's vector has unit L2 norm.
+    /// `elem_offset` allows normalizing a sub-region of the buffer (e.g.,
+    /// Q or K portion of a fused QKV buffer).
+    fn l2_normalize_heads(
+        &self,
+        data: &Self::Tensor,
+        num_heads: u32,
+        head_dim: u32,
+        elem_offset: u32,
+    );
+
+    /// Element-wise sigmoid: out[i] = 1/(1+exp(-input[i])).
+    /// Input is bf16 (from matmul), output is f32 (for DeltaNet gates).
+    fn sigmoid(&self, input: &Self::Tensor, out: &Self::Tensor, size: u32);
+
+    /// Element-wise sigmoid (bf16→bf16): out[i] = sigmoid(input[i]).
+    /// Used for GQA output gating where both input and output are bf16.
+    fn sigmoid_bf16(&self, input: &Self::Tensor, out: &Self::Tensor, size: u32);
+
+    /// Mamba-style decay gate: g = exp(softplus(x + dt_bias) * (-exp(A_log))).
+    /// x is bf16, dt_bias and A_log are f32, output is f32.
+    fn deltanet_decay_gate(
+        &self,
+        x: &Self::Tensor,
+        dt_bias: &Self::Tensor,
+        a_log: &Self::Tensor,
+        out: &Self::Tensor,
+        size: u32,
+    );
+
+    /// Element-wise SiLU on bf16 tensors: out[i] = silu(input[i]).
+    fn silu(&self, input: &Self::Tensor, out: &Self::Tensor, size: u32);
+
+    /// Element-wise multiply (bf16): out[i] = a[i] * b[i].
+    fn mul(&self, a: &Self::Tensor, b: &Self::Tensor, out: &Self::Tensor, size: u32);
+
+    /// DeltaNet recurrent state update + output computation (single token).
+    /// Updates the state matrix and computes the attention output for each head.
+    /// Q/K/V can be the same buffer at different element offsets (e.g., after
+    /// splitting a fused QKV conv output).
+    fn deltanet_step(
+        &self,
+        state: &Self::Tensor,
+        q: &Self::Tensor,
+        k: &Self::Tensor,
+        v: &Self::Tensor,
+        alpha: &Self::Tensor,
+        beta: &Self::Tensor,
+        out: &Self::Tensor,
+        num_qk_heads: u32,
+        num_v_heads: u32,
+        head_dim: u32,
+        q_offset: u32,
+        k_offset: u32,
+        v_offset: u32,
+    );
+
+    /// RMSNorm without learned weights: out = input / sqrt(mean(input^2) + eps).
+    /// Used in DeltaNet output path before gating.
+    fn rms_norm_no_weight(
+        &self,
+        input: &Self::Tensor,
+        out: &Self::Tensor,
+        size: u32,
+        eps: f32,
+    );
+
+    /// Partial RoPE: apply rotary embeddings to only the first `rotary_dim`
+    /// dimensions of each head, leaving the rest unchanged.
+    /// Used by Qwen 3.5 GQA layers where partial_rotary_factor=0.25.
+    fn rope_partial(
+        &self,
+        q: &Self::Tensor,
+        k: &Self::Tensor,
+        pos: u32,
+        rope_theta: f32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        rotary_dim: u32,
+    );
+
     /// Paged attention: compute softmax(Q·K^T / √d) · V using a paged KV pool.
     /// Same algorithm as attention() but reads K/V through block table indirection.
     fn paged_attention(

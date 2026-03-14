@@ -42,6 +42,7 @@
 
 use crate::model::kv_cache;
 use serde::Deserialize;
+use serde_json::Value;
 
 // ===========================================================================
 // Model architecture enum — detected from config.json's `model_type` field.
@@ -81,6 +82,22 @@ pub enum ModelArch {
     /// Attention is identical to Llama (no QKV bias), but adds QK-norm (RMSNorm
     /// on Q and K after projection, before RoPE) and uses ChatML chat template.
     Qwen3Moe,
+    /// Qwen 3.5 hybrid architecture (e.g. Qwen3.5-27B).
+    ///
+    /// Learning note: Qwen 3.5 uses a HYBRID attention design — 75% of layers
+    /// use Gated DeltaNet (linear attention with recurrent state) and 25% use
+    /// standard GQA softmax attention.  This is fundamentally different from all
+    /// other supported architectures.
+    ///
+    /// DeltaNet layers maintain a fixed-size [head_dim, head_dim] state matrix
+    /// per head, updated via a delta rule with exponential gating.  This gives
+    /// O(1) per-token cost regardless of sequence length.  GQA layers use a
+    /// standard paged KV cache for full-precision retrieval.
+    ///
+    /// The model is multimodal (VLM), but we only use the language model portion.
+    /// The config.json has text parameters nested under `text_config`.
+    /// Weight tensors are prefixed with `model.language_model.` instead of `model.`.
+    Qwen3_5,
 }
 
 impl ModelArch {
@@ -95,7 +112,7 @@ impl ModelArch {
         match self {
             ModelArch::Llama => false,
             ModelArch::Qwen2 => true,
-            ModelArch::Qwen3Moe => false,
+            ModelArch::Qwen3Moe | ModelArch::Qwen3_5 => false,
         }
     }
 
@@ -109,6 +126,7 @@ impl ModelArch {
     pub fn has_qk_norm(&self) -> bool {
         match self {
             ModelArch::Llama | ModelArch::Qwen2 => false,
+            ModelArch::Qwen3_5 => true,  // GQA layers have QK-norm
             ModelArch::Qwen3Moe => true,
         }
     }
@@ -119,8 +137,9 @@ impl ModelArch {
             "llama" => Ok(ModelArch::Llama),
             "qwen2" => Ok(ModelArch::Qwen2),
             "qwen3_moe" => Ok(ModelArch::Qwen3Moe),
+            "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => Ok(ModelArch::Qwen3_5),
             other => anyhow::bail!(
-                "unsupported model_type '{}' (expected 'llama', 'qwen2', or 'qwen3_moe')",
+                "unsupported model_type '{}' (expected 'llama', 'qwen2', 'qwen3_moe', or 'qwen3_5')",
                 other
             ),
         }
@@ -155,8 +174,10 @@ pub struct ModelConfig {
     /// Some models (Qwen 2.5) omit this — computed from hidden_size / num_heads.
     #[serde(default)]
     pub head_dim: usize,
-    /// FFN hidden dimension.
+    /// FFN hidden dimension (dense models).
     /// The FFN expands to this size then contracts back to hidden_size.
+    /// MoE-only models (e.g. Qwen3.5) have no dense FFN — this is 0.
+    #[serde(default)]
     pub intermediate_size: usize,
     /// Number of tokens in the vocabulary.
     pub vocab_size: usize,
@@ -199,6 +220,89 @@ pub struct ModelConfig {
     /// Qwen3-Coder-30B-A3B: 768 per expert (vs 6144 dense intermediate_size).
     #[serde(default)]
     pub moe_intermediate_size: usize,
+    /// Hidden dimension of the shared (always-active) expert's FFN.
+    /// Qwen3.5-35B-A3B: 512.  Only present in models with a shared expert.
+    #[serde(default)]
+    pub shared_expert_intermediate_size: usize,
+
+    // --- Qwen 3.5 hybrid DeltaNet + GQA fields ---
+    //
+    // Learning note: Qwen 3.5 uses a hybrid architecture where 75% of layers
+    // use Gated DeltaNet (linear attention with a fixed-size recurrent state
+    // matrix) and 25% use standard GQA softmax attention.  DeltaNet layers
+    // have different head configurations than GQA layers.
+    //
+    // DeltaNet maintains a [head_dim, head_dim] = [128, 128] state matrix per
+    // QK-head that's updated at each token.  This gives O(1) per-token cost
+    // regardless of sequence length — no growing KV cache.  The trade-off is
+    // that the fixed-size state can't represent every detail of long contexts,
+    // which is why some layers still use full attention.
+
+    /// Number of key heads in DeltaNet (linear attention) layers.
+    /// Qwen3.5-27B: 16 QK-heads with head_dim=128.
+    #[serde(default)]
+    pub linear_num_key_heads: usize,
+    /// Number of value heads in DeltaNet layers.
+    /// Qwen3.5-27B: 48 V-heads — 3 V-heads per QK-head (GQA-style grouping).
+    #[serde(default)]
+    pub linear_num_value_heads: usize,
+    /// Head dimension for keys in DeltaNet layers.
+    #[serde(default)]
+    pub linear_key_head_dim: usize,
+    /// Head dimension for values in DeltaNet layers.
+    #[serde(default)]
+    pub linear_value_head_dim: usize,
+    /// Kernel size for the causal depthwise Conv1D in DeltaNet layers.
+    /// Conv1D provides local positional information (DeltaNet has no RoPE).
+    #[serde(default)]
+    pub linear_conv_kernel_dim: usize,
+    /// How often a full-attention layer appears (e.g. 4 = every 4th layer).
+    /// Layer pattern: [DeltaNet, DeltaNet, DeltaNet, GQA, DeltaNet, ...].
+    #[serde(default)]
+    pub full_attention_interval: usize,
+    /// Per-layer attention type: "linear_attention" or "full_attention".
+    /// This is the authoritative source for which layers use which mechanism.
+    #[serde(default)]
+    pub layer_types: Vec<String>,
+    /// Fraction of head_dim that gets RoPE in full-attention layers.
+    /// Qwen3.5: 0.25, meaning only 64 of 256 dims get rotary embeddings.
+    #[serde(default)]
+    pub partial_rotary_factor: f64,
+    /// RoPE parameters for models with nested rope config (Qwen 3.5).
+    #[serde(default)]
+    pub rope_parameters: Option<RopeParameters>,
+
+    /// Whether full-attention layers use output gating (Qwen 3.5).
+    /// When true, q_proj produces [Q, Z] concatenated (2× q_dim), and the
+    /// attention output is gated: out = rmsnorm_no_weight(attn_out) * silu(Z).
+    #[serde(default)]
+    pub attn_output_gate: bool,
+
+    // --- Weight prefix ---
+    // Multimodal models (Qwen 3.5) prefix layer weights with
+    // "model.language_model." instead of "model.".  This field is set
+    // during config loading, not deserialized from JSON.
+    #[serde(skip)]
+    pub weight_prefix: String,
+}
+
+/// RoPE parameters for models with nested rope configuration (Qwen 3.5).
+///
+/// Unlike the older RopeScaling struct, this encodes the base theta and
+/// partial rotary factor directly, used by models with non-standard RoPE.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct RopeParameters {
+    #[serde(default)]
+    pub rope_type: String,
+    #[serde(default = "default_rope_theta")]
+    pub rope_theta: f64,
+    #[serde(default)]
+    pub partial_rotary_factor: f64,
+}
+
+fn default_rope_theta() -> f64 {
+    10000.0
 }
 
 /// RoPE frequency scaling parameters for extended context lengths.
@@ -225,11 +329,60 @@ pub struct RopeScaling {
 impl ModelConfig {
     /// Load config from a JSON file.
     ///
+    /// Handles two config layouts:
+    ///   1. Flat configs (Llama, Qwen2, Qwen3-MoE): fields at top level.
+    ///   2. Nested configs (Qwen 3.5 VLM): text model fields inside `text_config`,
+    ///      with `tie_word_embeddings` at the outer level.
+    ///
     /// If `head_dim` is missing from the JSON (e.g. Qwen 2.5), it's computed
     /// as hidden_size / num_attention_heads.
     pub fn from_file(path: &std::path::Path) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
-        let mut config: Self = serde_json::from_str(&contents)?;
+        let raw: Value = serde_json::from_str(&contents)?;
+
+        // Detect nested VLM config: if `text_config` exists, extract it and
+        // merge top-level fields (like `tie_word_embeddings`) into it.
+        let (config_value, weight_prefix) = if let Some(text_config) = raw.get("text_config") {
+            let mut merged = text_config.clone();
+            // Promote top-level `tie_word_embeddings` into text_config if not already set.
+            if let Some(tie) = raw.get("tie_word_embeddings") {
+                if merged.get("tie_word_embeddings").is_none() {
+                    merged.as_object_mut().unwrap().insert(
+                        "tie_word_embeddings".to_string(),
+                        tie.clone(),
+                    );
+                }
+            }
+            // Use "qwen3_5" as model_type for architecture detection.
+            merged.as_object_mut().unwrap().insert(
+                "model_type".to_string(),
+                Value::String("qwen3_5".to_string()),
+            );
+            // Extract rope_theta from nested rope_parameters if present.
+            // Clone values first to avoid borrow conflicts.
+            let rope_theta_val = merged.get("rope_parameters")
+                .and_then(|rp| rp.get("rope_theta"))
+                .cloned();
+            let prf_val = merged.get("rope_parameters")
+                .and_then(|rp| rp.get("partial_rotary_factor"))
+                .cloned();
+            if let Some(theta) = rope_theta_val {
+                if merged.get("rope_theta").is_none() {
+                    merged.as_object_mut().unwrap().insert("rope_theta".to_string(), theta);
+                }
+            }
+            if let Some(prf) = prf_val {
+                if merged.get("partial_rotary_factor").is_none() {
+                    merged.as_object_mut().unwrap().insert("partial_rotary_factor".to_string(), prf);
+                }
+            }
+            (merged, "model.language_model.".to_string())
+        } else {
+            (raw, "model.".to_string())
+        };
+
+        let mut config: Self = serde_json::from_value(config_value)?;
+        config.weight_prefix = weight_prefix;
         if config.head_dim == 0 {
             config.head_dim = config.hidden_size / config.num_attention_heads;
         }
@@ -251,6 +404,29 @@ impl ModelConfig {
     /// Whether this model uses Mixture of Experts instead of dense FFN.
     pub fn is_moe(&self) -> bool {
         self.num_experts > 0
+    }
+
+    /// Whether this model has a shared expert alongside routed experts.
+    pub fn has_shared_expert(&self) -> bool {
+        self.shared_expert_intermediate_size > 0
+    }
+
+    /// Effective intermediate size for buffer allocation.
+    ///
+    /// Dense models use `intermediate_size`.  MoE-only models have no dense FFN
+    /// (intermediate_size=0), but still need scratch buffers sized for the
+    /// largest operation — the output gate Z projection uses q_dim, and the
+    /// shared expert uses shared_expert_intermediate_size.
+    pub fn effective_intermediate_size(&self) -> usize {
+        if self.intermediate_size > 0 {
+            self.intermediate_size
+        } else {
+            let q_dim = self.num_attention_heads * self.head_dim;
+            q_dim
+                .max(self.hidden_size)
+                .max(self.shared_expert_intermediate_size)
+                .max(self.moe_intermediate_size)
+        }
     }
 
     /// Estimate total GPU memory for model weights in bytes.
@@ -318,6 +494,12 @@ impl ModelConfig {
                     + proj(moe_inter, hidden)             // up_proj
                     + proj(hidden, moe_inter);            // down_proj
                 layer += self.num_experts * per_expert;
+                // Shared expert (if present).
+                if self.has_shared_expert() {
+                    let se = self.shared_expert_intermediate_size;
+                    layer += proj(se, hidden) + proj(se, hidden) + proj(hidden, se);
+                    layer += 1 * hidden * 2; // shared_expert_gate [1, hidden] bf16
+                }
             } else {
                 // Dense FFN: gate/up/down projections.
                 layer += proj(inter, hidden); // gate_proj
@@ -355,5 +537,63 @@ impl ModelConfig {
         // Use 75% of available space for KV cache.
         let num_blocks = (available * 3 / 4 / bytes_per_block) as usize;
         num_blocks.clamp(256, 8192)
+    }
+
+    /// Whether this model uses the hybrid DeltaNet + GQA architecture.
+    pub fn is_hybrid_deltanet(&self) -> bool {
+        !self.layer_types.is_empty()
+    }
+
+    /// Whether a given layer uses DeltaNet (linear) attention.
+    /// Returns false for standard GQA (full attention) layers.
+    pub fn is_linear_attention_layer(&self, layer_idx: usize) -> bool {
+        if layer_idx < self.layer_types.len() {
+            self.layer_types[layer_idx] == "linear_attention"
+        } else {
+            false
+        }
+    }
+
+    /// Number of RoPE dimensions for full-attention layers.
+    /// Qwen 3.5: partial_rotary_factor=0.25, head_dim=256 → 64 RoPE dims.
+    pub fn rotary_dim(&self) -> usize {
+        if self.partial_rotary_factor > 0.0 && self.partial_rotary_factor < 1.0 {
+            (self.head_dim as f64 * self.partial_rotary_factor) as usize
+        } else {
+            self.head_dim
+        }
+    }
+
+    /// Number of layers that need KV cache (GQA layers only for hybrid models).
+    pub fn num_kv_layers(&self) -> usize {
+        if self.layer_types.is_empty() {
+            self.num_hidden_layers
+        } else {
+            self.layer_types
+                .iter()
+                .filter(|t| t.as_str() == "full_attention")
+                .count()
+        }
+    }
+
+    /// Build a mapping from layer_idx → kv_pool_idx (None for DeltaNet layers).
+    pub fn kv_layer_map(&self) -> Vec<Option<usize>> {
+        if self.layer_types.is_empty() {
+            (0..self.num_hidden_layers).map(Some).collect()
+        } else {
+            let mut idx = 0;
+            self.layer_types
+                .iter()
+                .map(|t| {
+                    if t == "full_attention" {
+                        let r = Some(idx);
+                        idx += 1;
+                        r
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
     }
 }

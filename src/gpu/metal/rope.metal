@@ -213,3 +213,69 @@ kernel void rotary_embedding_batch(
     data[idx_a] = bfloat(a * cos_val - b * sin_val);
     data[idx_b] = bfloat(a * sin_val + b * cos_val);
 }
+
+// ===========================================================================
+// Partial RoPE — only rotate the first `rotary_dim` dimensions of each head.
+//
+// Used by Qwen 3.5 GQA layers where partial_rotary_factor=0.25, meaning
+// only 64 of 256 head dimensions get rotary embeddings.  The remaining
+// 192 dimensions pass through unchanged.  This is a design choice from
+// the model training — the model learned to use some head dimensions
+// for positional information and others for pure content.
+//
+// Dispatch: one thread per (head, pair) where pair ∈ 0..rotary_dim/2.
+// Total threads: (num_heads + num_kv_heads) * (rotary_dim / 2).
+// ===========================================================================
+
+struct RopePartialParams {
+    uint pos;
+    float rope_theta;
+    uint num_heads;
+    uint num_kv_heads;
+    uint head_dim;      // full head dimension (256)
+    uint rotary_dim;    // dimensions to rotate (64)
+};
+
+kernel void rotary_embedding_partial(
+    constant RopePartialParams& params [[buffer(0)]],
+    device bfloat* q                   [[buffer(1)]],
+    device bfloat* k                   [[buffer(2)]],
+    uint gid                           [[thread_position_in_grid]]
+) {
+    const uint half_rotary = params.rotary_dim / 2;
+    const uint q_pairs = params.num_heads * half_rotary;
+    const uint total_pairs = q_pairs + params.num_kv_heads * half_rotary;
+
+    if (gid >= total_pairs) return;
+
+    device bfloat* data;
+    uint pair_within;
+    if (gid < q_pairs) {
+        data = q;
+        pair_within = gid;
+    } else {
+        data = k;
+        pair_within = gid - q_pairs;
+    }
+
+    uint head_idx = pair_within / half_rotary;
+    uint pair_in_head = pair_within % half_rotary;
+
+    // Frequency based on rotary_dim (not full head_dim).
+    float freq_exp = 2.0f * float(pair_in_head) / float(params.rotary_dim);
+    float inv_freq = 1.0f / pow(params.rope_theta, freq_exp);
+    float angle = float(params.pos) * inv_freq;
+    float cos_val = cos(angle);
+    float sin_val = sin(angle);
+
+    // Halved convention within the rotary portion only.
+    // Element i pairs with element i + rotary_dim/2, both within
+    // the first rotary_dim dims of the head.
+    uint head_offset = head_idx * params.head_dim;
+    uint idx_a = head_offset + pair_in_head;
+    uint idx_b = head_offset + pair_in_head + half_rotary;
+    float a = float(data[idx_a]);
+    float b = float(data[idx_b]);
+    data[idx_a] = bfloat(a * cos_val - b * sin_val);
+    data[idx_b] = bfloat(a * sin_val + b * cos_val);
+}

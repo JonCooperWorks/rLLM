@@ -159,6 +159,28 @@ pub(crate) struct Model<'a, B: GpuBackend> {
     /// (expert_index, routing_weight).  Eliminates per-layer GPU→CPU sync
     /// for top-k selection.
     pub(crate) routing_output: Option<B::Tensor>,  // [2*k] f32
+
+    // -----------------------------------------------------------------------
+    // DeltaNet state (Qwen 3.5 hybrid models only).
+    //
+    // DeltaNet layers maintain a fixed-size [head_dim, head_dim] recurrent
+    // state matrix per QK-head (in f32 for precision), plus a Conv1D history
+    // buffer for causal convolution.  These persist across tokens.
+    // -----------------------------------------------------------------------
+    pub(crate) deltanet_states: Option<Vec<B::Tensor>>,       // per-DeltaNet-layer f32 state
+    pub(crate) deltanet_conv_history: Option<Vec<B::Tensor>>, // per-DeltaNet-layer bf16 history
+
+    // DeltaNet scratch buffers (reused every forward pass).
+    pub(crate) dn_qkv_buf: Option<B::Tensor>,    // [qk_dim*2 + v_dim] bf16 — fused QKV output
+    pub(crate) dn_alpha_buf: Option<B::Tensor>,   // [num_v_heads] f32 — decay gates
+    pub(crate) dn_beta_buf: Option<B::Tensor>,    // [num_v_heads] f32 — update gates
+    pub(crate) dn_z_buf: Option<B::Tensor>,       // [v_dim] bf16 — output gate
+    pub(crate) dn_conv_out: Option<B::Tensor>,    // [conv_dim] bf16 — conv1d output
+    pub(crate) dn_attn_out: Option<B::Tensor>,    // [v_dim] bf16 — DeltaNet attention output
+    pub(crate) dn_norm_out: Option<B::Tensor>,    // [v_dim] bf16 — RMSNorm-no-weight output
+
+    // KV layer mapping: layer_idx → kv_pool_idx (None for DeltaNet layers).
+    pub(crate) kv_layer_map: Vec<Option<usize>>,
 }
 
 impl<'a, B: GpuBackend> Model<'a, B> {
@@ -169,13 +191,12 @@ impl<'a, B: GpuBackend> Model<'a, B> {
         backend: &'a B,
     ) -> anyhow::Result<Self> {
         let kv_dim = config.num_key_value_heads * config.head_dim;
+        let num_kv_layers = config.num_kv_layers();
 
-        // Allocate per-layer KV caches.
-        // Each cache is [MAX_SEQ_LEN, kv_dim] — flattened to a 1D buffer.
-        // For Llama 3.2 1B: kv_dim = 8 heads x 64 dim = 512 elements per position.
-        let mut k_cache = Vec::with_capacity(config.num_hidden_layers);
-        let mut v_cache = Vec::with_capacity(config.num_hidden_layers);
-        for _ in 0..config.num_hidden_layers {
+        // Allocate per-layer KV caches (only for GQA layers in hybrid models).
+        let mut k_cache = Vec::with_capacity(num_kv_layers);
+        let mut v_cache = Vec::with_capacity(num_kv_layers);
+        for _ in 0..num_kv_layers {
             k_cache.push(backend.alloc_tensor(&[MAX_SEQ_LEN, kv_dim], TensorDtype::BF16));
             v_cache.push(backend.alloc_tensor(&[MAX_SEQ_LEN, kv_dim], TensorDtype::BF16));
         }
@@ -200,7 +221,8 @@ impl<'a, B: GpuBackend> Model<'a, B> {
         num_blocks: usize,
     ) -> anyhow::Result<Self> {
         let kv_dim = config.num_key_value_heads * config.head_dim;
-        let pool = KvPool::new(backend, num_blocks, kv_dim, config.num_hidden_layers);
+        let num_kv_layers = config.num_kv_layers();
+        let pool = KvPool::new(backend, num_blocks, kv_dim, num_kv_layers);
         let seq_state = pool.new_sequence(backend);
 
         let kv_mode = KvMode::Paged { pool, seq_state };
@@ -220,16 +242,31 @@ impl<'a, B: GpuBackend> Model<'a, B> {
         // Qwen3 MoE has hidden=2048 with 32×128=4096 attention dimension.
         let q_dim = config.num_attention_heads * config.head_dim;
         let kv_dim = config.num_key_value_heads * config.head_dim;
-        let inter = config.intermediate_size;
+        let inter = config.effective_intermediate_size();
         let vocab = config.vocab_size;
+        let is_hybrid = config.is_hybrid_deltanet();
+
+        // For hybrid models, scratch buffers must be sized for the max dimension
+        // across both layer types (DeltaNet and GQA).
+        let (eff_q_dim, eff_kv_dim, eff_attn_dim) = if is_hybrid {
+            let dn_qk_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+            let dn_v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+            (
+                q_dim.max(dn_qk_dim),        // GQA Q vs DeltaNet Q
+                kv_dim.max(dn_qk_dim),       // GQA KV vs DeltaNet K
+                q_dim.max(dn_v_dim),          // GQA attn_out vs DeltaNet V output
+            )
+        } else {
+            (q_dim, kv_dim, q_dim)
+        };
 
         // Allocate scratch buffers — one of each, reused across all layers.
         let hidden_buf = backend.alloc_tensor(&[hidden], TensorDtype::BF16);
         let norm_buf = backend.alloc_tensor(&[hidden], TensorDtype::BF16);
-        let q_buf = backend.alloc_tensor(&[q_dim], TensorDtype::BF16);
-        let k_buf = backend.alloc_tensor(&[kv_dim], TensorDtype::BF16);
-        let v_buf = backend.alloc_tensor(&[kv_dim], TensorDtype::BF16);
-        let attn_out = backend.alloc_tensor(&[q_dim], TensorDtype::BF16);
+        let q_buf = backend.alloc_tensor(&[eff_q_dim], TensorDtype::BF16);
+        let k_buf = backend.alloc_tensor(&[eff_kv_dim], TensorDtype::BF16);
+        let v_buf = backend.alloc_tensor(&[eff_attn_dim], TensorDtype::BF16);
+        let attn_out = backend.alloc_tensor(&[eff_attn_dim], TensorDtype::BF16);
         let gate_buf = backend.alloc_tensor(&[inter], TensorDtype::BF16);
         let up_buf = backend.alloc_tensor(&[inter], TensorDtype::BF16);
         let logits_buf = backend.alloc_tensor(&[vocab], TensorDtype::BF16);
@@ -252,6 +289,57 @@ impl<'a, B: GpuBackend> Model<'a, B> {
                 (None, None, None, None, None)
             };
 
+        // DeltaNet state and scratch buffers: only for hybrid models.
+        let (deltanet_states, deltanet_conv_history, dn_qkv_buf, dn_alpha_buf,
+             dn_beta_buf, dn_z_buf, dn_conv_out, dn_attn_out, dn_norm_out) = if is_hybrid {
+            let num_qk_heads = config.linear_num_key_heads;
+            let num_v_heads = config.linear_num_value_heads;
+            let hd = config.linear_key_head_dim;
+            let v_per_qk = num_v_heads / num_qk_heads;
+            let v_dim = num_v_heads * config.linear_value_head_dim;
+            let qk_dim = num_qk_heads * hd;
+            let conv_dim = qk_dim * 2 + v_dim; // Q + K + V concatenated
+            let kernel_size = config.linear_conv_kernel_dim;
+
+            // State matrices: one [num_qk_heads * v_per_qk * hd * hd] f32 per DeltaNet layer.
+            let num_dn_layers = config.layer_types.iter()
+                .filter(|t| t.as_str() == "linear_attention").count();
+            let state_size = num_qk_heads * v_per_qk * hd * hd;
+            let mut states = Vec::with_capacity(num_dn_layers);
+            let mut conv_histories = Vec::with_capacity(num_dn_layers);
+            for _ in 0..num_dn_layers {
+                states.push(backend.alloc_tensor(&[state_size], TensorDtype::F32));
+                conv_histories.push(backend.alloc_tensor(
+                    &[(kernel_size - 1) * conv_dim],
+                    TensorDtype::BF16,
+                ));
+            }
+
+            // Zero-initialise states and conv histories.
+            for s in &states {
+                backend.fill_zero(s, state_size as u32);
+            }
+            for h in &conv_histories {
+                backend.fill_zero(h, ((kernel_size - 1) * conv_dim) as u32);
+            }
+
+            (
+                Some(states),
+                Some(conv_histories),
+                Some(backend.alloc_tensor(&[conv_dim], TensorDtype::BF16)),
+                Some(backend.alloc_tensor(&[num_v_heads], TensorDtype::F32)),
+                Some(backend.alloc_tensor(&[num_v_heads], TensorDtype::F32)),
+                Some(backend.alloc_tensor(&[v_dim], TensorDtype::BF16)),
+                Some(backend.alloc_tensor(&[conv_dim], TensorDtype::BF16)),
+                Some(backend.alloc_tensor(&[v_dim], TensorDtype::BF16)),
+                Some(backend.alloc_tensor(&[v_dim], TensorDtype::BF16)),
+            )
+        } else {
+            (None, None, None, None, None, None, None, None, None)
+        };
+
+        let kv_layer_map = config.kv_layer_map();
+
         Ok(Self {
             config,
             weights,
@@ -272,6 +360,16 @@ impl<'a, B: GpuBackend> Model<'a, B> {
             moe_up_buf,
             moe_output,
             routing_output,
+            deltanet_states,
+            deltanet_conv_history,
+            dn_qkv_buf,
+            dn_alpha_buf,
+            dn_beta_buf,
+            dn_z_buf,
+            dn_conv_out,
+            dn_attn_out,
+            dn_norm_out,
+            kv_layer_map,
         })
     }
 
@@ -297,6 +395,7 @@ impl<'a, B: GpuBackend> Model<'a, B> {
             ModelArch::Llama => registry::llama::forward(self, token_id),
             ModelArch::Qwen2 => registry::qwen::forward(self, token_id),
             ModelArch::Qwen3Moe => registry::qwen3_moe::forward(self, token_id),
+            ModelArch::Qwen3_5 => registry::qwen3_5::forward(self, token_id),
         }
     }
 
@@ -315,6 +414,7 @@ impl<'a, B: GpuBackend> Model<'a, B> {
             ModelArch::Llama => registry::llama::forward_single_paged(self, token_id, pool, seq_state),
             ModelArch::Qwen2 => registry::qwen::forward_single_paged(self, token_id, pool, seq_state),
             ModelArch::Qwen3Moe => registry::qwen3_moe::forward_single_paged(self, token_id, pool, seq_state),
+            ModelArch::Qwen3_5 => registry::qwen3_5::forward_single_paged(self, token_id, pool, seq_state),
         }
     }
 
@@ -339,6 +439,7 @@ impl<'a, B: GpuBackend> Model<'a, B> {
             ModelArch::Llama => registry::llama::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
             ModelArch::Qwen2 => registry::qwen::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
             ModelArch::Qwen3Moe => registry::qwen3_moe::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
+            ModelArch::Qwen3_5 => registry::qwen3_5::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
         }
     }
 
@@ -393,7 +494,7 @@ impl<B: GpuBackend> PrefillBuffers<B> {
         let hidden = config.hidden_size;
         let q_dim = config.num_attention_heads * config.head_dim;
         let kv_dim = config.num_key_value_heads * config.head_dim;
-        let inter = config.intermediate_size;
+        let inter = config.effective_intermediate_size();
 
         Self {
             hidden: backend.alloc_tensor(&[max_chunk, hidden], TensorDtype::BF16),

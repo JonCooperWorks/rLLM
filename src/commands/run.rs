@@ -91,7 +91,7 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
     let gpu_budget = backend.recommended_max_memory();
     let num_blocks = config.recommended_kv_blocks(gpu_budget, args.quantize);
     let kv_dim = config.num_key_value_heads * config.head_dim;
-    let mut kv_pool = kv_cache::KvPool::new(&backend, num_blocks, kv_dim, config.num_hidden_layers);
+    let mut kv_pool = kv_cache::KvPool::new(&backend, num_blocks, kv_dim, config.num_kv_layers());
     let mut seq_state = kv_pool.new_sequence(&backend);
     let max_prefill = 4096;
     let prefill_bufs = model::PrefillBuffers::new(&backend, &config, max_prefill);
