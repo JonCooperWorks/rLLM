@@ -47,6 +47,7 @@
 use crate::gpu::GpuBackend;
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives;
+use crate::model::profile::{self, Component};
 use crate::model::{KvMode, Model, PrefillBuffers};
 
 // ---------------------------------------------------------------------------
@@ -62,9 +63,8 @@ use crate::model::{KvMode, Model, PrefillBuffers};
 // different from first doing softmax over all experts then taking top-k.
 // ---------------------------------------------------------------------------
 
-/// Select top-k expert indices and compute their routing weights.
-///
-/// Returns Vec<(expert_index, routing_weight)> sorted by weight (descending).
+/// CPU fallback for top-k routing (unused — GPU kernel handles this now).
+#[allow(dead_code)]
 fn top_k_routing(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
     // Find the k largest logits by index.
     let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
@@ -98,6 +98,10 @@ fn top_k_routing(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
 // ---------------------------------------------------------------------------
 
 /// Run the MoE FFN block for a single token.
+///
+/// Uses GPU-side top-k routing to avoid per-layer GPU→CPU synchronization.
+/// The router matmul + top-k selection + softmax all happen on GPU; only
+/// the final (index, weight) pairs are read back to CPU for expert dispatch.
 fn moe_ffn_block<B: GpuBackend>(
     m: &Model<'_, B>,
     layer_idx: usize,
@@ -112,10 +116,10 @@ fn moe_ffn_block<B: GpuBackend>(
     // Unwrap MoE-specific buffers and weights.
     let router_gate = layer.router_gate.as_ref().unwrap();
     let experts = layer.experts.as_ref().unwrap();
-    let _router_logits = m.router_logits.as_ref().unwrap();
     let moe_gate_buf = m.moe_gate_buf.as_ref().unwrap();
     let moe_up_buf = m.moe_up_buf.as_ref().unwrap();
     let moe_output = m.moe_output.as_ref().unwrap();
+    let routing_output = m.routing_output.as_ref().unwrap();
 
     // Step 1: RMSNorm → norm_buf.
     m.backend.rms_norm(
@@ -126,52 +130,41 @@ fn moe_ffn_block<B: GpuBackend>(
     );
 
     // Step 2: Router matmul — compute per-expert scores.
-    // gate_weight [num_experts, hidden_size] × norm_buf [hidden_size] → router_logits [num_experts]
-    //
-    // Learning note: the router uses bf16 weights but f32 output logits.
-    // We use the standard matmul kernel which auto-detects bf16 weights.
-    // The output into router_logits (F32 tensor) is fine because matmul
-    // accumulates in f32 and narrows to the output dtype.  Actually the
-    // matmul kernel always outputs bf16 — so we need to use a bf16-sized
-    // buffer and then read it back as bf16.  Let's reuse norm_buf math below.
-    //
-    // Actually: router_logits is allocated as F32, but our matmul kernel
-    // outputs bf16.  We need to read back bf16 values.  Let's use the
-    // moe_output buffer (bf16, size [hidden_size]) — but that's the wrong
-    // size.  Better: allocate router_logits as bf16 too.
-    //
-    // Wait — the matmul output is bf16 (all our matmul kernels output bf16).
-    // But we need f32 logits for accurate top-k selection.  The simplest
-    // approach: matmul into a bf16 buffer, copy to host, convert to f32 on CPU.
-    // We can reuse moe_gate_buf or moe_up_buf if they're big enough (need
-    // num_experts elements).
-    //
-    // num_experts=128, moe_inter=768 — moe_gate_buf has 768 elements.
-    // 128 < 768, so moe_gate_buf is big enough to hold the router output.
+    // gate_weight [num_experts, hidden_size] × norm_buf [hidden_size]
+    // → moe_gate_buf (reused as temporary: first num_experts bf16 values)
     m.backend.matmul(
         router_gate,
         &m.norm_buf,
-        moe_gate_buf, // reuse as temporary: first 128 bf16 values
+        moe_gate_buf,
         num_experts as u32,
         hidden_size,
     );
 
-    // Step 3: Copy router logits to CPU for top-k selection.
-    // We read the full moe_gate_buf (it's bigger than num_experts, but
-    // copy_to_host requires the full tensor size) and use the first
-    // num_experts bf16 values.
-    let buf_bytes = m.backend.tensor_byte_count(moe_gate_buf);
-    let mut logit_buf = vec![0u8; buf_bytes];
-    m.backend.copy_to_host(moe_gate_buf, &mut logit_buf);
-    let logit_bytes = num_experts * 2; // bf16 = 2 bytes each
-    let bf16_logits: &[half::bf16] = bytemuck::cast_slice(&logit_buf[..logit_bytes]);
-    let f32_logits: Vec<f32> = bf16_logits[..num_experts]
-        .iter()
-        .map(|v| v.to_f32())
-        .collect();
+    // Step 3: GPU-side top-k + softmax.
+    // The kernel reads bf16 logits from moe_gate_buf, finds top-k indices,
+    // computes softmax weights, and writes (index, weight) pairs to
+    // routing_output as f32.
+    m.backend.top_k_softmax(
+        moe_gate_buf,
+        routing_output,
+        num_experts as u32,
+        num_experts_per_tok as u32,
+    );
 
-    // Step 4: Top-k routing on CPU.
-    let selected = top_k_routing(&f32_logits, num_experts_per_tok);
+    // Step 4: Read routing results to CPU.
+    // This triggers a GPU flush, but now the flush commits all accumulated
+    // work (attention + router + top-k) as a single batch — much cheaper
+    // than the old approach of flushing 50+ individual command buffers.
+    let k = num_experts_per_tok;
+    let routing_bytes = k * 2 * 4; // 2*k f32 values
+    let buf_bytes = m.backend.tensor_byte_count(routing_output);
+    let mut routing_buf = vec![0u8; buf_bytes];
+    m.backend.copy_to_host(routing_output, &mut routing_buf);
+    let routing_data: &[f32] = bytemuck::cast_slice(&routing_buf[..routing_bytes]);
+
+    let selected: Vec<(usize, f32)> = (0..k)
+        .map(|i| (routing_data[2 * i] as usize, routing_data[2 * i + 1]))
+        .collect();
 
     // Step 5: Zero the accumulator, then run each selected expert's FFN.
     m.backend.fill_zero(moe_output, hidden_size);
@@ -180,8 +173,6 @@ fn moe_ffn_block<B: GpuBackend>(
         let expert = &experts[expert_idx];
 
         // Expert FFN: gate/up projections → SwiGLU → down projection.
-        // gate_proj [moe_inter, hidden] × norm_buf → moe_gate_buf [moe_inter]
-        // up_proj   [moe_inter, hidden] × norm_buf → moe_up_buf [moe_inter]
         m.backend.matmul(
             &expert.gate_proj,
             &m.norm_buf,
@@ -201,13 +192,8 @@ fn moe_ffn_block<B: GpuBackend>(
         m.backend
             .silu_mul(moe_gate_buf, moe_up_buf, moe_gate_buf, moe_inter);
 
-        // Down projection: [hidden, moe_inter] × moe_gate_buf → gate_buf [hidden]
-        //
-        // Why gate_buf instead of norm_buf?  norm_buf holds the RMSNorm'd hidden
-        // state that ALL experts read from (gate/up matmuls above).  Writing the
-        // down_proj output to norm_buf would corrupt the input for subsequent
-        // experts.  gate_buf (sized [intermediate_size]) is unused by MoE layers
-        // and is large enough for [hidden_size].
+        // Down projection: gate_buf used as output (norm_buf must be preserved
+        // for all experts to read from).
         m.backend.matmul(
             &expert.down_proj,
             moe_gate_buf,
@@ -250,12 +236,15 @@ pub(crate) fn forward_single_paged<B: GpuBackend>(
     let num_experts = m.config.num_experts;
     let num_experts_per_tok = m.config.num_experts_per_tok;
 
+    let t = profile::begin(m.backend);
     primitives::embed_token(m.backend, &m.weights, token_id, &m.hidden, hidden_size);
+    profile::record(m.backend, t, Component::Embed);
 
     for layer_idx in 0..m.config.num_hidden_layers {
         let layer = &m.weights.layers[layer_idx];
 
         // --- Attention sub-block (same as Llama, plus QK-norm) ---
+        let t = profile::begin(m.backend);
         m.backend
             .rms_norm(&m.hidden, &layer.input_layernorm, eps, &m.norm_buf);
         primitives::qkv_projection_qdim(
@@ -288,15 +277,20 @@ pub(crate) fn forward_single_paged<B: GpuBackend>(
         primitives::o_proj_residual_qdim(
             m.backend, layer, &m.attn_out, &m.norm_buf, &m.hidden, hidden_size, q_dim,
         );
+        profile::record(m.backend, t, Component::Attention);
 
         // --- MoE FFN sub-block ---
+        let t = profile::begin(m.backend);
         moe_ffn_block(m, layer_idx, hidden_size, moe_inter, num_experts, num_experts_per_tok);
+        profile::record(m.backend, t, Component::Ffn);
     }
 
+    let t = profile::begin(m.backend);
     primitives::final_norm_and_lm_head(
         m.backend, &m.weights, &m.hidden, &m.norm_buf, &m.logits_buf,
         eps, hidden_size, m.config.vocab_size as u32,
     );
+    profile::record(m.backend, t, Component::Other);
 
     Ok(())
 }

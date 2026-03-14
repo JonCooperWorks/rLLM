@@ -87,17 +87,26 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
     // used by the GEMM-based prefill forward pass.  Allocated once, reused.
     let mut model = model::Model::new(config.clone(), weights, &backend)?;
 
-    let num_blocks = 8192; // 8192 blocks × 16 tokens/block = 131072 (128K) max positions.
+    // Dynamic KV cache sizing based on remaining GPU memory.
+    let gpu_budget = backend.recommended_max_memory();
+    let num_blocks = config.recommended_kv_blocks(gpu_budget, args.quantize);
     let kv_dim = config.num_key_value_heads * config.head_dim;
     let mut kv_pool = kv_cache::KvPool::new(&backend, num_blocks, kv_dim, config.num_hidden_layers);
     let mut seq_state = kv_pool.new_sequence(&backend);
     let max_prefill = 4096;
     let prefill_bufs = model::PrefillBuffers::new(&backend, &config, max_prefill);
+
+    let weight_mb = config.estimate_weight_bytes(args.quantize) as f64 / (1024.0 * 1024.0);
+    let kv_bytes_per_block =
+        2 * config.num_hidden_layers * kv_cache::BLOCK_SIZE * kv_dim * 2;
+    let kv_mb = (num_blocks * kv_bytes_per_block) as f64 / (1024.0 * 1024.0);
     eprintln!(
-        "KV cache: {} blocks ({} max tokens), prefill up to {} tokens",
+        "memory: {:.0} MB weights, {:.0} MB KV cache ({} blocks, {} max tokens), {:.0} MB GPU budget",
+        weight_mb,
+        kv_mb,
         num_blocks,
         num_blocks * kv_cache::BLOCK_SIZE,
-        max_prefill
+        gpu_budget as f64 / (1024.0 * 1024.0),
     );
 
     // --- Encode prompt ---
@@ -171,6 +180,7 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
         seq_state.sync_block_table(&backend);
         model.forward_single_paged(next_token, &kv_pool, &seq_state)?;
         seq_state.advance();
+        crate::model::profile::tick();
 
         // Sample the next token from the updated logits.
         next_token = sampler::sample(

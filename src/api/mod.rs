@@ -317,8 +317,12 @@ fn spawn_worker(model_dir: PathBuf, quantize: bool) -> anyhow::Result<WorkerHand
 
             let model = model::Model::new(config.clone(), weights, &backend)?;
 
-            // KV pool: 8192 blocks × 16 tokens/block = 131072 (128K) max context.
-            let num_blocks = 8192;
+            // Dynamic KV cache sizing: fit as many blocks as possible into
+            // the remaining GPU memory after weights.  Large models (e.g. 32B
+            // with 64 layers) need much more KV cache per block, so a fixed
+            // count can over-allocate and cause memory pressure / swap.
+            let gpu_budget = backend.recommended_max_memory();
+            let num_blocks = config.recommended_kv_blocks(gpu_budget, quantize);
             let kv_dim = config.num_key_value_heads * config.head_dim;
             let kv_pool =
                 kv_cache::KvPool::new(&backend, num_blocks, kv_dim, config.num_hidden_layers);
@@ -327,12 +331,19 @@ fn spawn_worker(model_dir: PathBuf, quantize: bool) -> anyhow::Result<WorkerHand
             let max_active = 32;
             let sched = scheduler::Scheduler::new(kv_pool, max_active);
 
+            let weight_mb = config.estimate_weight_bytes(quantize) as f64 / (1024.0 * 1024.0);
+            let kv_bytes_per_block =
+                2 * config.num_hidden_layers * kv_cache::BLOCK_SIZE * kv_dim * 2;
+            let kv_mb = (num_blocks * kv_bytes_per_block) as f64 / (1024.0 * 1024.0);
             eprintln!(
-                "KV cache: {} blocks ({} max tokens), max {} concurrent sequences",
+                "memory: {:.0} MB weights, {:.0} MB KV cache ({} blocks, {} max tokens), {:.0} MB GPU budget",
+                weight_mb,
+                kv_mb,
                 num_blocks,
                 num_blocks * kv_cache::BLOCK_SIZE,
-                max_active
+                gpu_budget as f64 / (1024.0 * 1024.0),
             );
+            eprintln!("max {} concurrent sequences", max_active);
 
             let mut eng = engine::Engine::new(
                 model,

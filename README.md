@@ -4,19 +4,19 @@ Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf
 
 ## Performance
 
-**Apple M4 Max** — 16-core CPU, 40-core GPU, 64 GB unified memory, 546 GB/s bandwidth. Measured via the `/v1/chat/completions` streaming endpoint, averaged over 3 runs.
+**Apple M4 Max** — 16-core CPU, 40-core GPU, 64 GB unified memory, 546 GB/s bandwidth. Measured via CLI (`rllm run --chat`), single run.
 
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
-| Llama 3.2 1B Instruct | 1.2B | 90 tok/s | 119 tok/s | 45 ms | 21 ms |
-| Llama 3.2 3B Instruct | 3.2B | 32 tok/s | 44 tok/s | 160 ms | 58 ms |
-| Qwen 2.5 3B Instruct | 3.1B | 28 tok/s | 37 tok/s | 139 ms | 53 ms |
-| Qwen 2.5 7B Instruct | 7.6B | 21 tok/s | 35 tok/s | 380 ms | 123 ms |
-| Llama 3.1 8B Instruct | 8.0B | 19 tok/s | 32 tok/s | 453 ms | 141 ms |
-| Qwen3 Coder 30B-A3B Instruct | 30.5B (3.3B active) | — | 9 tok/s | — | 2,600 ms |
-| DeepSeek-R1-Distill-Qwen-32B | 32.8B | — | 1.6 tok/s | — | 3,800 ms |
+| Llama 3.2 1B Instruct | 1.2B | 99 tok/s | 139 tok/s | 100 ms | 79 ms |
+| Llama 3.2 3B Instruct | 3.2B | 37 tok/s | 51 tok/s | 322 ms | 253 ms |
+| Qwen 2.5 3B Instruct | 3.1B | 31 tok/s | 45 tok/s | 242 ms | 98 ms |
+| Qwen 2.5 7B Instruct | 7.6B | 23 tok/s | 39 tok/s | 662 ms | 240 ms |
+| Llama 3.1 8B Instruct | 8.0B | 21 tok/s | 36 tok/s | 782 ms | 393 ms |
+| Qwen3 Coder 30B-A3B Instruct | 30.5B (3.3B active) | — | 11 tok/s | — | 2,900 ms |
+| DeepSeek-R1-Distill-Qwen-32B | 32.8B | — | 5 tok/s | — | 4,700 ms |
 
-Q4 quantization (`--quantize`) gives ~1.3-1.7x faster decode and ~3x faster prefill by reducing memory bandwidth. The Qwen3 MoE model uses Mixture of Experts (128 experts, 8 active per token). For models over ~30B dense params, bf16 is skipped since the full weights leave no room for KV cache on 64 GB.
+Q4 quantization (`--quantize`) gives ~1.3-1.5x faster decode by reducing memory bandwidth. The Qwen3 MoE model uses Mixture of Experts (128 experts, 8 active per token). For models over ~30B dense params, bf16 is skipped since the full weights leave no room for KV cache on 64 GB. Dynamic KV cache sizing automatically adjusts block count based on available GPU memory.
 
 ## Features
 

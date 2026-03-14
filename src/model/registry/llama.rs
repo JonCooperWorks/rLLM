@@ -14,6 +14,7 @@
 use crate::gpu::GpuBackend;
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives;
+use crate::model::profile::{self, Component};
 use crate::model::{KvMode, Model, PrefillBuffers};
 
 /// Single-token forward pass using an external paged KV cache.
@@ -33,12 +34,15 @@ pub(crate) fn forward_single_paged<B: GpuBackend>(
     let rope_theta = m.config.rope_theta as f32;
     let pos = seq_state.seq_len as u32;
 
+    let t = profile::begin(m.backend);
     primitives::embed_token(m.backend, &m.weights, token_id, &m.hidden, hidden_size);
+    profile::record(m.backend, t, Component::Embed);
 
     for layer_idx in 0..m.config.num_hidden_layers {
         let layer = &m.weights.layers[layer_idx];
 
         // Attention sub-block.
+        let t = profile::begin(m.backend);
         m.backend.rms_norm(&m.hidden, &layer.input_layernorm, eps, &m.norm_buf);
         primitives::qkv_projection(m.backend, layer, &m.norm_buf, &m.q_buf, &m.k_buf, &m.v_buf, hidden_size, kv_dim);
 
@@ -50,15 +54,20 @@ pub(crate) fn forward_single_paged<B: GpuBackend>(
             pool, seq_state, layer_idx, pos, num_heads, num_kv_heads, head_dim,
         );
         primitives::o_proj_residual(m.backend, layer, &m.attn_out, &m.norm_buf, &m.hidden, hidden_size);
+        profile::record(m.backend, t, Component::Attention);
 
         // FFN sub-block.
+        let t = profile::begin(m.backend);
         primitives::ffn_block(m.backend, layer, &m.hidden, &m.norm_buf, &m.gate_buf, &m.up_buf, eps, hidden_size, inter_size);
+        profile::record(m.backend, t, Component::Ffn);
     }
 
+    let t = profile::begin(m.backend);
     primitives::final_norm_and_lm_head(
         m.backend, &m.weights, &m.hidden, &m.norm_buf, &m.logits_buf,
         eps, hidden_size, m.config.vocab_size as u32,
     );
+    profile::record(m.backend, t, Component::Other);
 
     Ok(())
 }
@@ -169,6 +178,9 @@ pub(crate) fn forward_prefill_paged<B: GpuBackend>(
 
         // FFN sub-block.
         primitives::ffn_block_batch(m.backend, layer, bufs, eps, bs, hidden_size, inter_size);
+
+        // Submit this layer's work so the GPU starts executing while we encode the next layer.
+        m.backend.submit();
     }
 
     primitives::final_norm_and_lm_head_prefill(

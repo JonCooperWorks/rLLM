@@ -61,7 +61,6 @@
 //      field order, sizes, and alignment.  `#[repr(C)]` guarantees this.
 // ===========================================================================
 
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::anyhow;
 use metal::{CompileOptions, MTLResourceOptions, MTLSize};
@@ -110,9 +109,9 @@ impl MetalTensor {
 // MetalBackend — holds the Metal device, command queue, and all compiled
 // kernel pipeline states.
 //
-// The `has_pending_work` flag tracks whether any kernel dispatches have
-// been committed but not yet waited on.  `flush()` waits for all pending
-// GPU work to complete — it's called automatically by `copy_to_host()`.
+// Kernel dispatches are batched into a single Metal command buffer (stored
+// in `current_cmd`).  `flush()` commits and waits for the entire batch —
+// called automatically by `copy_to_host()`.
 // ---------------------------------------------------------------------------
 
 pub(crate) struct MetalBackend {
@@ -147,10 +146,20 @@ pub(crate) struct MetalBackend {
     pipeline_paged_copy_kv_batch: metal::ComputePipelineState,
     pipeline_prefill_attention: metal::ComputePipelineState,
 
-    // Async dispatch tracking.
-    // Set to true when any command buffer is committed without waiting.
-    // Cleared by `flush()`.
-    has_pending_work: AtomicBool,
+    // MoE routing kernel.
+    pipeline_top_k_softmax: metal::ComputePipelineState,
+
+    // Batched command encoding state.
+    //
+    // Instead of creating and committing a command buffer per kernel dispatch,
+    // we accumulate dispatches into a single command buffer.  This reduces Metal
+    // overhead dramatically for MoE models (~2500 dispatches/token → 1 commit
+    // per flush instead of 2500 individual commits).
+    //
+    // Metal allows creating sequential compute command encoders on one command
+    // buffer.  Each dispatch creates an encoder, encodes the kernel, and ends
+    // the encoder.  The command buffer is only committed when flush() is called.
+    current_cmd: std::sync::Mutex<Option<metal::CommandBuffer>>,
 }
 
 impl MetalBackend {
@@ -246,6 +255,12 @@ impl MetalBackend {
             "prefill_attention",
             &compile_opts,
         )?;
+        let pipeline_top_k_softmax = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_ELEMENTWISE,
+            "top_k_softmax",
+            &compile_opts,
+        )?;
 
         Ok(Self {
             device,
@@ -272,7 +287,8 @@ impl MetalBackend {
             pipeline_rope_batch,
             pipeline_paged_copy_kv_batch,
             pipeline_prefill_attention,
-            has_pending_work: AtomicBool::new(false),
+            pipeline_top_k_softmax,
+            current_cmd: std::sync::Mutex::new(None),
         })
     }
 
@@ -296,33 +312,45 @@ impl MetalBackend {
     }
 
     // =======================================================================
-    // ASYNC DISPATCH
+    // BATCHED ASYNC DISPATCH
     //
-    // Instead of the old synchronous pattern (encode → commit → wait per
-    // kernel), we now commit without waiting.  Metal's serial command queue
-    // guarantees execution order, so we only need to wait when the CPU
-    // needs to read GPU results.
+    // All kernel dispatches are accumulated into a single Metal command buffer.
+    // Each dispatch creates a compute encoder, encodes the kernel, and ends
+    // the encoder — but the command buffer is NOT committed until flush().
     //
-    // `dispatch_async`:   encode + commit, NO wait.
-    // `flush`:            wait for all pending GPU work.
+    // Metal allows sequential compute encoders on one command buffer, and the
+    // serial command queue guarantees execution order.  This batching reduces
+    // Metal API overhead dramatically:
+    //
+    //   Before: 2500 command buffer creations + commits per MoE token
+    //   After:  1 command buffer, committed only on flush (~48 flushes/token)
+    //
+    // `dispatch_async`:   encode into the current command buffer, NO commit.
+    // `flush`:            commit + wait for all accumulated work.
     // `copy_to_host`:     calls flush automatically.
     //
-    // Learning note: why not batch into a single command buffer?
-    //   That would require storing the command buffer and encoder across
-    //   method calls (complex lifetime management with Objective-C objects).
-    //   The per-kernel-commit approach is simpler and almost as fast — the
-    //   ~10μs overhead per command buffer creation is negligible compared
-    //   to eliminating ~144 blocking wait cycles.
-    //
     // Safety of param buffer lifetime:
-    //   `new_command_buffer()` creates a command buffer with RETAINED
-    //   references (the default).  After `commit()`, Metal retains all
-    //   buffers set on the encoder.  So when our local `param_buf` drops,
-    //   the retain count goes from 2→1; when the GPU finishes, Metal
-    //   releases its reference (1→0) and the buffer is deallocated.
+    //   Metal command buffers with retained references (the default) keep all
+    //   set_buffer references alive until completion.  When the local param_buf
+    //   drops, its retain count goes from 2→1; when the GPU finishes and the
+    //   command buffer is released, the count goes to 0 and the buffer is freed.
     // =======================================================================
 
-    /// Encode and commit a kernel dispatch WITHOUT waiting for completion.
+    /// Get or create the current command buffer for batching.
+    ///
+    /// `new_command_buffer()` returns a borrowed `&CommandBufferRef` with
+    /// autorelease semantics.  We retain it via `to_owned()` so it lives
+    /// in the Mutex until flush() commits it.
+    fn get_or_create_cmd(&self) -> std::sync::MutexGuard<'_, Option<metal::CommandBuffer>> {
+        let mut guard = self.current_cmd.lock().unwrap();
+        if guard.is_none() {
+            let cmd_ref = self.queue.new_command_buffer();
+            *guard = Some(cmd_ref.to_owned());
+        }
+        guard
+    }
+
+    /// Encode a kernel dispatch into the current batched command buffer.
     fn dispatch_async<T: Copy>(
         &self,
         pipeline: &metal::ComputePipelineState,
@@ -331,7 +359,9 @@ impl MetalBackend {
         grid_size: MTLSize,
         threadgroup_size: MTLSize,
     ) {
-        let cmd = self.queue.new_command_buffer();
+        let guard = self.get_or_create_cmd();
+        let cmd = guard.as_ref().unwrap();
+
         let encoder = cmd.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(pipeline);
 
@@ -350,24 +380,24 @@ impl MetalBackend {
         }
         encoder.dispatch_threads(grid_size, threadgroup_size);
         encoder.end_encoding();
-        cmd.commit();
-        // No wait! The GPU processes this while we encode the next kernel.
-
-        self.has_pending_work.store(true, Ordering::Release);
+        // No commit — stays in the command buffer until flush().
     }
 
-    /// Wait for all pending GPU work to complete.
-    ///
-    /// Submits a fence command buffer and waits for it.  Since Metal's
-    /// serial command queue processes buffers in commit order, waiting
-    /// for this buffer guarantees all prior buffers have completed.
+    /// Commit and wait for all pending GPU work in the current command buffer.
     fn flush(&self) {
-        if self.has_pending_work.swap(false, Ordering::AcqRel) {
-            let cmd = self.queue.new_command_buffer();
-            let encoder = cmd.new_compute_command_encoder();
-            encoder.end_encoding();
+        let cmd = self.current_cmd.lock().unwrap().take();
+        if let Some(cmd) = cmd {
             cmd.commit();
             cmd.wait_until_completed();
+        }
+    }
+
+    /// Commit pending GPU work without waiting — allows GPU to start executing
+    /// while the CPU continues encoding the next batch of dispatches.
+    fn submit(&self) {
+        let cmd = self.current_cmd.lock().unwrap().take();
+        if let Some(cmd) = cmd {
+            cmd.commit();
         }
     }
 }
@@ -526,6 +556,13 @@ struct PrefillAttentionParams {
     head_dim: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TopKParams {
+    num_experts: u32,
+    k: u32,
+}
+
 // ---------------------------------------------------------------------------
 // GpuBackend trait implementation.
 //
@@ -538,6 +575,18 @@ impl GpuBackend for MetalBackend {
 
     fn device_name(&self) -> &str {
         &self.name
+    }
+
+    fn recommended_max_memory(&self) -> u64 {
+        self.device.recommended_max_working_set_size()
+    }
+
+    fn flush(&self) {
+        MetalBackend::flush(self);
+    }
+
+    fn submit(&self) {
+        MetalBackend::submit(self);
     }
 
     fn alloc_tensor(&self, shape: &[usize], dtype: TensorDtype) -> MetalTensor {
@@ -893,6 +942,24 @@ impl GpuBackend for MetalBackend {
             ],
             MTLSize::new(num_heads as u64 * threads_per_group, 1, 1),
             MTLSize::new(threads_per_group, 1, 1),
+        );
+    }
+
+    fn top_k_softmax(
+        &self,
+        logits: &MetalTensor,
+        output: &MetalTensor,
+        num_experts: u32,
+        k: u32,
+    ) {
+        let params = TopKParams { num_experts, k };
+        // Single-thread kernel: only thread 0 does work.
+        self.dispatch_async(
+            &self.pipeline_top_k_softmax,
+            &params,
+            &[(&logits.buffer, 1), (&output.buffer, 2)],
+            MTLSize::new(1, 1, 1),
+            MTLSize::new(1, 1, 1),
         );
     }
 

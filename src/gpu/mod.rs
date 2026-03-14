@@ -146,6 +146,27 @@ pub(crate) trait GpuBackend: Send + Sync {
     /// Human-readable GPU device name (e.g. "Apple M4 Max").
     fn device_name(&self) -> &str;
 
+    /// Maximum recommended GPU working set size in bytes.
+    ///
+    /// On Apple Silicon (unified memory), this is the GPU's share of system
+    /// RAM before performance degrades.  Used to size the KV cache dynamically
+    /// so large models don't cause memory pressure and swap.
+    fn recommended_max_memory(&self) -> u64;
+
+    /// Wait for all pending GPU work to complete.
+    ///
+    /// Used for profiling (to time individual components) and by copy_to_host.
+    /// Most callers should not need this — it's called automatically when
+    /// reading GPU results.
+    fn flush(&self);
+
+    /// Submit pending GPU work without waiting for completion.
+    ///
+    /// Commits the current command buffer so the GPU can start executing it,
+    /// but returns immediately without blocking.  Used during prefill to
+    /// overlap GPU execution of layer N with CPU encoding of layer N+1.
+    fn submit(&self);
+
     // --- Memory management ---
 
     /// Allocate an uninitialised tensor on the GPU.
@@ -384,6 +405,21 @@ pub(crate) trait GpuBackend: Send + Sync {
         num_heads: u32,
         num_kv_heads: u32,
         head_dim: u32,
+    );
+
+    /// GPU-side top-k selection with softmax for MoE expert routing.
+    ///
+    /// Input:  logits buffer with at least `num_experts` bf16 values.
+    /// Output: [2*k] f32 values — alternating (expert_index, routing_weight).
+    ///
+    /// Replaces the CPU routing path to eliminate per-layer GPU→CPU syncs
+    /// in MoE models.
+    fn top_k_softmax(
+        &self,
+        logits: &Self::Tensor,
+        output: &Self::Tensor,
+        num_experts: u32,
+        k: u32,
     );
 }
 

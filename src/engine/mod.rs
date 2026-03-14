@@ -208,6 +208,7 @@ impl<'a, B: GpuBackend> Engine<'a, B> {
             self.model
                 .forward_single_paged(token, &self.scheduler.kv_pool, &seq.kv_state)?;
             seq.kv_state.advance();
+            crate::model::profile::tick();
 
             let next_token = crate::model::sampler::sample(
                 self.backend,

@@ -17,6 +17,15 @@ impl super::GpuBackend for CudaBackend {
     fn device_name(&self) -> &str {
         ""
     }
+    fn recommended_max_memory(&self) -> u64 {
+        unreachable!()
+    }
+    fn flush(&self) {
+        unreachable!()
+    }
+    fn submit(&self) {
+        unreachable!()
+    }
     fn alloc_tensor(&self, _: &[usize], _: super::TensorDtype) -> CudaTensor {
         unreachable!()
     }
@@ -146,6 +155,9 @@ impl super::GpuBackend for CudaBackend {
         _: u32,
         _: u32,
     ) {
+        unreachable!()
+    }
+    fn top_k_softmax(&self, _: &CudaTensor, _: &CudaTensor, _: u32, _: u32) {
         unreachable!()
     }
 }

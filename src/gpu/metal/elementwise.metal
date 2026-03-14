@@ -158,3 +158,78 @@ kernel void fill_zero(
     if (gid >= params.size) return;
     dst[gid] = bfloat(0.0f);
 }
+
+// ---------------------------------------------------------------------------
+// GPU-side top-k selection with softmax for MoE expert routing.
+//
+// Replaces the CPU-side routing path that required one GPU→CPU sync per layer
+// (48 syncs per token for Qwen3-Coder-30B).  The kernel runs on GPU and writes
+// results to a buffer that can be read later with a single copy_to_host.
+//
+// Input:  logits [num_experts] in bf16 (router matmul output)
+// Output: [2*k] f32 values — alternating (expert_index_as_f32, routing_weight)
+//
+// Uses a single thread since num_experts is small (128).  The entire kernel
+// runs faster than the GPU→CPU sync overhead it eliminates.
+// ---------------------------------------------------------------------------
+
+struct TopKParams {
+    uint num_experts;
+    uint k;
+};
+
+kernel void top_k_softmax(
+    constant TopKParams& params  [[buffer(0)]],
+    device const bfloat* logits  [[buffer(1)]],
+    device float* output         [[buffer(2)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid != 0) return;
+
+    uint n = params.num_experts;
+    uint k = params.k;
+
+    // Convert bf16 logits to f32 and find top-k indices.
+    // Simple selection: repeatedly find the max and mark it used.
+    // For k=8, n=128 this is 8 × 128 = 1024 comparisons — trivial.
+
+    // Use threadgroup memory for the f32 copy (max 256 experts).
+    float vals[256];
+    for (uint i = 0; i < n && i < 256; i++) {
+        vals[i] = float(logits[i]);
+    }
+
+    // Find top-k by iteratively selecting the maximum.
+    uint top_indices[32];  // max k=32
+    float top_logits[32];
+    for (uint j = 0; j < k; j++) {
+        float best_val = -INFINITY;
+        uint best_idx = 0;
+        for (uint i = 0; i < n; i++) {
+            if (vals[i] > best_val) {
+                best_val = vals[i];
+                best_idx = i;
+            }
+        }
+        top_indices[j] = best_idx;
+        top_logits[j] = best_val;
+        vals[best_idx] = -INFINITY;  // Mark as used.
+    }
+
+    // Softmax over the top-k logits (normalized routing).
+    float max_logit = top_logits[0];
+    for (uint j = 1; j < k; j++) {
+        max_logit = max(max_logit, top_logits[j]);
+    }
+    float exp_sum = 0.0f;
+    for (uint j = 0; j < k; j++) {
+        top_logits[j] = exp(top_logits[j] - max_logit);
+        exp_sum += top_logits[j];
+    }
+
+    // Write (index, weight) pairs to output.
+    for (uint j = 0; j < k; j++) {
+        output[2 * j]     = float(top_indices[j]);
+        output[2 * j + 1] = top_logits[j] / exp_sum;
+    }
+}

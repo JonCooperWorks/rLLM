@@ -1711,6 +1711,7 @@ dependencies = [
  "bytemuck",
  "clap",
  "cudarc",
+ "foreign-types",
  "half",
  "hyper",
  "hyper-util",

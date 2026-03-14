@@ -61,6 +61,7 @@ pub(crate) mod config;
 pub(crate) mod kv_cache;
 pub(crate) mod loader;
 pub(crate) mod primitives;
+pub(crate) mod profile;
 pub(crate) mod registry;
 pub(crate) mod sampler;
 pub(crate) mod tokenizer;
@@ -149,10 +150,15 @@ pub(crate) struct Model<'a, B: GpuBackend> {
     // top-k selection.  The moe_output buffer accumulates the weighted
     // sum of expert outputs before adding to the residual stream.
     // -----------------------------------------------------------------------
-    pub(crate) router_logits: Option<B::Tensor>,  // [num_experts] f32
-    pub(crate) moe_gate_buf: Option<B::Tensor>,   // [moe_inter] bf16
-    pub(crate) moe_up_buf: Option<B::Tensor>,     // [moe_inter] bf16
-    pub(crate) moe_output: Option<B::Tensor>,     // [hidden_size] bf16
+    #[allow(dead_code)]
+    pub(crate) router_logits: Option<B::Tensor>,    // [num_experts] f32
+    pub(crate) moe_gate_buf: Option<B::Tensor>,    // [moe_inter] bf16
+    pub(crate) moe_up_buf: Option<B::Tensor>,      // [moe_inter] bf16
+    pub(crate) moe_output: Option<B::Tensor>,      // [hidden_size] bf16
+    /// GPU-side routing output: [2 * num_experts_per_tok] f32 pairs of
+    /// (expert_index, routing_weight).  Eliminates per-layer GPU→CPU sync
+    /// for top-k selection.
+    pub(crate) routing_output: Option<B::Tensor>,  // [2*k] f32
 }
 
 impl<'a, B: GpuBackend> Model<'a, B> {
@@ -229,18 +235,22 @@ impl<'a, B: GpuBackend> Model<'a, B> {
         let logits_buf = backend.alloc_tensor(&[vocab], TensorDtype::BF16);
 
         // MoE buffers: only allocated for MoE models.
-        let (router_logits, moe_gate_buf, moe_up_buf, moe_output) = if config.is_moe() {
-            let moe_inter = config.moe_intermediate_size;
-            (
-                // Router logits are f32 for precision during top-k selection.
-                Some(backend.alloc_tensor(&[config.num_experts], TensorDtype::F32)),
-                Some(backend.alloc_tensor(&[moe_inter], TensorDtype::BF16)),
-                Some(backend.alloc_tensor(&[moe_inter], TensorDtype::BF16)),
-                Some(backend.alloc_tensor(&[hidden], TensorDtype::BF16)),
-            )
-        } else {
-            (None, None, None, None)
-        };
+        let (router_logits, moe_gate_buf, moe_up_buf, moe_output, routing_output) =
+            if config.is_moe() {
+                let moe_inter = config.moe_intermediate_size;
+                let k = config.num_experts_per_tok;
+                (
+                    // Router logits are f32 for precision during top-k selection.
+                    Some(backend.alloc_tensor(&[config.num_experts], TensorDtype::F32)),
+                    Some(backend.alloc_tensor(&[moe_inter], TensorDtype::BF16)),
+                    Some(backend.alloc_tensor(&[moe_inter], TensorDtype::BF16)),
+                    Some(backend.alloc_tensor(&[hidden], TensorDtype::BF16)),
+                    // GPU routing output: [2*k] f32 (index, weight) pairs.
+                    Some(backend.alloc_tensor(&[2 * k], TensorDtype::F32)),
+                )
+            } else {
+                (None, None, None, None, None)
+            };
 
         Ok(Self {
             config,
@@ -261,6 +271,7 @@ impl<'a, B: GpuBackend> Model<'a, B> {
             moe_gate_buf,
             moe_up_buf,
             moe_output,
+            routing_output,
         })
     }
 

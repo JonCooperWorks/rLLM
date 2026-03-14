@@ -40,6 +40,7 @@
 //   training length.  The scaling is a no-op for our 4096-token limit.
 // ===========================================================================
 
+use crate::model::kv_cache;
 use serde::Deserialize;
 
 // ===========================================================================
@@ -250,5 +251,109 @@ impl ModelConfig {
     /// Whether this model uses Mixture of Experts instead of dense FFN.
     pub fn is_moe(&self) -> bool {
         self.num_experts > 0
+    }
+
+    /// Estimate total GPU memory for model weights in bytes.
+    ///
+    /// Matches the loading logic in loader.rs: projection weights are Q4 when
+    /// `quantize` is true, everything else (embeddings, norms, biases, router
+    /// gates) stays BF16.
+    pub fn estimate_weight_bytes(&self, quantize: bool) -> usize {
+        let hidden = self.hidden_size;
+        let q_dim = self.num_attention_heads * self.head_dim;
+        let kv_dim = self.num_key_value_heads * self.head_dim;
+        let inter = self.intermediate_size;
+
+        // Helper: byte count for a [m, k] projection weight.
+        let proj = |m: usize, k: usize| -> usize {
+            if quantize {
+                crate::gpu::q4_byte_count(m, k)
+            } else {
+                m * k * 2 // bf16
+            }
+        };
+
+        // Embedding table (always BF16).
+        let mut total = self.vocab_size * hidden * 2;
+
+        // LM head (BF16, only if untied).
+        if !self.tie_word_embeddings {
+            total += self.vocab_size * hidden * 2;
+        }
+
+        // Final norm weight (BF16).
+        total += hidden * 2;
+
+        // Per-layer weights.
+        let per_layer = {
+            let mut layer = 0usize;
+
+            // Attention projections (Q4 or BF16).
+            layer += proj(q_dim, hidden);  // q_proj
+            layer += proj(kv_dim, hidden); // k_proj
+            layer += proj(kv_dim, hidden); // v_proj
+            layer += proj(hidden, q_dim);  // o_proj
+
+            // Norm weights (always BF16, small).
+            layer += hidden * 2; // input_layernorm
+            layer += hidden * 2; // post_attention_layernorm
+
+            // QKV bias (BF16, only Qwen2).
+            if self.arch().map_or(false, |a| a.has_qkv_bias()) {
+                layer += (q_dim + kv_dim + kv_dim) * 2;
+            }
+
+            // QK-norm weights (BF16, only Qwen3 MoE).
+            if self.arch().map_or(false, |a| a.has_qk_norm()) {
+                layer += self.head_dim * 2 * 2; // q_norm + k_norm
+            }
+
+            // FFN weights.
+            if self.is_moe() {
+                // Router gate (always BF16).
+                layer += self.num_experts * hidden * 2;
+                // Expert weights (Q4 or BF16).
+                let moe_inter = self.moe_intermediate_size;
+                let per_expert = proj(moe_inter, hidden) // gate_proj
+                    + proj(moe_inter, hidden)             // up_proj
+                    + proj(hidden, moe_inter);            // down_proj
+                layer += self.num_experts * per_expert;
+            } else {
+                // Dense FFN: gate/up/down projections.
+                layer += proj(inter, hidden); // gate_proj
+                layer += proj(inter, hidden); // up_proj
+                layer += proj(hidden, inter); // down_proj
+            }
+
+            layer
+        };
+
+        total += per_layer * self.num_hidden_layers;
+        total
+    }
+
+    /// Compute the number of KV cache blocks that fit in the remaining GPU
+    /// memory after weights are loaded.
+    ///
+    /// Uses 75% of available memory for KV cache, leaving headroom for scratch
+    /// buffers, Metal overhead, and macOS.  Result is clamped to [256, 8192].
+    pub fn recommended_kv_blocks(&self, gpu_budget: u64, quantize: bool) -> usize {
+        let weight_bytes = self.estimate_weight_bytes(quantize) as u64;
+        // Reserve 512 MB for scratch buffers and Metal overhead.
+        let scratch_overhead = 512 * 1024 * 1024u64;
+        let available = gpu_budget.saturating_sub(weight_bytes + scratch_overhead);
+
+        let kv_dim = (self.num_key_value_heads * self.head_dim) as u64;
+        // bytes per block = 2 (K+V) × num_layers × BLOCK_SIZE × kv_dim × 2 (bf16)
+        let bytes_per_block =
+            2 * self.num_hidden_layers as u64 * kv_cache::BLOCK_SIZE as u64 * kv_dim * 2;
+
+        if bytes_per_block == 0 {
+            return 8192;
+        }
+
+        // Use 75% of available space for KV cache.
+        let num_blocks = (available * 3 / 4 / bytes_per_block) as usize;
+        num_blocks.clamp(256, 8192)
     }
 }
