@@ -1,6 +1,6 @@
 # rLLM
 
-Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf16 and Q4 quantization, multi-architecture support (Llama 3, Qwen 2.5, Qwen3 MoE). Paged KV cache, batched prefill (GEMM), continuous batching. No frameworks, no GGML — just raw GPU compute.
+Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf16 and Q4 quantization, multi-architecture support (Llama 3, Qwen 2.5, Qwen3 MoE, DeepSeek-R1-Distill). Paged KV cache, batched prefill (GEMM), continuous batching. No frameworks, no GGML — just raw GPU compute.
 
 ## Performance
 
@@ -14,8 +14,9 @@ Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf
 | Qwen 2.5 7B Instruct | 7.6B | 21 tok/s | 35 tok/s | 380 ms | 123 ms |
 | Llama 3.1 8B Instruct | 8.0B | 19 tok/s | 32 tok/s | 453 ms | 141 ms |
 | Qwen3 Coder 30B-A3B Instruct | 30.5B (3.3B active) | — | 9 tok/s | — | 2,600 ms |
+| DeepSeek-R1-Distill-Qwen-32B | 32.8B | — | 1.6 tok/s | — | 3,800 ms |
 
-Q4 quantization (`--quantize`) gives ~1.3-1.7x faster decode and ~3x faster prefill by reducing memory bandwidth. The Qwen3 MoE model uses Mixture of Experts (128 experts, 8 active per token); bf16 skipped since the full 61 GB model leaves no room for KV cache.
+Q4 quantization (`--quantize`) gives ~1.3-1.7x faster decode and ~3x faster prefill by reducing memory bandwidth. The Qwen3 MoE model uses Mixture of Experts (128 experts, 8 active per token). For models over ~30B dense params, bf16 is skipped since the full weights leave no room for KV cache on 64 GB.
 
 ## Features
 
@@ -281,6 +282,9 @@ hf download Qwen/Qwen2.5-7B-Instruct --local-dir models/qwen-2.5-7b-instruct
 
 # Qwen3 MoE — 30.5B total, 3.3B active per token (~61 GB download)
 hf download Qwen/Qwen3-Coder-30B-A3B-Instruct --local-dir models/qwen3-coder-30b-a3b-instruct
+
+# DeepSeek R1 distilled — 32.8B dense (~61 GB download)
+hf download deepseek-ai/DeepSeek-R1-Distill-Qwen-32B --local-dir models/DeepSeek-R1-Distill-Qwen-32B
 ```
 
 > **Note:** Llama models are gated — you'll need to [accept the license](https://huggingface.co/meta-llama/Llama-3.2-1B) on Hugging Face and authenticate with `hf auth login` before downloading. Qwen models are open access (Apache-2.0).

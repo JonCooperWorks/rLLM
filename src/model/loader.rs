@@ -595,7 +595,21 @@ fn upload_maybe_q4<B: GpuBackend>(
 ///     [4..20]:  16 bytes, 2 packed nibbles each
 ///               byte[i] = u[2i] | (u[2i+1] << 4)
 fn quantize_bf16_to_q4(bf16_data: &[u8], m: usize, k: usize) -> Vec<u8> {
-    let values: &[bf16] = bytemuck::cast_slice(bf16_data);
+    assert_eq!(bf16_data.len(), m * k * 2);
+
+    // Try zero-copy cast first; fall back to a copy if the mmap slice
+    // isn't 2-byte aligned (can happen with some safetensors packing).
+    let owned_buf: Vec<bf16>;
+    let values: &[bf16] = match bytemuck::try_cast_slice(bf16_data) {
+        Ok(v) => v,
+        Err(_) => {
+            owned_buf = bf16_data
+                .chunks_exact(2)
+                .map(|c| bf16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            &owned_buf
+        }
+    };
     assert_eq!(values.len(), m * k);
 
     let blocks_per_row = k / 32;
