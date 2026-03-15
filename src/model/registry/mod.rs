@@ -19,6 +19,7 @@
 
 pub(crate) mod gemma;
 pub(crate) mod llama;
+pub(crate) mod mistral;
 pub(crate) mod phi;
 pub(crate) mod qwen;
 pub(crate) mod qwen3_5;

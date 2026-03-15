@@ -6,7 +6,7 @@
 // What this file does:
 //   Converts a list of chat messages (system, user, assistant) into the
 //   special-token-delimited string format that instruct models expect.
-//   Supports both Llama 3 and Qwen 2.5 (ChatML) formats.
+//   Supports Llama 3, ChatML (Qwen), Gemma 3, Phi, and Mistral formats.
 //
 // Why do instruct models need a chat template?
 //   Base models are trained on raw text — they just predict the next token.
@@ -77,6 +77,8 @@ pub(crate) struct Message {
 pub(crate) fn format_chat(arch: ModelArch, messages: &[Message]) -> String {
     match arch {
         ModelArch::Llama => format_llama3(messages),
+        // Mistral uses [INST]/[/INST] markers with system prepended to first user message.
+        ModelArch::Mistral => format_mistral(messages),
         // Qwen 2.5, Qwen 3 MoE, and Qwen 3.5 all use ChatML format.
         ModelArch::Qwen2 | ModelArch::Qwen3Moe | ModelArch::Qwen3_5 => format_chatml(messages),
         // Phi uses a ChatML-like format but with <|im_sep|> between role and content.
@@ -213,6 +215,53 @@ fn format_phi(messages: &[Message]) -> String {
     out
 }
 
+/// Format chat messages into the Mistral instruct template string.
+///
+/// Mistral uses `[INST]` and `[/INST]` markers.  If a system message is present,
+/// it's prepended to the first user message (separated by a blank line).
+/// Multi-turn conversations alternate `[INST] user [/INST] assistant</s>`.
+///
+///   <s>[INST] You are helpful.\n\nWhat is 2+2? [/INST]
+///
+/// The tokenizer handles `<s>` (BOS=1) and `</s>` (EOS=2) as special tokens.
+fn format_mistral(messages: &[Message]) -> String {
+    let mut out = String::with_capacity(512);
+
+    // Extract optional system message.
+    let (system, rest) = if messages.first().map(|m| m.role.as_str()) == Some("system") {
+        (Some(messages[0].content.as_str()), &messages[1..])
+    } else {
+        (None, messages.as_ref())
+    };
+
+    let mut first_user = true;
+    for msg in rest {
+        match msg.role.as_str() {
+            "user" => {
+                out.push_str(" [INST] ");
+                // Prepend system message to the first user message.
+                if first_user {
+                    if let Some(sys) = system {
+                        out.push_str(sys);
+                        out.push_str("\n\n");
+                    }
+                    first_user = false;
+                }
+                out.push_str(&msg.content);
+                out.push_str(" [/INST]");
+            }
+            "assistant" => {
+                out.push(' ');
+                out.push_str(&msg.content);
+                out.push_str("</s>");
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,6 +369,27 @@ mod tests {
     }
 
     #[test]
+    fn test_mistral_system_and_user() {
+        let messages = vec![
+            msg("system", "You are helpful."),
+            msg("user", "Hello"),
+        ];
+        let result = format_chat(ModelArch::Mistral, &messages);
+        assert_eq!(result, " [INST] You are helpful.\n\nHello [/INST]");
+    }
+
+    #[test]
+    fn test_mistral_multi_turn() {
+        let messages = vec![
+            msg("user", "Hi"),
+            msg("assistant", "Hello!"),
+            msg("user", "How are you?"),
+        ];
+        let result = format_chat(ModelArch::Mistral, &messages);
+        assert_eq!(result, " [INST] Hi [/INST] Hello!</s> [INST] How are you? [/INST]");
+    }
+
+    #[test]
     fn test_all_formats_end_with_generation_prompt() {
         let messages = vec![msg("user", "Hi")];
         // Every format ends with a prompt for the assistant to generate
@@ -334,6 +404,9 @@ mod tests {
 
         let gemma = format_chat(ModelArch::Gemma3, &messages);
         assert!(gemma.ends_with("<start_of_turn>model\n"));
+
+        let mistral = format_chat(ModelArch::Mistral, &messages);
+        assert!(mistral.ends_with("[/INST]"));
     }
 
     #[test]

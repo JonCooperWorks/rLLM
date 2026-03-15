@@ -42,7 +42,7 @@ pub(crate) struct RunArgs {
     top_p: f32,
 
     /// Enable chat mode for instruct models.  Wraps --prompt in the model's
-    /// chat template (auto-detected: Llama 3 or ChatML for Qwen 2.5).
+    /// chat template (auto-detected: Llama 3, ChatML, Gemma 3, Phi, or Mistral).
     #[arg(long)]
     chat: bool,
 

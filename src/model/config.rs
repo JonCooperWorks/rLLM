@@ -30,8 +30,10 @@
 //   tie_word_embeddings:     true   / false
 //   model_type:              llama  / qwen2
 //
-// Both families use the same architecture (RMSNorm, GQA, SwiGLU, RoPE).
-// The main difference is Qwen adds bias to Q/K/V attention projections.
+// All supported architectures (Llama, Qwen, Phi, Gemma, Mistral, Qwen3 MoE,
+// Qwen 3.5) share the same core building blocks (RMSNorm, GQA, SwiGLU, RoPE).
+// Differences are captured by ModelArch: QKV bias (Qwen), QK-norm (Qwen3 MoE),
+// fused QKV (Gemma), chat template format, and MoE vs dense FFN.
 //
 // RoPE scaling:
 //   Llama 3.2 uses a custom RoPE scaling scheme for long contexts (>8192).
@@ -51,21 +53,6 @@ use serde_json::Value;
 fn null_as_zero<'de, D: Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
     Ok(Option::<usize>::deserialize(d)?.unwrap_or(0))
 }
-
-// ===========================================================================
-// Model architecture enum — detected from config.json's `model_type` field.
-//
-// Why an enum instead of a trait?
-//   When two models share 95% of their architecture (same RMSNorm, GQA,
-//   SwiGLU, RoPE), a trait with dynamic dispatch adds complexity without
-//   benefit.  An enum lets us encode the small set of differences (QKV bias,
-//   chat template, stop tokens) as simple method calls.  Adding a third
-//   model?  Just add a variant and fill in the methods.
-//
-//   If models ever diverge significantly (different forward pass structure,
-//   different attention mechanism), THEN a trait would be justified.  But
-//   for the Llama/Qwen family, enum dispatch keeps things flat and readable.
-// ===========================================================================
 
 /// Supported model architectures, detected from config.json's `model_type`.
 ///
@@ -106,6 +93,13 @@ pub enum ModelArch {
     /// The config.json has text parameters nested under `text_config`.
     /// Weight tensors are prefixed with `model.language_model.` instead of `model.`.
     Qwen3_5,
+    /// Mistral family (Mistral AI, 7B).
+    ///
+    /// Learning note: Mistral 7B is architecturally identical to Llama (RMSNorm,
+    /// GQA, SwiGLU, RoPE).  No QKV bias, no QK-norm, no fused weights.  The only
+    /// differences are the chat template ([INST]/[/INST] markers) and stop tokens.
+    /// The forward pass reuses Llama's implementation directly.
+    Mistral,
     /// Phi family (Microsoft Phi-3, Phi-4).
     ///
     /// Learning note: Phi models are architecturally near-identical to Llama
@@ -167,7 +161,7 @@ impl ModelArch {
     /// this helps at smaller model sizes.
     pub fn has_qkv_bias(&self) -> bool {
         match self {
-            ModelArch::Llama | ModelArch::Phi | ModelArch::Gemma3 => false,
+            ModelArch::Llama | ModelArch::Mistral | ModelArch::Phi | ModelArch::Gemma3 => false,
             ModelArch::Qwen2 => true,
             ModelArch::Qwen3Moe | ModelArch::Qwen3_5 => false,
         }
@@ -182,7 +176,7 @@ impl ModelArch {
     /// rely on the implicit normalisation from RMSNorm on the hidden state.
     pub fn has_qk_norm(&self) -> bool {
         match self {
-            ModelArch::Llama | ModelArch::Qwen2 | ModelArch::Phi => false,
+            ModelArch::Llama | ModelArch::Mistral | ModelArch::Qwen2 | ModelArch::Phi => false,
             ModelArch::Gemma3 => true,  // Both 4B and 27B have q_norm/k_norm weights
             ModelArch::Qwen3_5 => true,  // GQA layers have QK-norm
             ModelArch::Qwen3Moe => true,
@@ -204,13 +198,14 @@ impl ModelArch {
     pub fn from_model_type(model_type: &str) -> anyhow::Result<Self> {
         match model_type {
             "llama" => Ok(ModelArch::Llama),
+            "mistral" => Ok(ModelArch::Mistral),
             "qwen2" => Ok(ModelArch::Qwen2),
             "qwen3_moe" => Ok(ModelArch::Qwen3Moe),
             "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => Ok(ModelArch::Qwen3_5),
             "phi3" | "phi4" => Ok(ModelArch::Phi),
             "gemma3_text" | "gemma3" => Ok(ModelArch::Gemma3),
             other => anyhow::bail!(
-                "unsupported model_type '{}' (expected 'llama', 'qwen2', 'qwen3_moe', 'qwen3_5', 'phi3', or 'gemma3_text')",
+                "unsupported model_type '{}' (expected 'llama', 'mistral', 'qwen2', 'qwen3_moe', 'qwen3_5', 'phi3', or 'gemma3_text')",
                 other
             ),
         }
@@ -219,7 +214,7 @@ impl ModelArch {
 
 /// Model configuration, deserialized from `config.json`.
 ///
-/// These fields are shared across Llama 3 and Qwen 2.5 — both use the same
+/// These fields are shared across all supported architectures — they use the same
 /// HuggingFace field names for all architecture parameters.
 ///
 /// Uses serde's `Deserialize` trait — any field not present in the JSON
@@ -850,6 +845,7 @@ mod tests {
     #[test]
     fn test_model_arch_from_model_type() {
         assert_eq!(ModelArch::from_model_type("llama").unwrap(), ModelArch::Llama);
+        assert_eq!(ModelArch::from_model_type("mistral").unwrap(), ModelArch::Mistral);
         assert_eq!(ModelArch::from_model_type("qwen2").unwrap(), ModelArch::Qwen2);
         assert_eq!(ModelArch::from_model_type("qwen3_moe").unwrap(), ModelArch::Qwen3Moe);
         assert_eq!(ModelArch::from_model_type("qwen3_5").unwrap(), ModelArch::Qwen3_5);
@@ -867,6 +863,7 @@ mod tests {
     #[test]
     fn test_model_arch_has_qkv_bias() {
         assert!(!ModelArch::Llama.has_qkv_bias());
+        assert!(!ModelArch::Mistral.has_qkv_bias());
         assert!(ModelArch::Qwen2.has_qkv_bias());
         assert!(!ModelArch::Qwen3Moe.has_qkv_bias());
         assert!(!ModelArch::Qwen3_5.has_qkv_bias());
@@ -877,6 +874,7 @@ mod tests {
     #[test]
     fn test_model_arch_has_qk_norm() {
         assert!(!ModelArch::Llama.has_qk_norm());
+        assert!(!ModelArch::Mistral.has_qk_norm());
         assert!(!ModelArch::Qwen2.has_qk_norm());
         assert!(ModelArch::Qwen3Moe.has_qk_norm());
         assert!(ModelArch::Qwen3_5.has_qk_norm());
@@ -887,6 +885,7 @@ mod tests {
     #[test]
     fn test_model_arch_has_fused_qkv() {
         assert!(!ModelArch::Llama.has_fused_qkv());
+        assert!(!ModelArch::Mistral.has_fused_qkv());
         assert!(!ModelArch::Qwen2.has_fused_qkv());
         assert!(ModelArch::Phi.has_fused_qkv());
         assert!(!ModelArch::Gemma3.has_fused_qkv());

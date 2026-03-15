@@ -32,7 +32,7 @@
 //   on demand.  This means near-instant startup and no memory duplication
 //   (shared with the OS page cache).
 //
-// Weight naming convention (shared by Llama and Qwen):
+// Weight naming convention (shared by all dense transformer architectures):
 //   model.embed_tokens.weight                          → [vocab_size, hidden_size]
 //   model.layers.{i}.input_layernorm.weight            → [hidden_size]
 //   model.layers.{i}.self_attn.q_proj.weight           → [q_dim, hidden_size]
@@ -45,7 +45,7 @@
 //   model.layers.{i}.mlp.down_proj.weight              → [hidden_size, inter_size]
 //   model.norm.weight                                  → [hidden_size]
 //
-// QKV bias (Qwen 2.5 only — Llama has no biases):
+// QKV bias (Qwen 2.5 and Qwen 3.5 only — Llama, Phi, Gemma, Mistral have none):
 //   model.layers.{i}.self_attn.q_proj.bias             → [q_dim]
 //   model.layers.{i}.self_attn.k_proj.bias             → [kv_dim]
 //   model.layers.{i}.self_attn.v_proj.bias             → [kv_dim]
@@ -224,7 +224,7 @@ pub(crate) struct LayerWeights<B: GpuCore> {
     pub v_proj: B::Tensor,          // Value projection [kv_dim, hidden_size]
     pub o_proj: B::Tensor,          // Output projection [hidden_size, q_dim]
 
-    // --- QKV bias (Qwen 2.5 only, None for Llama and Qwen3Moe) ---
+    // --- QKV bias (Qwen 2.5 / Qwen 3.5 only, None for Llama/Phi/Gemma/Mistral/Qwen3Moe) ---
     //
     // Learning note: bias in a linear layer means output = W @ x + b.
     // After computing Q = W_q @ hidden, Qwen adds: Q = Q + b_q.
@@ -234,7 +234,7 @@ pub(crate) struct LayerWeights<B: GpuCore> {
     // No new GPU kernel needed: reuses the existing `backend.add()`.
     //
     // Bias tensors are always bf16 (1D, small) and never quantised.
-    // O projection has NO bias in either Llama or Qwen.
+    // O projection has NO bias in any supported architecture.
     pub q_bias: Option<B::Tensor>, // [hidden_size], or None for Llama
     pub k_bias: Option<B::Tensor>, // [kv_dim], or None for Llama
     pub v_bias: Option<B::Tensor>, // [kv_dim], or None for Llama

@@ -1,6 +1,6 @@
 # rLLM
 
-Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf16 and Q4 quantization, multi-architecture support (Llama 3, Qwen 2.5, Qwen3 MoE, Qwen3.5, Phi-4, Gemma 3, DeepSeek-R1-Distill). Paged KV cache, batched prefill (GEMM), continuous batching. No frameworks, no GGML — just raw GPU compute.
+Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf16 and Q4 quantization, multi-architecture support (Llama 3, Qwen 2.5, Mistral, Qwen3 MoE, Qwen3.5, Phi-4, Gemma 3, DeepSeek-R1-Distill). Paged KV cache, batched prefill (GEMM), continuous batching. No frameworks, no GGML — just raw GPU compute.
 
 ## Performance
 
@@ -12,6 +12,7 @@ Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf
 | Llama 3.2 3B Instruct | 3.2B | 37 tok/s | 51 tok/s | 322 ms | 253 ms |
 | Qwen 2.5 3B Instruct | 3.1B | 31 tok/s | 45 tok/s | 242 ms | 98 ms |
 | Qwen 2.5 7B Instruct | 7.6B | 23 tok/s | 39 tok/s | 662 ms | 240 ms |
+| Mistral 7B Instruct | 7.2B | 19 tok/s | 32 tok/s | 2,100 ms | 353 ms |
 | Llama 3.1 8B Instruct | 8.0B | 21 tok/s | 36 tok/s | 782 ms | 393 ms |
 | Gemma 3 4B Instruct | 4.3B | 25 tok/s | 32 tok/s | 400 ms | 330 ms |
 | Gemma 3 27B Instruct | 27.4B | 2 tok/s | 7 tok/s | 50,000 ms | 4,300 ms |
@@ -24,7 +25,7 @@ Q4 quantization (`--quantize`) gives ~1.3-3.5x faster decode by reducing memory 
 
 ## Features
 
-- **Multi-architecture** — Llama 3, Qwen 2.5, Qwen3 MoE, Qwen3.5, Phi-4, and Gemma 3 from the same codebase
+- **Multi-architecture** — Llama 3, Qwen 2.5, Mistral, Qwen3 MoE, Qwen3.5, Phi-4, and Gemma 3 from the same codebase
 - **Metal GPU backend** — SIMD-cooperative matmul, async command buffer dispatch
 - **Batched prefill** — GEMM-based prompt processing (3-10x faster than token-by-token)
 - **Paged KV cache** — on-demand block allocation, shared across sequences
@@ -34,7 +35,7 @@ Q4 quantization (`--quantize`) gives ~1.3-3.5x faster decode by reducing memory 
 - **Safetensors loading** — single and multi-shard weight files
 - **BPE tokenizer** — HuggingFace-compatible tokenizer.json
 - **Mixture of Experts** — top-k expert routing with per-token dispatch (Qwen3 MoE)
-- **Chat templates** — Llama 3, ChatML (Qwen), Phi, and Gemma instruct formats with `--chat`
+- **Chat templates** — Llama 3, ChatML (Qwen), Mistral, Phi, and Gemma instruct formats with `--chat`
 - **Temperature + top-p sampling** — configurable via `--temperature` and `--top-p`
 - **Streaming output** — tokens printed as generated
 - **API server** — OpenAI and Anthropic compatible HTTP endpoints with SSE streaming
@@ -53,11 +54,12 @@ With Q4 quantization:
 cargo run --release -- run --model models/llama-3.2-1b --prompt "The meaning of life is" --max-tokens 128 --quantize
 ```
 
-Chat mode (instruct models — auto-detects Llama 3 or ChatML template):
+Chat mode (instruct models — auto-detects chat template per architecture):
 
 ```
 cargo run --release -- run --model models/llama-3.2-3b-instruct --prompt "Write a Python program that adds 4 numbers" --chat --temperature 0
 cargo run --release -- run --model models/qwen-2.5-7b-instruct --prompt "Explain hash maps" --chat --temperature 0
+cargo run --release -- run --model models/mistral-7b-instruct --prompt "Explain what a hash map is" --chat --temperature 0
 cargo run --release -- run --model models/qwen3-coder-30b-a3b-instruct --prompt "Write a fibonacci function" --chat --quantize --temperature 0
 ```
 
@@ -201,7 +203,7 @@ src/
 │   ├── config.rs        — HuggingFace config.json parsing, ModelArch detection
 │   ├── loader.rs        — Safetensors loading, Q4 on-load quantization
 │   ├── tokenizer.rs     — BPE tokenizer with per-model special tokens
-│   ├── chat.rs          — Chat template formatter (Llama 3 + ChatML + Phi)
+│   ├── chat.rs          — Chat template formatter (Llama 3, ChatML, Mistral, Phi, Gemma)
 │   ├── kv_cache.rs      — Paged KV cache (block pool + per-sequence state)
 │   └── sampler.rs       — Temperature + top-p sampling
 ├── engine/
@@ -225,7 +227,7 @@ src/
     └── cuda/            — CUDA backend
 ```
 
-Model code is generic over a `GpuBackend` trait with an associated `Tensor` type. Platform selection uses OS-conditional compilation — Metal on macOS, CUDA on Linux. Llama, Qwen, and Phi share the same forward pass primitives; differences are in weight loading (Phi uses fused qkv/gate_up tensors split on load) and QKV bias (Qwen 2.5 only). Gemma 3 has a dedicated forward pass with sandwich norms (4 RMSNorm per layer), GeGLU activation, sliding window attention, QK-norm, and dual RoPE bases.
+Model code is generic over a `GpuBackend` trait with an associated `Tensor` type. Platform selection uses OS-conditional compilation — Metal on macOS, CUDA on Linux. Llama, Qwen, Mistral, and Phi share the same forward pass primitives; differences are in weight loading (Phi uses fused qkv/gate_up tensors split on load), QKV bias (Qwen 2.5 only), and chat template. Mistral is architecturally identical to Llama and re-exports its forward pass directly. Gemma 3 has a dedicated forward pass with sandwich norms (4 RMSNorm per layer), GeGLU activation, sliding window attention, QK-norm, and dual RoPE bases. Qwen3 MoE and Qwen 3.5 use Mixture of Experts with shared routing primitives.
 
 ### Inference pipeline
 
@@ -280,6 +282,9 @@ hf download meta-llama/Llama-3.2-1B-Instruct --local-dir models/llama-3.2-1b-ins
 hf download meta-llama/Llama-3.2-3B-Instruct --local-dir models/llama-3.2-3b-instruct
 hf download meta-llama/Llama-3.1-8B-Instruct --local-dir models/llama-3.1-8b-instruct
 
+# Mistral 7B — instruct model (architecturally identical to Llama)
+hf download mistralai/Mistral-7B-Instruct-v0.3 --local-dir models/mistral-7b-instruct
+
 # Qwen 2.5 — instruct models
 hf download Qwen/Qwen2.5-3B-Instruct --local-dir models/qwen-2.5-3b-instruct
 hf download Qwen/Qwen2.5-7B-Instruct --local-dir models/qwen-2.5-7b-instruct
@@ -298,6 +303,6 @@ hf download microsoft/phi-4 --local-dir models/phi-4
 hf download deepseek-ai/DeepSeek-R1-Distill-Qwen-32B --local-dir models/DeepSeek-R1-Distill-Qwen-32B
 ```
 
-> **Note:** Llama and Gemma models are gated — you'll need to accept the license on Hugging Face and authenticate with `hf auth login` before downloading. Qwen models are open access (Apache-2.0).
+> **Note:** Llama, Gemma, and Mistral models are gated — you'll need to accept the license on Hugging Face and authenticate with `hf auth login` before downloading. Qwen models are open access (Apache-2.0).
 
 Each model directory should contain `config.json`, `tokenizer.json`, and one or more `.safetensors` weight files.
