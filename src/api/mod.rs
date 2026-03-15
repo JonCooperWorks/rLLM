@@ -61,7 +61,7 @@ use std::sync::Arc;
 use crate::ServeArgs;
 use crate::engine;
 use crate::engine::scheduler::{self, SeqId};
-use crate::gpu::{self, GpuBackend};
+use crate::gpu::{self, GpuCore};
 use crate::model;
 use crate::model::loader;
 use crate::model::{config, kv_cache, tokenizer};

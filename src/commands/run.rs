@@ -9,7 +9,7 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use crate::gpu::{self, GpuBackend};
+use crate::gpu::{self, GpuCore};
 use crate::model;
 use crate::model::{kv_cache, loader, sampler};
 

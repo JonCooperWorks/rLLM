@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use crate::engine;
 use crate::engine::scheduler;
-use crate::gpu::{self, GpuBackend};
+use crate::gpu::{self, GpuCore};
 use crate::model;
 use crate::model::{kv_cache, loader};
 
