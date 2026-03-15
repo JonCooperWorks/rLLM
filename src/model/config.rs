@@ -775,3 +775,372 @@ impl ModelConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    // Helper to load a config from the models directory if it exists.
+    fn load_config(subdir: &str) -> Option<ModelConfig> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("models")
+            .join(subdir)
+            .join("config.json");
+        if path.exists() {
+            Some(ModelConfig::from_file(&path).expect(&format!("failed to parse {}", path.display())))
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn test_model_arch_from_model_type() {
+        assert_eq!(ModelArch::from_model_type("llama").unwrap(), ModelArch::Llama);
+        assert_eq!(ModelArch::from_model_type("qwen2").unwrap(), ModelArch::Qwen2);
+        assert_eq!(ModelArch::from_model_type("qwen3_moe").unwrap(), ModelArch::Qwen3Moe);
+        assert_eq!(ModelArch::from_model_type("qwen3_5").unwrap(), ModelArch::Qwen3_5);
+        assert_eq!(ModelArch::from_model_type("qwen3_5_text").unwrap(), ModelArch::Qwen3_5);
+        assert_eq!(ModelArch::from_model_type("qwen3_5_moe").unwrap(), ModelArch::Qwen3_5);
+        assert_eq!(ModelArch::from_model_type("qwen3_5_moe_text").unwrap(), ModelArch::Qwen3_5);
+        assert_eq!(ModelArch::from_model_type("phi3").unwrap(), ModelArch::Phi);
+        assert_eq!(ModelArch::from_model_type("phi4").unwrap(), ModelArch::Phi);
+        assert_eq!(ModelArch::from_model_type("gemma3_text").unwrap(), ModelArch::Gemma3);
+        assert_eq!(ModelArch::from_model_type("gemma3").unwrap(), ModelArch::Gemma3);
+        assert!(ModelArch::from_model_type("gpt2").is_err());
+        assert!(ModelArch::from_model_type("").is_err());
+    }
+
+    #[test]
+    fn test_model_arch_has_qkv_bias() {
+        assert!(!ModelArch::Llama.has_qkv_bias());
+        assert!(ModelArch::Qwen2.has_qkv_bias());
+        assert!(!ModelArch::Qwen3Moe.has_qkv_bias());
+        assert!(!ModelArch::Qwen3_5.has_qkv_bias());
+        assert!(!ModelArch::Phi.has_qkv_bias());
+        assert!(!ModelArch::Gemma3.has_qkv_bias());
+    }
+
+    #[test]
+    fn test_model_arch_has_qk_norm() {
+        assert!(!ModelArch::Llama.has_qk_norm());
+        assert!(!ModelArch::Qwen2.has_qk_norm());
+        assert!(ModelArch::Qwen3Moe.has_qk_norm());
+        assert!(ModelArch::Qwen3_5.has_qk_norm());
+        assert!(!ModelArch::Phi.has_qk_norm());
+        assert!(!ModelArch::Gemma3.has_qk_norm());
+    }
+
+    #[test]
+    fn test_model_arch_has_fused_qkv() {
+        assert!(!ModelArch::Llama.has_fused_qkv());
+        assert!(!ModelArch::Qwen2.has_fused_qkv());
+        assert!(ModelArch::Phi.has_fused_qkv());
+        assert!(!ModelArch::Gemma3.has_fused_qkv());
+    }
+
+    #[test]
+    fn test_parse_llama_config() {
+        let Some(config) = load_config("llama-3.2-1b") else { return };
+        assert_eq!(config.model_type, "llama");
+        assert_eq!(config.hidden_size, 2048);
+        assert_eq!(config.num_hidden_layers, 16);
+        assert_eq!(config.num_attention_heads, 32);
+        assert_eq!(config.num_key_value_heads, 8);
+        assert_eq!(config.head_dim, 64);
+        assert_eq!(config.intermediate_size, 8192);
+        assert_eq!(config.vocab_size, 128256);
+        assert!(config.tie_word_embeddings);
+        assert_eq!(config.arch().unwrap(), ModelArch::Llama);
+        assert!(!config.is_moe());
+        assert!(!config.is_hybrid_deltanet());
+        assert!(!config.uses_geglu());
+        assert_eq!(config.weight_prefix, "model.");
+    }
+
+    #[test]
+    fn test_parse_qwen2_config() {
+        let Some(config) = load_config("qwen-2.5-3b-instruct") else { return };
+        assert_eq!(config.model_type, "qwen2");
+        assert_eq!(config.arch().unwrap(), ModelArch::Qwen2);
+        assert!(config.arch().unwrap().has_qkv_bias());
+        assert!(config.tie_word_embeddings);
+        assert!(!config.is_moe());
+        // head_dim should be computed from hidden_size / num_attention_heads
+        assert!(config.head_dim > 0);
+        assert_eq!(config.head_dim, config.hidden_size / config.num_attention_heads);
+    }
+
+    #[test]
+    fn test_parse_phi_config() {
+        let Some(config) = load_config("phi-4") else { return };
+        assert_eq!(config.arch().unwrap(), ModelArch::Phi);
+        assert!(config.arch().unwrap().has_fused_qkv());
+        assert!(!config.arch().unwrap().has_qkv_bias());
+        assert!(!config.is_moe());
+    }
+
+    #[test]
+    fn test_parse_qwen3_moe_config() {
+        let Some(config) = load_config("qwen3-coder-30b-a3b-instruct") else { return };
+        assert_eq!(config.arch().unwrap(), ModelArch::Qwen3Moe);
+        assert!(config.is_moe());
+        assert!(config.num_experts > 0);
+        assert!(config.num_experts_per_tok > 0);
+        assert!(config.moe_intermediate_size > 0);
+        assert!(config.arch().unwrap().has_qk_norm());
+    }
+
+    #[test]
+    fn test_is_moe() {
+        // A config with num_experts=0 is not MoE
+        let mut config = minimal_config();
+        assert!(!config.is_moe());
+        config.num_experts = 8;
+        assert!(config.is_moe());
+    }
+
+    #[test]
+    fn test_has_shared_expert() {
+        let mut config = minimal_config();
+        assert!(!config.has_shared_expert());
+        config.shared_expert_intermediate_size = 512;
+        assert!(config.has_shared_expert());
+    }
+
+    #[test]
+    fn test_effective_intermediate_size_dense() {
+        let mut config = minimal_config();
+        config.intermediate_size = 8192;
+        assert_eq!(config.effective_intermediate_size(), 8192);
+    }
+
+    #[test]
+    fn test_effective_intermediate_size_moe_only() {
+        let mut config = minimal_config();
+        config.intermediate_size = 0;
+        config.num_attention_heads = 16;
+        config.head_dim = 128;
+        config.hidden_size = 2048;
+        config.moe_intermediate_size = 768;
+        config.shared_expert_intermediate_size = 512;
+        // q_dim = 16 * 128 = 2048, max(2048, 2048, 512, 768) = 2048
+        assert_eq!(config.effective_intermediate_size(), 2048);
+    }
+
+    #[test]
+    fn test_rotary_dim_full() {
+        let mut config = minimal_config();
+        config.head_dim = 128;
+        config.partial_rotary_factor = 0.0;
+        assert_eq!(config.rotary_dim(), 128);
+    }
+
+    #[test]
+    fn test_rotary_dim_partial() {
+        let mut config = minimal_config();
+        config.head_dim = 256;
+        config.partial_rotary_factor = 0.25;
+        assert_eq!(config.rotary_dim(), 64);
+    }
+
+    #[test]
+    fn test_uses_geglu() {
+        let mut config = minimal_config();
+        assert!(!config.uses_geglu());
+        config.hidden_activation = "gelu_pytorch_tanh".to_string();
+        assert!(config.uses_geglu());
+    }
+
+    #[test]
+    fn test_has_sliding_window() {
+        let mut config = minimal_config();
+        assert!(!config.has_sliding_window());
+        config.sliding_window = 4096;
+        assert!(config.has_sliding_window());
+    }
+
+    #[test]
+    fn test_num_kv_layers_dense() {
+        let config = minimal_config();
+        assert_eq!(config.num_kv_layers(), 4);
+    }
+
+    #[test]
+    fn test_num_kv_layers_hybrid() {
+        let mut config = minimal_config();
+        config.layer_types = vec![
+            "linear_attention".into(),
+            "linear_attention".into(),
+            "linear_attention".into(),
+            "full_attention".into(),
+        ];
+        assert_eq!(config.num_kv_layers(), 1);
+    }
+
+    #[test]
+    fn test_kv_layer_map_dense() {
+        let config = minimal_config();
+        assert_eq!(config.kv_layer_map(), vec![Some(0), Some(1), Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn test_kv_layer_map_hybrid() {
+        let mut config = minimal_config();
+        config.layer_types = vec![
+            "linear_attention".into(),
+            "full_attention".into(),
+            "linear_attention".into(),
+            "full_attention".into(),
+        ];
+        assert_eq!(config.kv_layer_map(), vec![None, Some(0), None, Some(1)]);
+    }
+
+    #[test]
+    fn test_is_hybrid_deltanet() {
+        let mut config = minimal_config();
+        assert!(!config.is_hybrid_deltanet());
+        config.layer_types = vec!["full_attention".into()];
+        assert!(!config.is_hybrid_deltanet());
+        config.layer_types = vec!["linear_attention".into(), "full_attention".into()];
+        assert!(config.is_hybrid_deltanet());
+    }
+
+    #[test]
+    fn test_is_linear_attention_layer() {
+        let mut config = minimal_config();
+        config.layer_types = vec![
+            "linear_attention".into(),
+            "full_attention".into(),
+        ];
+        assert!(config.is_linear_attention_layer(0));
+        assert!(!config.is_linear_attention_layer(1));
+        assert!(!config.is_linear_attention_layer(99)); // out of bounds
+    }
+
+    #[test]
+    fn test_is_sliding_attention_layer() {
+        let mut config = minimal_config();
+        config.layer_types = vec![
+            "sliding_attention".into(),
+            "full_attention".into(),
+        ];
+        assert!(config.is_sliding_attention_layer(0));
+        assert!(!config.is_sliding_attention_layer(1));
+        assert!(!config.is_sliding_attention_layer(99));
+    }
+
+    #[test]
+    fn test_sliding_window_pattern_generates_layer_types() {
+        // Create a JSON config with sliding_window_pattern=6 and 12 layers
+        let json = serde_json::json!({
+            "model_type": "gemma3_text",
+            "hidden_size": 256,
+            "num_hidden_layers": 12,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 64,
+            "intermediate_size": 512,
+            "vocab_size": 1000,
+            "max_position_embeddings": 2048,
+            "rope_theta": 10000.0,
+            "rms_norm_eps": 1e-5,
+            "sliding_window_pattern": 6
+        });
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), json.to_string()).unwrap();
+        let config = ModelConfig::from_file(tmp.path()).unwrap();
+
+        assert_eq!(config.layer_types.len(), 12);
+        // Every 6th layer (1-indexed) should be "full_attention"
+        // Layer 0: (0+1)%6=1 → sliding
+        // Layer 5: (5+1)%6=0 → full
+        // Layer 11: (11+1)%6=0 → full
+        for (i, lt) in config.layer_types.iter().enumerate() {
+            if (i + 1) % 6 == 0 {
+                assert_eq!(lt, "full_attention", "layer {i} should be full");
+            } else {
+                assert_eq!(lt, "sliding_attention", "layer {i} should be sliding");
+            }
+        }
+    }
+
+    #[test]
+    fn test_head_dim_computed_when_zero() {
+        let json = serde_json::json!({
+            "model_type": "qwen2",
+            "hidden_size": 2048,
+            "num_hidden_layers": 16,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 2,
+            "intermediate_size": 8192,
+            "vocab_size": 152064,
+            "max_position_embeddings": 32768,
+            "rope_theta": 10000.0,
+            "rms_norm_eps": 1e-6
+        });
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), json.to_string()).unwrap();
+        let config = ModelConfig::from_file(tmp.path()).unwrap();
+        assert_eq!(config.head_dim, 128); // 2048 / 16
+    }
+
+    #[test]
+    fn test_estimate_weight_bytes_sanity() {
+        let Some(config) = load_config("llama-3.2-1b") else { return };
+        let bf16_bytes = config.estimate_weight_bytes(false);
+        let q4_bytes = config.estimate_weight_bytes(true);
+        // BF16 should be larger than Q4
+        assert!(bf16_bytes > q4_bytes, "bf16={bf16_bytes} should be > q4={q4_bytes}");
+        // Sanity: 1B model should be roughly 2GB bf16
+        assert!(bf16_bytes > 1_000_000_000, "bf16 bytes {bf16_bytes} too small for 1B model");
+        assert!(bf16_bytes < 5_000_000_000, "bf16 bytes {bf16_bytes} too large for 1B model");
+    }
+
+    #[test]
+    fn test_num_heads_per_kv_group() {
+        let mut config = minimal_config();
+        config.num_attention_heads = 32;
+        config.num_key_value_heads = 8;
+        assert_eq!(config.num_heads_per_kv_group(), 4);
+    }
+
+    /// Create a minimal valid ModelConfig for unit testing.
+    fn minimal_config() -> ModelConfig {
+        ModelConfig {
+            model_type: "llama".to_string(),
+            hidden_size: 256,
+            num_hidden_layers: 4,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: 64,
+            intermediate_size: 512,
+            vocab_size: 1000,
+            max_position_embeddings: 2048,
+            rope_theta: 10000.0,
+            rms_norm_eps: 1e-5,
+            tie_word_embeddings: true,
+            rope_scaling: None,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
+            linear_num_key_heads: 0,
+            linear_num_value_heads: 0,
+            linear_key_head_dim: 0,
+            linear_value_head_dim: 0,
+            linear_conv_kernel_dim: 0,
+            full_attention_interval: 0,
+            layer_types: vec![],
+            partial_rotary_factor: 0.0,
+            rope_parameters: None,
+            attn_output_gate: false,
+            sliding_window: 0,
+            sliding_window_pattern: 0,
+            query_pre_attn_scalar: 0.0,
+            rope_local_base_freq: 0.0,
+            hidden_activation: String::new(),
+            weight_prefix: "model.".to_string(),
+        }
+    }
+}

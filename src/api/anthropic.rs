@@ -324,3 +324,84 @@ fn error_response(status: StatusCode, message: &str) -> Response {
     });
     (status, Json(body)).into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_messages_request_deserialization() {
+        let json = r#"{
+            "model": "claude-3",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 200,
+            "temperature": 0.5,
+            "top_p": 0.8,
+            "stream": false,
+            "system": "You are helpful."
+        }"#;
+        let req: MessagesRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.model.as_deref(), Some("claude-3"));
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.max_tokens, 200);
+        assert!((req.temperature.unwrap() - 0.5).abs() < 0.001);
+        assert!((req.top_p.unwrap() - 0.8).abs() < 0.001);
+        assert!(!req.stream);
+        assert_eq!(req.system.as_deref(), Some("You are helpful."));
+    }
+
+    #[test]
+    fn test_messages_request_defaults() {
+        let json = r#"{"messages": [{"role": "user", "content": "Hi"}]}"#;
+        let req: MessagesRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.model, None);
+        assert_eq!(req.max_tokens, 4096);
+        assert_eq!(req.temperature, None);
+        assert_eq!(req.top_p, None);
+        assert!(!req.stream);
+        assert_eq!(req.system, None);
+    }
+
+    #[test]
+    fn test_messages_request_system_field() {
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Hi"}],
+            "system": "Be concise."
+        }"#;
+        let req: MessagesRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.system.as_deref(), Some("Be concise."));
+    }
+
+    #[test]
+    fn test_stop_reason_str_values() {
+        assert_eq!(stop_reason_str(StopReason::EndOfSequence), "end_turn");
+        assert_eq!(stop_reason_str(StopReason::MaxTokens), "max_tokens");
+    }
+
+    #[test]
+    fn test_messages_response_serialization() {
+        let response = MessagesResponse {
+            id: "msg_test123".into(),
+            type_: "message",
+            role: "assistant",
+            content: vec![ContentBlock {
+                type_: "text",
+                text: "Hello!".into(),
+            }],
+            model: "test-model".into(),
+            stop_reason: Some("end_turn".into()),
+            usage: AnthropicUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+            },
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["type"], "message");
+        assert_eq!(json["role"], "assistant");
+        assert_eq!(json["content"][0]["type"], "text");
+        assert_eq!(json["content"][0]["text"], "Hello!");
+        assert_eq!(json["stop_reason"], "end_turn");
+        assert_eq!(json["usage"]["input_tokens"], 10);
+        assert_eq!(json["usage"]["output_tokens"], 5);
+    }
+}

@@ -162,4 +162,210 @@ impl<B: GpuBackend> Scheduler<B> {
     pub fn has_work(&self) -> bool {
         !self.waiting.is_empty() || !self.active.is_empty()
     }
+
+    /// Number of waiting requests.
+    #[cfg(test)]
+    pub fn waiting_count(&self) -> usize {
+        self.waiting.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu::cpu::CpuBackend;
+
+    fn make_request(prompt_len: usize, max_gen: usize) -> SequenceRequest {
+        SequenceRequest {
+            prompt_tokens: vec![1; prompt_len],
+            max_gen_tokens: max_gen,
+            temperature: 1.0,
+            top_p: 0.9,
+        }
+    }
+
+    fn setup(num_blocks: usize, max_active: usize) -> (CpuBackend, Scheduler<CpuBackend>) {
+        let backend = CpuBackend;
+        let pool = KvPool::new(&backend, num_blocks, 4, 1); // kv_dim=4, 1 layer
+        let scheduler = Scheduler::new(pool, max_active);
+        (backend, scheduler)
+    }
+
+    #[test]
+    fn test_add_request_returns_incrementing_ids() {
+        let (_b, mut s) = setup(10, 4);
+        let id0 = s.add_request(make_request(4, 10));
+        let id1 = s.add_request(make_request(4, 10));
+        let id2 = s.add_request(make_request(4, 10));
+        assert_eq!(id0, 0);
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+        assert_eq!(s.waiting_count(), 3);
+        assert!(s.active.is_empty());
+    }
+
+    #[test]
+    fn test_schedule_admits_to_active() {
+        let (b, mut s) = setup(10, 4);
+        s.add_request(make_request(4, 10));
+        s.add_request(make_request(4, 10));
+
+        let admitted = s.schedule(&b);
+        assert_eq!(admitted.len(), 2);
+        assert_eq!(s.active.len(), 2);
+        assert_eq!(s.waiting_count(), 0);
+    }
+
+    #[test]
+    fn test_schedule_respects_max_active() {
+        let (b, mut s) = setup(10, 2);
+        s.add_request(make_request(4, 10));
+        s.add_request(make_request(4, 10));
+        s.add_request(make_request(4, 10));
+
+        let admitted = s.schedule(&b);
+        assert_eq!(admitted.len(), 2);
+        assert_eq!(s.active.len(), 2);
+        assert_eq!(s.waiting_count(), 1); // one still waiting
+    }
+
+    #[test]
+    fn test_schedule_blocks_on_kv_memory() {
+        // schedule() checks free_block_count but doesn't allocate blocks —
+        // it's an admission heuristic.  With 2 blocks, a 20-token prompt
+        // (needs 2 blocks) can be admitted, but a second identical request
+        // also passes the check because blocks aren't consumed at admit time.
+        // Use a request that needs MORE blocks than exist to see rejection.
+        let (b, mut s) = setup(2, 4);
+        s.add_request(make_request(48, 10)); // needs ceil(48/16) = 3 blocks > 2 available
+
+        let admitted = s.schedule(&b);
+        assert_eq!(admitted.len(), 0);
+        assert_eq!(s.waiting_count(), 1);
+
+        // A request that fits should be admitted
+        s.add_request(make_request(16, 10)); // needs 1 block
+        let admitted = s.schedule(&b);
+        // The first (48 tokens) still blocks, but second (16 tokens) is behind it in FCFS
+        // FCFS means the blocked first request prevents the second from being tried
+        assert_eq!(admitted.len(), 0);
+    }
+
+    #[test]
+    fn test_abort_waiting_sequence() {
+        let (_b, mut s) = setup(10, 4);
+        let id0 = s.add_request(make_request(4, 10));
+        let _id1 = s.add_request(make_request(4, 10));
+
+        s.abort_sequence(id0);
+        assert_eq!(s.waiting_count(), 1);
+    }
+
+    #[test]
+    fn test_abort_active_sequence_frees_blocks() {
+        let (b, mut s) = setup(4, 4);
+        s.add_request(make_request(16, 10));
+        let admitted = s.schedule(&b);
+        let id = admitted[0];
+
+        // Simulate the engine allocating blocks (schedule doesn't consume blocks)
+        s.active.get_mut(&id).unwrap().kv_state.ensure_slots(&mut s.kv_pool, 16).unwrap();
+
+        let free_before = s.kv_pool.free_block_count();
+        s.abort_sequence(id);
+        let free_after = s.kv_pool.free_block_count();
+
+        assert!(s.active.is_empty());
+        assert_eq!(free_after, free_before + 1);
+    }
+
+    #[test]
+    fn test_collect_finished() {
+        let (b, mut s) = setup(10, 4);
+        let id0 = s.add_request(make_request(4, 10));
+        let id1 = s.add_request(make_request(4, 10));
+        s.schedule(&b);
+
+        // Mark one as finished
+        s.active.get_mut(&id0).unwrap().finished = true;
+
+        let finished = s.collect_finished();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].0, id0);
+        assert_eq!(s.active.len(), 1);
+        assert!(s.active.contains_key(&id1));
+    }
+
+    #[test]
+    fn test_collect_finished_frees_blocks() {
+        let (b, mut s) = setup(10, 4);
+        s.add_request(make_request(16, 10));
+        s.schedule(&b);
+
+        // Simulate engine allocating blocks
+        for seq in s.active.values_mut() {
+            seq.kv_state.ensure_slots(&mut s.kv_pool, 16).unwrap();
+        }
+
+        let free_before = s.kv_pool.free_block_count();
+        for seq in s.active.values_mut() {
+            seq.finished = true;
+        }
+        s.collect_finished();
+        let free_after = s.kv_pool.free_block_count();
+
+        assert!(s.active.is_empty());
+        assert_eq!(free_after, free_before + 1);
+    }
+
+    #[test]
+    fn test_has_work() {
+        let (b, mut s) = setup(10, 4);
+        assert!(!s.has_work());
+
+        s.add_request(make_request(4, 10));
+        assert!(s.has_work()); // waiting
+
+        s.schedule(&b);
+        assert!(s.has_work()); // active
+
+        for seq in s.active.values_mut() {
+            seq.finished = true;
+        }
+        s.collect_finished();
+        assert!(!s.has_work()); // empty
+    }
+
+    #[test]
+    fn test_schedule_admits_after_finish_frees_blocks() {
+        let (b, mut s) = setup(3, 4);
+        // First request: 20 tokens, needs ceil(20/16) = 2 blocks
+        s.add_request(make_request(20, 10));
+        s.schedule(&b);
+        assert_eq!(s.active.len(), 1);
+
+        // Simulate engine allocating 2 blocks
+        for seq in s.active.values_mut() {
+            seq.kv_state.ensure_slots(&mut s.kv_pool, 20).unwrap();
+        }
+        assert_eq!(s.kv_pool.free_block_count(), 1);
+
+        // Second request needs 2 blocks but only 1 free → can't admit
+        s.add_request(make_request(20, 10));
+        let admitted = s.schedule(&b);
+        assert_eq!(admitted.len(), 0);
+        assert_eq!(s.waiting_count(), 1);
+
+        // Finish first → frees 2 blocks → second can be admitted
+        for seq in s.active.values_mut() {
+            seq.finished = true;
+        }
+        s.collect_finished();
+        assert_eq!(s.kv_pool.free_block_count(), 3);
+
+        let admitted = s.schedule(&b);
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(s.active.len(), 1);
+        assert_eq!(s.waiting_count(), 0);
+    }
 }

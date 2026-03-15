@@ -128,3 +128,51 @@ pub(crate) fn q4_byte_count(m: usize, k: usize) -> usize {
 pub(crate) fn create_backend() -> anyhow::Result<Backend> {
     Backend::new()
 }
+
+#[cfg(test)]
+pub(crate) mod cpu;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tensor_dtype_byte_size_bf16() {
+        assert_eq!(TensorDtype::BF16.byte_size(), 2);
+    }
+
+    #[test]
+    fn test_tensor_dtype_byte_size_f32() {
+        assert_eq!(TensorDtype::F32.byte_size(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "Q4 has variable byte size")]
+    fn test_tensor_dtype_byte_size_q4_panics() {
+        let _ = TensorDtype::Q4.byte_size();
+    }
+
+    #[test]
+    fn test_q4_byte_count_single_block() {
+        // 1 row, 32 elements = 1 block = 20 bytes
+        assert_eq!(q4_byte_count(1, 32), 20);
+    }
+
+    #[test]
+    fn test_q4_byte_count_multiple_blocks() {
+        // 1 row, 64 elements = 2 blocks = 40 bytes
+        assert_eq!(q4_byte_count(1, 64), 40);
+    }
+
+    #[test]
+    fn test_q4_byte_count_multiple_rows() {
+        // 4 rows, 64 elements each = 4 * 2 blocks * 20 = 160
+        assert_eq!(q4_byte_count(4, 64), 160);
+    }
+
+    #[test]
+    fn test_q4_byte_count_large() {
+        // 2048 rows, 2048 cols = 2048 * 64 * 20 = 2621440
+        assert_eq!(q4_byte_count(2048, 2048), 2048 * (2048 / 32) * 20);
+    }
+}

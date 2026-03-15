@@ -212,3 +212,135 @@ fn format_phi(messages: &[Message]) -> String {
 
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(role: &str, content: &str) -> Message {
+        Message {
+            role: role.to_string(),
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_llama3_system_and_user() {
+        let messages = vec![
+            msg("system", "You are helpful."),
+            msg("user", "Hello"),
+        ];
+        let result = format_chat(ModelArch::Llama, &messages);
+        assert_eq!(
+            result,
+            "<|start_header_id|>system<|end_header_id|>\n\nYou are helpful.<|eot_id|>\
+             <|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|>\
+             <|start_header_id|>assistant<|end_header_id|>\n\n"
+        );
+    }
+
+    #[test]
+    fn test_llama3_multi_turn() {
+        let messages = vec![
+            msg("system", "Be concise."),
+            msg("user", "Hi"),
+            msg("assistant", "Hello!"),
+            msg("user", "How are you?"),
+        ];
+        let result = format_chat(ModelArch::Llama, &messages);
+        assert!(result.contains("<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nHello!<|eot_id|>"));
+        assert!(result.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
+    }
+
+    #[test]
+    fn test_chatml_format() {
+        let messages = vec![
+            msg("system", "You are helpful."),
+            msg("user", "Hello"),
+        ];
+        let result = format_chat(ModelArch::Qwen2, &messages);
+        assert_eq!(
+            result,
+            "<|im_start|>system\nYou are helpful.<|im_end|>\n\
+             <|im_start|>user\nHello<|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn test_chatml_used_for_qwen_variants() {
+        let messages = vec![msg("user", "Hi")];
+        let qwen2 = format_chat(ModelArch::Qwen2, &messages);
+        let qwen3_moe = format_chat(ModelArch::Qwen3Moe, &messages);
+        let qwen3_5 = format_chat(ModelArch::Qwen3_5, &messages);
+        // All Qwen variants produce ChatML format
+        assert_eq!(qwen2, qwen3_moe);
+        assert_eq!(qwen2, qwen3_5);
+    }
+
+    #[test]
+    fn test_phi_format() {
+        let messages = vec![
+            msg("system", "You are helpful."),
+            msg("user", "Hello"),
+        ];
+        let result = format_chat(ModelArch::Phi, &messages);
+        assert_eq!(
+            result,
+            "<|im_start|>system<|im_sep|>\nYou are helpful.<|im_end|>\n\
+             <|im_start|>user<|im_sep|>\nHello<|im_end|>\n\
+             <|im_start|>assistant<|im_sep|>\n"
+        );
+    }
+
+    #[test]
+    fn test_gemma3_format() {
+        let messages = vec![
+            msg("user", "Hello"),
+        ];
+        let result = format_chat(ModelArch::Gemma3, &messages);
+        assert_eq!(
+            result,
+            "<start_of_turn>user\nHello<end_of_turn>\n\
+             <start_of_turn>model\n"
+        );
+    }
+
+    #[test]
+    fn test_gemma3_assistant_becomes_model() {
+        let messages = vec![
+            msg("user", "Hi"),
+            msg("assistant", "Hello!"),
+            msg("user", "Bye"),
+        ];
+        let result = format_chat(ModelArch::Gemma3, &messages);
+        // "assistant" role should be mapped to "model" in Gemma 3
+        assert!(result.contains("<start_of_turn>model\nHello!<end_of_turn>"));
+        assert!(!result.contains("<start_of_turn>assistant"));
+    }
+
+    #[test]
+    fn test_all_formats_end_with_generation_prompt() {
+        let messages = vec![msg("user", "Hi")];
+        // Every format ends with a prompt for the assistant to generate
+        let llama = format_chat(ModelArch::Llama, &messages);
+        assert!(llama.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
+
+        let chatml = format_chat(ModelArch::Qwen2, &messages);
+        assert!(chatml.ends_with("<|im_start|>assistant\n"));
+
+        let phi = format_chat(ModelArch::Phi, &messages);
+        assert!(phi.ends_with("<|im_start|>assistant<|im_sep|>\n"));
+
+        let gemma = format_chat(ModelArch::Gemma3, &messages);
+        assert!(gemma.ends_with("<start_of_turn>model\n"));
+    }
+
+    #[test]
+    fn test_empty_messages() {
+        let messages: Vec<Message> = vec![];
+        // Should just produce the generation prompt
+        let llama = format_chat(ModelArch::Llama, &messages);
+        assert_eq!(llama, "<|start_header_id|>assistant<|end_header_id|>\n\n");
+    }
+}

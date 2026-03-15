@@ -241,3 +241,153 @@ impl<B: GpuCore> SeqKvState<B> {
         self.block_table_cpu.len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu::cpu::CpuBackend;
+
+    fn make_pool(num_blocks: usize) -> (CpuBackend, KvPool<CpuBackend>) {
+        let backend = CpuBackend;
+        let pool = KvPool::new(&backend, num_blocks, 4, 2); // kv_dim=4, 2 layers
+        (backend, pool)
+    }
+
+    #[test]
+    fn test_pool_initial_state() {
+        let (_b, pool) = make_pool(8);
+        assert_eq!(pool.free_block_count(), 8);
+        assert_eq!(pool.total_blocks(), 8);
+        assert_eq!(pool.num_layers(), 2);
+        assert_eq!(pool.kv_dim(), 4);
+        assert_eq!(pool.k_pool.len(), 2);
+        assert_eq!(pool.v_pool.len(), 2);
+    }
+
+    #[test]
+    fn test_alloc_and_free_block() {
+        let (_b, mut pool) = make_pool(4);
+        let b0 = pool.alloc_block().unwrap();
+        assert_eq!(b0, 0); // LIFO: reversed, so first pop = 0
+        assert_eq!(pool.free_block_count(), 3);
+
+        let b1 = pool.alloc_block().unwrap();
+        assert_eq!(b1, 1);
+        assert_eq!(pool.free_block_count(), 2);
+
+        pool.free_block(b0);
+        assert_eq!(pool.free_block_count(), 3);
+
+        // Re-allocate should get b0 back (LIFO)
+        let b_realloc = pool.alloc_block().unwrap();
+        assert_eq!(b_realloc, b0);
+    }
+
+    #[test]
+    fn test_alloc_block_exhaustion() {
+        let (_b, mut pool) = make_pool(2);
+        assert!(pool.alloc_block().is_some());
+        assert!(pool.alloc_block().is_some());
+        assert!(pool.alloc_block().is_none()); // exhausted
+    }
+
+    #[test]
+    fn test_new_sequence_empty() {
+        let (b, pool) = make_pool(4);
+        let seq = pool.new_sequence(&b);
+        assert_eq!(seq.seq_len, 0);
+        assert_eq!(seq.num_blocks(), 0);
+    }
+
+    #[test]
+    fn test_ensure_slot_allocates_blocks() {
+        let (b, mut pool) = make_pool(4);
+        let mut seq = pool.new_sequence(&b);
+
+        // First token needs first block
+        seq.ensure_slot(&mut pool).unwrap();
+        assert_eq!(seq.num_blocks(), 1);
+        assert_eq!(pool.free_block_count(), 3);
+
+        // Fill up first block (BLOCK_SIZE = 16 tokens)
+        seq.advance();
+        for _ in 1..BLOCK_SIZE {
+            seq.ensure_slot(&mut pool).unwrap();
+            seq.advance();
+        }
+        assert_eq!(seq.num_blocks(), 1); // still one block
+        assert_eq!(seq.seq_len, BLOCK_SIZE);
+
+        // Next token spills into second block
+        seq.ensure_slot(&mut pool).unwrap();
+        assert_eq!(seq.num_blocks(), 2);
+        assert_eq!(pool.free_block_count(), 2);
+    }
+
+    #[test]
+    fn test_ensure_slots_bulk() {
+        let (b, mut pool) = make_pool(10);
+        let mut seq = pool.new_sequence(&b);
+
+        // Bulk allocate for 40 tokens: ceil(40/16) = 3 blocks
+        seq.ensure_slots(&mut pool, 40).unwrap();
+        assert_eq!(seq.num_blocks(), 3);
+        assert_eq!(pool.free_block_count(), 7);
+    }
+
+    #[test]
+    fn test_ensure_slot_oom() {
+        let (b, mut pool) = make_pool(1);
+        let mut seq = pool.new_sequence(&b);
+
+        // First block ok
+        seq.ensure_slot(&mut pool).unwrap();
+        // Fill the block
+        for _ in 0..BLOCK_SIZE {
+            seq.advance();
+        }
+        // Next block should fail (only 1 block total, already used)
+        let result = seq.ensure_slot(&mut pool);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_free_sequence_returns_blocks() {
+        let (b, mut pool) = make_pool(4);
+        let mut seq = pool.new_sequence(&b);
+        seq.ensure_slots(&mut pool, 20).unwrap(); // 2 blocks
+        assert_eq!(pool.free_block_count(), 2);
+
+        pool.free_sequence(&seq);
+        assert_eq!(pool.free_block_count(), 4); // all returned
+    }
+
+    #[test]
+    fn test_sync_block_table() {
+        let (b, mut pool) = make_pool(4);
+        let mut seq = pool.new_sequence(&b);
+        seq.ensure_slot(&mut pool).unwrap();
+
+        // Should be dirty after alloc
+        assert!(seq.dirty);
+        seq.sync_block_table(&b);
+        assert!(!seq.dirty);
+
+        // Second sync should be a no-op
+        seq.sync_block_table(&b);
+        assert!(!seq.dirty);
+    }
+
+    #[test]
+    fn test_advance_and_advance_by() {
+        let (b, pool) = make_pool(4);
+        let mut seq = pool.new_sequence(&b);
+        assert_eq!(seq.seq_len, 0);
+
+        seq.advance();
+        assert_eq!(seq.seq_len, 1);
+
+        seq.advance_by(10);
+        assert_eq!(seq.seq_len, 11);
+    }
+}

@@ -221,3 +221,50 @@ fn argmax_bf16(data: &[u8]) -> u32 {
         .map(|(idx, _)| idx as u32)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use half::bf16;
+
+    fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+        let bf16_values: Vec<bf16> = values.iter().map(|&v| bf16::from_f32(v)).collect();
+        bytemuck::cast_slice(&bf16_values).to_vec()
+    }
+
+    #[test]
+    fn test_argmax_bf16_basic() {
+        let data = bf16_bytes(&[1.0, 3.0, 2.0, 0.5]);
+        assert_eq!(argmax_bf16(&data), 1);
+    }
+
+    #[test]
+    fn test_argmax_bf16_single() {
+        let data = bf16_bytes(&[42.0]);
+        assert_eq!(argmax_bf16(&data), 0);
+    }
+
+    #[test]
+    fn test_argmax_bf16_all_negative() {
+        let data = bf16_bytes(&[-5.0, -1.0, -3.0, -2.0]);
+        assert_eq!(argmax_bf16(&data), 1); // -1.0 is the largest
+    }
+
+    #[test]
+    fn test_argmax_bf16_last_is_max() {
+        let data = bf16_bytes(&[0.0, 0.0, 0.0, 10.0]);
+        assert_eq!(argmax_bf16(&data), 3);
+    }
+
+    #[test]
+    fn test_argmax_bf16_first_is_max() {
+        let data = bf16_bytes(&[10.0, 0.0, 0.0, 0.0]);
+        assert_eq!(argmax_bf16(&data), 0);
+    }
+
+    #[test]
+    fn test_argmax_bf16_mixed() {
+        let data = bf16_bytes(&[-100.0, 0.0, 100.0, 50.0, -50.0]);
+        assert_eq!(argmax_bf16(&data), 2);
+    }
+}

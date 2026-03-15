@@ -469,3 +469,117 @@ fn error_response(status: StatusCode, message: &str) -> Response {
     });
     (status, Json(body)).into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_chat_request_deserialization() {
+        let json = r#"{
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 100,
+            "temperature": 0.7,
+            "top_p": 0.95,
+            "stream": true
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.model.as_deref(), Some("test-model"));
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].role, "user");
+        assert_eq!(req.messages[0].content, "Hello");
+        assert_eq!(req.max_tokens, 100);
+        assert!((req.temperature - 0.7).abs() < 0.001);
+        assert!((req.top_p - 0.95).abs() < 0.001);
+        assert!(req.stream);
+    }
+
+    #[test]
+    fn test_chat_request_defaults() {
+        let json = r#"{"messages": [{"role": "user", "content": "Hi"}]}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.model, None);
+        assert_eq!(req.max_tokens, 4096);
+        assert!((req.temperature - 1.0).abs() < 0.001);
+        assert!((req.top_p - 0.9).abs() < 0.001);
+        assert!(!req.stream);
+    }
+
+    #[test]
+    fn test_completion_request_deserialization() {
+        let json = r#"{"prompt": "Once upon a time", "max_tokens": 50}"#;
+        let req: CompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.prompt, "Once upon a time");
+        assert_eq!(req.max_tokens, 50);
+        assert!((req.temperature - 1.0).abs() < 0.001); // default
+    }
+
+    #[test]
+    fn test_completion_request_defaults() {
+        let json = r#"{"prompt": "test"}"#;
+        let req: CompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.max_tokens, 4096);
+        assert!((req.temperature - 1.0).abs() < 0.001);
+        assert!((req.top_p - 0.9).abs() < 0.001);
+        assert!(!req.stream);
+    }
+
+    #[test]
+    fn test_finish_reason_str_values() {
+        assert_eq!(finish_reason_str(StopReason::EndOfSequence), "stop");
+        assert_eq!(finish_reason_str(StopReason::MaxTokens), "length");
+    }
+
+    #[test]
+    fn test_chat_response_serialization() {
+        let response = ChatCompletionResponse {
+            id: "chatcmpl-test123".into(),
+            object: "chat.completion",
+            created: 1234567890,
+            model: "test-model".into(),
+            choices: vec![ChatChoice {
+                index: 0,
+                message: Message {
+                    role: "assistant".into(),
+                    content: "Hello!".into(),
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+            },
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["object"], "chat.completion");
+        assert_eq!(json["choices"][0]["message"]["content"], "Hello!");
+        assert_eq!(json["choices"][0]["finish_reason"], "stop");
+        assert_eq!(json["usage"]["total_tokens"], 15);
+    }
+
+    #[test]
+    fn test_completion_response_serialization() {
+        let response = CompletionResponse {
+            id: "cmpl-test123".into(),
+            object: "text_completion",
+            created: 1234567890,
+            model: "test-model".into(),
+            choices: vec![CompletionChoice {
+                index: 0,
+                text: "world".into(),
+                finish_reason: Some("length".into()),
+            }],
+            usage: Usage {
+                prompt_tokens: 3,
+                completion_tokens: 10,
+                total_tokens: 13,
+            },
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["object"], "text_completion");
+        assert_eq!(json["choices"][0]["text"], "world");
+        assert_eq!(json["usage"]["prompt_tokens"], 3);
+    }
+}
