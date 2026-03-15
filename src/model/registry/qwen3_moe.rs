@@ -53,23 +53,13 @@ use crate::model::profile::{self, Component};
 use crate::model::{Model, PrefillBuffers};
 
 // ---------------------------------------------------------------------------
-// MoE FFN block: router → top-k select → expert FFNs → weighted sum.
+// MoE FFN block: delegates to primitives::moe_ffn_block.
 //
-// This replaces the dense FFN block (primitives::ffn_block) for MoE layers.
-// The steps are:
-//   1. RMSNorm on the hidden state
-//   2. Router matmul to get per-expert scores
-//   3. GPU top-k + softmax
-//   4. CPU readback of routing decisions
-//   5. For each selected expert: gate/up → SwiGLU → down → scale_add
-//   6. Residual add
+// The core MoE dispatch (router → top-k → expert FFNs → weighted sum →
+// residual) is shared across all MoE model families.  See primitives.rs.
 // ---------------------------------------------------------------------------
 
-/// Run the MoE FFN block for a single token.
-///
-/// Uses GPU-side top-k routing to avoid per-layer GPU→CPU synchronization.
-/// The router matmul + top-k selection + softmax all happen on GPU; only
-/// the final (index, weight) pairs are read back to CPU for expert dispatch.
+/// Run the MoE FFN block for a single token (delegates to shared primitive).
 fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
     m: &Model<'_, B>,
     layer_idx: usize,
@@ -79,60 +69,24 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
     num_experts_per_tok: usize,
 ) {
     let layer = &m.weights.layers[layer_idx];
-
-    // Unwrap MoE-specific buffers and weights.
-    let router_gate = layer.router_gate.as_ref().unwrap();
-    let experts = layer.experts.as_ref().unwrap();
-    let moe_gate_buf = m.moe_gate_buf.as_ref().unwrap();
-    let moe_up_buf = m.moe_up_buf.as_ref().unwrap();
-    let moe_output = m.moe_output.as_ref().unwrap();
-    let routing_output = m.routing_output.as_ref().unwrap();
-
-    // Step 1: RMSNorm → norm_buf.
-    m.backend.rms_norm(
-        &m.hidden, &layer.post_attention_layernorm, d.eps, &m.norm_buf,
+    primitives::moe_ffn_block(
+        m.backend,
+        &layer.post_attention_layernorm,
+        layer.router_gate.as_ref().unwrap(),
+        layer.experts.as_ref().unwrap(),
+        &m.hidden,
+        &m.norm_buf,
+        m.moe_gate_buf.as_ref().unwrap(),
+        m.moe_up_buf.as_ref().unwrap(),
+        m.moe_output.as_ref().unwrap(),
+        m.routing_output.as_ref().unwrap(),
+        &m.gate_buf,
+        d.eps,
+        d.hidden_size,
+        moe_inter,
+        num_experts,
+        num_experts_per_tok,
     );
-
-    // Step 2: Router matmul — compute per-expert scores.
-    m.backend.matmul(
-        router_gate, &m.norm_buf, moe_gate_buf,
-        num_experts as u32, d.hidden_size,
-    );
-
-    // Step 3: GPU-side top-k + softmax.
-    m.backend.top_k_softmax(
-        moe_gate_buf, routing_output,
-        num_experts as u32, num_experts_per_tok as u32,
-    );
-
-    // Step 4: Read routing results to CPU.
-    let k = num_experts_per_tok;
-    let routing_bytes = k * 2 * 4; // 2*k f32 values (index, weight) pairs.
-    let buf_bytes = m.backend.tensor_byte_count(routing_output);
-    let mut routing_buf = vec![0u8; buf_bytes];
-    m.backend.copy_to_host(routing_output, &mut routing_buf);
-    let routing_data: &[f32] = bytemuck::cast_slice(&routing_buf[..routing_bytes]);
-
-    let selected: Vec<(usize, f32)> = (0..k)
-        .map(|i| (routing_data[2 * i] as usize, routing_data[2 * i + 1]))
-        .collect();
-
-    // Step 5: Zero the accumulator, then run each selected expert's FFN.
-    m.backend.fill_zero(moe_output, d.hidden_size);
-
-    for &(expert_idx, routing_weight) in &selected {
-        let expert = &experts[expert_idx];
-
-        // Expert FFN: gate/up projections → SwiGLU → down projection.
-        m.backend.matmul(&expert.gate_proj, &m.norm_buf, moe_gate_buf, moe_inter, d.hidden_size);
-        m.backend.matmul(&expert.up_proj, &m.norm_buf, moe_up_buf, moe_inter, d.hidden_size);
-        m.backend.silu_mul(moe_gate_buf, moe_up_buf, moe_gate_buf, moe_inter);
-        m.backend.matmul(&expert.down_proj, moe_gate_buf, &m.gate_buf, d.hidden_size, moe_inter);
-        m.backend.scale_add(moe_output, &m.gate_buf, routing_weight, d.hidden_size);
-    }
-
-    // Step 6: Residual add: hidden += moe_output.
-    m.backend.add(&m.hidden, moe_output, &m.hidden, d.hidden_size);
 }
 
 // ===========================================================================

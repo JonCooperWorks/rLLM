@@ -169,9 +169,11 @@ fn deltanet_attention_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + 
 // ---------------------------------------------------------------------------
 // MoE FFN block with shared expert — replaces dense FFN for Qwen 3.5.
 //
-// MoE: router → top-k experts → weighted sum
-// Shared expert: always-active FFN, gated by sigmoid(linear(hidden))
-// Final: hidden += moe_output + gate * shared_expert_output
+// The core MoE routing (router → top-k → expert FFNs → weighted sum)
+// delegates to primitives::moe_expert_dispatch.  The shared expert is
+// Qwen3.5-specific: an always-active FFN gated by sigmoid(linear(hidden)).
+//
+// Flow: hidden += routed_experts(hidden) + gate * shared_expert(hidden)
 // ---------------------------------------------------------------------------
 
 fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
@@ -183,46 +185,33 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
     let moe_inter = m.config.moe_intermediate_size as u32;
     let num_experts = m.config.num_experts;
     let num_experts_per_tok = m.config.num_experts_per_tok;
-
-    let router_gate = layer.router_gate.as_ref().unwrap();
-    let experts = layer.experts.as_ref().unwrap();
     let moe_gate_buf = m.moe_gate_buf.as_ref().unwrap();
     let moe_up_buf = m.moe_up_buf.as_ref().unwrap();
     let moe_output = m.moe_output.as_ref().unwrap();
-    let routing_output = m.routing_output.as_ref().unwrap();
 
     // Step 1: RMSNorm → norm_buf.
     m.backend.rms_norm(&m.hidden, &layer.post_attention_layernorm, d.eps, &m.norm_buf);
 
-    // Step 2: Router matmul → per-expert scores.
-    m.backend.matmul(router_gate, &m.norm_buf, moe_gate_buf, num_experts as u32, d.hidden_size);
+    // Step 2: Core MoE expert dispatch → moe_output.
+    // Uses the shared primitive (same as Qwen3Moe, Mixtral, etc.).
+    primitives::moe_expert_dispatch(
+        m.backend,
+        layer.router_gate.as_ref().unwrap(),
+        layer.experts.as_ref().unwrap(),
+        &m.norm_buf,
+        moe_gate_buf,
+        moe_up_buf,
+        moe_output,
+        m.routing_output.as_ref().unwrap(),
+        &m.gate_buf,
+        d.hidden_size,
+        moe_inter,
+        num_experts,
+        num_experts_per_tok,
+    );
 
-    // Step 3: GPU top-k + softmax.
-    m.backend.top_k_softmax(moe_gate_buf, routing_output, num_experts as u32, num_experts_per_tok as u32);
-
-    // Step 4: Read routing results to CPU.
-    let k = num_experts_per_tok;
-    let routing_bytes = k * 2 * 4;
-    let buf_bytes = m.backend.tensor_byte_count(routing_output);
-    let mut routing_buf = vec![0u8; buf_bytes];
-    m.backend.copy_to_host(routing_output, &mut routing_buf);
-    let routing_data: &[f32] = bytemuck::cast_slice(&routing_buf[..routing_bytes]);
-    let selected: Vec<(usize, f32)> = (0..k)
-        .map(|i| (routing_data[2 * i] as usize, routing_data[2 * i + 1]))
-        .collect();
-
-    // Step 5: Run selected experts.
-    m.backend.fill_zero(moe_output, d.hidden_size);
-    for &(expert_idx, routing_weight) in &selected {
-        let expert = &experts[expert_idx];
-        m.backend.matmul(&expert.gate_proj, &m.norm_buf, moe_gate_buf, moe_inter, d.hidden_size);
-        m.backend.matmul(&expert.up_proj, &m.norm_buf, moe_up_buf, moe_inter, d.hidden_size);
-        m.backend.silu_mul(moe_gate_buf, moe_up_buf, moe_gate_buf, moe_inter);
-        m.backend.matmul(&expert.down_proj, moe_gate_buf, &m.gate_buf, d.hidden_size, moe_inter);
-        m.backend.scale_add(moe_output, &m.gate_buf, routing_weight, d.hidden_size);
-    }
-
-    // Step 6: Shared expert (always-active, gated by sigmoid scalar).
+    // Step 3: Shared expert (Qwen3.5-specific) — always-active, gated by sigmoid scalar.
+    // Uses the same norm_buf from step 1 (still valid, expert dispatch doesn't modify it).
     if let (Some(se_gate_proj), Some(se_up_proj), Some(se_down_proj), Some(se_gate)) = (
         layer.shared_expert_gate_proj.as_ref(),
         layer.shared_expert_up_proj.as_ref(),
@@ -247,7 +236,7 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
         m.backend.scale_add(moe_output, &m.gate_buf, gate_val, d.hidden_size);
     }
 
-    // Step 7: Residual add.
+    // Step 4: Residual add: hidden += moe_output.
     m.backend.add(&m.hidden, moe_output, &m.hidden, d.hidden_size);
 }
 

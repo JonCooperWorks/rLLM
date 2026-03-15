@@ -20,7 +20,7 @@ use crate::gpu::{
 };
 use crate::model::config::ModelConfig;
 use crate::model::kv_cache::{KvPool, SeqKvState};
-use crate::model::loader::{LayerWeights, ModelWeights};
+use crate::model::loader::{ExpertWeights, LayerWeights, ModelWeights};
 use crate::model::PrefillBuffers;
 
 // ===========================================================================
@@ -281,6 +281,128 @@ pub(crate) fn ffn_block<B: GpuNorm + GpuMatmul + GpuElementwise>(
     backend.silu_mul(gate_buf, up_buf, gate_buf, inter_size);
     backend.matmul(&layer.down_proj, gate_buf, norm_buf, hidden_size, inter_size);
     backend.add(hidden, norm_buf, hidden, hidden_size);
+}
+
+// ===========================================================================
+// MoE FFN block — shared by all Mixture-of-Experts model families.
+//
+// Replaces the dense FFN block for MoE layers.  The core algorithm:
+//   1. RMSNorm on the hidden state
+//   2. Router matmul → per-expert scores
+//   3. GPU top-k + softmax
+//   4. CPU readback of routing decisions (only k index-weight pairs)
+//   5. For each selected expert: gate/up → SwiGLU → down → scale_add
+//   6. Residual add
+//
+// Models with a shared expert (Qwen3.5) call this for the routed experts
+// and handle the shared expert separately at the call site.
+// ===========================================================================
+
+/// MoE FFN block for a single token: norm → route → dispatch → accumulate → residual.
+///
+/// Performs the full MoE FFN sub-block including RMSNorm and residual add.
+/// Models with a shared expert (Qwen3.5) should use `moe_expert_dispatch`
+/// instead for finer control over the residual add.
+///
+/// Buffer requirements:
+///   - `norm_buf`: [hidden_size] — receives RMSNorm output
+///   - `moe_gate_buf`: [max(num_experts, moe_inter)] — scratch for router + expert gate
+///   - `moe_up_buf`: [moe_inter] — scratch for expert up projection
+///   - `moe_output`: [hidden_size] — expert output accumulator (zeroed internally)
+///   - `routing_output`: [2 * num_experts_per_tok] — GPU top-k output
+///   - `down_buf`: [hidden_size] — scratch for expert down projection
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn moe_ffn_block<B: GpuNorm + GpuMatmul + GpuElementwise>(
+    backend: &B,
+    // Weights
+    post_attn_norm: &B::Tensor,
+    router_gate: &B::Tensor,
+    experts: &[ExpertWeights<B>],
+    // Buffers
+    hidden: &B::Tensor,
+    norm_buf: &B::Tensor,
+    moe_gate_buf: &B::Tensor,
+    moe_up_buf: &B::Tensor,
+    moe_output: &B::Tensor,
+    routing_output: &B::Tensor,
+    down_buf: &B::Tensor,
+    // Dimensions
+    eps: f32,
+    hidden_size: u32,
+    moe_inter: u32,
+    num_experts: usize,
+    num_experts_per_tok: usize,
+) {
+    // RMSNorm → norm_buf.
+    backend.rms_norm(hidden, post_attn_norm, eps, norm_buf);
+
+    // Core expert dispatch → moe_output.
+    moe_expert_dispatch(
+        backend, router_gate, experts,
+        norm_buf, moe_gate_buf, moe_up_buf, moe_output, routing_output, down_buf,
+        hidden_size, moe_inter, num_experts, num_experts_per_tok,
+    );
+
+    // Residual add: hidden += moe_output.
+    backend.add(hidden, moe_output, hidden, hidden_size);
+}
+
+/// Core MoE expert dispatch: route → select top-k → run expert FFNs → accumulate.
+///
+/// This is the inner loop shared by all MoE models.  It does NOT include
+/// RMSNorm or the residual add — callers handle those.  This allows models
+/// with a shared expert (Qwen3.5) to accumulate shared expert output into
+/// `moe_output` before the residual add.
+///
+/// On return, `moe_output` contains the weighted sum of selected expert outputs.
+/// The `norm_buf` (normalized hidden state) is consumed but not modified.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn moe_expert_dispatch<B: GpuMatmul + GpuElementwise>(
+    backend: &B,
+    router_gate: &B::Tensor,
+    experts: &[ExpertWeights<B>],
+    // Buffers
+    norm_buf: &B::Tensor,
+    moe_gate_buf: &B::Tensor,
+    moe_up_buf: &B::Tensor,
+    moe_output: &B::Tensor,
+    routing_output: &B::Tensor,
+    down_buf: &B::Tensor,
+    // Dimensions
+    hidden_size: u32,
+    moe_inter: u32,
+    num_experts: usize,
+    num_experts_per_tok: usize,
+) {
+    // Router matmul — compute per-expert scores.
+    backend.matmul(router_gate, norm_buf, moe_gate_buf, num_experts as u32, hidden_size);
+
+    // GPU-side top-k + softmax.
+    backend.top_k_softmax(moe_gate_buf, routing_output, num_experts as u32, num_experts_per_tok as u32);
+
+    // Read routing results to CPU.
+    let k = num_experts_per_tok;
+    let routing_bytes = k * 2 * 4; // 2*k f32 values (index, weight) pairs.
+    let buf_bytes = backend.tensor_byte_count(routing_output);
+    let mut routing_buf = vec![0u8; buf_bytes];
+    backend.copy_to_host(routing_output, &mut routing_buf);
+    let routing_data: &[f32] = bytemuck::cast_slice(&routing_buf[..routing_bytes]);
+
+    let selected: Vec<(usize, f32)> = (0..k)
+        .map(|i| (routing_data[2 * i] as usize, routing_data[2 * i + 1]))
+        .collect();
+
+    // Zero the accumulator, then run each selected expert's SwiGLU FFN.
+    backend.fill_zero(moe_output, hidden_size);
+
+    for &(expert_idx, routing_weight) in &selected {
+        let expert = &experts[expert_idx];
+        backend.matmul(&expert.gate_proj, norm_buf, moe_gate_buf, moe_inter, hidden_size);
+        backend.matmul(&expert.up_proj, norm_buf, moe_up_buf, moe_inter, hidden_size);
+        backend.silu_mul(moe_gate_buf, moe_up_buf, moe_gate_buf, moe_inter);
+        backend.matmul(&expert.down_proj, moe_gate_buf, down_buf, hidden_size, moe_inter);
+        backend.scale_add(moe_output, down_buf, routing_weight, hidden_size);
+    }
 }
 
 // ===========================================================================
