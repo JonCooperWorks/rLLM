@@ -22,6 +22,14 @@
 //   - Each expert: gate_proj [768, 2048], up_proj [768, 2048], down_proj [2048, 768]
 //   - Chat template: ChatML (same as Qwen 2.5)
 //
+// Why this file can't use standard.rs:
+//   Two differences from the standard dense pipeline:
+//     1. QK-norm: after QKV projection, RMSNorm is applied per-head to Q and K
+//        (with learned weights).  This happens BEFORE RoPE.
+//     2. q_dim ≠ hidden_size: Qwen3 MoE has hidden=2048 but 32×128=4096
+//        attention dimension, requiring the _qdim projection variants.
+//     3. MoE FFN: router → top-k experts → weighted sum replaces dense FFN.
+//
 // QK-norm (new in Qwen 3):
 //   After computing Q = W_q @ hidden and K = W_k @ hidden, RMSNorm is applied
 //   to each head's Q and K vector independently (using per-head learned weights
@@ -34,56 +42,13 @@
 //   router computes logits = gate @ hidden_norm, then selects the top-k
 //   experts by logit value.  The selected experts' outputs are weighted by
 //   softmax(top_k_logits) and summed.
-//
-// Why CPU routing instead of GPU routing?
-//   The router logits are just [128] floats — 512 bytes.  Computing top-k=8
-//   and softmax on the CPU is trivial (~1μs) and avoids the complexity of a
-//   GPU top-k kernel.  The cost is one GPU→CPU sync per layer (48 syncs per
-//   token, each flushing a small amount of GPU work).  This adds ~1-2ms per
-//   token — acceptable for an initial implementation.  A GPU-side top-k
-//   kernel can be added later to eliminate these syncs.
 // ===========================================================================
 
 use crate::gpu::GpuBackend;
 use crate::model::kv_cache::{KvPool, SeqKvState};
-use crate::model::primitives;
+use crate::model::primitives::{self, Dims};
 use crate::model::profile::{self, Component};
-use crate::model::{KvMode, Model, PrefillBuffers};
-
-// ---------------------------------------------------------------------------
-// MoE routing: top-k selection and softmax on CPU.
-//
-// This is the simplest correct implementation.  The router produces [num_experts]
-// logits on the GPU; we copy them to the CPU, find the top-k indices, apply
-// softmax to the top-k logits (normalized routing), and return the indices
-// and weights.
-//
-// Learning note: `norm_topk_prob: true` in the config means we apply softmax
-// ONLY to the top-k logits (not all 128), so the weights sum to 1.  This is
-// different from first doing softmax over all experts then taking top-k.
-// ---------------------------------------------------------------------------
-
-/// CPU fallback for top-k routing (unused — GPU kernel handles this now).
-#[allow(dead_code)]
-fn top_k_routing(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
-    // Find the k largest logits by index.
-    let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-    // Partial sort: move top-k to the front.
-    indexed.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
-    let top_k = &indexed[..k];
-
-    // Softmax over only the selected top-k logits (normalized routing).
-    let max_logit = top_k.iter().map(|&(_, v)| v).fold(f32::NEG_INFINITY, f32::max);
-    let exp_sum: f32 = top_k.iter().map(|&(_, v)| (v - max_logit).exp()).sum();
-
-    top_k
-        .iter()
-        .map(|&(idx, logit)| {
-            let weight = (logit - max_logit).exp() / exp_sum;
-            (idx, weight)
-        })
-        .collect()
-}
+use crate::model::{Model, PrefillBuffers};
 
 // ---------------------------------------------------------------------------
 // MoE FFN block: router → top-k select → expert FFNs → weighted sum.
@@ -92,9 +57,10 @@ fn top_k_routing(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
 // The steps are:
 //   1. RMSNorm on the hidden state
 //   2. Router matmul to get per-expert scores
-//   3. CPU top-k selection + softmax
-//   4. For each selected expert: gate/up → SwiGLU → down → scale_add
-//   5. Residual add
+//   3. GPU top-k + softmax
+//   4. CPU readback of routing decisions
+//   5. For each selected expert: gate/up → SwiGLU → down → scale_add
+//   6. Residual add
 // ---------------------------------------------------------------------------
 
 /// Run the MoE FFN block for a single token.
@@ -105,13 +71,12 @@ fn top_k_routing(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
 fn moe_ffn_block<B: GpuBackend>(
     m: &Model<'_, B>,
     layer_idx: usize,
-    hidden_size: u32,
+    d: &Dims,
     moe_inter: u32,
     num_experts: usize,
     num_experts_per_tok: usize,
 ) {
     let layer = &m.weights.layers[layer_idx];
-    let eps = m.config.rms_norm_eps as f32;
 
     // Unwrap MoE-specific buffers and weights.
     let router_gate = layer.router_gate.as_ref().unwrap();
@@ -123,40 +88,24 @@ fn moe_ffn_block<B: GpuBackend>(
 
     // Step 1: RMSNorm → norm_buf.
     m.backend.rms_norm(
-        &m.hidden,
-        &layer.post_attention_layernorm,
-        eps,
-        &m.norm_buf,
+        &m.hidden, &layer.post_attention_layernorm, d.eps, &m.norm_buf,
     );
 
     // Step 2: Router matmul — compute per-expert scores.
-    // gate_weight [num_experts, hidden_size] × norm_buf [hidden_size]
-    // → moe_gate_buf (reused as temporary: first num_experts bf16 values)
     m.backend.matmul(
-        router_gate,
-        &m.norm_buf,
-        moe_gate_buf,
-        num_experts as u32,
-        hidden_size,
+        router_gate, &m.norm_buf, moe_gate_buf,
+        num_experts as u32, d.hidden_size,
     );
 
     // Step 3: GPU-side top-k + softmax.
-    // The kernel reads bf16 logits from moe_gate_buf, finds top-k indices,
-    // computes softmax weights, and writes (index, weight) pairs to
-    // routing_output as f32.
     m.backend.top_k_softmax(
-        moe_gate_buf,
-        routing_output,
-        num_experts as u32,
-        num_experts_per_tok as u32,
+        moe_gate_buf, routing_output,
+        num_experts as u32, num_experts_per_tok as u32,
     );
 
     // Step 4: Read routing results to CPU.
-    // This triggers a GPU flush, but now the flush commits all accumulated
-    // work (attention + router + top-k) as a single batch — much cheaper
-    // than the old approach of flushing 50+ individual command buffers.
     let k = num_experts_per_tok;
-    let routing_bytes = k * 2 * 4; // 2*k f32 values
+    let routing_bytes = k * 2 * 4; // 2*k f32 values (index, weight) pairs.
     let buf_bytes = m.backend.tensor_byte_count(routing_output);
     let mut routing_buf = vec![0u8; buf_bytes];
     m.backend.copy_to_host(routing_output, &mut routing_buf);
@@ -167,49 +116,21 @@ fn moe_ffn_block<B: GpuBackend>(
         .collect();
 
     // Step 5: Zero the accumulator, then run each selected expert's FFN.
-    m.backend.fill_zero(moe_output, hidden_size);
+    m.backend.fill_zero(moe_output, d.hidden_size);
 
     for &(expert_idx, routing_weight) in &selected {
         let expert = &experts[expert_idx];
 
         // Expert FFN: gate/up projections → SwiGLU → down projection.
-        m.backend.matmul(
-            &expert.gate_proj,
-            &m.norm_buf,
-            moe_gate_buf,
-            moe_inter,
-            hidden_size,
-        );
-        m.backend.matmul(
-            &expert.up_proj,
-            &m.norm_buf,
-            moe_up_buf,
-            moe_inter,
-            hidden_size,
-        );
-
-        // SwiGLU activation: moe_gate_buf = silu(moe_gate_buf) * moe_up_buf
-        m.backend
-            .silu_mul(moe_gate_buf, moe_up_buf, moe_gate_buf, moe_inter);
-
-        // Down projection: gate_buf used as output (norm_buf must be preserved
-        // for all experts to read from).
-        m.backend.matmul(
-            &expert.down_proj,
-            moe_gate_buf,
-            &m.gate_buf,
-            hidden_size,
-            moe_inter,
-        );
-
-        // Weighted accumulate: moe_output += routing_weight * gate_buf
-        m.backend
-            .scale_add(moe_output, &m.gate_buf, routing_weight, hidden_size);
+        m.backend.matmul(&expert.gate_proj, &m.norm_buf, moe_gate_buf, moe_inter, d.hidden_size);
+        m.backend.matmul(&expert.up_proj, &m.norm_buf, moe_up_buf, moe_inter, d.hidden_size);
+        m.backend.silu_mul(moe_gate_buf, moe_up_buf, moe_gate_buf, moe_inter);
+        m.backend.matmul(&expert.down_proj, moe_gate_buf, &m.gate_buf, d.hidden_size, moe_inter);
+        m.backend.scale_add(moe_output, &m.gate_buf, routing_weight, d.hidden_size);
     }
 
-    // Step 6: Residual add: hidden += moe_output
-    m.backend
-        .add(&m.hidden, moe_output, &m.hidden, hidden_size);
+    // Step 6: Residual add: hidden += moe_output.
+    m.backend.add(&m.hidden, moe_output, &m.hidden, d.hidden_size);
 }
 
 // ===========================================================================
@@ -223,21 +144,14 @@ pub(crate) fn forward_single_paged<B: GpuBackend>(
     pool: &KvPool<B>,
     seq_state: &SeqKvState<B>,
 ) -> anyhow::Result<()> {
-    let hidden_size = m.config.hidden_size as u32;
-    let num_heads = m.config.num_attention_heads as u32;
-    let num_kv_heads = m.config.num_key_value_heads as u32;
-    let head_dim = m.config.head_dim as u32;
-    let q_dim = (m.config.num_attention_heads * m.config.head_dim) as u32;
-    let kv_dim = (m.config.num_key_value_heads * m.config.head_dim) as u32;
-    let eps = m.config.rms_norm_eps as f32;
-    let rope_theta = m.config.rope_theta as f32;
+    let d = Dims::from_config(&m.config);
     let pos = seq_state.seq_len as u32;
     let moe_inter = m.config.moe_intermediate_size as u32;
     let num_experts = m.config.num_experts;
     let num_experts_per_tok = m.config.num_experts_per_tok;
 
     let t = profile::begin(m.backend);
-    primitives::embed_token(m.backend, &m.weights, token_id, &m.hidden, hidden_size);
+    primitives::embed_token(m.backend, &m.weights, token_id, &m.hidden, d.hidden_size);
     profile::record(m.backend, t, Component::Embed);
 
     for layer_idx in 0..m.config.num_hidden_layers {
@@ -245,11 +159,10 @@ pub(crate) fn forward_single_paged<B: GpuBackend>(
 
         // --- Attention sub-block (same as Llama, plus QK-norm) ---
         let t = profile::begin(m.backend);
-        m.backend
-            .rms_norm(&m.hidden, &layer.input_layernorm, eps, &m.norm_buf);
+        m.backend.rms_norm(&m.hidden, &layer.input_layernorm, d.eps, &m.norm_buf);
         primitives::qkv_projection_qdim(
             m.backend, layer, &m.norm_buf, &m.q_buf, &m.k_buf, &m.v_buf,
-            q_dim, hidden_size, kv_dim,
+            d.q_dim, d.hidden_size, d.kv_dim,
         );
 
         // No QKV bias for Qwen 3 MoE.
@@ -261,127 +174,39 @@ pub(crate) fn forward_single_paged<B: GpuBackend>(
         // normalises each head independently.  The norm weight [head_dim]
         // is broadcast across all heads.  Same for K with num_kv_heads.
         if let (Some(q_norm), Some(k_norm)) = (&layer.q_norm, &layer.k_norm) {
-            m.backend
-                .rms_norm_batch(&m.q_buf, q_norm, eps, &m.q_buf, num_heads);
-            m.backend
-                .rms_norm_batch(&m.k_buf, k_norm, eps, &m.k_buf, num_kv_heads);
+            m.backend.rms_norm_batch(&m.q_buf, q_norm, d.eps, &m.q_buf, d.num_heads);
+            m.backend.rms_norm_batch(&m.k_buf, k_norm, d.eps, &m.k_buf, d.num_kv_heads);
         }
 
         primitives::apply_rope(
-            m.backend, &m.q_buf, &m.k_buf, pos, rope_theta, num_heads, num_kv_heads, head_dim,
+            m.backend, &m.q_buf, &m.k_buf, pos, d.rope_theta,
+            d.num_heads, d.num_kv_heads, d.head_dim,
         );
         primitives::paged_kv_and_attention(
             m.backend, &m.k_buf, &m.v_buf, &m.q_buf, &m.attn_out,
-            pool, seq_state, layer_idx, pos, num_heads, num_kv_heads, head_dim,
+            pool, seq_state, layer_idx, pos,
+            d.num_heads, d.num_kv_heads, d.head_dim,
+            0, 0.0,
         );
         primitives::o_proj_residual_qdim(
-            m.backend, layer, &m.attn_out, &m.norm_buf, &m.hidden, hidden_size, q_dim,
+            m.backend, layer, &m.attn_out, &m.norm_buf, &m.hidden,
+            d.hidden_size, d.q_dim,
         );
         profile::record(m.backend, t, Component::Attention);
 
         // --- MoE FFN sub-block ---
         let t = profile::begin(m.backend);
-        moe_ffn_block(m, layer_idx, hidden_size, moe_inter, num_experts, num_experts_per_tok);
+        moe_ffn_block(m, layer_idx, &d, moe_inter, num_experts, num_experts_per_tok);
         profile::record(m.backend, t, Component::Ffn);
     }
 
     let t = profile::begin(m.backend);
     primitives::final_norm_and_lm_head(
         m.backend, &m.weights, &m.hidden, &m.norm_buf, &m.logits_buf,
-        eps, hidden_size, m.config.vocab_size as u32,
+        d.eps, d.hidden_size, m.config.vocab_size as u32,
     );
     profile::record(m.backend, t, Component::Other);
 
-    Ok(())
-}
-
-/// Single-token forward pass with flat/paged KV cache (legacy path).
-pub(crate) fn forward<B: GpuBackend>(m: &mut Model<'_, B>, token_id: u32) -> anyhow::Result<()> {
-    let hidden_size = m.config.hidden_size as u32;
-    let num_heads = m.config.num_attention_heads as u32;
-    let num_kv_heads = m.config.num_key_value_heads as u32;
-    let head_dim = m.config.head_dim as u32;
-    let q_dim = (m.config.num_attention_heads * m.config.head_dim) as u32;
-    let kv_dim = (m.config.num_key_value_heads * m.config.head_dim) as u32;
-    let eps = m.config.rms_norm_eps as f32;
-    let rope_theta = m.config.rope_theta as f32;
-    let moe_inter = m.config.moe_intermediate_size as u32;
-    let num_experts = m.config.num_experts;
-    let num_experts_per_tok = m.config.num_experts_per_tok;
-
-    let pos = match &mut m.kv_mode {
-        KvMode::Flat { pos, .. } => *pos as u32,
-        KvMode::Paged { pool, seq_state } => {
-            seq_state.ensure_slot(pool)?;
-            seq_state.sync_block_table(m.backend);
-            seq_state.seq_len as u32
-        }
-    };
-
-    primitives::embed_token(m.backend, &m.weights, token_id, &m.hidden, hidden_size);
-
-    for layer_idx in 0..m.config.num_hidden_layers {
-        let layer = &m.weights.layers[layer_idx];
-
-        m.backend
-            .rms_norm(&m.hidden, &layer.input_layernorm, eps, &m.norm_buf);
-        primitives::qkv_projection_qdim(
-            m.backend, layer, &m.norm_buf, &m.q_buf, &m.k_buf, &m.v_buf,
-            q_dim, hidden_size, kv_dim,
-        );
-
-        // QK-norm before RoPE.
-        if let (Some(q_norm), Some(k_norm)) = (&layer.q_norm, &layer.k_norm) {
-            m.backend
-                .rms_norm_batch(&m.q_buf, q_norm, eps, &m.q_buf, num_heads);
-            m.backend
-                .rms_norm_batch(&m.k_buf, k_norm, eps, &m.k_buf, num_kv_heads);
-        }
-
-        primitives::apply_rope(
-            m.backend, &m.q_buf, &m.k_buf, pos, rope_theta, num_heads, num_kv_heads, head_dim,
-        );
-
-        match &m.kv_mode {
-            KvMode::Flat {
-                k_cache, v_cache, ..
-            } => {
-                m.backend.copy_to_kv_cache(
-                    &m.k_buf, &k_cache[layer_idx], pos, num_kv_heads, head_dim,
-                );
-                m.backend.copy_to_kv_cache(
-                    &m.v_buf, &v_cache[layer_idx], pos, num_kv_heads, head_dim,
-                );
-                m.backend.attention(
-                    &m.q_buf, &k_cache[layer_idx], &v_cache[layer_idx], &m.attn_out,
-                    pos + 1, num_heads, num_kv_heads, head_dim,
-                );
-            }
-            KvMode::Paged { pool, seq_state } => {
-                primitives::paged_kv_and_attention(
-                    m.backend, &m.k_buf, &m.v_buf, &m.q_buf, &m.attn_out,
-                    pool, seq_state, layer_idx, pos, num_heads, num_kv_heads, head_dim,
-                );
-            }
-        }
-
-        primitives::o_proj_residual_qdim(
-            m.backend, layer, &m.attn_out, &m.norm_buf, &m.hidden, hidden_size, q_dim,
-        );
-
-        // MoE FFN sub-block.
-        moe_ffn_block(m, layer_idx, hidden_size, moe_inter, num_experts, num_experts_per_tok);
-    }
-
-    primitives::final_norm_and_lm_head(
-        m.backend, &m.weights, &m.hidden, &m.norm_buf, &m.logits_buf,
-        eps, hidden_size, m.config.vocab_size as u32,
-    );
-
-    match &mut m.kv_mode {
-        KvMode::Flat { pos, .. } => *pos += 1,
-        KvMode::Paged { seq_state, .. } => seq_state.advance(),
-    }
     Ok(())
 }
 
@@ -408,91 +233,82 @@ pub(crate) fn forward_prefill_paged<B: GpuBackend>(
     seq_state: &SeqKvState<B>,
     bufs: &PrefillBuffers<B>,
 ) -> anyhow::Result<()> {
+    let d = Dims::from_config(&m.config);
     let bs = tokens.len() as u32;
-    let hidden_size = m.config.hidden_size as u32;
-    let num_heads = m.config.num_attention_heads as u32;
-    let num_kv_heads = m.config.num_key_value_heads as u32;
-    let head_dim = m.config.head_dim as u32;
-    let q_dim = (m.config.num_attention_heads * m.config.head_dim) as u32;
-    let kv_dim = (m.config.num_key_value_heads * m.config.head_dim) as u32;
-    let eps = m.config.rms_norm_eps as f32;
-    let rope_theta = m.config.rope_theta as f32;
     let start_pos = seq_state.seq_len as u32;
     let moe_inter = m.config.moe_intermediate_size as u32;
     let num_experts = m.config.num_experts;
     let num_experts_per_tok = m.config.num_experts_per_tok;
 
     primitives::upload_prefill_inputs(m.backend, bufs, tokens, start_pos, bs);
-    primitives::embed_batch(m.backend, &m.weights, bufs, bs, hidden_size);
+    primitives::embed_batch(m.backend, &m.weights, bufs, bs, d.hidden_size);
 
     for layer_idx in 0..m.config.num_hidden_layers {
         let layer = &m.weights.layers[layer_idx];
 
         // --- Batched attention (GEMM-based, same as dense models) ---
         m.backend.rms_norm_batch(
-            &bufs.hidden, &layer.input_layernorm, eps, &bufs.norm_buf, bs,
+            &bufs.hidden, &layer.input_layernorm, d.eps, &bufs.norm_buf, bs,
         );
-        primitives::qkv_projection_batch_qdim(m.backend, layer, bufs, bs, q_dim, hidden_size, kv_dim);
+        primitives::qkv_projection_batch_qdim(
+            m.backend, layer, bufs, bs, d.q_dim, d.hidden_size, d.kv_dim,
+        );
 
         // No QKV bias for Qwen 3 MoE.
 
         // QK-norm (batched): treat [batch_size * num_heads, head_dim] as batch.
         if let (Some(q_norm), Some(k_norm)) = (&layer.q_norm, &layer.k_norm) {
             m.backend.rms_norm_batch(
-                &bufs.q_buf, q_norm, eps, &bufs.q_buf, bs * num_heads,
+                &bufs.q_buf, q_norm, d.eps, &bufs.q_buf, bs * d.num_heads,
             );
             m.backend.rms_norm_batch(
-                &bufs.k_buf, k_norm, eps, &bufs.k_buf, bs * num_kv_heads,
+                &bufs.k_buf, k_norm, d.eps, &bufs.k_buf, bs * d.num_kv_heads,
             );
         }
 
-        primitives::apply_rope_batch(m.backend, bufs, rope_theta, bs, num_heads, num_kv_heads, head_dim);
+        primitives::apply_rope_batch(
+            m.backend, bufs, d.rope_theta, bs,
+            d.num_heads, d.num_kv_heads, d.head_dim,
+        );
         primitives::paged_kv_and_prefill_attention(
             m.backend, bufs, pool, seq_state, layer_idx,
-            bs, start_pos, num_heads, num_kv_heads, head_dim,
+            bs, start_pos, d.num_heads, d.num_kv_heads, d.head_dim,
+            0, 0.0,
         );
-        primitives::o_proj_residual_batch_qdim(m.backend, layer, bufs, bs, hidden_size, q_dim);
+        primitives::o_proj_residual_batch_qdim(
+            m.backend, layer, bufs, bs, d.hidden_size, d.q_dim,
+        );
 
         // --- MoE FFN: process each token independently ---
         //
         // Extract each token's hidden state from the batched buffer,
         // run MoE routing + expert FFNs, and write back.
-        //
-        // This is the slow path: O(batch_size * num_experts_per_tok * 3) matmuls
-        // per layer instead of a single GEMM.  For short prompts it's fine.
         let hidden_byte_size = m.config.hidden_size * 2; // bf16
         let full_bytes = m.backend.tensor_byte_count(&bufs.hidden);
         let mut host_hidden = vec![0u8; full_bytes];
         m.backend.copy_to_host(&bufs.hidden, &mut host_hidden);
 
         for t in 0..tokens.len() {
-            // Copy this token's hidden state to the single-token hidden buffer.
             let offset = t * hidden_byte_size;
             m.backend.copy_to_tensor(
                 &m.hidden,
                 &host_hidden[offset..offset + hidden_byte_size],
             );
 
-            // Run MoE FFN on this single token.
-            moe_ffn_block(
-                m, layer_idx, hidden_size, moe_inter, num_experts, num_experts_per_tok,
-            );
+            moe_ffn_block(m, layer_idx, &d, moe_inter, num_experts, num_experts_per_tok);
 
-            // Copy the result back to the batch buffer.
             let mut token_hidden = vec![0u8; hidden_byte_size];
             m.backend.copy_to_host(&m.hidden, &mut token_hidden);
-            // Write back into host_hidden at the right offset.
             host_hidden[offset..offset + hidden_byte_size]
                 .copy_from_slice(&token_hidden);
         }
 
-        // Upload the modified batch hidden states back to GPU.
         m.backend.copy_to_tensor(&bufs.hidden, &host_hidden);
     }
 
     primitives::final_norm_and_lm_head_prefill(
         m.backend, &m.weights, bufs, &m.norm_buf, &m.logits_buf,
-        eps, bs, m.config.hidden_size, m.config.vocab_size as u32,
+        d.eps, bs, m.config.hidden_size, m.config.vocab_size as u32,
     );
 
     Ok(())

@@ -13,12 +13,12 @@ Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf
 | Qwen 2.5 3B Instruct | 3.1B | 31 tok/s | 45 tok/s | 242 ms | 98 ms |
 | Qwen 2.5 7B Instruct | 7.6B | 23 tok/s | 39 tok/s | 662 ms | 240 ms |
 | Llama 3.1 8B Instruct | 8.0B | 21 tok/s | 36 tok/s | 782 ms | 393 ms |
-| Qwen3 Coder 30B-A3B Instruct | 30.5B (3.3B active) | — | 11 tok/s | — | 2,900 ms |
-| Qwen3.5 35B-A3B | 35.1B (3.3B active) | — | 16 tok/s | — | 2,000 ms |
-| Phi-4 | 14.7B | 8 tok/s | 15 tok/s | 5,300 ms | 813 ms |
+| Qwen3 Coder 30B-A3B Instruct | 30.5B (3.3B active) | 2 tok/s | 11 tok/s | 40,000 ms | 2,900 ms |
+| Qwen3.5 35B-A3B | 35.1B (3.3B active) | 5 tok/s | 16 tok/s | 44,600 ms | 2,000 ms |
+| Phi-4 | 14.7B | 2 tok/s | 15 tok/s | 5,300 ms | 813 ms |
 | DeepSeek-R1-Distill-Qwen-32B | 32.8B | — | 5 tok/s | — | 4,700 ms |
 
-Q4 quantization (`--quantize`) gives ~1.3-1.9x faster decode by reducing memory bandwidth. The Qwen3 and Qwen3.5 MoE models use Mixture of Experts with sparse activation (only ~3B params active per token). Qwen3.5 also uses DeltaNet linear attention layers. Phi-4 bf16 TTFT is high because the 14.7B model uses ~28 GB in bf16, leaving limited headroom for KV cache on 64 GB. For models over ~30B dense params, bf16 is skipped since the full weights leave no room for KV cache. Dynamic KV cache sizing automatically adjusts block count based on available GPU memory.
+Q4 quantization (`--quantize`) gives ~1.3-1.9x faster decode by reducing memory bandwidth. The Qwen3 and Qwen3.5 MoE models use Mixture of Experts with sparse activation (only ~3B params active per token). Qwen3.5 also uses DeltaNet linear attention layers. Large models (Phi-4, Qwen3/3.5 MoE) run in bf16 but are slow because the weights consume most of the 64 GB unified memory, leaving limited headroom for KV cache. Q4 is strongly recommended for models over ~8B params. Dynamic KV cache sizing automatically adjusts block count based on available GPU memory.
 
 ## Features
 

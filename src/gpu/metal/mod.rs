@@ -128,6 +128,8 @@ pub(crate) struct MetalBackend {
     #[allow(dead_code)]
     pipeline_attention: metal::ComputePipelineState,
     pipeline_silu_mul: metal::ComputePipelineState,
+    pipeline_gelu_mul: metal::ComputePipelineState,
+    pipeline_scalar_mul: metal::ComputePipelineState,
     pipeline_add: metal::ComputePipelineState,
     pipeline_bias_add: metal::ComputePipelineState,
     pipeline_scale_add: metal::ComputePipelineState,
@@ -201,6 +203,10 @@ impl MetalBackend {
             Self::make_pipeline(&device, METAL_SOURCE_ATTENTION, "attention", &compile_opts)?;
         let pipeline_silu_mul =
             Self::make_pipeline(&device, METAL_SOURCE_ELEMENTWISE, "silu_mul", &compile_opts)?;
+        let pipeline_gelu_mul =
+            Self::make_pipeline(&device, METAL_SOURCE_ELEMENTWISE, "gelu_mul", &compile_opts)?;
+        let pipeline_scalar_mul =
+            Self::make_pipeline(&device, METAL_SOURCE_ELEMENTWISE, "scalar_mul", &compile_opts)?;
         let pipeline_add = Self::make_pipeline(
             &device,
             METAL_SOURCE_ELEMENTWISE,
@@ -342,6 +348,8 @@ impl MetalBackend {
             pipeline_rope,
             pipeline_attention,
             pipeline_silu_mul,
+            pipeline_gelu_mul,
+            pipeline_scalar_mul,
             pipeline_add,
             pipeline_bias_add,
             pipeline_scale_add,
@@ -524,6 +532,8 @@ struct AttentionParams {
     num_heads: u32,
     num_kv_heads: u32,
     head_dim: u32,
+    window_size: u32,
+    attn_scale: f32,
 }
 
 #[repr(C)]
@@ -538,6 +548,14 @@ struct ElemParams {
 struct ScaleAddParams {
     size: u32,
     scale: f32,
+}
+
+/// Params for scalar multiply kernel.  Must match Metal `ScalarMulParams`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ScalarMulParams {
+    size: u32,
+    scalar: f32,
 }
 
 /// Params for broadcast bias-add kernel. Must match Metal `BiasAddParams`.
@@ -581,6 +599,8 @@ struct PagedAttentionParams {
     num_kv_heads: u32,
     head_dim: u32,
     block_size: u32,
+    window_size: u32,
+    attn_scale: f32,
 }
 
 // Phase 3: batched prefill param structs.
@@ -635,6 +655,8 @@ struct PrefillAttentionParams {
     num_heads: u32,
     num_kv_heads: u32,
     head_dim: u32,
+    window_size: u32,
+    attn_scale: f32,
 }
 
 #[repr(C)]
@@ -888,12 +910,16 @@ impl GpuBackend for MetalBackend {
         num_heads: u32,
         num_kv_heads: u32,
         head_dim: u32,
+        window_size: u32,
+        attn_scale: f32,
     ) {
         let params = AttentionParams {
             seq_len,
             num_heads,
             num_kv_heads,
             head_dim,
+            window_size,
+            attn_scale,
         };
         let threads_per_group: u64 = 256;
         self.dispatch_async(
@@ -917,6 +943,30 @@ impl GpuBackend for MetalBackend {
             &self.pipeline_silu_mul,
             &params,
             &[(&gate.buffer, 1), (&up.buffer, 2), (&out.buffer, 3)],
+            MTLSize::new(size as u64, 1, 1),
+            MTLSize::new(256.min(size as u64), 1, 1),
+        );
+    }
+
+    /// GeGLU activation: one thread per element.
+    fn gelu_mul(&self, gate: &MetalTensor, up: &MetalTensor, out: &MetalTensor, size: u32) {
+        let params = ElemParams { size };
+        self.dispatch_async(
+            &self.pipeline_gelu_mul,
+            &params,
+            &[(&gate.buffer, 1), (&up.buffer, 2), (&out.buffer, 3)],
+            MTLSize::new(size as u64, 1, 1),
+            MTLSize::new(256.min(size as u64), 1, 1),
+        );
+    }
+
+    /// Scalar multiply: one thread per element.
+    fn scalar_mul(&self, input: &MetalTensor, out: &MetalTensor, scalar: f32, size: u32) {
+        let params = ScalarMulParams { size, scalar };
+        self.dispatch_async(
+            &self.pipeline_scalar_mul,
+            &params,
+            &[(&input.buffer, 1), (&out.buffer, 2)],
             MTLSize::new(size as u64, 1, 1),
             MTLSize::new(256.min(size as u64), 1, 1),
         );
@@ -1060,6 +1110,8 @@ impl GpuBackend for MetalBackend {
         num_heads: u32,
         num_kv_heads: u32,
         head_dim: u32,
+        window_size: u32,
+        attn_scale: f32,
     ) {
         let params = PagedAttentionParams {
             seq_len,
@@ -1067,6 +1119,8 @@ impl GpuBackend for MetalBackend {
             num_kv_heads,
             head_dim,
             block_size: crate::model::kv_cache::BLOCK_SIZE as u32,
+            window_size,
+            attn_scale,
         };
         let threads_per_group: u64 = 256;
         self.dispatch_async(
@@ -1264,6 +1318,8 @@ impl GpuBackend for MetalBackend {
         num_heads: u32,
         num_kv_heads: u32,
         head_dim: u32,
+        window_size: u32,
+        attn_scale: f32,
     ) {
         let params = PrefillAttentionParams {
             chunk_size,
@@ -1271,6 +1327,8 @@ impl GpuBackend for MetalBackend {
             num_heads,
             num_kv_heads,
             head_dim,
+            window_size,
+            attn_scale,
         };
         let threads_per_group: u64 = 256;
         let num_threadgroups = chunk_size as u64 * num_heads as u64;

@@ -281,6 +281,16 @@ pub(crate) struct LayerWeights<B: GpuBackend> {
     pub dt_bias: Option<B::Tensor>,        // [num_v_heads] f32 — dt bias
     pub linear_norm: Option<B::Tensor>,    // [value_head_dim] bf16 — output norm weight
 
+    // --- Gemma 3 sandwich norms (extra post-norms applied before residual add) ---
+    //
+    // Learning note: "sandwich norms" wrap each sub-layer in TWO norms:
+    //   residual = residual + post_norm(sublayer(pre_norm(residual)))
+    // This controls the magnitude of sub-layer outputs before they enter the
+    // residual stream, preventing unbounded growth in deep networks.
+    // Most models use only pre-norms; Gemma 3 adds post-norms for stability.
+    pub pre_feedforward_layernorm: Option<B::Tensor>,   // [hidden_size] — pre-FFN norm (Gemma 3)
+    pub post_feedforward_layernorm: Option<B::Tensor>,  // [hidden_size] — post-FFN norm (Gemma 3)
+
     // --- GQA output gate (Qwen 3.5 full-attention layers with attn_output_gate) ---
     pub attn_z_proj: Option<B::Tensor>,    // [q_dim, hidden_size] — output gate projection
 
@@ -359,8 +369,11 @@ pub(crate) fn load_weights<B: GpuBackend>(
     let head_dim = config.head_dim;
     let is_hybrid = config.is_hybrid_deltanet();
     let has_fused_qkv = arch.has_fused_qkv();
-    // Qwen 3.5 stores RMSNorm weights as residual offsets (effective = 1 + stored).
-    let residual_norm = matches!(arch, ModelArch::Qwen3_5);
+    // Qwen 3.5 and Gemma 3 store RMSNorm weights as residual offsets
+    // (effective = 1 + stored_weight).  Both initialise norm weights to zero,
+    // so the effective scale starts at 1.0 and learns from there.
+    let residual_norm = matches!(arch, ModelArch::Qwen3_5 | ModelArch::Gemma3);
+    let is_gemma3 = matches!(arch, ModelArch::Gemma3);
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for i in 0..config.num_hidden_layers {
         let prefix = format!("{wp}layers.{i}");
@@ -892,6 +905,23 @@ pub(crate) fn load_weights<B: GpuBackend>(
             }
         };
 
+        // Gemma 3 sandwich norms: extra pre/post norms around the FFN sub-block.
+        // These are loaded with residual form (1 + stored) just like the other norms.
+        let (pre_ffn_norm, post_ffn_norm) = if is_gemma3 {
+            (
+                Some(upload_norm(
+                    &format!("{prefix}.pre_feedforward_layernorm.weight"),
+                    &[hidden],
+                )?),
+                Some(upload_norm(
+                    &format!("{prefix}.post_feedforward_layernorm.weight"),
+                    &[hidden],
+                )?),
+            )
+        } else {
+            (None, None)
+        };
+
         layers.push(LayerWeights {
             input_layernorm: upload_norm(
                 &format!("{prefix}.input_layernorm.weight"),
@@ -915,6 +945,8 @@ pub(crate) fn load_weights<B: GpuBackend>(
             down_proj,
             router_gate,
             experts,
+            pre_feedforward_layernorm: pre_ffn_norm,
+            post_feedforward_layernorm: post_ffn_norm,
             in_proj_qkv,
             in_proj_a,
             in_proj_b,

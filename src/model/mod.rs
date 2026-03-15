@@ -10,13 +10,13 @@
 //   appropriate architecture-specific module.
 //
 // Architecture dispatch (registry pattern, similar to vLLM):
-//   Each model family lives in its own file under model/registry/:
-//     - model/registry/llama.rs  — Llama 3.x family (no QKV bias)
-//     - model/registry/qwen.rs   — Qwen 2.5 family (QKV bias)
+//   Each model family lives in its own file under model/registry/.
+//   Standard dense transformers (Llama, Phi, Qwen) share a common forward
+//   pass in model/standard.rs, parameterised by ArchFeatures.  Complex
+//   architectures (Gemma, Qwen3 MoE, Qwen3.5 hybrid) have custom files.
 //
-//   Model families compose shared primitives from model/primitives.rs, which
-//   build on top of the GpuBackend trait.  The dispatch chain is:
-//     Model::forward() → registry::llama/qwen → primitives → GpuBackend
+//   The dispatch chain:
+//     Model::forward_*() → registry::llama/qwen/... → primitives → GpuBackend
 //
 //   Adding a new architecture means:
 //     1. Create a new file in model/registry/ (e.g. deepseek.rs)
@@ -63,6 +63,7 @@ pub(crate) mod loader;
 pub(crate) mod primitives;
 pub(crate) mod profile;
 pub(crate) mod registry;
+pub(crate) mod standard;
 pub(crate) mod sampler;
 pub(crate) mod tokenizer;
 
@@ -383,35 +384,30 @@ impl<'a, B: GpuBackend> Model<'a, B> {
     // Forward pass dispatch — model registry.
     //
     // Each model family lives in its own file under registry/ and composes
-    // shared primitives from primitives.rs.  The dispatch pattern is similar
-    // to vLLM's model registry: the Model struct routes to the right family
-    // based on ModelArch.
+    // shared primitives from primitives.rs.  The dispatch chain is:
+    //   Model::forward_*() → registry::llama/qwen/... → primitives → GpuBackend
+    //
+    // Two entry points, matching the two inference modes:
+    //   - forward_single_paged: decode one token (mat-vec, paged KV).
+    //   - forward_prefill_paged: process prompt chunk (GEMM, paged KV).
+    //
+    // The legacy `forward()` (flat/paged KV, `&mut self`) was removed:
+    // no call sites remain — the engine exclusively uses the paged path.
     // =======================================================================
 
-    /// Forward pass with flat/paged KV cache (original mode).
-    #[allow(dead_code)]
-    pub fn forward(&mut self, token_id: u32) -> anyhow::Result<()> {
-        match self.arch {
-            ModelArch::Llama => registry::llama::forward(self, token_id),
-            ModelArch::Phi => registry::phi::forward(self, token_id),
-            ModelArch::Qwen2 => registry::qwen::forward(self, token_id),
-            ModelArch::Qwen3Moe => registry::qwen3_moe::forward(self, token_id),
-            ModelArch::Qwen3_5 => registry::qwen3_5::forward(self, token_id),
-        }
-    }
-
-    /// Forward pass using an EXTERNAL paged KV pool and sequence state.
+    /// Decode a single token using an external paged KV pool and sequence state.
     ///
-    /// This is used by the engine for continuous batching: the model's own
-    /// kv_mode is ignored, and the caller provides the pool and sequence state
-    /// for the specific sequence being processed.
+    /// Used by the engine for continuous batching: the model's own kv_mode
+    /// is ignored — the caller provides the pool and sequence state for the
+    /// specific sequence being processed.
     pub fn forward_single_paged(
-        &mut self,
+        &self,
         token_id: u32,
         pool: &KvPool<B>,
         seq_state: &SeqKvState<B>,
     ) -> anyhow::Result<()> {
         match self.arch {
+            ModelArch::Gemma3 => registry::gemma::forward_single_paged(self, token_id, pool, seq_state),
             ModelArch::Llama => registry::llama::forward_single_paged(self, token_id, pool, seq_state),
             ModelArch::Phi => registry::phi::forward_single_paged(self, token_id, pool, seq_state),
             ModelArch::Qwen2 => registry::qwen::forward_single_paged(self, token_id, pool, seq_state),
@@ -438,6 +434,7 @@ impl<'a, B: GpuBackend> Model<'a, B> {
         bufs: &PrefillBuffers<B>,
     ) -> anyhow::Result<()> {
         match self.arch {
+            ModelArch::Gemma3 => registry::gemma::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
             ModelArch::Llama => registry::llama::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
             ModelArch::Phi => registry::phi::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
             ModelArch::Qwen2 => registry::qwen::forward_prefill_paged(self, tokens, pool, seq_state, bufs),

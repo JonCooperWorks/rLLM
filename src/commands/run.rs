@@ -85,7 +85,7 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
     //
     // PrefillBuffers are batch-sized scratch tensors (up to 4096 tokens)
     // used by the GEMM-based prefill forward pass.  Allocated once, reused.
-    let mut model = model::Model::new(config.clone(), weights, &backend)?;
+    let model = model::Model::new(config.clone(), weights, &backend)?;
 
     // Dynamic KV cache sizing based on remaining GPU memory.
     let gpu_budget = backend.recommended_max_memory();

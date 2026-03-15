@@ -55,6 +55,11 @@ struct AttentionParams {
     uint num_heads;     // Query heads (32).
     uint num_kv_heads;  // KV heads (8, shared via GQA).
     uint head_dim;      // Dimension per head (64).
+    uint window_size;   // Sliding window size (0 = attend to full context).
+                        // When > 0, only attend to the last window_size tokens.
+                        // Used by Gemma 3 local attention layers.
+    float attn_scale;   // Custom attention scale (0 = use default 1/√head_dim).
+                        // Gemma 3 uses 1/√query_pre_attn_scalar instead.
 };
 
 // Threadgroup shared memory layout:
@@ -87,8 +92,18 @@ kernel void attention(
     // Stride between consecutive positions in the KV cache.
     const uint kv_stride = num_kv_heads * head_dim;
 
-    // Attention scale factor: 1/√d.  `rsqrt` = 1/sqrt (single instruction).
-    const float scale = rsqrt(float(head_dim));
+    // Attention scale factor.
+    // Default: 1/√head_dim.  Gemma 3 overrides with 1/√query_pre_attn_scalar.
+    const float scale = (params.attn_scale > 0.0f) ? params.attn_scale : rsqrt(float(head_dim));
+
+    // Sliding window: only attend to the last window_size tokens.
+    // When window_size=0 (default), attend to ALL tokens (start=0).
+    // Learning note: Gemma 3 local layers use window_size=512, meaning each
+    // token only "sees" the 512 most recent tokens.  This drastically reduces
+    // memory and compute for long sequences, since most local patterns (syntax,
+    // coreference) are captured within a few hundred tokens.
+    const uint start = (params.window_size > 0 && seq_len > params.window_size)
+                       ? (seq_len - params.window_size) : 0;
 
     // Pointer to this head's query vector.
     device const bfloat* q_ptr = q + head_id * head_dim;
@@ -96,7 +111,7 @@ kernel void attention(
     // -----------------------------------------------------------------------
     // Pass 1: Online softmax — find global max and sum of exp(score - max).
     //
-    // Each thread scans ALL cache positions (strided by tg_size), computing
+    // Each thread scans cache positions (strided by tg_size), computing
     // Q·K dot products on the fly.  The online softmax trick maintains a
     // running (max, sum_exp) pair that gets corrected when a new max is found:
     //
@@ -112,7 +127,7 @@ kernel void attention(
     float local_max = -INFINITY;
     float local_sum_exp = 0.0f;
 
-    for (uint pos = tid; pos < seq_len; pos += tg_size) {
+    for (uint pos = start + tid; pos < seq_len; pos += tg_size) {
         // Compute Q · K[pos] (dot product with one cached key vector).
         device const bfloat* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
         float dot = 0.0f;
@@ -186,7 +201,7 @@ kernel void attention(
 
     for (uint d = tid; d < head_dim; d += tg_size) {
         float acc = 0.0f;
-        for (uint pos = 0; pos < seq_len; pos++) {
+        for (uint pos = start; pos < seq_len; pos++) {
             // Recompute attention score for this position.
             device const bfloat* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
             float dot = 0.0f;
@@ -296,6 +311,8 @@ struct PagedAttentionParams {
     uint num_kv_heads;  // KV heads (8).
     uint head_dim;      // Dimension per head (64).
     uint block_size;    // = 16
+    uint window_size;   // Sliding window (0 = full context).
+    float attn_scale;   // Custom scale (0 = default 1/√head_dim).
 };
 
 kernel void paged_attention(
@@ -317,7 +334,9 @@ kernel void paged_attention(
     const uint kv_dim = num_kv_heads * head_dim;
     const uint block_size = params.block_size;
 
-    const float scale = rsqrt(float(head_dim));
+    const float scale = (params.attn_scale > 0.0f) ? params.attn_scale : rsqrt(float(head_dim));
+    const uint start = (params.window_size > 0 && seq_len > params.window_size)
+                       ? (seq_len - params.window_size) : 0;
     device const bfloat* q_ptr = q + head_id * head_dim;
 
     // -------------------------------------------------------------------
@@ -332,12 +351,13 @@ kernel void paged_attention(
     // -------------------------------------------------------------------
     // Pass 1: Online softmax — find global max and sum of exp(score - max).
     // Identical algorithm to flat attention, just different K addressing.
+    // With sliding window, we skip positions before `start`.
     // -------------------------------------------------------------------
 
     float local_max = -INFINITY;
     float local_sum_exp = 0.0f;
 
-    for (uint pos = tid; pos < seq_len; pos += tg_size) {
+    for (uint pos = start + tid; pos < seq_len; pos += tg_size) {
         device const bfloat* k_vec = PAGED_K_VEC(pos);
         float dot = 0.0f;
         for (uint d = 0; d < head_dim; d++) {
@@ -395,7 +415,7 @@ kernel void paged_attention(
 
     for (uint d = tid; d < head_dim; d += tg_size) {
         float acc = 0.0f;
-        for (uint pos = 0; pos < seq_len; pos++) {
+        for (uint pos = start; pos < seq_len; pos++) {
             device const bfloat* k_vec = PAGED_K_VEC(pos);
             float dot = 0.0f;
             for (uint dd = 0; dd < head_dim; dd++) {
@@ -520,6 +540,8 @@ struct PrefillAttentionParams {
     uint num_heads;     // Query heads (32).
     uint num_kv_heads;  // KV heads (8).
     uint head_dim;      // Dimension per head (64).
+    uint window_size;   // Sliding window (0 = full causal attention).
+    float attn_scale;   // Custom scale (0 = default 1/√head_dim).
 };
 
 kernel void prefill_attention(
@@ -545,7 +567,7 @@ kernel void prefill_attention(
     if (qi >= chunk_size) return;
 
     const uint kv_head = head_id / heads_per_kv;
-    const float scale = rsqrt(float(head_dim));
+    const float scale = (params.attn_scale > 0.0f) ? params.attn_scale : rsqrt(float(head_dim));
 
     // Strides for the dense Q/K/V tensors.
     const uint q_stride = num_heads * head_dim;      // row stride in Q
@@ -555,18 +577,24 @@ kernel void prefill_attention(
     device const bfloat* q_ptr = q + qi * q_stride + head_id * head_dim;
 
     // Causal mask: this query attends to chunk positions 0..=qi.
-    // (If start_pos > 0, the chunk's tokens are at absolute positions
-    //  start_pos..start_pos+chunk_size, but K/V within this chunk are
-    //  indexed 0..chunk_size-1.  The causal constraint is on chunk indices.)
+    // With sliding window: also limit to at most window_size positions.
+    //
+    // Learning note: during prefill the K/V tensors are dense (not paged),
+    // indexed 0..chunk_size-1 within this chunk.  The absolute position of
+    // chunk token `qi` is `start_pos + qi`.  With sliding window, we only
+    // attend to positions whose absolute position is >= (start_pos + qi + 1 - window_size).
+    // Mapped back to chunk-local indices: attend_start = max(0, qi + 1 - window_size).
     const uint attend_len = qi + 1;
+    const uint attend_start = (params.window_size > 0 && attend_len > params.window_size)
+                              ? (attend_len - params.window_size) : 0;
 
     // -------------------------------------------------------------------
-    // Pass 1: Online softmax over K positions 0..attend_len-1.
+    // Pass 1: Online softmax over K positions attend_start..attend_len-1.
     // -------------------------------------------------------------------
     float local_max = -INFINITY;
     float local_sum_exp = 0.0f;
 
-    for (uint pos = tid; pos < attend_len; pos += tg_size) {
+    for (uint pos = attend_start + tid; pos < attend_len; pos += tg_size) {
         device const bfloat* k_vec = k + pos * kv_stride + kv_head * head_dim;
         float dot = 0.0f;
         for (uint d = 0; d < head_dim; d++) {
@@ -624,7 +652,7 @@ kernel void prefill_attention(
 
     for (uint d = tid; d < head_dim; d += tg_size) {
         float acc = 0.0f;
-        for (uint pos = 0; pos < attend_len; pos++) {
+        for (uint pos = attend_start; pos < attend_len; pos++) {
             device const bfloat* k_vec = k + pos * kv_stride + kv_head * head_dim;
             float dot = 0.0f;
             for (uint dd = 0; dd < head_dim; dd++) {

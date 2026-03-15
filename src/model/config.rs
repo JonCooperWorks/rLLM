@@ -41,8 +41,16 @@
 // ===========================================================================
 
 use crate::model::kv_cache;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
+
+/// Deserialize a `usize` that may be `null` in JSON (treat null as 0).
+///
+/// Many HuggingFace configs set optional numeric fields to `null` rather than
+/// omitting them.  `#[serde(default)]` handles the absent case but not null.
+fn null_as_zero<'de, D: Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
+    Ok(Option::<usize>::deserialize(d)?.unwrap_or(0))
+}
 
 // ===========================================================================
 // Model architecture enum — detected from config.json's `model_type` field.
@@ -109,6 +117,44 @@ pub enum ModelArch {
     /// No QKV bias, no QK-norm.  Chat template uses `<|im_start|>`/`<|im_sep|>`
     /// markers (similar to ChatML but with a separator token).
     Phi,
+    /// Gemma 3 family (Google, 1B, 4B, 12B, 27B).
+    ///
+    /// Learning note: Gemma 3 shares the Llama backbone (GQA, RoPE, gated FFN)
+    /// but has several architectural innovations:
+    ///
+    ///   1. **Sliding window attention**: alternating local (sliding window) and
+    ///      global (full context) layers.  Pattern: 5 local + 1 global, repeating.
+    ///      Local layers only attend to the last `sliding_window` tokens (512–4096),
+    ///      saving KV cache memory without degrading quality — nearby tokens matter
+    ///      most for local patterns, while periodic global layers capture long-range
+    ///      dependencies.
+    ///
+    ///   2. **Sandwich norms**: 4 RMSNorm layers per decoder layer instead of
+    ///      Llama's 2.  Pre-norm AND post-norm around both attention and FFN.
+    ///      The post-norms stabilize training for deeper models by controlling
+    ///      the scale of sub-layer outputs before they enter the residual stream.
+    ///
+    ///   3. **GeGLU**: GELU-gated linear unit instead of SiLU (SwiGLU).
+    ///      `gelu(gate) * up` replaces `silu(gate) * up`.  GELU's smoother
+    ///      gradient landscape empirically helps with training stability.
+    ///
+    ///   4. **Dual RoPE bases**: local layers use rope_local_base_freq (10000),
+    ///      global layers use rope_theta (1000000).  Lower theta for local layers
+    ///      gives sharper positional encoding for nearby tokens; higher theta for
+    ///      global layers supports long-range position discrimination.
+    ///
+    ///   5. **Embedding scaling**: embeddings multiplied by √hidden_size after
+    ///      lookup, instead of a learned norm.  This ensures the embedding vectors
+    ///      start at the right magnitude for the residual stream.
+    ///
+    ///   6. **Offset RMSNorm**: `(1 + w) * normalized(x)` — weights init to 0,
+    ///      effective scale starts at 1.0.  Same as Qwen 3.5.
+    ///
+    ///   7. **Custom attention scale**: `query_pre_attn_scalar` replaces head_dim
+    ///      for computing 1/√(scale).  Decouples the scale from head dimension.
+    ///
+    /// No QKV bias, no QK-norm.  Chat uses `<start_of_turn>`/`<end_of_turn>`.
+    Gemma3,
 }
 
 impl ModelArch {
@@ -121,7 +167,7 @@ impl ModelArch {
     /// this helps at smaller model sizes.
     pub fn has_qkv_bias(&self) -> bool {
         match self {
-            ModelArch::Llama | ModelArch::Phi => false,
+            ModelArch::Llama | ModelArch::Phi | ModelArch::Gemma3 => false,
             ModelArch::Qwen2 => true,
             ModelArch::Qwen3Moe | ModelArch::Qwen3_5 => false,
         }
@@ -136,7 +182,7 @@ impl ModelArch {
     /// rely on the implicit normalisation from RMSNorm on the hidden state.
     pub fn has_qk_norm(&self) -> bool {
         match self {
-            ModelArch::Llama | ModelArch::Qwen2 | ModelArch::Phi => false,
+            ModelArch::Llama | ModelArch::Qwen2 | ModelArch::Phi | ModelArch::Gemma3 => false,
             ModelArch::Qwen3_5 => true,  // GQA layers have QK-norm
             ModelArch::Qwen3Moe => true,
         }
@@ -161,8 +207,9 @@ impl ModelArch {
             "qwen3_moe" => Ok(ModelArch::Qwen3Moe),
             "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => Ok(ModelArch::Qwen3_5),
             "phi3" | "phi4" => Ok(ModelArch::Phi),
+            "gemma3_text" | "gemma3" => Ok(ModelArch::Gemma3),
             other => anyhow::bail!(
-                "unsupported model_type '{}' (expected 'llama', 'qwen2', 'qwen3_moe', 'qwen3_5', or 'phi3')",
+                "unsupported model_type '{}' (expected 'llama', 'qwen2', 'qwen3_moe', 'qwen3_5', 'phi3', or 'gemma3_text')",
                 other
             ),
         }
@@ -301,6 +348,49 @@ pub struct ModelConfig {
     #[serde(default)]
     pub attn_output_gate: bool,
 
+    // --- Gemma 3 fields ---
+    //
+    // Learning note: Gemma 3 uses sliding window attention where most layers
+    // only attend to a limited window of recent tokens, with periodic "global"
+    // layers that see the full context.  This is a memory-efficiency trick:
+    // local patterns (syntax, coreference) are captured by sliding window layers,
+    // while long-range dependencies (document structure, early context) are
+    // handled by global layers.  The pattern is typically 5 local + 1 global.
+    //
+    // Gemma 3 also uses two different RoPE frequencies — a lower base for
+    // local layers (where precise nearby-token positioning matters) and a
+    // higher base for global layers (where long-range discrimination matters).
+
+    /// Sliding window size for local attention layers (tokens).
+    /// Gemma 3 1B: 512, larger models: up to 4096.
+    /// Only used when layer_types contains "sliding_attention".
+    #[serde(default, deserialize_with = "null_as_zero")]
+    pub sliding_window: usize,
+    /// How often a global (full-attention) layer appears in the interleaved
+    /// pattern.  Gemma 3: 6 (every 6th layer is global, i.e. 5 local + 1 global).
+    /// Used to auto-generate layer_types when the config omits them.
+    #[serde(default)]
+    pub sliding_window_pattern: usize,
+    /// Custom attention scale factor.  When > 0, attention uses
+    /// 1/√(query_pre_attn_scalar) instead of the default 1/√(head_dim).
+    /// Gemma 3: typically set to head_dim (256), making it equivalent, but
+    /// this decouples the scale from the actual head dimension.
+    #[serde(default)]
+    pub query_pre_attn_scalar: f64,
+    /// RoPE base frequency for LOCAL (sliding window) attention layers.
+    /// Gemma 3: 10000 (standard).  Global layers use `rope_theta` (1000000)
+    /// for better long-range position discrimination.
+    #[serde(default)]
+    pub rope_local_base_freq: f64,
+    /// FFN hidden activation function name (from HuggingFace config).
+    /// "gelu_pytorch_tanh" = GeGLU (Gemma 3), empty or absent = SwiGLU (default).
+    ///
+    /// Learning note: GeGLU uses gelu(gate) × up, while SwiGLU uses silu(gate) × up.
+    /// GELU has a smoother gradient landscape which empirically helps training stability.
+    /// The "pytorch_tanh" suffix refers to PyTorch's tanh-approximated GELU variant.
+    #[serde(default)]
+    pub hidden_activation: String,
+
     // --- Weight prefix ---
     // Multimodal models (Qwen 3.5) prefix layer weights with
     // "model.language_model." instead of "model.".  This field is set
@@ -409,6 +499,24 @@ impl ModelConfig {
         if config.head_dim == 0 {
             config.head_dim = config.hidden_size / config.num_attention_heads;
         }
+
+        // Gemma 3: auto-generate layer_types from sliding_window_pattern if not
+        // explicitly provided.  Some HF configs include `layer_types` directly,
+        // others only provide `sliding_window_pattern` (e.g. 6 = every 6th layer
+        // is global).  We normalise to an explicit per-layer array so the forward
+        // pass can just index into it.
+        if config.layer_types.is_empty() && config.sliding_window_pattern > 0 {
+            config.layer_types = (0..config.num_hidden_layers)
+                .map(|i| {
+                    if (i + 1) % config.sliding_window_pattern == 0 {
+                        "full_attention".to_string()
+                    } else {
+                        "sliding_attention".to_string()
+                    }
+                })
+                .collect();
+        }
+
         Ok(config)
     }
 
@@ -494,8 +602,13 @@ impl ModelConfig {
             layer += proj(hidden, q_dim);  // o_proj
 
             // Norm weights (always BF16, small).
+            // Gemma 3 uses 4 norms per layer (sandwich norms); all others use 2.
             layer += hidden * 2; // input_layernorm
             layer += hidden * 2; // post_attention_layernorm
+            if matches!(self.arch(), Ok(ModelArch::Gemma3)) {
+                layer += hidden * 2; // pre_feedforward_layernorm
+                layer += hidden * 2; // post_feedforward_layernorm
+            }
 
             // QKV bias (BF16, only Qwen2).
             if self.arch().map_or(false, |a| a.has_qkv_bias()) {
@@ -565,6 +678,7 @@ impl ModelConfig {
     /// Whether this model uses the hybrid DeltaNet + GQA architecture.
     pub fn is_hybrid_deltanet(&self) -> bool {
         !self.layer_types.is_empty()
+            && self.layer_types.iter().any(|t| t == "linear_attention")
     }
 
     /// Whether a given layer uses DeltaNet (linear) attention.
@@ -577,6 +691,35 @@ impl ModelConfig {
         }
     }
 
+    /// Whether a given layer uses sliding window (local) attention.
+    ///
+    /// Learning note: Gemma 3 interleaves local layers (attending to the last
+    /// `sliding_window` tokens) with global layers (full context).  This saves
+    /// memory — local layers don't need to store KV for the entire sequence —
+    /// while periodic global layers prevent information loss.
+    pub fn is_sliding_attention_layer(&self, layer_idx: usize) -> bool {
+        if layer_idx < self.layer_types.len() {
+            self.layer_types[layer_idx] == "sliding_attention"
+        } else {
+            false
+        }
+    }
+
+    /// Whether the model uses GeGLU (GELU-gated) instead of SwiGLU (SiLU-gated) FFN.
+    ///
+    /// Learning note: both are gated linear units — gate(x) * up(x) — but differ
+    /// in the gate activation.  SiLU (x * sigmoid(x)) is sharper; GELU
+    /// (0.5x * (1 + tanh(√(2/π)(x + 0.044715x³)))) is smoother.  Gemma 3 uses
+    /// GELU; most other models (Llama, Qwen, Phi) use SiLU.
+    pub fn uses_geglu(&self) -> bool {
+        self.hidden_activation.contains("gelu")
+    }
+
+    /// Whether this model uses sliding window attention (Gemma 3 pattern).
+    pub fn has_sliding_window(&self) -> bool {
+        self.sliding_window > 0
+    }
+
     /// Number of RoPE dimensions for full-attention layers.
     /// Qwen 3.5: partial_rotary_factor=0.25, head_dim=256 → 64 RoPE dims.
     pub fn rotary_dim(&self) -> usize {
@@ -587,19 +730,30 @@ impl ModelConfig {
         }
     }
 
-    /// Number of layers that need KV cache (GQA layers only for hybrid models).
+    /// Number of layers that need KV cache.
+    ///
+    /// For Qwen 3.5 hybrid models, only GQA ("full_attention") layers need a
+    /// KV cache — DeltaNet ("linear_attention") layers use a fixed-size state.
+    /// For Gemma 3, ALL layers need KV cache (both "sliding_attention" and
+    /// "full_attention" use standard softmax attention, just with different
+    /// context windows).
     pub fn num_kv_layers(&self) -> usize {
         if self.layer_types.is_empty() {
             self.num_hidden_layers
         } else {
+            // Only DeltaNet layers skip KV cache.  Sliding attention and full
+            // attention both need it.
             self.layer_types
                 .iter()
-                .filter(|t| t.as_str() == "full_attention")
+                .filter(|t| t.as_str() != "linear_attention")
                 .count()
         }
     }
 
     /// Build a mapping from layer_idx → kv_pool_idx (None for DeltaNet layers).
+    ///
+    /// Layers using any form of softmax attention (full or sliding window) get
+    /// a KV pool slot.  Only DeltaNet (linear_attention) layers return None.
     pub fn kv_layer_map(&self) -> Vec<Option<usize>> {
         if self.layer_types.is_empty() {
             (0..self.num_hidden_layers).map(Some).collect()
@@ -608,12 +762,13 @@ impl ModelConfig {
             self.layer_types
                 .iter()
                 .map(|t| {
-                    if t == "full_attention" {
+                    if t == "linear_attention" {
+                        None
+                    } else {
+                        // Both "full_attention" and "sliding_attention" need KV.
                         let r = Some(idx);
                         idx += 1;
                         r
-                    } else {
-                        None
                     }
                 })
                 .collect()

@@ -1,5 +1,5 @@
 // ===========================================================================
-// Element-wise GPU kernels: SwiGLU activation and tensor addition.
+// Element-wise GPU kernels: gated activations and tensor arithmetic.
 //
 // LEARNING OVERVIEW
 //
@@ -8,15 +8,18 @@
 // Metal's dispatch_threads creates N threads and each one reads its inputs,
 // computes, and writes its output.
 //
-// SwiGLU (Swish-Gated Linear Unit):
-//   The FFN (feed-forward network) in Llama uses the SwiGLU activation:
-//     FFN(x) = (silu(x @ W_gate) * (x @ W_up)) @ W_down
+// Gated activations (SwiGLU and GeGLU):
+//   The FFN (feed-forward network) in most LLMs uses a gated activation:
+//     FFN(x) = (act(x @ W_gate) * (x @ W_up)) @ W_down
 //
-//   where silu(x) = x * sigmoid(x) = x / (1 + exp(-x)).
+//   The "gate" controls how much of the "up" projection passes through.
+//   Different models use different gate activations:
+//     - SwiGLU (Llama, Qwen, Phi): silu(x) = x * sigmoid(x)
+//     - GeGLU  (Gemma 3):          gelu(x) ≈ 0.5x(1 + tanh(√(2/π)(x + 0.044715x³)))
 //
-//   This is a "gated" activation: the gate projection controls how much
-//   of the up projection passes through.  SwiGLU was shown to outperform
-//   ReLU and GELU in transformer FFNs (Shazeer, 2020).
+//   Both outperform plain ReLU in practice (Shazeer, 2020).  GELU's smoother
+//   gradient landscape may help training stability, which is why Google chose
+//   it for Gemma.
 //
 // Residual connections:
 //   The add kernel implements the residual (skip) connections in the
@@ -54,6 +57,67 @@ kernel void silu_mul(
     // silu(g) = g / (1 + exp(-g)) = g * sigmoid(g)
     float silu = g / (1.0f + exp(-g));
     output[gid] = bfloat(silu * u);
+}
+
+// ---------------------------------------------------------------------------
+// GeGLU activation: out[i] = gelu(gate[i]) * up[i]
+//
+// gelu_pytorch_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+//
+// Learning note: Gemma 3 uses this instead of SwiGLU.  The tanh approximation
+// is PyTorch's default and matches the HuggingFace "gelu_pytorch_tanh" variant.
+// The exact GELU uses the error function (erf) which is slightly more expensive.
+// In practice the tanh approximation is indistinguishable from exact GELU.
+//
+// Performance note: this kernel uses precise::tanh for numerical accuracy.
+// The fast math tanh would introduce small errors that accumulate across layers.
+// ---------------------------------------------------------------------------
+
+kernel void gelu_mul(
+    constant ElemParams& params [[buffer(0)]],
+    device const bfloat* gate   [[buffer(1)]],
+    device const bfloat* up     [[buffer(2)]],
+    device bfloat* output       [[buffer(3)]],
+    uint gid                    [[thread_position_in_grid]]
+) {
+    if (gid >= params.size) return;
+    float g = float(gate[gid]);
+    float u = float(up[gid]);
+    // gelu_pytorch_tanh(g) = 0.5 * g * (1 + tanh(sqrt(2/π) * (g + 0.044715 * g³)))
+    const float SQRT_2_OVER_PI = 0.7978845608028654f;  // sqrt(2/π)
+    float inner = SQRT_2_OVER_PI * (g + 0.044715f * g * g * g);
+    float gelu = 0.5f * g * (1.0f + precise::tanh(inner));
+    output[gid] = bfloat(gelu * u);
+}
+
+// ---------------------------------------------------------------------------
+// Scalar multiply: out[i] = scalar * input[i]
+//
+// Used by Gemma 3 for embedding scaling: after looking up a token's embedding
+// vector, the vector is multiplied by √(hidden_size).  This ensures the
+// embedding magnitudes match the expected scale of the residual stream —
+// without this scaling, embeddings would be too small relative to the
+// intermediate representations in deeper layers.
+//
+// Learning note: Llama doesn't need this because its embeddings are already
+// normalized during training.  Gemma follows the original Transformer paper's
+// convention where embeddings are scaled by √d_model to prevent them from
+// being negligibly small compared to positional encodings.
+// ---------------------------------------------------------------------------
+
+struct ScalarMulParams {
+    uint size;
+    float scalar;
+};
+
+kernel void scalar_mul(
+    constant ScalarMulParams& params [[buffer(0)]],
+    device const bfloat* input       [[buffer(1)]],
+    device bfloat* output            [[buffer(2)]],
+    uint gid                         [[thread_position_in_grid]]
+) {
+    if (gid >= params.size) return;
+    output[gid] = bfloat(params.scalar * float(input[gid]));
 }
 
 // ---------------------------------------------------------------------------

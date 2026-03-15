@@ -84,6 +84,10 @@ impl Tokenizer {
             // Phi (Microsoft): no BOS.  Stop on <|im_end|> (100265) or
             // <|endoftext|> (100257).  Uses tiktoken-based 100352-token vocab.
             ModelArch::Phi => (None, vec![100257, 100265]),
+
+            // Gemma 3: BOS=2 (<bos>).  Stop on <end_of_turn> (107) or <eos> (1).
+            // Gemma uses a 262144-token SentencePiece vocabulary.
+            ModelArch::Gemma3 => (Some(2), vec![1, 107]),
         };
 
         Ok(Self {

@@ -224,9 +224,12 @@ pub(crate) trait GpuBackend: Send + Sync {
         head_dim: u32,
     );
 
-    /// Grouped-Query Attention: compute softmax(Q·K^T / √d) · V
+    /// Grouped-Query Attention: compute softmax(Q·K^T / scale) · V
     /// Uses the flat KV cache (all positions 0..seq_len).
     /// With GQA, multiple query heads share one KV head (4:1 in Llama 3.2).
+    ///
+    /// `window_size`: sliding window (0 = attend to all positions).
+    /// `attn_scale`: custom scale factor (0.0 = default 1/√head_dim).
     #[allow(dead_code)]
     fn attention(
         &self,
@@ -238,11 +241,29 @@ pub(crate) trait GpuBackend: Send + Sync {
         num_heads: u32,
         num_kv_heads: u32,
         head_dim: u32,
+        window_size: u32,
+        attn_scale: f32,
     );
 
     /// SwiGLU activation: out[i] = silu(gate[i]) * up[i]
-    /// where silu(x) = x * sigmoid(x).  Used in the FFN block.
+    /// where silu(x) = x * sigmoid(x).  Used in the FFN block (Llama, Qwen, Phi).
     fn silu_mul(&self, gate: &Self::Tensor, up: &Self::Tensor, out: &Self::Tensor, size: u32);
+
+    /// GeGLU activation: out[i] = gelu(gate[i]) * up[i]
+    ///
+    /// Learning note: Gemma 3 uses GELU instead of SiLU as the gate activation
+    /// in its FFN.  The PyTorch tanh-approximated GELU is:
+    ///   gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+    /// Both SwiGLU and GeGLU are "gated linear units" — they just differ in
+    /// the gate activation function.
+    fn gelu_mul(&self, gate: &Self::Tensor, up: &Self::Tensor, out: &Self::Tensor, size: u32);
+
+    /// Scalar multiply: out[i] = scalar * input[i]
+    ///
+    /// Used by Gemma 3 for embedding scaling: after looking up a token's
+    /// embedding vector, it's multiplied by √(hidden_size) to match the
+    /// expected magnitude of the residual stream.
+    fn scalar_mul(&self, input: &Self::Tensor, out: &Self::Tensor, scalar: f32, size: u32);
 
     /// Element-wise addition: out[i] = a[i] + b[i]
     /// Used for residual connections after attention and FFN.
@@ -379,6 +400,9 @@ pub(crate) trait GpuBackend: Send + Sync {
     /// k: [chunk_size, num_kv_heads * head_dim]
     /// v: [chunk_size, num_kv_heads * head_dim]
     /// out: [chunk_size, num_heads * head_dim]
+    ///
+    /// `window_size`: sliding window (0 = full causal attention).
+    /// `attn_scale`: custom scale factor (0.0 = default 1/√head_dim).
     fn prefill_attention(
         &self,
         q: &Self::Tensor,
@@ -390,6 +414,8 @@ pub(crate) trait GpuBackend: Send + Sync {
         num_heads: u32,
         num_kv_heads: u32,
         head_dim: u32,
+        window_size: u32,
+        attn_scale: f32,
     );
 
     // --- DeltaNet operations (Qwen 3.5 hybrid attention) ---
@@ -503,8 +529,11 @@ pub(crate) trait GpuBackend: Send + Sync {
         rotary_dim: u32,
     );
 
-    /// Paged attention: compute softmax(Q·K^T / √d) · V using a paged KV pool.
+    /// Paged attention: compute softmax(Q·K^T / scale) · V using a paged KV pool.
     /// Same algorithm as attention() but reads K/V through block table indirection.
+    ///
+    /// `window_size`: sliding window (0 = attend to all positions).
+    /// `attn_scale`: custom scale factor (0.0 = default 1/√head_dim).
     fn paged_attention(
         &self,
         q: &Self::Tensor,
@@ -516,6 +545,8 @@ pub(crate) trait GpuBackend: Send + Sync {
         num_heads: u32,
         num_kv_heads: u32,
         head_dim: u32,
+        window_size: u32,
+        attn_scale: f32,
     );
 
     /// GPU-side top-k selection with softmax for MoE expert routing.

@@ -81,6 +81,8 @@ pub(crate) fn format_chat(arch: ModelArch, messages: &[Message]) -> String {
         ModelArch::Qwen2 | ModelArch::Qwen3Moe | ModelArch::Qwen3_5 => format_chatml(messages),
         // Phi uses a ChatML-like format but with <|im_sep|> between role and content.
         ModelArch::Phi => format_phi(messages),
+        // Gemma 3 uses <start_of_turn>/<end_of_turn> markers.
+        ModelArch::Gemma3 => format_gemma3(messages),
     }
 }
 
@@ -142,6 +144,39 @@ fn format_chatml(messages: &[Message]) -> String {
 
     // Generation prompt — model fills in the assistant response.
     out.push_str("<|im_start|>assistant\n");
+
+    out
+}
+
+/// Format chat messages into the Gemma 3 instruct template string.
+///
+/// Gemma 3 uses `<start_of_turn>` and `<end_of_turn>` markers with a newline
+/// separating the role name from the content:
+///
+///   <start_of_turn>user
+///   What is 2+2?<end_of_turn>
+///   <start_of_turn>model
+///
+/// Note: Gemma uses "model" instead of "assistant" for the model's role.
+///
+/// Special tokens:
+///   <start_of_turn> → 106
+///   <end_of_turn>   → 107
+fn format_gemma3(messages: &[Message]) -> String {
+    let mut out = String::with_capacity(512);
+
+    for msg in messages {
+        out.push_str("<start_of_turn>");
+        // Gemma uses "model" for the assistant role.
+        let role = if msg.role == "assistant" { "model" } else { &msg.role };
+        out.push_str(role);
+        out.push('\n');
+        out.push_str(&msg.content);
+        out.push_str("<end_of_turn>\n");
+    }
+
+    // Generation prompt — model fills in the response.
+    out.push_str("<start_of_turn>model\n");
 
     out
 }
