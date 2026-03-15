@@ -182,7 +182,8 @@ impl ModelArch {
     /// rely on the implicit normalisation from RMSNorm on the hidden state.
     pub fn has_qk_norm(&self) -> bool {
         match self {
-            ModelArch::Llama | ModelArch::Qwen2 | ModelArch::Phi | ModelArch::Gemma3 => false,
+            ModelArch::Llama | ModelArch::Qwen2 | ModelArch::Phi => false,
+            ModelArch::Gemma3 => true,  // Both 4B and 27B have q_norm/k_norm weights
             ModelArch::Qwen3_5 => true,  // GQA layers have QK-norm
             ModelArch::Qwen3Moe => true,
         }
@@ -235,9 +236,12 @@ pub struct ModelConfig {
     /// Number of transformer layers.
     pub num_hidden_layers: usize,
     /// Number of query attention heads.
+    /// Gemma 3 4B omits this from text_config — filled in by apply_gemma3_defaults().
+    #[serde(default)]
     pub num_attention_heads: usize,
     /// Number of key/value attention heads.
     /// Fewer than query heads = Grouped-Query Attention (GQA).
+    #[serde(default)]
     pub num_key_value_heads: usize,
     /// Dimension per attention head.
     /// Invariant: num_attention_heads × head_dim = hidden_size.
@@ -250,14 +254,18 @@ pub struct ModelConfig {
     #[serde(default)]
     pub intermediate_size: usize,
     /// Number of tokens in the vocabulary.
+    #[serde(default)]
     pub vocab_size: usize,
     /// Maximum sequence length the model supports.
+    #[serde(default)]
     pub max_position_embeddings: usize,
     /// RoPE base frequency.
     /// Higher theta = slower rotation = longer effective context.
+    #[serde(default)]
     pub rope_theta: f64,
     /// Epsilon for RMSNorm numerical stability.
     /// Prevents division by zero when the input vector is near-zero.
+    #[serde(default)]
     pub rms_norm_eps: f64,
     /// Whether the LM head shares weights with the embedding table.
     /// When true, there is no separate `lm_head.weight` in the checkpoint.
@@ -427,15 +435,18 @@ fn default_rope_theta() -> f64 {
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct RopeScaling {
-    /// Scaling algorithm type (e.g. "llama3").
+    /// Scaling algorithm type (e.g. "llama3", "linear").
     pub rope_type: String,
     /// Overall scaling factor.
     pub factor: f64,
-    /// Factor for high-frequency RoPE dimensions.
+    /// Factor for high-frequency RoPE dimensions (Llama 3 only).
+    #[serde(default)]
     pub high_freq_factor: f64,
-    /// Factor for low-frequency RoPE dimensions.
+    /// Factor for low-frequency RoPE dimensions (Llama 3 only).
+    #[serde(default)]
     pub low_freq_factor: f64,
-    /// Training context length before scaling was applied.
+    /// Training context length before scaling was applied (Llama 3 only).
+    #[serde(default)]
     pub original_max_position_embeddings: usize,
 }
 
@@ -466,11 +477,23 @@ impl ModelConfig {
                     );
                 }
             }
-            // Use "qwen3_5" as model_type for architecture detection.
-            merged.as_object_mut().unwrap().insert(
-                "model_type".to_string(),
-                Value::String("qwen3_5".to_string()),
-            );
+            // Detect which VLM wrapper this is.  Gemma 3 text_config has
+            // model_type="gemma3_text" and keeps it; Qwen 3.5 VLMs need
+            // the type forced to "qwen3_5".
+            let text_model_type = merged.get("model_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let weight_prefix = if text_model_type.starts_with("gemma3") {
+                // Gemma 3 VLM: text weights under "language_model.model."
+                "language_model.model.".to_string()
+            } else {
+                // Qwen 3.5 VLM: force model_type and use language_model prefix.
+                merged.as_object_mut().unwrap().insert(
+                    "model_type".to_string(),
+                    Value::String("qwen3_5".to_string()),
+                );
+                "model.language_model.".to_string()
+            };
             // Extract rope_theta from nested rope_parameters if present.
             // Clone values first to avoid borrow conflicts.
             let rope_theta_val = merged.get("rope_parameters")
@@ -489,13 +512,42 @@ impl ModelConfig {
                     merged.as_object_mut().unwrap().insert("partial_rotary_factor".to_string(), prf);
                 }
             }
-            (merged, "model.language_model.".to_string())
+            (merged, weight_prefix)
         } else {
             (raw, "model.".to_string())
         };
 
         let mut config: Self = serde_json::from_value(config_value)?;
         config.weight_prefix = weight_prefix;
+
+        // Apply Gemma 3 defaults for fields omitted by minimal HF configs.
+        // Google's Gemma 3 4B config.json only includes a sparse text_config
+        // (hidden_size, intermediate_size, num_hidden_layers, sliding_window).
+        // The full defaults come from HF's Gemma3TextConfig class.
+        if config.model_type == "gemma3_text" || config.model_type == "gemma3" {
+            if config.num_attention_heads == 0 { config.num_attention_heads = 8; }
+            if config.num_key_value_heads == 0 { config.num_key_value_heads = 4; }
+            if config.head_dim == 0 { config.head_dim = 256; }
+            if config.vocab_size == 0 { config.vocab_size = 262208; }
+            if config.max_position_embeddings == 0 { config.max_position_embeddings = 131072; }
+            if config.rope_theta == 0.0 { config.rope_theta = 1_000_000.0; }
+            if config.rms_norm_eps == 0.0 { config.rms_norm_eps = 1e-6; }
+            if config.sliding_window_pattern == 0 { config.sliding_window_pattern = 6; }
+            if config.hidden_activation.is_empty() {
+                config.hidden_activation = "gelu_pytorch_tanh".to_string();
+            }
+            if config.query_pre_attn_scalar == 0.0 {
+                config.query_pre_attn_scalar = config.head_dim as f64;
+            }
+            if config.sliding_window == 0 { config.sliding_window = 1024; }
+            if config.rope_local_base_freq == 0.0 { config.rope_local_base_freq = 10_000.0; }
+            // Gemma 3 ties embeddings (no separate lm_head.weight).
+            // The top-level config may not specify this, so default to true.
+            if !config.tie_word_embeddings {
+                config.tie_word_embeddings = true;
+            }
+        }
+
         if config.head_dim == 0 {
             config.head_dim = config.hidden_size / config.num_attention_heads;
         }
@@ -716,6 +768,7 @@ impl ModelConfig {
     }
 
     /// Whether this model uses sliding window attention (Gemma 3 pattern).
+    #[cfg(test)]
     pub fn has_sliding_window(&self) -> bool {
         self.sliding_window > 0
     }
@@ -828,7 +881,7 @@ mod tests {
         assert!(ModelArch::Qwen3Moe.has_qk_norm());
         assert!(ModelArch::Qwen3_5.has_qk_norm());
         assert!(!ModelArch::Phi.has_qk_norm());
-        assert!(!ModelArch::Gemma3.has_qk_norm());
+        assert!(ModelArch::Gemma3.has_qk_norm());
     }
 
     #[test]
@@ -889,6 +942,35 @@ mod tests {
         assert!(config.num_experts_per_tok > 0);
         assert!(config.moe_intermediate_size > 0);
         assert!(config.arch().unwrap().has_qk_norm());
+    }
+
+    #[test]
+    fn test_parse_gemma3_4b_config() {
+        let Some(config) = load_config("gemma-3-4b-it") else { return };
+        assert_eq!(config.arch().unwrap(), ModelArch::Gemma3);
+        // Verify defaults were applied for the sparse 4B config
+        assert_eq!(config.num_attention_heads, 8);
+        assert_eq!(config.num_key_value_heads, 4);
+        assert_eq!(config.head_dim, 256);
+        assert_eq!(config.vocab_size, 262208);
+        assert_eq!(config.hidden_size, 2560);
+        assert_eq!(config.num_hidden_layers, 34);
+        assert!(config.uses_geglu());
+        assert!(config.has_sliding_window());
+        assert!(!config.is_moe());
+    }
+
+    #[test]
+    fn test_parse_gemma3_27b_config() {
+        let Some(config) = load_config("gemma-3-27b-it") else { return };
+        assert_eq!(config.arch().unwrap(), ModelArch::Gemma3);
+        assert_eq!(config.num_attention_heads, 32);
+        assert_eq!(config.num_key_value_heads, 16);
+        assert_eq!(config.head_dim, 128);
+        assert_eq!(config.hidden_size, 5376);
+        assert_eq!(config.num_hidden_layers, 62);
+        assert!(config.uses_geglu());
+        assert!(config.has_sliding_window());
     }
 
     #[test]

@@ -32,7 +32,6 @@ impl GpuCore for CudaBackend {
 impl GpuNorm for CudaBackend {
     fn rms_norm(&self, _: &CudaTensor, _: &CudaTensor, _: f32, _: &CudaTensor) { unreachable!() }
     fn rms_norm_batch(&self, _: &CudaTensor, _: &CudaTensor, _: f32, _: &CudaTensor, _: u32) { unreachable!() }
-    fn rms_norm_no_weight(&self, _: &CudaTensor, _: &CudaTensor, _: u32, _: f32) { unreachable!() }
 }
 
 impl GpuMatmul for CudaBackend {

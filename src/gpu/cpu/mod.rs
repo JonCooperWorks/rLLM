@@ -22,6 +22,7 @@ use super::TensorDtype;
 
 pub(crate) struct CpuBackend;
 
+#[allow(dead_code)]
 pub(crate) struct CpuTensor {
     pub data: Vec<u8>,
     pub shape: Vec<usize>,
@@ -70,13 +71,6 @@ fn write_bf16_at(tensor: &CpuTensor, offset: usize, values: &[f32]) {
 fn write_f32(tensor: &CpuTensor, values: &[f32]) {
     let bytes = bytemuck::cast_slice::<f32, u8>(values);
     let dst = tensor.data.as_ptr() as *mut u8;
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
-}
-
-/// Write f32 values at a byte offset into a tensor's buffer.
-fn write_f32_at(tensor: &CpuTensor, offset: usize, values: &[f32]) {
-    let bytes = bytemuck::cast_slice::<f32, u8>(values);
-    let dst = unsafe { (tensor.data.as_ptr() as *mut u8).add(offset) };
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
 }
 
@@ -161,14 +155,6 @@ impl GpuNorm for CpuBackend {
         }
     }
 
-    fn rms_norm_no_weight(&self, input: &CpuTensor, out: &CpuTensor, size: u32, eps: f32) {
-        let n = size as usize;
-        let x = read_bf16(input, n);
-        let mean_sq: f32 = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
-        let scale = 1.0 / (mean_sq + eps).sqrt();
-        let result: Vec<f32> = x.iter().map(|xi| xi * scale).collect();
-        write_bf16(out, &result);
-    }
 }
 
 // ===========================================================================
@@ -917,17 +903,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_rms_norm_no_weight() {
-        let b = CpuBackend;
-        let input = b.upload_tensor(&bf16_bytes(&[3.0, 4.0]), &[2], TensorDtype::BF16);
-        let out = b.alloc_tensor(&[2], TensorDtype::BF16);
-        b.rms_norm_no_weight(&input, &out, 2, 1e-5);
-        // RMS = sqrt((9+16)/2) = sqrt(12.5) ≈ 3.5355
-        let rms = 12.5f32.sqrt();
-        assert_bf16_close(&out, &[3.0 / rms, 4.0 / rms], 0.02);
-    }
-
     // -----------------------------------------------------------------------
     // GpuEmbed tests
     // -----------------------------------------------------------------------
@@ -1151,7 +1126,7 @@ mod tests {
         use crate::gpu::metal::MetalBackend;
 
         fn assert_tensors_close(
-            cpu_backend: &CpuBackend,
+            _cpu_backend: &CpuBackend,
             cpu_tensor: &CpuTensor,
             metal_backend: &MetalBackend,
             metal_tensor: &<MetalBackend as GpuCore>::Tensor,

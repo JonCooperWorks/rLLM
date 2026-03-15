@@ -132,7 +132,6 @@ pub(crate) struct MetalBackend {
     pub(crate) pipeline_silu_elem: metal::ComputePipelineState,
     pub(crate) pipeline_mul_elem: metal::ComputePipelineState,
     pub(crate) pipeline_deltanet_step: metal::ComputePipelineState,
-    pub(crate) pipeline_rms_norm_no_weight: metal::ComputePipelineState,
     pub(crate) pipeline_rope_partial: metal::ComputePipelineState,
 
     // Batched command encoding state.
@@ -295,12 +294,6 @@ impl MetalBackend {
             "deltanet_step",
             &compile_opts,
         )?;
-        let pipeline_rms_norm_no_weight = Self::make_pipeline(
-            &device,
-            METAL_SOURCE_DELTANET,
-            "rms_norm_no_weight",
-            &compile_opts,
-        )?;
         let pipeline_rope_partial = Self::make_pipeline(
             &device,
             METAL_SOURCE_ROPE,
@@ -345,7 +338,6 @@ impl MetalBackend {
             pipeline_silu_elem,
             pipeline_mul_elem,
             pipeline_deltanet_step,
-            pipeline_rms_norm_no_weight,
             pipeline_rope_partial,
             current_cmd: std::sync::Mutex::new(None),
         })

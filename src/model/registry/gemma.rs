@@ -141,11 +141,17 @@ pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
         // Pre-attention norm.
         m.backend.rms_norm(&m.hidden, &layer.input_layernorm, d.eps, &m.norm_buf);
 
-        // Q/K/V projections — no bias, no QK-norm for Gemma 3.
-        primitives::qkv_projection(
+        // Q/K/V projections (q_dim may differ from hidden_size, e.g. 4B: 2048 vs 2560).
+        primitives::qkv_projection_qdim(
             m.backend, layer, &m.norm_buf, &m.q_buf, &m.k_buf, &m.v_buf,
-            d.hidden_size, d.kv_dim,
+            d.q_dim, d.hidden_size, d.kv_dim,
         );
+
+        // QK-norm: per-head RMSNorm on Q and K after projection, before RoPE.
+        if let (Some(q_norm), Some(k_norm)) = (&layer.q_norm, &layer.k_norm) {
+            m.backend.rms_norm_batch(&m.q_buf, q_norm, d.eps, &m.q_buf, d.num_heads);
+            m.backend.rms_norm_batch(&m.k_buf, k_norm, d.eps, &m.k_buf, d.num_kv_heads);
+        }
 
         // RoPE with layer-specific theta (local vs global).
         primitives::apply_rope(
@@ -162,7 +168,8 @@ pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
         );
 
         // O projection into norm_buf (reused as scratch).
-        m.backend.matmul(&layer.o_proj, &m.attn_out, &m.norm_buf, d.hidden_size, d.hidden_size);
+        // O weight shape: [hidden_size, q_dim] — maps attention output back to residual stream.
+        m.backend.matmul(&layer.o_proj, &m.attn_out, &m.norm_buf, d.hidden_size, d.q_dim);
 
         // Post-attention norm (sandwich norm): normalise before adding to residual.
         // This is the key Gemma 3 difference — Llama skips this step.
@@ -260,7 +267,13 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
 
         // Pre-attention norm (batched).
         m.backend.rms_norm_batch(&bufs.hidden, &layer.input_layernorm, d.eps, &bufs.norm_buf, bs);
-        primitives::qkv_projection_batch(m.backend, layer, bufs, bs, d.hidden_size, d.kv_dim);
+        primitives::qkv_projection_batch_qdim(m.backend, layer, bufs, bs, d.q_dim, d.hidden_size, d.kv_dim);
+
+        // QK-norm: per-head RMSNorm on Q and K after projection, before RoPE.
+        if let (Some(q_norm), Some(k_norm)) = (&layer.q_norm, &layer.k_norm) {
+            m.backend.rms_norm_batch(&bufs.q_buf, q_norm, d.eps, &bufs.q_buf, bs * d.num_heads);
+            m.backend.rms_norm_batch(&bufs.k_buf, k_norm, d.eps, &bufs.k_buf, bs * d.num_kv_heads);
+        }
 
         // RoPE with per-layer theta.
         primitives::apply_rope_batch(m.backend, bufs, rope_theta, bs, d.num_heads, d.num_kv_heads, d.head_dim);
@@ -272,10 +285,10 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
             window_size, attn_scale,
         );
 
-        // O projection (batched).
+        // O projection (batched): O weight [hidden_size, q_dim].
         m.backend.matmul_batch(
             &layer.o_proj, &bufs.attn_out, &bufs.norm_buf,
-            bs, d.hidden_size, d.hidden_size,
+            bs, d.hidden_size, d.q_dim,
         );
 
         // Post-attention norm (batched sandwich norm).

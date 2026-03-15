@@ -2,10 +2,9 @@
 // GpuNorm — normalisation kernels.
 //
 // RMSNorm is used before every attention and FFN block in the transformer.
-// The three variants cover: single-token decode, batched prefill, and the
-// weight-free version used in DeltaNet output paths.
+// Two variants: single-token decode and batched prefill.
 //
-// Metal shaders: shaders/rms_norm.metal, shaders/deltanet.metal
+// Metal shaders: shaders/rms_norm.metal
 // Metal impl:    gpu/metal/kernels/norm.rs
 // ---------------------------------------------------------------------------
 
@@ -24,7 +23,4 @@ pub(crate) trait GpuNorm: GpuCore {
         out: &Self::Tensor,
         batch_size: u32,
     );
-
-    /// RMSNorm without learned weights: out = input / sqrt(mean(input^2) + eps).
-    fn rms_norm_no_weight(&self, input: &Self::Tensor, out: &Self::Tensor, size: u32, eps: f32);
 }
