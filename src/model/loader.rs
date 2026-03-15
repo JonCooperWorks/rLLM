@@ -458,10 +458,18 @@ pub(crate) fn load_weights<B: GpuCore>(
 
             // Router gate: [num_experts, hidden_size].  Stays bf16 — routing
             // accuracy matters more than speed here (it's a single small matmul).
+            //
+            // Mixtral uses `block_sparse_moe.gate` instead of `mlp.gate`.
+            let is_mixtral = matches!(arch, ModelArch::Mixtral);
+            let router_name = if is_mixtral {
+                format!("{prefix}.block_sparse_moe.gate.weight")
+            } else {
+                format!("{prefix}.mlp.gate.weight")
+            };
             let router = upload_tensor(
                 &store,
                 backend,
-                &format!("{prefix}.mlp.gate.weight"),
+                &router_name,
                 &[num_experts, hidden],
             )?;
 
@@ -529,24 +537,43 @@ pub(crate) fn load_weights<B: GpuCore>(
                 }
                 experts
             } else {
-                // Per-expert format (Qwen3-MoE): separate tensors per expert.
+                // Per-expert format: separate tensors per expert.
+                //
+                // Two naming conventions exist:
+                //   Qwen3-MoE:  mlp.experts.{j}.gate_proj / up_proj / down_proj
+                //   Mixtral:    block_sparse_moe.experts.{j}.w1 / w3 / w2
+                //               (w1=gate, w3=up, w2=down — Mixtral convention)
                 let mut experts = Vec::with_capacity(num_experts);
                 for j in 0..num_experts {
-                    let ep = format!("{prefix}.mlp.experts.{j}");
+                    let (gate_name, up_name, down_name) = if is_mixtral {
+                        let ep = format!("{prefix}.block_sparse_moe.experts.{j}");
+                        (
+                            format!("{ep}.w1.weight"),
+                            format!("{ep}.w3.weight"),
+                            format!("{ep}.w2.weight"),
+                        )
+                    } else {
+                        let ep = format!("{prefix}.mlp.experts.{j}");
+                        (
+                            format!("{ep}.gate_proj.weight"),
+                            format!("{ep}.up_proj.weight"),
+                            format!("{ep}.down_proj.weight"),
+                        )
+                    };
                     experts.push(ExpertWeights {
                         gate_proj: upload_maybe_q4(
                             &store, backend,
-                            &format!("{ep}.gate_proj.weight"),
+                            &gate_name,
                             &[moe_inter, hidden], quantize,
                         )?,
                         up_proj: upload_maybe_q4(
                             &store, backend,
-                            &format!("{ep}.up_proj.weight"),
+                            &up_name,
                             &[moe_inter, hidden], quantize,
                         )?,
                         down_proj: upload_maybe_q4(
                             &store, backend,
-                            &format!("{ep}.down_proj.weight"),
+                            &down_name,
                             &[hidden, moe_inter], quantize,
                         )?,
                     });

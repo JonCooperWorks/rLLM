@@ -64,8 +64,8 @@ impl Tokenizer {
             // Llama 3.x: BOS=128000, stop on EOS (128001) or EOT (128009).
             ModelArch::Llama => (Some(128000), vec![128001, 128009]),
 
-            // Mistral 7B: BOS=1, EOS=2 (SentencePiece 32K vocab).
-            ModelArch::Mistral => (Some(1), vec![2]),
+            // Mistral 7B / Mixtral 8x7B: BOS=1, EOS=2 (SentencePiece 32K vocab).
+            ModelArch::Mistral | ModelArch::Mixtral => (Some(1), vec![2]),
 
             // Qwen 2.5: no BOS token.  Stop on <|endoftext|> or <|im_end|>.
             //

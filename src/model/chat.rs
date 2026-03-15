@@ -77,8 +77,8 @@ pub(crate) struct Message {
 pub(crate) fn format_chat(arch: ModelArch, messages: &[Message]) -> String {
     match arch {
         ModelArch::Llama => format_llama3(messages),
-        // Mistral uses [INST]/[/INST] markers with system prepended to first user message.
-        ModelArch::Mistral => format_mistral(messages),
+        // Mistral and Mixtral use [INST]/[/INST] markers with system prepended to first user message.
+        ModelArch::Mistral | ModelArch::Mixtral => format_mistral(messages),
         // Qwen 2.5, Qwen 3 MoE, and Qwen 3.5 all use ChatML format.
         ModelArch::Qwen2 | ModelArch::Qwen3Moe | ModelArch::Qwen3_5 => format_chatml(messages),
         // Phi uses a ChatML-like format but with <|im_sep|> between role and content.

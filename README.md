@@ -1,6 +1,6 @@
 # rLLM
 
-Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf16 and Q4 quantization, multi-architecture support (Llama 3, Qwen 2.5, Mistral, Qwen3 MoE, Qwen3.5, Phi-4, Gemma 3, DeepSeek-R1-Distill). Paged KV cache, batched prefill (GEMM), continuous batching. No frameworks, no GGML — just raw GPU compute.
+Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf16 and Q4 quantization, multi-architecture support (Llama 3, Qwen 2.5, Mistral, Mixtral 8x7B, Qwen3 MoE, Qwen3.5, Phi-4, Gemma 3, DeepSeek-R1-Distill). Paged KV cache, batched prefill (GEMM), continuous batching. No frameworks, no GGML — just raw GPU compute.
 
 ## Performance
 
@@ -13,6 +13,7 @@ Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf
 | Qwen 2.5 3B Instruct | 3.1B | 31 tok/s | 45 tok/s | 242 ms | 98 ms |
 | Qwen 2.5 7B Instruct | 7.6B | 23 tok/s | 39 tok/s | 662 ms | 240 ms |
 | Mistral 7B Instruct | 7.2B | 19 tok/s | 32 tok/s | 2,100 ms | 353 ms |
+| Mixtral 8x7B Instruct | 46.7B (12.9B active) | — | 10 tok/s | — | 7,100 ms |
 | Llama 3.1 8B Instruct | 8.0B | 21 tok/s | 36 tok/s | 782 ms | 393 ms |
 | Gemma 3 4B Instruct | 4.3B | 25 tok/s | 32 tok/s | 400 ms | 330 ms |
 | Gemma 3 27B Instruct | 27.4B | 2 tok/s | 7 tok/s | 50,000 ms | 4,300 ms |
@@ -21,11 +22,11 @@ Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf
 | Phi-4 | 14.7B | 2 tok/s | 15 tok/s | 5,300 ms | 813 ms |
 | DeepSeek-R1-Distill-Qwen-32B | 32.8B | — | 5 tok/s | — | 4,700 ms |
 
-Q4 quantization (`--quantize`) gives ~1.3-3.5x faster decode by reducing memory bandwidth. The Qwen3 and Qwen3.5 MoE models use Mixture of Experts with sparse activation (only ~3B params active per token). Qwen3.5 also uses DeltaNet linear attention layers. Large models (Gemma 3 27B, Phi-4, Qwen3/3.5 MoE) run in bf16 but are slow because the weights consume most of the 64 GB unified memory, leaving limited headroom for KV cache. Q4 is strongly recommended for models over ~8B params. Dynamic KV cache sizing automatically adjusts block count based on available GPU memory.
+Q4 quantization (`--quantize`) gives ~1.3-3.5x faster decode by reducing memory bandwidth. Mixtral 8x7B, Qwen3, and Qwen3.5 MoE models use Mixture of Experts with sparse activation (only a fraction of params active per token). Mixtral activates 2 of 8 experts (~12.9B of 46.7B active). Qwen3.5 also uses DeltaNet linear attention layers. Mixtral requires Q4 (bf16 would need ~87 GB). Large models (Gemma 3 27B, Phi-4, Qwen3/3.5 MoE) run in bf16 but are slow because the weights consume most of the 64 GB unified memory, leaving limited headroom for KV cache. Q4 is strongly recommended for models over ~8B params. Dynamic KV cache sizing automatically adjusts block count based on available GPU memory.
 
 ## Features
 
-- **Multi-architecture** — Llama 3, Qwen 2.5, Mistral, Qwen3 MoE, Qwen3.5, Phi-4, and Gemma 3 from the same codebase
+- **Multi-architecture** — Llama 3, Qwen 2.5, Mistral, Mixtral 8x7B, Qwen3 MoE, Qwen3.5, Phi-4, and Gemma 3 from the same codebase
 - **Metal GPU backend** — SIMD-cooperative matmul, async command buffer dispatch
 - **Batched prefill** — GEMM-based prompt processing (3-10x faster than token-by-token)
 - **Paged KV cache** — on-demand block allocation, shared across sequences
@@ -34,8 +35,8 @@ Q4 quantization (`--quantize`) gives ~1.3-3.5x faster decode by reducing memory 
 - **bf16 inference** — native half-precision on Apple Silicon
 - **Safetensors loading** — single and multi-shard weight files
 - **BPE tokenizer** — HuggingFace-compatible tokenizer.json
-- **Mixture of Experts** — top-k expert routing with per-token dispatch (Qwen3 MoE)
-- **Chat templates** — Llama 3, ChatML (Qwen), Mistral, Phi, and Gemma instruct formats with `--chat`
+- **Mixture of Experts** — top-k expert routing with per-token dispatch (Mixtral, Qwen3 MoE)
+- **Chat templates** — Llama 3, ChatML (Qwen), Mistral/Mixtral, Phi, and Gemma instruct formats with `--chat`
 - **Temperature + top-p sampling** — configurable via `--temperature` and `--top-p`
 - **Streaming output** — tokens printed as generated
 - **API server** — OpenAI and Anthropic compatible HTTP endpoints with SSE streaming
@@ -60,6 +61,7 @@ Chat mode (instruct models — auto-detects chat template per architecture):
 cargo run --release -- run --model models/llama-3.2-3b-instruct --prompt "Write a Python program that adds 4 numbers" --chat --temperature 0
 cargo run --release -- run --model models/qwen-2.5-7b-instruct --prompt "Explain hash maps" --chat --temperature 0
 cargo run --release -- run --model models/mistral-7b-instruct --prompt "Explain what a hash map is" --chat --temperature 0
+cargo run --release -- run --model models/mixtral-8x7b-instruct --prompt "Write a fibonacci function" --chat --quantize --temperature 0
 cargo run --release -- run --model models/qwen3-coder-30b-a3b-instruct --prompt "Write a fibonacci function" --chat --quantize --temperature 0
 ```
 
@@ -227,7 +229,7 @@ src/
     └── cuda/            — CUDA backend
 ```
 
-Model code is generic over a `GpuBackend` trait with an associated `Tensor` type. Platform selection uses OS-conditional compilation — Metal on macOS, CUDA on Linux. Llama, Qwen, Mistral, and Phi share the same forward pass primitives; differences are in weight loading (Phi uses fused qkv/gate_up tensors split on load), QKV bias (Qwen 2.5 only), and chat template. Mistral is architecturally identical to Llama and re-exports its forward pass directly. Gemma 3 has a dedicated forward pass with sandwich norms (4 RMSNorm per layer), GeGLU activation, sliding window attention, QK-norm, and dual RoPE bases. Qwen3 MoE and Qwen 3.5 use Mixture of Experts with shared routing primitives.
+Model code is generic over a `GpuBackend` trait with an associated `Tensor` type. Platform selection uses OS-conditional compilation — Metal on macOS, CUDA on Linux. Llama, Qwen, Mistral, and Phi share the same forward pass primitives; differences are in weight loading (Phi uses fused qkv/gate_up tensors split on load), QKV bias (Qwen 2.5 only), and chat template. Mistral is architecturally identical to Llama and re-exports its forward pass directly. Mixtral 8x7B combines Mistral's attention with 8-expert MoE FFN (top-2 routing). Gemma 3 has a dedicated forward pass with sandwich norms (4 RMSNorm per layer), GeGLU activation, sliding window attention, QK-norm, and dual RoPE bases. Qwen3 MoE and Qwen 3.5 use Mixture of Experts with shared routing primitives.
 
 ### Inference pipeline
 
@@ -284,6 +286,9 @@ hf download meta-llama/Llama-3.1-8B-Instruct --local-dir models/llama-3.1-8b-ins
 
 # Mistral 7B — instruct model (architecturally identical to Llama)
 hf download mistralai/Mistral-7B-Instruct-v0.3 --local-dir models/mistral-7b-instruct
+
+# Mixtral 8x7B — sparse MoE (8 experts, top-2 routing, ~87 GB download, Q4 recommended)
+hf download mistralai/Mixtral-8x7B-Instruct-v0.1 --local-dir models/mixtral-8x7b-instruct
 
 # Qwen 2.5 — instruct models
 hf download Qwen/Qwen2.5-3B-Instruct --local-dir models/qwen-2.5-3b-instruct

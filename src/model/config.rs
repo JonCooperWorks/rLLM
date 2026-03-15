@@ -100,6 +100,20 @@ pub enum ModelArch {
     /// differences are the chat template ([INST]/[/INST] markers) and stop tokens.
     /// The forward pass reuses Llama's implementation directly.
     Mistral,
+    /// Mixtral family (Mistral AI, 8x7B sparse MoE).
+    ///
+    /// Learning note: Mixtral is Mistral's attention (identical to Llama: GQA,
+    /// RoPE, SwiGLU, no bias, no QK-norm) combined with a Mixture-of-Experts FFN.
+    /// Each layer has 8 expert FFNs with top-2 routing — only 2 of 8 experts
+    /// activate per token, giving ~46.7B total params but ~12.9B active.
+    ///
+    /// Config differences from Qwen3-MoE:
+    ///   - Uses `num_local_experts` (not `num_experts`) in config.json
+    ///   - Expert FFN size is `intermediate_size` (not separate `moe_intermediate_size`)
+    ///   - Weight paths use `block_sparse_moe` prefix with w1/w2/w3 naming
+    ///
+    /// Chat template: [INST]/[/INST] (same as Mistral).
+    Mixtral,
     /// Phi family (Microsoft Phi-3, Phi-4).
     ///
     /// Learning note: Phi models are architecturally near-identical to Llama
@@ -161,7 +175,7 @@ impl ModelArch {
     /// this helps at smaller model sizes.
     pub fn has_qkv_bias(&self) -> bool {
         match self {
-            ModelArch::Llama | ModelArch::Mistral | ModelArch::Phi | ModelArch::Gemma3 => false,
+            ModelArch::Llama | ModelArch::Mistral | ModelArch::Mixtral | ModelArch::Phi | ModelArch::Gemma3 => false,
             ModelArch::Qwen2 => true,
             ModelArch::Qwen3Moe | ModelArch::Qwen3_5 => false,
         }
@@ -176,7 +190,7 @@ impl ModelArch {
     /// rely on the implicit normalisation from RMSNorm on the hidden state.
     pub fn has_qk_norm(&self) -> bool {
         match self {
-            ModelArch::Llama | ModelArch::Mistral | ModelArch::Qwen2 | ModelArch::Phi => false,
+            ModelArch::Llama | ModelArch::Mistral | ModelArch::Mixtral | ModelArch::Qwen2 | ModelArch::Phi => false,
             ModelArch::Gemma3 => true,  // Both 4B and 27B have q_norm/k_norm weights
             ModelArch::Qwen3_5 => true,  // GQA layers have QK-norm
             ModelArch::Qwen3Moe => true,
@@ -199,13 +213,14 @@ impl ModelArch {
         match model_type {
             "llama" => Ok(ModelArch::Llama),
             "mistral" => Ok(ModelArch::Mistral),
+            "mixtral" => Ok(ModelArch::Mixtral),
             "qwen2" => Ok(ModelArch::Qwen2),
             "qwen3_moe" => Ok(ModelArch::Qwen3Moe),
             "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => Ok(ModelArch::Qwen3_5),
             "phi3" | "phi4" => Ok(ModelArch::Phi),
             "gemma3_text" | "gemma3" => Ok(ModelArch::Gemma3),
             other => anyhow::bail!(
-                "unsupported model_type '{}' (expected 'llama', 'mistral', 'qwen2', 'qwen3_moe', 'qwen3_5', 'phi3', or 'gemma3_text')",
+                "unsupported model_type '{}' (expected 'llama', 'mistral', 'mixtral', 'qwen2', 'qwen3_moe', 'qwen3_5', 'phi3', or 'gemma3_text')",
                 other
             ),
         }
@@ -282,7 +297,8 @@ pub struct ModelConfig {
 
     /// Total number of expert FFN sub-networks per layer.
     /// Qwen3-Coder-30B-A3B: 128 experts per layer.
-    #[serde(default)]
+    /// Mixtral uses `num_local_experts` in config.json (serde alias handles this).
+    #[serde(default, alias = "num_local_experts")]
     pub num_experts: usize,
     /// How many experts are activated (routed to) per token.
     /// Qwen3-Coder-30B-A3B: top-8 experts selected per token.
@@ -514,6 +530,13 @@ impl ModelConfig {
 
         let mut config: Self = serde_json::from_value(config_value)?;
         config.weight_prefix = weight_prefix;
+
+        // Mixtral: expert FFN size equals intermediate_size (no separate
+        // moe_intermediate_size field in config.json).  Map it so the MoE
+        // code path can uniformly use moe_intermediate_size.
+        if config.model_type == "mixtral" && config.moe_intermediate_size == 0 && config.num_experts > 0 {
+            config.moe_intermediate_size = config.intermediate_size;
+        }
 
         // Apply Gemma 3 defaults for fields omitted by minimal HF configs.
         // Google's Gemma 3 4B config.json only includes a sparse text_config
