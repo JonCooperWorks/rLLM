@@ -16,7 +16,7 @@
 //   token.  The hybrid mixes both: DeltaNet for most layers (fast, memory-
 //   efficient) and periodic GQA layers for retrieval "checkpoints".
 //
-// Why this file can't use standard.rs:
+// Why this file can't reuse llama.rs:
 //   The hybrid architecture is fundamentally different from a standard dense
 //   transformer.  Each layer is either DeltaNet (recurrent state + Conv1D +
 //   gating) or GQA (with QK-norm + partial RoPE + output gate).  The per-
@@ -51,7 +51,9 @@
 //   5. O projection + residual add
 // ===========================================================================
 
-use crate::gpu::GpuBackend;
+use crate::gpu::{
+    GpuAttention, GpuCore, GpuDeltaNet, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
+};
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives::{self, Dims};
 use crate::model::{Model, PrefillBuffers};
@@ -78,7 +80,7 @@ fn dn_layer_index(config: &crate::model::config::ModelConfig, layer_idx: usize) 
 }
 
 /// Run the DeltaNet attention sub-block for a single token.
-fn deltanet_attention_block<B: GpuBackend>(
+fn deltanet_attention_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuDeltaNet>(
     m: &Model<'_, B>,
     layer_idx: usize,
     d: &Dims,
@@ -172,7 +174,7 @@ fn deltanet_attention_block<B: GpuBackend>(
 // Final: hidden += moe_output + gate * shared_expert_output
 // ---------------------------------------------------------------------------
 
-fn moe_ffn_block<B: GpuBackend>(
+fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
     m: &Model<'_, B>,
     layer_idx: usize,
     d: &Dims,
@@ -262,7 +264,7 @@ fn moe_ffn_block<B: GpuBackend>(
 // gate_proj/up_proj/down_proj per layer.
 // ---------------------------------------------------------------------------
 
-fn ffn_block<B: GpuBackend>(m: &Model<'_, B>, layer_idx: usize, d: &Dims) {
+fn ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(m: &Model<'_, B>, layer_idx: usize, d: &Dims) {
     if m.config.is_moe() {
         moe_ffn_block(m, layer_idx, d);
     } else {
@@ -279,7 +281,7 @@ fn ffn_block<B: GpuBackend>(m: &Model<'_, B>, layer_idx: usize, d: &Dims) {
 // ===========================================================================
 
 /// Single-token forward pass using an external paged KV cache.
-pub(crate) fn forward_single_paged<B: GpuBackend>(
+pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed + GpuDeltaNet>(
     m: &Model<'_, B>,
     token_id: u32,
     pool: &KvPool<B>,
@@ -376,7 +378,7 @@ pub(crate) fn forward_single_paged<B: GpuBackend>(
 // ===========================================================================
 
 /// Batched prefill for Qwen 3.5 hybrid model.
-pub(crate) fn forward_prefill_paged<B: GpuBackend>(
+pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed + GpuDeltaNet>(
     m: &Model<'_, B>,
     tokens: &[u32],
     pool: &KvPool<B>,

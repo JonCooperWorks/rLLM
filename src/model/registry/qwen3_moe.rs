@@ -22,7 +22,7 @@
 //   - Each expert: gate_proj [768, 2048], up_proj [768, 2048], down_proj [2048, 768]
 //   - Chat template: ChatML (same as Qwen 2.5)
 //
-// Why this file can't use standard.rs:
+// Why this file can't reuse llama.rs:
 //   Two differences from the standard dense pipeline:
 //     1. QK-norm: after QKV projection, RMSNorm is applied per-head to Q and K
 //        (with learned weights).  This happens BEFORE RoPE.
@@ -44,7 +44,9 @@
 //   softmax(top_k_logits) and summed.
 // ===========================================================================
 
-use crate::gpu::GpuBackend;
+use crate::gpu::{
+    GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
+};
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives::{self, Dims};
 use crate::model::profile::{self, Component};
@@ -68,7 +70,7 @@ use crate::model::{Model, PrefillBuffers};
 /// Uses GPU-side top-k routing to avoid per-layer GPU→CPU synchronization.
 /// The router matmul + top-k selection + softmax all happen on GPU; only
 /// the final (index, weight) pairs are read back to CPU for expert dispatch.
-fn moe_ffn_block<B: GpuBackend>(
+fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
     m: &Model<'_, B>,
     layer_idx: usize,
     d: &Dims,
@@ -138,7 +140,7 @@ fn moe_ffn_block<B: GpuBackend>(
 // ===========================================================================
 
 /// Single-token forward pass using an external paged KV cache.
-pub(crate) fn forward_single_paged<B: GpuBackend>(
+pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed>(
     m: &Model<'_, B>,
     token_id: u32,
     pool: &KvPool<B>,
@@ -226,7 +228,7 @@ pub(crate) fn forward_single_paged<B: GpuBackend>(
 // ===========================================================================
 
 /// Batched prefill: process entire prompt, MoE FFN is token-by-token per layer.
-pub(crate) fn forward_prefill_paged<B: GpuBackend>(
+pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed>(
     m: &Model<'_, B>,
     tokens: &[u32],
     pool: &KvPool<B>,

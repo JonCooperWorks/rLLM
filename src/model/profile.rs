@@ -13,7 +13,7 @@
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use crate::gpu::GpuBackend;
+use crate::gpu::GpuCore;
 
 /// Whether profiling is enabled (checked once, cached).
 pub(crate) fn is_enabled() -> bool {
@@ -47,7 +47,7 @@ impl ForwardProfile {
 }
 
 /// Start timing a component.  Returns the current instant.
-pub(crate) fn begin<B: GpuBackend>(backend: &B) -> Instant {
+pub(crate) fn begin<B: GpuCore>(backend: &B) -> Instant {
     if !is_enabled() {
         return Instant::now();
     }
@@ -56,7 +56,7 @@ pub(crate) fn begin<B: GpuBackend>(backend: &B) -> Instant {
 }
 
 /// Record elapsed time for a component.
-pub(crate) fn record<B: GpuBackend>(backend: &B, t: Instant, component: Component) {
+pub(crate) fn record<B: GpuCore>(backend: &B, t: Instant, component: Component) {
     if !is_enabled() {
         return;
     }

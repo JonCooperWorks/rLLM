@@ -12,7 +12,7 @@
 // Architecture dispatch (registry pattern, similar to vLLM):
 //   Each model family lives in its own file under model/registry/.
 //   Standard dense transformers (Llama, Phi, Qwen) share a common forward
-//   pass in model/standard.rs, parameterised by ArchFeatures.  Complex
+//   pass in registry/llama.rs, parameterised by ArchFeatures.  Complex
 //   architectures (Gemma, Qwen3 MoE, Qwen3.5 hybrid) have custom files.
 //
 //   The dispatch chain:
@@ -63,14 +63,13 @@ pub(crate) mod loader;
 pub(crate) mod primitives;
 pub(crate) mod profile;
 pub(crate) mod registry;
-pub(crate) mod standard;
 pub(crate) mod sampler;
 pub(crate) mod tokenizer;
 
 use self::config::{ModelArch, ModelConfig};
 use self::kv_cache::{KvPool, SeqKvState};
 use self::loader::ModelWeights;
-use crate::gpu::{GpuBackend, TensorDtype};
+use crate::gpu::{GpuBackend, GpuCore, GpuElementwise, TensorDtype};
 
 /// Maximum sequence length supported by the flat KV cache.
 /// Llama 3.2 supports up to 131072 with RoPE scaling, but we cap at 4096
@@ -90,7 +89,7 @@ const MAX_SEQ_LEN: usize = 4096;
 /// wastes memory for short sequences and can't share across concurrent
 /// requests.  Paged mode allocates blocks on demand from a shared pool.
 #[allow(dead_code)]
-pub(crate) enum KvMode<B: GpuBackend> {
+pub(crate) enum KvMode<B: GpuCore> {
     /// Original flat cache (backward compatible).
     Flat {
         k_cache: Vec<B::Tensor>,
@@ -104,7 +103,7 @@ pub(crate) enum KvMode<B: GpuBackend> {
     },
 }
 
-pub(crate) struct Model<'a, B: GpuBackend> {
+pub(crate) struct Model<'a, B: GpuCore> {
     pub(crate) config: ModelConfig,
     pub(crate) weights: ModelWeights<B>,
     pub(crate) backend: &'a B,
@@ -184,7 +183,12 @@ pub(crate) struct Model<'a, B: GpuBackend> {
     pub(crate) kv_layer_map: Vec<Option<usize>>,
 }
 
-impl<'a, B: GpuBackend> Model<'a, B> {
+// ---------------------------------------------------------------------------
+// Construction: needs GpuCore (tensor allocation) + GpuElementwise (fill_zero
+// for DeltaNet state init).
+// ---------------------------------------------------------------------------
+
+impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
     /// Create a new model with flat KV cache (original mode).
     pub fn new(
         config: ModelConfig,
@@ -374,18 +378,37 @@ impl<'a, B: GpuBackend> Model<'a, B> {
         })
     }
 
+    /// Accessor for config (needed by engine for buffer allocation).
+    pub fn config(&self) -> &ModelConfig {
+        &self.config
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Read-only accessors: only need GpuCore (tensor types).
+// ---------------------------------------------------------------------------
+
+impl<'a, B: GpuCore> Model<'a, B> {
     /// Returns a reference to the logits buffer (vocab-sized output).
     /// Call this after `forward()` to read the model's predictions.
     pub fn logits(&self) -> &B::Tensor {
         &self.logits_buf
     }
+}
 
+// ---------------------------------------------------------------------------
+// Forward pass dispatch: needs GpuBackend (full supertrait) because the
+// dispatch hub calls into ALL architectures, including Qwen 3.5 which
+// requires GpuDeltaNet.
+// ---------------------------------------------------------------------------
+
+impl<'a, B: GpuBackend> Model<'a, B> {
     // =======================================================================
     // Forward pass dispatch — model registry.
     //
     // Each model family lives in its own file under registry/ and composes
     // shared primitives from primitives.rs.  The dispatch chain is:
-    //   Model::forward_*() → registry::llama/qwen/... → primitives → GpuBackend
+    //   Model::forward_*() → registry::llama/qwen/... → primitives → Gpu*
     //
     // Two entry points, matching the two inference modes:
     //   - forward_single_paged: decode one token (mat-vec, paged KV).
@@ -442,11 +465,6 @@ impl<'a, B: GpuBackend> Model<'a, B> {
             ModelArch::Qwen3_5 => registry::qwen3_5::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
         }
     }
-
-    /// Accessor for config (needed by engine for buffer allocation).
-    pub fn config(&self) -> &ModelConfig {
-        &self.config
-    }
 }
 
 // ===========================================================================
@@ -474,7 +492,7 @@ impl<'a, B: GpuBackend> Model<'a, B> {
 // between prefills.
 // ===========================================================================
 
-pub(crate) struct PrefillBuffers<B: GpuBackend> {
+pub(crate) struct PrefillBuffers<B: GpuCore> {
     pub hidden: B::Tensor,    // [max_chunk, hidden_size]
     pub norm_buf: B::Tensor,  // [max_chunk, hidden_size]
     pub q_buf: B::Tensor,     // [max_chunk, num_heads * head_dim]
@@ -489,7 +507,7 @@ pub(crate) struct PrefillBuffers<B: GpuBackend> {
     pub max_chunk: usize,
 }
 
-impl<B: GpuBackend> PrefillBuffers<B> {
+impl<B: GpuCore> PrefillBuffers<B> {
     pub fn new(backend: &B, config: &ModelConfig, max_chunk: usize) -> Self {
         let hidden = config.hidden_size;
         let q_dim = config.num_attention_heads * config.head_dim;

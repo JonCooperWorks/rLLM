@@ -8,7 +8,7 @@
 //   shares the Llama backbone (GQA attention + gated FFN + RoPE) but has
 //   several distinctive architectural choices that set it apart.
 //
-// Why this file can't use standard.rs:
+// Why this file can't reuse llama.rs:
 //   Gemma 3 differs from the standard dense pipeline in too many ways:
 //
 //   1. **Sandwich norms**: 4 RMSNorm layers per decoder block instead of 2.
@@ -51,7 +51,9 @@
 //   3. Final norm + LM head projection
 // ===========================================================================
 
-use crate::gpu::GpuBackend;
+use crate::gpu::{
+    GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
+};
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives::{self, Dims};
 use crate::model::profile::{self, Component};
@@ -101,7 +103,7 @@ fn layer_window_size(config: &crate::model::config::ModelConfig, layer_idx: usiz
 // ===========================================================================
 
 /// Single-token forward pass using an external paged KV cache.
-pub(crate) fn forward_single_paged<B: GpuBackend>(
+pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed>(
     m: &Model<'_, B>,
     token_id: u32,
     pool: &KvPool<B>,
@@ -226,7 +228,7 @@ pub(crate) fn forward_single_paged<B: GpuBackend>(
 // ===========================================================================
 
 /// Batched prefill: process entire prompt in one GEMM-based forward pass.
-pub(crate) fn forward_prefill_paged<B: GpuBackend>(
+pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed>(
     m: &Model<'_, B>,
     tokens: &[u32],
     pool: &KvPool<B>,

@@ -72,7 +72,7 @@ use safetensors::SafeTensors;
 
 use super::config::{ModelArch, ModelConfig};
 use super::tokenizer::Tokenizer;
-use crate::gpu::{self, GpuBackend, TensorDtype};
+use crate::gpu::{self, GpuCore, TensorDtype};
 
 // ---------------------------------------------------------------------------
 // TensorStore — abstracts single-file vs sharded safetensors.
@@ -176,9 +176,9 @@ fn load_safetensors_files(model_dir: &Path) -> anyhow::Result<(Vec<Mmap>, HashMa
 // ---------------------------------------------------------------------------
 
 /// All model weights, organised by layer.
-/// Generic over `B: GpuBackend` — tensors are GPU-resident (Metal buffers,
+/// Generic over `B: GpuCore` — tensors are GPU-resident (Metal buffers,
 /// CUDA device pointers, etc.) but this struct doesn't know or care which.
-pub(crate) struct ModelWeights<B: GpuBackend> {
+pub(crate) struct ModelWeights<B: GpuCore> {
     /// Token embedding table [vocab_size, hidden_size].
     /// Also used as the LM head weight matrix (tied embeddings).
     pub embed_tokens: B::Tensor,
@@ -209,14 +209,14 @@ pub(crate) struct ModelWeights<B: GpuBackend> {
 // ---------------------------------------------------------------------------
 
 /// Weights for a single expert FFN sub-network.
-pub(crate) struct ExpertWeights<B: GpuBackend> {
+pub(crate) struct ExpertWeights<B: GpuCore> {
     pub gate_proj: B::Tensor, // [moe_inter, hidden_size]
     pub up_proj: B::Tensor,   // [moe_inter, hidden_size]
     pub down_proj: B::Tensor, // [hidden_size, moe_inter]
 }
 
 /// Weights for a single transformer layer.
-pub(crate) struct LayerWeights<B: GpuBackend> {
+pub(crate) struct LayerWeights<B: GpuCore> {
     // --- Attention sub-block ---
     pub input_layernorm: B::Tensor, // RMSNorm weight [hidden_size]
     pub q_proj: B::Tensor,          // Query projection [q_dim, hidden_size]
@@ -311,7 +311,7 @@ pub(crate) struct LayerWeights<B: GpuBackend> {
 /// are quantised from bf16 to Q4 on the CPU during loading.  This reduces
 /// memory ~3.2x and speeds up matmul ~1.5-2x.  Norm weights and the embedding
 /// table stay in bf16 (they're small and used for lookup/norm, not matmul).
-pub(crate) fn load_weights<B: GpuBackend>(
+pub(crate) fn load_weights<B: GpuCore>(
     backend: &B,
     model_dir: &Path,
     config: &ModelConfig,
@@ -985,7 +985,7 @@ pub(crate) fn load_weights<B: GpuBackend>(
 // ---------------------------------------------------------------------------
 
 /// Upload a single tensor from the store to GPU memory (bf16 or f32).
-fn upload_tensor<B: GpuBackend>(
+fn upload_tensor<B: GpuCore>(
     store: &TensorStore,
     backend: &B,
     name: &str,
@@ -1014,7 +1014,7 @@ fn upload_tensor<B: GpuBackend>(
 /// effective weight starts at 1.0).  This differs from Llama/Qwen2 which store
 /// direct scale factors (initialized to ones).  We add 1.0 during loading so the
 /// existing rms_norm kernel works unchanged.
-fn upload_norm_residual<B: GpuBackend>(
+fn upload_norm_residual<B: GpuCore>(
     store: &TensorStore,
     backend: &B,
     name: &str,
@@ -1047,7 +1047,7 @@ fn upload_norm_residual<B: GpuBackend>(
 }
 
 /// Upload a tensor, optionally quantising to Q4.
-fn upload_maybe_q4<B: GpuBackend>(
+fn upload_maybe_q4<B: GpuCore>(
     store: &TensorStore,
     backend: &B,
     name: &str,
@@ -1157,7 +1157,7 @@ fn quantize_bf16_to_q4(bf16_data: &[u8], m: usize, k: usize) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 /// Everything needed to run inference, loaded from a model directory.
-pub(crate) struct LoadedModel<B: GpuBackend> {
+pub(crate) struct LoadedModel<B: GpuCore> {
     pub config: ModelConfig,
     pub arch: ModelArch,
     pub tokenizer: Tokenizer,
@@ -1167,7 +1167,7 @@ pub(crate) struct LoadedModel<B: GpuBackend> {
 /// Load config, tokenizer, and weights from a model directory.
 ///
 /// Logs progress to stderr so the user sees what's happening.
-pub(crate) fn load_model<B: GpuBackend>(
+pub(crate) fn load_model<B: GpuCore>(
     backend: &B,
     model_dir: &Path,
     quantize: bool,

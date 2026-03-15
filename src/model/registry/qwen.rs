@@ -18,35 +18,37 @@
 //   This is controlled by the `has_qkv_bias` flag in ArchFeatures.
 //
 //   Everything else — norm, RoPE, attention, FFN, residuals — is identical
-//   to Llama.  The shared forward pass in standard.rs handles both.
+//   to Llama.  The shared forward pass in llama.rs handles both.
 // ===========================================================================
 
-use crate::gpu::GpuBackend;
+use crate::gpu::{
+    GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
+};
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::{Model, PrefillBuffers};
 
-use crate::model::standard::{self, ArchFeatures};
+use super::llama::ArchFeatures;
 
 /// Qwen features: QKV bias is the only difference from Llama.
 const FEATURES: ArchFeatures = ArchFeatures {
     has_qkv_bias: true,
 };
 
-pub(crate) fn forward_single_paged<B: GpuBackend>(
+pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed>(
     m: &Model<'_, B>,
     token_id: u32,
     pool: &KvPool<B>,
     seq_state: &SeqKvState<B>,
 ) -> anyhow::Result<()> {
-    standard::forward_single_paged(m, token_id, pool, seq_state, &FEATURES)
+    super::llama::forward_single_impl(m, token_id, pool, seq_state, &FEATURES)
 }
 
-pub(crate) fn forward_prefill_paged<B: GpuBackend>(
+pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed>(
     m: &Model<'_, B>,
     tokens: &[u32],
     pool: &KvPool<B>,
     seq_state: &SeqKvState<B>,
     bufs: &PrefillBuffers<B>,
 ) -> anyhow::Result<()> {
-    standard::forward_prefill_paged(m, tokens, pool, seq_state, bufs, &FEATURES)
+    super::llama::forward_prefill_impl(m, tokens, pool, seq_state, bufs, &FEATURES)
 }

@@ -10,9 +10,14 @@
 // (raw kernel dispatch) and the model family forward passes (architecture-
 // specific orchestration).  Similar to vLLM's model registry concept:
 //   GPU backend → primitives → model families → registry dispatch
+//
+// Each function declares the minimal set of Gpu* sub-traits it needs,
+// so callers only pay for the GPU capabilities they actually use.
 // ===========================================================================
 
-use crate::gpu::GpuBackend;
+use crate::gpu::{
+    GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
+};
 use crate::model::config::ModelConfig;
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::loader::{LayerWeights, ModelWeights};
@@ -83,7 +88,7 @@ impl Dims {
 // ===========================================================================
 
 /// Look up token embedding and write to hidden buffer.
-pub(crate) fn embed_token<B: GpuBackend>(
+pub(crate) fn embed_token<B: GpuEmbed>(
     backend: &B,
     weights: &ModelWeights<B>,
     token_id: u32,
@@ -94,7 +99,7 @@ pub(crate) fn embed_token<B: GpuBackend>(
 }
 
 /// Final RMSNorm + LM head projection → logits.
-pub(crate) fn final_norm_and_lm_head<B: GpuBackend>(
+pub(crate) fn final_norm_and_lm_head<B: GpuNorm + GpuMatmul>(
     backend: &B,
     weights: &ModelWeights<B>,
     hidden: &B::Tensor,
@@ -114,7 +119,7 @@ pub(crate) fn final_norm_and_lm_head<B: GpuBackend>(
 // ===========================================================================
 
 /// QKV projection: matmul Q, K, V from the normalized hidden state.
-pub(crate) fn qkv_projection<B: GpuBackend>(
+pub(crate) fn qkv_projection<B: GpuMatmul>(
     backend: &B,
     layer: &LayerWeights<B>,
     norm_buf: &B::Tensor,
@@ -135,7 +140,7 @@ pub(crate) fn qkv_projection<B: GpuBackend>(
 
 /// Like qkv_projection but with explicit q_dim for models where
 /// num_heads × head_dim ≠ hidden_size (e.g. Qwen3 MoE: 4096 vs 2048).
-pub(crate) fn qkv_projection_qdim<B: GpuBackend>(
+pub(crate) fn qkv_projection_qdim<B: GpuMatmul>(
     backend: &B,
     layer: &LayerWeights<B>,
     norm_buf: &B::Tensor,
@@ -152,7 +157,7 @@ pub(crate) fn qkv_projection_qdim<B: GpuBackend>(
 }
 
 /// Apply QKV bias (for architectures that have it, e.g. Qwen).
-pub(crate) fn apply_qkv_bias<B: GpuBackend>(
+pub(crate) fn apply_qkv_bias<B: GpuElementwise>(
     backend: &B,
     layer: &LayerWeights<B>,
     q_buf: &B::Tensor,
@@ -173,7 +178,7 @@ pub(crate) fn apply_qkv_bias<B: GpuBackend>(
 }
 
 /// RoPE on Q and K buffers.
-pub(crate) fn apply_rope<B: GpuBackend>(
+pub(crate) fn apply_rope<B: GpuRope>(
     backend: &B,
     q_buf: &B::Tensor,
     k_buf: &B::Tensor,
@@ -191,7 +196,7 @@ pub(crate) fn apply_rope<B: GpuBackend>(
 /// `window_size`: sliding window size (0 = full context, attend to all positions).
 /// `attn_scale`: custom attention scale (0.0 = default 1/sqrt(head_dim)).
 /// Most models pass 0/0.0 for standard full-context attention with default scaling.
-pub(crate) fn paged_kv_and_attention<B: GpuBackend>(
+pub(crate) fn paged_kv_and_attention<B: GpuAttention>(
     backend: &B,
     k_buf: &B::Tensor,
     v_buf: &B::Tensor,
@@ -227,7 +232,7 @@ pub(crate) fn paged_kv_and_attention<B: GpuBackend>(
 ///
 /// For models where q_dim == hidden_size, pass hidden_size for both args.
 /// For models where q_dim ≠ hidden_size (Qwen3 MoE), use o_proj_residual_qdim.
-pub(crate) fn o_proj_residual<B: GpuBackend>(
+pub(crate) fn o_proj_residual<B: GpuMatmul + GpuElementwise>(
     backend: &B,
     layer: &LayerWeights<B>,
     attn_out: &B::Tensor,
@@ -241,7 +246,7 @@ pub(crate) fn o_proj_residual<B: GpuBackend>(
 
 /// O projection + residual for models where q_dim ≠ hidden_size.
 /// o_proj weight is [hidden_size, q_dim], input attn_out is [q_dim].
-pub(crate) fn o_proj_residual_qdim<B: GpuBackend>(
+pub(crate) fn o_proj_residual_qdim<B: GpuMatmul + GpuElementwise>(
     backend: &B,
     layer: &LayerWeights<B>,
     attn_out: &B::Tensor,
@@ -259,7 +264,7 @@ pub(crate) fn o_proj_residual_qdim<B: GpuBackend>(
 // ===========================================================================
 
 /// Full FFN sub-block: RMSNorm → gate/up projections → SwiGLU → down → residual.
-pub(crate) fn ffn_block<B: GpuBackend>(
+pub(crate) fn ffn_block<B: GpuNorm + GpuMatmul + GpuElementwise>(
     backend: &B,
     layer: &LayerWeights<B>,
     hidden: &B::Tensor,
@@ -283,7 +288,7 @@ pub(crate) fn ffn_block<B: GpuBackend>(
 // ===========================================================================
 
 /// Upload token IDs and positions for batched prefill.
-pub(crate) fn upload_prefill_inputs<B: GpuBackend>(
+pub(crate) fn upload_prefill_inputs<B: GpuCore>(
     backend: &B,
     bufs: &PrefillBuffers<B>,
     tokens: &[u32],
@@ -299,7 +304,7 @@ pub(crate) fn upload_prefill_inputs<B: GpuBackend>(
 }
 
 /// Batched embedding lookup.
-pub(crate) fn embed_batch<B: GpuBackend>(
+pub(crate) fn embed_batch<B: GpuEmbed>(
     backend: &B,
     weights: &ModelWeights<B>,
     bufs: &PrefillBuffers<B>,
@@ -312,7 +317,7 @@ pub(crate) fn embed_batch<B: GpuBackend>(
 }
 
 /// Batched QKV projection (GEMM).
-pub(crate) fn qkv_projection_batch<B: GpuBackend>(
+pub(crate) fn qkv_projection_batch<B: GpuMatmul>(
     backend: &B,
     layer: &LayerWeights<B>,
     bufs: &PrefillBuffers<B>,
@@ -326,7 +331,7 @@ pub(crate) fn qkv_projection_batch<B: GpuBackend>(
 }
 
 /// Batched QKV projection with explicit q_dim (for q_dim ≠ hidden_size).
-pub(crate) fn qkv_projection_batch_qdim<B: GpuBackend>(
+pub(crate) fn qkv_projection_batch_qdim<B: GpuMatmul>(
     backend: &B,
     layer: &LayerWeights<B>,
     bufs: &PrefillBuffers<B>,
@@ -341,7 +346,7 @@ pub(crate) fn qkv_projection_batch_qdim<B: GpuBackend>(
 }
 
 /// Apply QKV bias in batched mode (broadcast-add).
-pub(crate) fn apply_qkv_bias_batch<B: GpuBackend>(
+pub(crate) fn apply_qkv_bias_batch<B: GpuElementwise>(
     backend: &B,
     layer: &LayerWeights<B>,
     bufs: &PrefillBuffers<B>,
@@ -361,7 +366,7 @@ pub(crate) fn apply_qkv_bias_batch<B: GpuBackend>(
 }
 
 /// Batched RoPE.
-pub(crate) fn apply_rope_batch<B: GpuBackend>(
+pub(crate) fn apply_rope_batch<B: GpuRope>(
     backend: &B,
     bufs: &PrefillBuffers<B>,
     rope_theta: f32,
@@ -380,7 +385,7 @@ pub(crate) fn apply_rope_batch<B: GpuBackend>(
 ///
 /// `window_size`: sliding window size (0 = full context).
 /// `attn_scale`: custom attention scale (0.0 = default 1/sqrt(head_dim)).
-pub(crate) fn paged_kv_and_prefill_attention<B: GpuBackend>(
+pub(crate) fn paged_kv_and_prefill_attention<B: GpuAttention>(
     backend: &B,
     bufs: &PrefillBuffers<B>,
     pool: &KvPool<B>,
@@ -410,7 +415,7 @@ pub(crate) fn paged_kv_and_prefill_attention<B: GpuBackend>(
 }
 
 /// Batched O projection + residual.
-pub(crate) fn o_proj_residual_batch<B: GpuBackend>(
+pub(crate) fn o_proj_residual_batch<B: GpuMatmul + GpuElementwise>(
     backend: &B,
     layer: &LayerWeights<B>,
     bufs: &PrefillBuffers<B>,
@@ -422,7 +427,7 @@ pub(crate) fn o_proj_residual_batch<B: GpuBackend>(
 }
 
 /// Batched O projection + residual with explicit q_dim.
-pub(crate) fn o_proj_residual_batch_qdim<B: GpuBackend>(
+pub(crate) fn o_proj_residual_batch_qdim<B: GpuMatmul + GpuElementwise>(
     backend: &B,
     layer: &LayerWeights<B>,
     bufs: &PrefillBuffers<B>,
@@ -435,7 +440,7 @@ pub(crate) fn o_proj_residual_batch_qdim<B: GpuBackend>(
 }
 
 /// Batched FFN sub-block.
-pub(crate) fn ffn_block_batch<B: GpuBackend>(
+pub(crate) fn ffn_block_batch<B: GpuNorm + GpuMatmul + GpuElementwise>(
     backend: &B,
     layer: &LayerWeights<B>,
     bufs: &PrefillBuffers<B>,
@@ -453,7 +458,7 @@ pub(crate) fn ffn_block_batch<B: GpuBackend>(
 }
 
 /// Final norm + LM head for batched prefill (extracts last token's hidden state).
-pub(crate) fn final_norm_and_lm_head_prefill<B: GpuBackend>(
+pub(crate) fn final_norm_and_lm_head_prefill<B: GpuCore + GpuNorm + GpuMatmul>(
     backend: &B,
     weights: &ModelWeights<B>,
     bufs: &PrefillBuffers<B>,

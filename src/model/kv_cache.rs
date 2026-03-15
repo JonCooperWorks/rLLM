@@ -31,7 +31,7 @@
 //   well with Metal's memory access patterns and flash attention tile sizes.
 // ===========================================================================
 
-use crate::gpu::{GpuBackend, TensorDtype};
+use crate::gpu::{GpuCore, TensorDtype};
 
 /// Number of token positions stored per KV cache block.
 pub(crate) const BLOCK_SIZE: usize = 16;
@@ -46,7 +46,7 @@ pub(crate) const MAX_BLOCKS_PER_SEQ: usize = 8192;
 /// layers.  Individual sequences get assigned physical blocks from this pool
 /// via their block tables.
 #[allow(dead_code)]
-pub(crate) struct KvPool<B: GpuBackend> {
+pub(crate) struct KvPool<B: GpuCore> {
     /// Physical K cache pool: one buffer per layer.
     /// Shape per buffer: [num_physical_blocks * BLOCK_SIZE, kv_dim] in bf16.
     pub k_pool: Vec<B::Tensor>,
@@ -68,7 +68,7 @@ pub(crate) struct KvPool<B: GpuBackend> {
 /// The block table maps logical block indices to physical block indices
 /// in the shared KvPool.  It lives on the CPU and is uploaded to GPU
 /// when the attention kernel needs it.
-pub(crate) struct SeqKvState<B: GpuBackend> {
+pub(crate) struct SeqKvState<B: GpuCore> {
     /// Logical block index -> physical block index.
     /// Length = ceil(seq_len / BLOCK_SIZE), grows as the sequence gets longer.
     block_table_cpu: Vec<u32>,
@@ -81,7 +81,7 @@ pub(crate) struct SeqKvState<B: GpuBackend> {
     dirty: bool,
 }
 
-impl<B: GpuBackend> KvPool<B> {
+impl<B: GpuCore> KvPool<B> {
     /// Allocate a KV pool with room for `num_blocks` physical blocks.
     ///
     /// Total GPU memory = num_blocks * BLOCK_SIZE * kv_dim * 2 bytes * 2 (K+V)
@@ -165,7 +165,7 @@ impl<B: GpuBackend> KvPool<B> {
     }
 }
 
-impl<B: GpuBackend> SeqKvState<B> {
+impl<B: GpuCore> SeqKvState<B> {
     /// Ensure there is room for one more token.  If the current last block
     /// is full (or no blocks allocated yet), allocate a new block from the pool.
     pub fn ensure_slot(&mut self, pool: &mut KvPool<B>) -> anyhow::Result<()> {
