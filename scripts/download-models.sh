@@ -38,8 +38,8 @@ for arg in "$@"; do
   esac
 done
 
-# ---- 1. Install huggingface-cli if missing ------------------------------
-if ! command -v huggingface-cli &>/dev/null; then
+# ---- 1. Install hf if missing ------------------------------
+if ! command -v hf &>/dev/null; then
   echo "Installing huggingface_hub CLI..."
   pip install -q huggingface_hub[cli]
 fi
@@ -47,10 +47,10 @@ fi
 # ---- 2. Authenticate with HuggingFace ----------------------------------
 # Gated models (Llama, Gemma, Mistral) require an access token.
 # Priority: HF_TOKEN env var > existing cached login > interactive prompt.
-if ! huggingface-cli whoami &>/dev/null; then
+if ! hf auth whoami &>/dev/null; then
   if [[ -n "${HF_TOKEN:-}" ]]; then
     echo "Logging in with HF_TOKEN..."
-    huggingface-cli login --token "$HF_TOKEN"
+    hf auth login --token "$HF_TOKEN"
   else
     echo "Not logged in to HuggingFace."
     echo "Gated models (Llama, Gemma, Mistral) require authentication."
@@ -58,14 +58,14 @@ if ! huggingface-cli whoami &>/dev/null; then
     echo ""
     read -rp "Paste your HF token (or press Enter to skip): " token
     if [[ -n "$token" ]]; then
-      huggingface-cli login --token "$token"
+      hf auth login --token "$token"
     else
       echo "Skipping auth — gated model downloads may fail."
     fi
   fi
 fi
 
-echo "Authenticated as: $(huggingface-cli whoami 2>/dev/null | head -1)"
+echo "Authenticated as: $(hf auth whoami 2>/dev/null | head -1)"
 echo ""
 
 mkdir -p "$DEST"
@@ -150,12 +150,22 @@ for model in "${MODELS[@]}"; do
   name=$(echo "$model" | awk -F/ '{print $NF}' | tr '[:upper:]' '[:lower:]')
   echo "=== $model → $DEST/$name ==="
 
-  if huggingface-cli download "$model" \
+  # If dir exists but has no safetensors, clear stale HF cache to force re-download
+  if [[ -d "$DEST/$name" ]] && ! ls "$DEST/$name"/*.safetensors &>/dev/null; then
+    echo "  (clearing stale cache — no .safetensors found)"
+    rm -rf "$DEST/$name/.cache"
+  fi
+
+  if hf download "$model" \
     --local-dir "$DEST/$name" \
-    --include "*.safetensors" "config.json" "tokenizer.json" "tokenizer_config.json"; then
+    --include "*.safetensors" \
+    --include "*.safetensors.index.json" \
+    --include "config.json" \
+    --include "tokenizer.json" \
+    --include "tokenizer_config.json"; then
     echo "  ✓ done"
   else
-    echo "  ✗ FAILED (gated model? run: huggingface-cli login)"
+    echo "  ✗ FAILED (gated model? run: hf auth login)"
     FAILED+=("$model")
   fi
   echo ""

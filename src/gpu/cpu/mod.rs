@@ -1713,4 +1713,639 @@ mod tests {
             assert_tensors_close(&cpu, &cout, &metal, &mout, chunk_size as usize * q_stride, 0.15, "prefill_attn_hd128");
         }
     }
+
+    // -----------------------------------------------------------------------
+    // CUDA cross-validation tests (Linux only)
+    //
+    // Same pattern as Metal tests: run the same operation on both CPU and
+    // CUDA backends, compare results within tolerance.  This validates that
+    // the CUDA kernels produce correct results by cross-referencing against
+    // the CPU reference implementation.
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "cuda")]
+    mod cuda_cross {
+        use super::*;
+        use crate::gpu::cuda::CudaBackend;
+
+        fn assert_tensors_close_bf16(
+            _cpu_backend: &CpuBackend,
+            cpu_tensor: &CpuTensor,
+            cuda_backend: &CudaBackend,
+            cuda_tensor: &<CudaBackend as GpuCore>::Tensor,
+            count: usize,
+            tol: f32,
+            label: &str,
+        ) {
+            let cpu_values = read_bf16(cpu_tensor, count);
+            let mut cuda_bytes = vec![0u8; count * 2];
+            cuda_backend.copy_to_host(cuda_tensor, &mut cuda_bytes);
+            let cuda_values = read_bf16_bytes(&cuda_bytes, count);
+
+            for (i, (c, g)) in cpu_values.iter().zip(cuda_values.iter()).enumerate() {
+                assert!(
+                    (c - g).abs() < tol,
+                    "{label} element {i}: cpu={c}, cuda={g}, diff={}",
+                    (c - g).abs()
+                );
+            }
+        }
+
+        fn assert_tensors_close_f32(
+            cuda_backend: &CudaBackend,
+            cuda_tensor: &<CudaBackend as GpuCore>::Tensor,
+            expected: &[f32],
+            tol: f32,
+            label: &str,
+        ) {
+            let mut cuda_bytes = vec![0u8; expected.len() * 4];
+            cuda_backend.copy_to_host(cuda_tensor, &mut cuda_bytes);
+            let cuda_values: &[f32] = bytemuck::cast_slice(&cuda_bytes);
+
+            for (i, (g, e)) in cuda_values.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (g - e).abs() < tol,
+                    "{label} element {i}: cuda={g}, expected={e}, diff={}",
+                    (g - e).abs()
+                );
+            }
+        }
+
+        /// Deterministic pseudo-random data for tests.
+        fn make_test_data(count: usize, seed: u32) -> Vec<f32> {
+            let mut state = seed;
+            (0..count).map(|_| {
+                state = state.wrapping_mul(1103515245).wrapping_add(12345);
+                ((state >> 16) as f32 / 32768.0) - 1.0
+            }).collect()
+        }
+
+        // -------------------------------------------------------------------
+        // GpuCore tests
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn test_cuda_core_upload_roundtrip() {
+            let cuda = CudaBackend::new().unwrap();
+            let data = bf16_bytes(&[1.0, 2.0, 3.0, 4.0]);
+            let t = cuda.upload_tensor(&data, &[4], TensorDtype::BF16);
+            let mut dst = vec![0u8; data.len()];
+            cuda.copy_to_host(&t, &mut dst);
+            assert_eq!(dst, data);
+        }
+
+        #[test]
+        fn test_cuda_core_alloc_zero() {
+            let cuda = CudaBackend::new().unwrap();
+            let t = cuda.alloc_tensor(&[4], TensorDtype::BF16);
+            let mut dst = vec![0u8; 8];
+            cuda.copy_to_host(&t, &mut dst);
+            let vals = read_bf16_bytes(&dst, 4);
+            for v in &vals {
+                assert!((v - 0.0).abs() < 0.001, "expected zero, got {v}");
+            }
+        }
+
+        #[test]
+        fn test_cuda_core_copy_to_tensor() {
+            let cuda = CudaBackend::new().unwrap();
+            let t = cuda.alloc_tensor(&[4], TensorDtype::BF16);
+            let data = bf16_bytes(&[5.0, 6.0, 7.0, 8.0]);
+            cuda.copy_to_tensor(&t, &data);
+            let mut dst = vec![0u8; 8];
+            cuda.copy_to_host(&t, &mut dst);
+            let vals = read_bf16_bytes(&dst, 4);
+            for (i, (a, e)) in vals.iter().zip([5.0, 6.0, 7.0, 8.0].iter()).enumerate() {
+                assert!((a - e).abs() < 0.1, "element {i}: {a} != {e}");
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // GpuElementwise tests
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn test_cuda_vs_cpu_add() {
+            let cpu = CpuBackend;
+            let cuda = CudaBackend::new().unwrap();
+            let a_data = bf16_bytes(&[1.0, 2.0, 3.0, 4.0]);
+            let b_data = bf16_bytes(&[10.0, 20.0, 30.0, 40.0]);
+
+            let ca = cpu.upload_tensor(&a_data, &[4], TensorDtype::BF16);
+            let cb = cpu.upload_tensor(&b_data, &[4], TensorDtype::BF16);
+            let cout = cpu.alloc_tensor(&[4], TensorDtype::BF16);
+            cpu.add(&ca, &cb, &cout, 4);
+
+            let ga = cuda.upload_tensor(&a_data, &[4], TensorDtype::BF16);
+            let gb = cuda.upload_tensor(&b_data, &[4], TensorDtype::BF16);
+            let gout = cuda.alloc_tensor(&[4], TensorDtype::BF16);
+            cuda.add(&ga, &gb, &gout, 4);
+
+            assert_tensors_close_bf16(&cpu, &cout, &cuda, &gout, 4, 0.1, "add");
+        }
+
+        #[test]
+        fn test_cuda_vs_cpu_scalar_mul() {
+            let cpu = CpuBackend;
+            let cuda = CudaBackend::new().unwrap();
+            let data = bf16_bytes(&[1.0, 2.0, 3.0, 4.0]);
+
+            let ci = cpu.upload_tensor(&data, &[4], TensorDtype::BF16);
+            let cout = cpu.alloc_tensor(&[4], TensorDtype::BF16);
+            cpu.scalar_mul(&ci, &cout, 2.5, 4);
+
+            let gi = cuda.upload_tensor(&data, &[4], TensorDtype::BF16);
+            let gout = cuda.alloc_tensor(&[4], TensorDtype::BF16);
+            cuda.scalar_mul(&gi, &gout, 2.5, 4);
+
+            assert_tensors_close_bf16(&cpu, &cout, &cuda, &gout, 4, 0.1, "scalar_mul");
+        }
+
+        #[test]
+        fn test_cuda_vs_cpu_silu_mul() {
+            let cpu = CpuBackend;
+            let cuda = CudaBackend::new().unwrap();
+            let gate_data = bf16_bytes(&[0.0, 1.0, 2.0, -1.0]);
+            let up_data = bf16_bytes(&[1.0, 2.0, 3.0, 4.0]);
+
+            let cg = cpu.upload_tensor(&gate_data, &[4], TensorDtype::BF16);
+            let cu = cpu.upload_tensor(&up_data, &[4], TensorDtype::BF16);
+            let cout = cpu.alloc_tensor(&[4], TensorDtype::BF16);
+            cpu.silu_mul(&cg, &cu, &cout, 4);
+
+            let gg = cuda.upload_tensor(&gate_data, &[4], TensorDtype::BF16);
+            let gu = cuda.upload_tensor(&up_data, &[4], TensorDtype::BF16);
+            let gout = cuda.alloc_tensor(&[4], TensorDtype::BF16);
+            cuda.silu_mul(&gg, &gu, &gout, 4);
+
+            assert_tensors_close_bf16(&cpu, &cout, &cuda, &gout, 4, 0.1, "silu_mul");
+        }
+
+        #[test]
+        fn test_cuda_vs_cpu_gelu_mul() {
+            let cpu = CpuBackend;
+            let cuda = CudaBackend::new().unwrap();
+            let gate_data = bf16_bytes(&[0.0, 1.0, -1.0]);
+            let up_data = bf16_bytes(&[1.0, 1.0, 1.0]);
+
+            let cg = cpu.upload_tensor(&gate_data, &[3], TensorDtype::BF16);
+            let cu = cpu.upload_tensor(&up_data, &[3], TensorDtype::BF16);
+            let cout = cpu.alloc_tensor(&[3], TensorDtype::BF16);
+            cpu.gelu_mul(&cg, &cu, &cout, 3);
+
+            let gg = cuda.upload_tensor(&gate_data, &[3], TensorDtype::BF16);
+            let gu = cuda.upload_tensor(&up_data, &[3], TensorDtype::BF16);
+            let gout = cuda.alloc_tensor(&[3], TensorDtype::BF16);
+            cuda.gelu_mul(&gg, &gu, &gout, 3);
+
+            assert_tensors_close_bf16(&cpu, &cout, &cuda, &gout, 3, 0.1, "gelu_mul");
+        }
+
+        #[test]
+        fn test_cuda_vs_cpu_scale_add() {
+            let cpu = CpuBackend;
+            let cuda = CudaBackend::new().unwrap();
+            let dst_data = bf16_bytes(&[1.0, 2.0, 3.0]);
+            let src_data = bf16_bytes(&[10.0, 20.0, 30.0]);
+
+            let cdst = cpu.upload_tensor(&dst_data, &[3], TensorDtype::BF16);
+            let csrc = cpu.upload_tensor(&src_data, &[3], TensorDtype::BF16);
+            cpu.scale_add(&cdst, &csrc, 0.5, 3);
+
+            let gdst = cuda.upload_tensor(&dst_data, &[3], TensorDtype::BF16);
+            let gsrc = cuda.upload_tensor(&src_data, &[3], TensorDtype::BF16);
+            cuda.scale_add(&gdst, &gsrc, 0.5, 3);
+
+            assert_tensors_close_bf16(&cpu, &cdst, &cuda, &gdst, 3, 0.1, "scale_add");
+        }
+
+        #[test]
+        fn test_cuda_vs_cpu_fill_zero() {
+            let cuda = CudaBackend::new().unwrap();
+            let t = cuda.upload_tensor(&bf16_bytes(&[1.0, 2.0, 3.0, 4.0]), &[4], TensorDtype::BF16);
+            cuda.fill_zero(&t, 4);
+            let mut dst = vec![0u8; 8];
+            cuda.copy_to_host(&t, &mut dst);
+            let vals = read_bf16_bytes(&dst, 4);
+            for v in &vals {
+                assert!((v - 0.0).abs() < 0.001, "expected zero, got {v}");
+            }
+        }
+
+        #[test]
+        fn test_cuda_vs_cpu_bias_add() {
+            let cpu = CpuBackend;
+            let cuda = CudaBackend::new().unwrap();
+            let input_data = bf16_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+            let bias_data = bf16_bytes(&[0.1, 0.2, 0.3]);
+
+            let ci = cpu.upload_tensor(&input_data, &[2, 3], TensorDtype::BF16);
+            let cb = cpu.upload_tensor(&bias_data, &[3], TensorDtype::BF16);
+            let cout = cpu.alloc_tensor(&[2, 3], TensorDtype::BF16);
+            cpu.bias_add_batch(&ci, &cb, &cout, 2, 3);
+
+            let gi = cuda.upload_tensor(&input_data, &[2, 3], TensorDtype::BF16);
+            let gb = cuda.upload_tensor(&bias_data, &[3], TensorDtype::BF16);
+            let gout = cuda.alloc_tensor(&[2, 3], TensorDtype::BF16);
+            cuda.bias_add_batch(&gi, &gb, &gout, 2, 3);
+
+            assert_tensors_close_bf16(&cpu, &cout, &cuda, &gout, 6, 0.1, "bias_add");
+        }
+
+        #[test]
+        fn test_cuda_vs_cpu_top_k_softmax() {
+            let cpu = CpuBackend;
+            let cuda = CudaBackend::new().unwrap();
+            // CPU takes f32 logits, CUDA takes bf16 logits.
+            let logits_f32 = f32_bytes(&[1.0, 3.0, 2.0, 0.5]);
+            let logits_bf16 = bf16_bytes(&[1.0, 3.0, 2.0, 0.5]);
+
+            let cl = cpu.upload_tensor(&logits_f32, &[4], TensorDtype::F32);
+            let cout = cpu.alloc_tensor(&[4], TensorDtype::F32);
+            cpu.top_k_softmax(&cl, &cout, 4, 2);
+            let cpu_result = read_f32(&cout, 4);
+
+            let gl = cuda.upload_tensor(&logits_bf16, &[4], TensorDtype::BF16);
+            let gout = cuda.alloc_tensor(&[4], TensorDtype::F32);
+            cuda.top_k_softmax(&gl, &gout, 4, 2);
+
+            // Check indices and weights match
+            assert_tensors_close_f32(&cuda, &gout, &cpu_result, 0.01, "top_k_softmax");
+        }
+
+        // -------------------------------------------------------------------
+        // GpuNorm tests
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn test_cuda_vs_cpu_rms_norm() {
+            let cpu = CpuBackend;
+            let cuda = CudaBackend::new().unwrap();
+            let input_data = bf16_bytes(&[1.0, 2.0, 3.0, 4.0]);
+            let weight_data = bf16_bytes(&[1.0, 1.0, 1.0, 1.0]);
+
+            let ci = cpu.upload_tensor(&input_data, &[4], TensorDtype::BF16);
+            let cw = cpu.upload_tensor(&weight_data, &[4], TensorDtype::BF16);
+            let cout = cpu.alloc_tensor(&[4], TensorDtype::BF16);
+            cpu.rms_norm(&ci, &cw, 1e-5, &cout);
+
+            let gi = cuda.upload_tensor(&input_data, &[4], TensorDtype::BF16);
+            let gw = cuda.upload_tensor(&weight_data, &[4], TensorDtype::BF16);
+            let gout = cuda.alloc_tensor(&[4], TensorDtype::BF16);
+            cuda.rms_norm(&gi, &gw, 1e-5, &gout);
+
+            assert_tensors_close_bf16(&cpu, &cout, &cuda, &gout, 4, 0.05, "rms_norm");
+        }
+
+        #[test]
+        fn test_cuda_vs_cpu_rms_norm_batch() {
+            let cpu = CpuBackend;
+            let cuda = CudaBackend::new().unwrap();
+            let input_data = bf16_bytes(&[1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0]);
+            let weight_data = bf16_bytes(&[1.0, 1.0, 1.0, 1.0]);
+
+            let ci = cpu.upload_tensor(&input_data, &[2, 4], TensorDtype::BF16);
+            let cw = cpu.upload_tensor(&weight_data, &[4], TensorDtype::BF16);
+            let cout = cpu.alloc_tensor(&[2, 4], TensorDtype::BF16);
+            cpu.rms_norm_batch(&ci, &cw, 1e-5, &cout, 2);
+
+            let gi = cuda.upload_tensor(&input_data, &[2, 4], TensorDtype::BF16);
+            let gw = cuda.upload_tensor(&weight_data, &[4], TensorDtype::BF16);
+            let gout = cuda.alloc_tensor(&[2, 4], TensorDtype::BF16);
+            cuda.rms_norm_batch(&gi, &gw, 1e-5, &gout, 2);
+
+            assert_tensors_close_bf16(&cpu, &cout, &cuda, &gout, 8, 0.05, "rms_norm_batch");
+        }
+
+        // -------------------------------------------------------------------
+        // GpuEmbed tests
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn test_cuda_vs_cpu_embed_lookup() {
+            let cpu = CpuBackend;
+            let cuda = CudaBackend::new().unwrap();
+            let table = bf16_bytes(&[
+                0.1, 0.2, 0.3,
+                1.1, 1.2, 1.3,
+                2.1, 2.2, 2.3,
+            ]);
+
+            let ct = cpu.upload_tensor(&table, &[3, 3], TensorDtype::BF16);
+            let cout = cpu.alloc_tensor(&[3], TensorDtype::BF16);
+            cpu.embed_lookup(&ct, 1, &cout, 3);
+
+            let gt = cuda.upload_tensor(&table, &[3, 3], TensorDtype::BF16);
+            let gout = cuda.alloc_tensor(&[3], TensorDtype::BF16);
+            cuda.embed_lookup(&gt, 1, &gout, 3);
+
+            assert_tensors_close_bf16(&cpu, &cout, &cuda, &gout, 3, 0.05, "embed_lookup");
+        }
+
+        #[test]
+        fn test_cuda_vs_cpu_embed_lookup_batch() {
+            let cpu = CpuBackend;
+            let cuda = CudaBackend::new().unwrap();
+            let table = bf16_bytes(&[
+                0.1, 0.2,
+                1.1, 1.2,
+                2.1, 2.2,
+            ]);
+            let token_ids: Vec<u8> = bytemuck::cast_slice(&[2u32, 0u32]).to_vec();
+
+            let ct = cpu.upload_tensor(&table, &[3, 2], TensorDtype::BF16);
+            let cids = cpu.upload_tensor(&token_ids, &[2], TensorDtype::F32);
+            let cout = cpu.alloc_tensor(&[2, 2], TensorDtype::BF16);
+            cpu.embed_lookup_batch(&ct, &cids, &cout, 2, 2);
+
+            let gt = cuda.upload_tensor(&table, &[3, 2], TensorDtype::BF16);
+            let gids = cuda.upload_tensor(&token_ids, &[2], TensorDtype::F32);
+            let gout = cuda.alloc_tensor(&[2, 2], TensorDtype::BF16);
+            cuda.embed_lookup_batch(&gt, &gids, &gout, 2, 2);
+
+            assert_tensors_close_bf16(&cpu, &cout, &cuda, &gout, 4, 0.05, "embed_lookup_batch");
+        }
+
+        // -------------------------------------------------------------------
+        // GpuMatmul tests
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn test_cuda_vs_cpu_matmul() {
+            let cpu = CpuBackend;
+            let cuda = CudaBackend::new().unwrap();
+
+            // Weight [2, 128], input [128] — must be multiple of 128 for warp-cooperative kernel
+            let w_data = bf16_bytes(&make_test_data(2 * 128, 42));
+            let i_data = bf16_bytes(&make_test_data(128, 123));
+
+            let cw = cpu.upload_tensor(&w_data, &[2, 128], TensorDtype::BF16);
+            let ci = cpu.upload_tensor(&i_data, &[128], TensorDtype::BF16);
+            let cout = cpu.alloc_tensor(&[2], TensorDtype::BF16);
+            cpu.matmul(&cw, &ci, &cout, 2, 128);
+
+            let gw = cuda.upload_tensor(&w_data, &[2, 128], TensorDtype::BF16);
+            let gi = cuda.upload_tensor(&i_data, &[128], TensorDtype::BF16);
+            let gout = cuda.alloc_tensor(&[2], TensorDtype::BF16);
+            cuda.matmul(&gw, &gi, &gout, 2, 128);
+
+            assert_tensors_close_bf16(&cpu, &cout, &cuda, &gout, 2, 0.5, "matmul");
+        }
+
+        #[test]
+        fn test_cuda_vs_cpu_matmul_batch() {
+            let cpu = CpuBackend;
+            let cuda = CudaBackend::new().unwrap();
+
+            let w_data = bf16_bytes(&make_test_data(2 * 128, 42));
+            let i_data = bf16_bytes(&make_test_data(3 * 128, 123));
+
+            let cw = cpu.upload_tensor(&w_data, &[2, 128], TensorDtype::BF16);
+            let ci = cpu.upload_tensor(&i_data, &[3, 128], TensorDtype::BF16);
+            let cout = cpu.alloc_tensor(&[3, 2], TensorDtype::BF16);
+            cpu.matmul_batch(&cw, &ci, &cout, 3, 2, 128);
+
+            let gw = cuda.upload_tensor(&w_data, &[2, 128], TensorDtype::BF16);
+            let gi = cuda.upload_tensor(&i_data, &[3, 128], TensorDtype::BF16);
+            let gout = cuda.alloc_tensor(&[3, 2], TensorDtype::BF16);
+            cuda.matmul_batch(&gw, &gi, &gout, 3, 2, 128);
+
+            assert_tensors_close_bf16(&cpu, &cout, &cuda, &gout, 6, 0.5, "matmul_batch");
+        }
+
+        // -------------------------------------------------------------------
+        // GpuRope tests
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn test_cuda_vs_cpu_rope() {
+            let cpu = CpuBackend;
+            let cuda = CudaBackend::new().unwrap();
+            let q_data = bf16_bytes(&[1.0, 2.0, 3.0, 4.0]);
+            let k_data = bf16_bytes(&[5.0, 6.0, 7.0, 8.0]);
+
+            let cq = cpu.upload_tensor(&q_data, &[4], TensorDtype::BF16);
+            let ck = cpu.upload_tensor(&k_data, &[4], TensorDtype::BF16);
+            cpu.rope(&cq, &ck, 3, 10000.0, 1, 1, 4);
+
+            let gq = cuda.upload_tensor(&q_data, &[4], TensorDtype::BF16);
+            let gk = cuda.upload_tensor(&k_data, &[4], TensorDtype::BF16);
+            cuda.rope(&gq, &gk, 3, 10000.0, 1, 1, 4);
+
+            assert_tensors_close_bf16(&cpu, &cq, &cuda, &gq, 4, 0.05, "rope_q");
+            assert_tensors_close_bf16(&cpu, &ck, &cuda, &gk, 4, 0.05, "rope_k");
+        }
+
+        #[test]
+        fn test_cuda_vs_cpu_rope_position_zero() {
+            let cuda = CudaBackend::new().unwrap();
+            let q_data = bf16_bytes(&[1.0, 2.0, 3.0, 4.0]);
+            let k_data = bf16_bytes(&[5.0, 6.0, 7.0, 8.0]);
+
+            let gq = cuda.upload_tensor(&q_data, &[4], TensorDtype::BF16);
+            let gk = cuda.upload_tensor(&k_data, &[4], TensorDtype::BF16);
+            cuda.rope(&gq, &gk, 0, 10000.0, 1, 1, 4);
+
+            // At position 0, angles = 0 → identity transform
+            let mut q_out = vec![0u8; 8];
+            let mut k_out = vec![0u8; 8];
+            cuda.copy_to_host(&gq, &mut q_out);
+            cuda.copy_to_host(&gk, &mut k_out);
+            let q_vals = read_bf16_bytes(&q_out, 4);
+            let k_vals = read_bf16_bytes(&k_out, 4);
+            for (i, (a, e)) in q_vals.iter().zip([1.0, 2.0, 3.0, 4.0].iter()).enumerate() {
+                assert!((a - e).abs() < 0.02, "rope q[{i}]: {a} != {e}");
+            }
+            for (i, (a, e)) in k_vals.iter().zip([5.0, 6.0, 7.0, 8.0].iter()).enumerate() {
+                assert!((a - e).abs() < 0.02, "rope k[{i}]: {a} != {e}");
+            }
+        }
+
+        #[test]
+        fn test_cuda_vs_cpu_rope_partial() {
+            let cpu = CpuBackend;
+            let cuda = CudaBackend::new().unwrap();
+            let q_data = bf16_bytes(&[1.0, 2.0, 3.0, 4.0]);
+            let k_data = bf16_bytes(&[0.0; 4]);
+
+            let cq = cpu.upload_tensor(&q_data, &[4], TensorDtype::BF16);
+            let ck = cpu.upload_tensor(&k_data, &[4], TensorDtype::BF16);
+            cpu.rope_partial(&cq, &ck, 5, 10000.0, 1, 1, 4, 2);
+
+            let gq = cuda.upload_tensor(&q_data, &[4], TensorDtype::BF16);
+            let gk = cuda.upload_tensor(&k_data, &[4], TensorDtype::BF16);
+            cuda.rope_partial(&gq, &gk, 5, 10000.0, 1, 1, 4, 2);
+
+            assert_tensors_close_bf16(&cpu, &cq, &cuda, &gq, 4, 0.05, "rope_partial_q");
+        }
+
+        // -------------------------------------------------------------------
+        // GpuAttention tests
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn test_cuda_vs_cpu_attention_hd128() {
+            let cpu = CpuBackend;
+            let cuda = CudaBackend::new().unwrap();
+
+            let num_heads: u32 = 4;
+            let num_kv_heads: u32 = 2;
+            let head_dim: u32 = 128;
+            let seq_len: u32 = 20;
+            let max_seq: u32 = 32;
+            let kv_dim = (num_kv_heads * head_dim) as usize;
+            let attn_scale = 1.0 / (head_dim as f32).sqrt();
+
+            let q_data = bf16_bytes(&make_test_data((num_heads * head_dim) as usize, 42));
+            let k_cache_data = bf16_bytes(&make_test_data(max_seq as usize * kv_dim, 123));
+            let v_cache_data = bf16_bytes(&make_test_data(max_seq as usize * kv_dim, 456));
+
+            let cq = cpu.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+            let ck = cpu.upload_tensor(&k_cache_data, &[max_seq as usize, kv_dim], TensorDtype::BF16);
+            let cv = cpu.upload_tensor(&v_cache_data, &[max_seq as usize, kv_dim], TensorDtype::BF16);
+            let cout = cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+            cpu.attention(&cq, &ck, &cv, &cout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+
+            let gq = cuda.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+            let gk = cuda.upload_tensor(&k_cache_data, &[max_seq as usize, kv_dim], TensorDtype::BF16);
+            let gv = cuda.upload_tensor(&v_cache_data, &[max_seq as usize, kv_dim], TensorDtype::BF16);
+            let gout = cuda.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+            cuda.attention(&gq, &gk, &gv, &gout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+
+            assert_tensors_close_bf16(&cpu, &cout, &cuda, &gout, (num_heads * head_dim) as usize, 0.15, "attention_hd128");
+        }
+
+        #[test]
+        fn test_cuda_vs_cpu_paged_attention_hd128() {
+            let cpu = CpuBackend;
+            let cuda = CudaBackend::new().unwrap();
+
+            let num_heads: u32 = 4;
+            let num_kv_heads: u32 = 2;
+            let head_dim: u32 = 128;
+            let seq_len: u32 = 20;
+            let block_size: u32 = 16;
+            let kv_dim = (num_kv_heads * head_dim) as usize;
+            let attn_scale = 1.0 / (head_dim as f32).sqrt();
+
+            let num_physical_blocks: u32 = 4;
+            let block_table: Vec<u32> = vec![3, 1];
+            let block_table_bytes: Vec<u8> = bytemuck::cast_slice(&block_table).to_vec();
+
+            let pool_size = (num_physical_blocks * block_size) as usize * kv_dim;
+            let q_data = bf16_bytes(&make_test_data((num_heads * head_dim) as usize, 42));
+
+            let k_pool_data = vec![0u8; pool_size * 2];
+            let v_pool_data = vec![0u8; pool_size * 2];
+
+            let ck_pool = cpu.upload_tensor(&k_pool_data, &[pool_size], TensorDtype::BF16);
+            let cv_pool = cpu.upload_tensor(&v_pool_data, &[pool_size], TensorDtype::BF16);
+            let cbt = cpu.upload_tensor(&block_table_bytes, &[block_table.len()], TensorDtype::F32);
+            let gk_pool = cuda.upload_tensor(&k_pool_data, &[pool_size], TensorDtype::BF16);
+            let gv_pool = cuda.upload_tensor(&v_pool_data, &[pool_size], TensorDtype::BF16);
+            let gbt = cuda.upload_tensor(&block_table_bytes, &[block_table.len()], TensorDtype::F32);
+
+            for pos in 0..seq_len {
+                let kv_vec = bf16_bytes(&make_test_data(kv_dim, 1000 + pos));
+                let csrc = cpu.upload_tensor(&kv_vec, &[kv_dim], TensorDtype::BF16);
+                cpu.copy_to_paged_kv_cache(&csrc, &ck_pool, &cbt, pos, num_kv_heads, head_dim);
+                cpu.copy_to_paged_kv_cache(&csrc, &cv_pool, &cbt, pos, num_kv_heads, head_dim);
+
+                let gsrc = cuda.upload_tensor(&kv_vec, &[kv_dim], TensorDtype::BF16);
+                cuda.copy_to_paged_kv_cache(&gsrc, &gk_pool, &gbt, pos, num_kv_heads, head_dim);
+                cuda.copy_to_paged_kv_cache(&gsrc, &gv_pool, &gbt, pos, num_kv_heads, head_dim);
+            }
+
+            let cq = cpu.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+            let cout = cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+            cpu.paged_attention(&cq, &ck_pool, &cv_pool, &cbt, &cout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+
+            let gq = cuda.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+            let gout = cuda.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+            cuda.paged_attention(&gq, &gk_pool, &gv_pool, &gbt, &gout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+
+            assert_tensors_close_bf16(&cpu, &cout, &cuda, &gout, (num_heads * head_dim) as usize, 0.15, "paged_attn_hd128");
+        }
+
+        #[test]
+        fn test_cuda_vs_cpu_paged_attention_fused_hd128() {
+            let cpu = CpuBackend;
+            let cuda = CudaBackend::new().unwrap();
+
+            let num_heads: u32 = 4;
+            let num_kv_heads: u32 = 2;
+            let head_dim: u32 = 128;
+            let block_size: u32 = 16;
+            let kv_dim = (num_kv_heads * head_dim) as usize;
+            let attn_scale = 1.0 / (head_dim as f32).sqrt();
+
+            let num_physical_blocks: u32 = 4;
+            let block_table: Vec<u32> = vec![3, 1];
+            let block_table_bytes: Vec<u8> = bytemuck::cast_slice(&block_table).to_vec();
+
+            let pool_size = (num_physical_blocks * block_size) as usize * kv_dim;
+
+            let ck_pool = cpu.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
+            let cv_pool = cpu.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
+            let cbt = cpu.upload_tensor(&block_table_bytes, &[block_table.len()], TensorDtype::F32);
+            let gk_pool = cuda.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
+            let gv_pool = cuda.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
+            let gbt = cuda.upload_tensor(&block_table_bytes, &[block_table.len()], TensorDtype::F32);
+
+            for pos in 0..10u32 {
+                let q_data = bf16_bytes(&make_test_data((num_heads * head_dim) as usize, 42 + pos));
+                let k_data = bf16_bytes(&make_test_data(kv_dim, 1000 + pos));
+                let v_data = bf16_bytes(&make_test_data(kv_dim, 2000 + pos));
+
+                let cq = cpu.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+                let ck = cpu.upload_tensor(&k_data, &[kv_dim], TensorDtype::BF16);
+                let cv_in = cpu.upload_tensor(&v_data, &[kv_dim], TensorDtype::BF16);
+                let cout = cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+                cpu.paged_attention_fused(&cq, &ck, &cv_in, &ck_pool, &cv_pool, &cbt, &cout, pos, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+
+                let gq = cuda.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+                let gk = cuda.upload_tensor(&k_data, &[kv_dim], TensorDtype::BF16);
+                let gv_in = cuda.upload_tensor(&v_data, &[kv_dim], TensorDtype::BF16);
+                let gout = cuda.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+                cuda.paged_attention_fused(&gq, &gk, &gv_in, &gk_pool, &gv_pool, &gbt, &gout, pos, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+
+                if pos == 9 {
+                    assert_tensors_close_bf16(&cpu, &cout, &cuda, &gout, (num_heads * head_dim) as usize, 0.15, "paged_attn_fused_hd128");
+                }
+            }
+        }
+
+        #[test]
+        fn test_cuda_vs_cpu_prefill_attention_hd128() {
+            let cpu = CpuBackend;
+            let cuda = CudaBackend::new().unwrap();
+
+            let num_heads: u32 = 4;
+            let num_kv_heads: u32 = 2;
+            let head_dim: u32 = 128;
+            let chunk_size: u32 = 8;
+            let start_pos: u32 = 0;
+            let q_stride = (num_heads * head_dim) as usize;
+            let kv_stride = (num_kv_heads * head_dim) as usize;
+            let attn_scale = 1.0 / (head_dim as f32).sqrt();
+
+            let q_data = bf16_bytes(&make_test_data(chunk_size as usize * q_stride, 42));
+            let k_data = bf16_bytes(&make_test_data(chunk_size as usize * kv_stride, 123));
+            let v_data = bf16_bytes(&make_test_data(chunk_size as usize * kv_stride, 456));
+
+            let cq = cpu.upload_tensor(&q_data, &[chunk_size as usize, q_stride], TensorDtype::BF16);
+            let ck = cpu.upload_tensor(&k_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
+            let cv = cpu.upload_tensor(&v_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
+            let cout = cpu.alloc_tensor(&[chunk_size as usize, q_stride], TensorDtype::BF16);
+            cpu.prefill_attention(&cq, &ck, &cv, &cout, chunk_size, start_pos, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+
+            let gq = cuda.upload_tensor(&q_data, &[chunk_size as usize, q_stride], TensorDtype::BF16);
+            let gk = cuda.upload_tensor(&k_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
+            let gv = cuda.upload_tensor(&v_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
+            let gout = cuda.alloc_tensor(&[chunk_size as usize, q_stride], TensorDtype::BF16);
+            cuda.prefill_attention(&gq, &gk, &gv, &gout, chunk_size, start_pos, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+
+            assert_tensors_close_bf16(&cpu, &cout, &cuda, &gout, chunk_size as usize * q_stride, 0.15, "prefill_attn_hd128");
+        }
+    }
 }
