@@ -32,8 +32,11 @@ metal = "0.33.0"
 objc = "0.2.4"
 foreign-types = "0.5"
 
+[features]
+cuda = ["cudarc"]
+
 [target.'cfg(target_os = "linux")'.dependencies]
-cudarc = { version = "0.19", features = ["std", "driver", "nvrtc", "cuda-version-from-build-system"] }
+cudarc = { version = "0.19", features = ["std", "driver", "nvrtc", "cuda-version-from-build-system"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

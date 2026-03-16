@@ -29,11 +29,12 @@
 //
 // PLATFORM SELECTION
 //
-// We use OS-conditional compilation (`#[cfg(target_os = "...")]`) rather
-// than Cargo feature flags.  On macOS we compile the Metal backend; on
-// Linux we compile the CUDA backend.  Only one backend exists in a given
-// binary.  The `Backend` type alias resolves to whichever backend is
-// active, so call sites just write `gpu::Backend` and `gpu::create_backend()`.
+// On macOS we compile the Metal backend unconditionally.  On Linux the
+// CUDA backend is gated behind the `cuda` Cargo feature — this allows
+// `cargo test` on any Linux machine without a CUDA toolkit.  Only one
+// backend exists in a given binary.  The `Backend` type alias resolves
+// to whichever backend is active, so call sites just write
+// `gpu::Backend` and `gpu::create_backend()`.
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -78,7 +79,7 @@ impl<T> GpuBackend for T where
 #[cfg(target_os = "macos")]
 pub(crate) mod metal;
 
-#[cfg(target_os = "linux")]
+#[cfg(feature = "cuda")]
 pub(crate) mod cuda;
 
 // ---------------------------------------------------------------------------
@@ -88,7 +89,7 @@ pub(crate) mod cuda;
 #[cfg(target_os = "macos")]
 pub(crate) type Backend = self::metal::MetalBackend;
 
-#[cfg(target_os = "linux")]
+#[cfg(feature = "cuda")]
 pub(crate) type Backend = self::cuda::CudaBackend;
 
 // ---------------------------------------------------------------------------
@@ -125,11 +126,24 @@ pub(crate) fn q4_byte_count(m: usize, k: usize) -> usize {
 // Factory function.
 // ---------------------------------------------------------------------------
 
+#[cfg(any(target_os = "macos", feature = "cuda"))]
 pub(crate) fn create_backend() -> anyhow::Result<Backend> {
     Backend::new()
 }
 
-#[cfg(test)]
+#[cfg(not(any(target_os = "macos", feature = "cuda")))]
+pub(crate) fn create_backend() -> anyhow::Result<cpu::CpuBackend> {
+    eprintln!("warning: no GPU backend available, using CPU (slow)");
+    Ok(cpu::CpuBackend)
+}
+
+#[cfg(not(any(target_os = "macos", feature = "cuda")))]
+pub(crate) type Backend = cpu::CpuBackend;
+
+
+// CPU backend: always available in tests for correctness validation,
+// and used as the runtime fallback when no GPU backend is compiled.
+#[cfg(any(test, not(any(target_os = "macos", feature = "cuda"))))]
 pub(crate) mod cpu;
 
 #[cfg(test)]
