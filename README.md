@@ -45,7 +45,7 @@ Q4 quantization (`--quantize`) gives ~1.3-3.5x faster decode by reducing memory 
 <details>
 <summary><b>NVIDIA H100 80GB HBM3</b> — 3.35 TB/s bandwidth</summary>
 
-Measured via `rllm run`, single run, 128 max tokens.
+Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Measured via `rllm run`, single run, 128 max tokens.
 
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
@@ -244,7 +244,7 @@ src/
 
 ## Scripts
 
-The scripts make it easy to get running quickly on a rented GPU (e.g. Lambda, RunPod, Vast.ai) — install Rust, pull models, and benchmark in a few commands.
+The scripts make it easy to get running quickly on a rented GPU — install Rust, pull models, and benchmark in a few commands. [Vast.ai](https://cloud.vast.ai/?ref_id=394548) is a good option for cheap H100 access.
 
 | Script | Description |
 |---|---|
