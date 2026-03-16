@@ -123,6 +123,83 @@ pub(crate) fn q4_byte_count(m: usize, k: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Q4 quantisation — default format used by Metal and CPU backends.
+//
+// Backends that use a different quantisation format (e.g. CUDA with CUTLASS
+// INT4) override `GpuCore::quantize_upload` and never call this function.
+// ---------------------------------------------------------------------------
+
+/// Quantise a bf16 weight matrix [m, k] to block-wise Q4.
+///
+/// Block layout (symmetric quantisation, block_size=32):
+///   For each block of 32 consecutive weights:
+///     scale = max(|w_i|) / 7.0           (maps [-max, max] to [-7, 7])
+///     q_i = clamp(round(w_i / scale), -8, 7)  (4-bit signed, range [-8, 7])
+///     stored as unsigned: u_i = q_i + 8  (range [0, 15], fits in 4 bits)
+///
+///   Output per block (20 bytes):
+///     [0..4]:   f32 scale (little-endian)
+///     [4..20]:  16 bytes, 2 packed nibbles each
+///               byte[i] = u[2i] | (u[2i+1] << 4)
+pub(crate) fn quantize_bf16_to_q4(bf16_data: &[u8], m: usize, k: usize) -> Vec<u8> {
+    use half::bf16;
+
+    assert_eq!(bf16_data.len(), m * k * 2);
+
+    // Try zero-copy cast first; fall back to a copy if the mmap slice
+    // isn't 2-byte aligned (can happen with some safetensors packing).
+    let owned_buf: Vec<bf16>;
+    let values: &[bf16] = match bytemuck::try_cast_slice(bf16_data) {
+        Ok(v) => v,
+        Err(_) => {
+            owned_buf = bf16_data
+                .chunks_exact(2)
+                .map(|c| bf16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            &owned_buf
+        }
+    };
+    assert_eq!(values.len(), m * k);
+
+    let blocks_per_row = k / 32;
+    let mut out = vec![0u8; q4_byte_count(m, k)];
+
+    for row in 0..m {
+        for block in 0..blocks_per_row {
+            let src_offset = row * k + block * 32;
+            let dst_offset = (row * blocks_per_row + block) * 20;
+
+            // Find max absolute value in the block for scale computation.
+            let mut max_abs: f32 = 0.0;
+            for i in 0..32 {
+                let v = values[src_offset + i].to_f32().abs();
+                if v > max_abs {
+                    max_abs = v;
+                }
+            }
+            let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 7.0 };
+            let inv_scale = 1.0 / scale;
+
+            // Write scale.
+            out[dst_offset..dst_offset + 4].copy_from_slice(&scale.to_le_bytes());
+
+            // Quantise and pack pairs of weights into bytes.
+            for i in 0..16 {
+                let v0 = values[src_offset + i * 2].to_f32();
+                let v1 = values[src_offset + i * 2 + 1].to_f32();
+
+                let q0 = ((v0 * inv_scale).round() as i32).clamp(-8, 7) + 8;
+                let q1 = ((v1 * inv_scale).round() as i32).clamp(-8, 7) + 8;
+
+                out[dst_offset + 4 + i] = (q0 as u8) | ((q1 as u8) << 4);
+            }
+        }
+    }
+
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Factory function.
 // ---------------------------------------------------------------------------
 

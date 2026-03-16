@@ -510,24 +510,9 @@ pub(crate) fn load_weights<B: GpuCore>(
                     let d_offset = j * down_expert_bytes;
                     let down_raw = &down_data[d_offset..d_offset + down_expert_bytes];
 
-                    let gate_t = if quantize {
-                        let q4 = quantize_bf16_to_q4(gate_raw, moe_inter, hidden);
-                        backend.upload_tensor(&q4, &[moe_inter, hidden], TensorDtype::Q4)
-                    } else {
-                        backend.upload_tensor(gate_raw, &[moe_inter, hidden], TensorDtype::BF16)
-                    };
-                    let up_t = if quantize {
-                        let q4 = quantize_bf16_to_q4(up_raw, moe_inter, hidden);
-                        backend.upload_tensor(&q4, &[moe_inter, hidden], TensorDtype::Q4)
-                    } else {
-                        backend.upload_tensor(up_raw, &[moe_inter, hidden], TensorDtype::BF16)
-                    };
-                    let down_t = if quantize {
-                        let q4 = quantize_bf16_to_q4(down_raw, hidden, moe_inter);
-                        backend.upload_tensor(&q4, &[hidden, moe_inter], TensorDtype::Q4)
-                    } else {
-                        backend.upload_tensor(down_raw, &[hidden, moe_inter], TensorDtype::BF16)
-                    };
+                    let gate_t = upload_raw_maybe_quantized(backend, gate_raw, &[moe_inter, hidden], quantize);
+                    let up_t = upload_raw_maybe_quantized(backend, up_raw, &[moe_inter, hidden], quantize);
+                    let down_t = upload_raw_maybe_quantized(backend, down_raw, &[hidden, moe_inter], quantize);
 
                     experts.push(ExpertWeights {
                         gate_proj: gate_t,
@@ -561,17 +546,17 @@ pub(crate) fn load_weights<B: GpuCore>(
                         )
                     };
                     experts.push(ExpertWeights {
-                        gate_proj: upload_maybe_q4(
+                        gate_proj: upload_maybe_quantized(
                             &store, backend,
                             &gate_name,
                             &[moe_inter, hidden], quantize,
                         )?,
-                        up_proj: upload_maybe_q4(
+                        up_proj: upload_maybe_quantized(
                             &store, backend,
                             &up_name,
                             &[moe_inter, hidden], quantize,
                         )?,
-                        down_proj: upload_maybe_q4(
+                        down_proj: upload_maybe_quantized(
                             &store, backend,
                             &down_name,
                             &[hidden, moe_inter], quantize,
@@ -590,17 +575,17 @@ pub(crate) fn load_weights<B: GpuCore>(
 
             // Load shared expert weights if present.
             let (se_gate_proj, se_up_proj, se_down_proj, se_gate) = if has_shared_expert {
-                let gp = upload_maybe_q4(
+                let gp = upload_maybe_quantized(
                     &store, backend,
                     &format!("{prefix}.mlp.shared_expert.gate_proj.weight"),
                     &[shared_inter, hidden], quantize,
                 )?;
-                let up = upload_maybe_q4(
+                let up = upload_maybe_quantized(
                     &store, backend,
                     &format!("{prefix}.mlp.shared_expert.up_proj.weight"),
                     &[shared_inter, hidden], quantize,
                 )?;
-                let dp = upload_maybe_q4(
+                let dp = upload_maybe_quantized(
                     &store, backend,
                     &format!("{prefix}.mlp.shared_expert.down_proj.weight"),
                     &[hidden, shared_inter], quantize,
@@ -648,19 +633,9 @@ pub(crate) fn load_weights<B: GpuCore>(
             let gate_raw = &raw[..half];
             let up_raw = &raw[half..2 * half];
 
-            let gate = if quantize {
-                let q4_data = quantize_bf16_to_q4(gate_raw, inter, hidden);
-                backend.upload_tensor(&q4_data, &[inter, hidden], TensorDtype::Q4)
-            } else {
-                backend.upload_tensor(gate_raw, &[inter, hidden], TensorDtype::BF16)
-            };
-            let up = if quantize {
-                let q4_data = quantize_bf16_to_q4(up_raw, inter, hidden);
-                backend.upload_tensor(&q4_data, &[inter, hidden], TensorDtype::Q4)
-            } else {
-                backend.upload_tensor(up_raw, &[inter, hidden], TensorDtype::BF16)
-            };
-            let down = upload_maybe_q4(
+            let gate = upload_raw_maybe_quantized(backend, gate_raw, &[inter, hidden], quantize);
+            let up = upload_raw_maybe_quantized(backend, up_raw, &[inter, hidden], quantize);
+            let down = upload_maybe_quantized(
                 &store,
                 backend,
                 &format!("{prefix}.mlp.down_proj.weight"),
@@ -670,21 +645,21 @@ pub(crate) fn load_weights<B: GpuCore>(
             (gate, up, down, None, None, None, None, None, None)
         } else {
             // Dense FFN: standard gate/up/down projections.
-            let gate = upload_maybe_q4(
+            let gate = upload_maybe_quantized(
                 &store,
                 backend,
                 &format!("{prefix}.mlp.gate_proj.weight"),
                 &[inter, hidden],
                 quantize,
             )?;
-            let up = upload_maybe_q4(
+            let up = upload_maybe_quantized(
                 &store,
                 backend,
                 &format!("{prefix}.mlp.up_proj.weight"),
                 &[inter, hidden],
                 quantize,
             )?;
-            let down = upload_maybe_q4(
+            let down = upload_maybe_quantized(
                 &store,
                 backend,
                 &format!("{prefix}.mlp.down_proj.weight"),
@@ -709,22 +684,22 @@ pub(crate) fn load_weights<B: GpuCore>(
                 let conv_dim = fused_dim; // Conv1D applied to concatenated QKV
                 let kernel_size = config.linear_conv_kernel_dim;
 
-                let qkv = upload_maybe_q4(
+                let qkv = upload_maybe_quantized(
                     &store, backend,
                     &format!("{prefix}.linear_attn.in_proj_qkv.weight"),
                     &[fused_dim, hidden], quantize,
                 )?;
-                let a = upload_maybe_q4(
+                let a = upload_maybe_quantized(
                     &store, backend,
                     &format!("{prefix}.linear_attn.in_proj_a.weight"),
                     &[config.linear_num_value_heads, hidden], quantize,
                 )?;
-                let b = upload_maybe_q4(
+                let b = upload_maybe_quantized(
                     &store, backend,
                     &format!("{prefix}.linear_attn.in_proj_b.weight"),
                     &[config.linear_num_value_heads, hidden], quantize,
                 )?;
-                let z = upload_maybe_q4(
+                let z = upload_maybe_quantized(
                     &store, backend,
                     &format!("{prefix}.linear_attn.in_proj_z.weight"),
                     &[v_dim, hidden], quantize,
@@ -735,7 +710,7 @@ pub(crate) fn load_weights<B: GpuCore>(
                     &format!("{prefix}.linear_attn.conv1d.weight"),
                     &[conv_dim, 1, kernel_size],
                 )?;
-                let out = upload_maybe_q4(
+                let out = upload_maybe_quantized(
                     &store, backend,
                     &format!("{prefix}.linear_attn.out_proj.weight"),
                     &[hidden, v_dim], quantize,
@@ -821,25 +796,10 @@ pub(crate) fn load_weights<B: GpuCore>(
                 let k_raw = &raw[q_bytes..q_bytes + kv_bytes];
                 let v_raw = &raw[q_bytes + kv_bytes..q_bytes + 2 * kv_bytes];
 
-                let qp = if quantize {
-                    let q4 = quantize_bf16_to_q4(q_raw, q_dim, hidden);
-                    backend.upload_tensor(&q4, &[q_dim, hidden], TensorDtype::Q4)
-                } else {
-                    backend.upload_tensor(q_raw, &[q_dim, hidden], TensorDtype::BF16)
-                };
-                let kp = if quantize {
-                    let q4 = quantize_bf16_to_q4(k_raw, kv_dim, hidden);
-                    backend.upload_tensor(&q4, &[kv_dim, hidden], TensorDtype::Q4)
-                } else {
-                    backend.upload_tensor(k_raw, &[kv_dim, hidden], TensorDtype::BF16)
-                };
-                let vp = if quantize {
-                    let q4 = quantize_bf16_to_q4(v_raw, kv_dim, hidden);
-                    backend.upload_tensor(&q4, &[kv_dim, hidden], TensorDtype::Q4)
-                } else {
-                    backend.upload_tensor(v_raw, &[kv_dim, hidden], TensorDtype::BF16)
-                };
-                let op = upload_maybe_q4(
+                let qp = upload_raw_maybe_quantized(backend, q_raw, &[q_dim, hidden], quantize);
+                let kp = upload_raw_maybe_quantized(backend, k_raw, &[kv_dim, hidden], quantize);
+                let vp = upload_raw_maybe_quantized(backend, v_raw, &[kv_dim, hidden], quantize);
+                let op = upload_maybe_quantized(
                     &store, backend,
                     &format!("{prefix}.self_attn.o_proj.weight"),
                     &[hidden, q_dim], quantize,
@@ -883,38 +843,28 @@ pub(crate) fn load_weights<B: GpuCore>(
                         z_raw.extend_from_slice(&raw[base + hd_bytes..base + 2 * hd_bytes]);
                     }
 
-                    let q_tensor = if quantize {
-                        let q4_data = quantize_bf16_to_q4(&q_raw, q_dim, hidden);
-                        backend.upload_tensor(&q4_data, &[q_dim, hidden], TensorDtype::Q4)
-                    } else {
-                        backend.upload_tensor(&q_raw, &[q_dim, hidden], TensorDtype::BF16)
-                    };
-                    let z_tensor = if quantize {
-                        let q4_data = quantize_bf16_to_q4(&z_raw, q_dim, hidden);
-                        backend.upload_tensor(&q4_data, &[q_dim, hidden], TensorDtype::Q4)
-                    } else {
-                        backend.upload_tensor(&z_raw, &[q_dim, hidden], TensorDtype::BF16)
-                    };
+                    let q_tensor = upload_raw_maybe_quantized(backend, &q_raw, &[q_dim, hidden], quantize);
+                    let z_tensor = upload_raw_maybe_quantized(backend, &z_raw, &[q_dim, hidden], quantize);
                     (q_tensor, Some(z_tensor))
                 } else {
-                    let qp = upload_maybe_q4(
+                    let qp = upload_maybe_quantized(
                         &store, backend,
                         &format!("{prefix}.self_attn.q_proj.weight"),
                         &[q_dim, hidden], quantize,
                     )?;
                     (qp, None)
                 };
-                let kp = upload_maybe_q4(
+                let kp = upload_maybe_quantized(
                     &store, backend,
                     &format!("{prefix}.self_attn.k_proj.weight"),
                     &[kv_dim, hidden], quantize,
                 )?;
-                let vp = upload_maybe_q4(
+                let vp = upload_maybe_quantized(
                     &store, backend,
                     &format!("{prefix}.self_attn.v_proj.weight"),
                     &[kv_dim, hidden], quantize,
                 )?;
-                let op = upload_maybe_q4(
+                let op = upload_maybe_quantized(
                     &store, backend,
                     &format!("{prefix}.self_attn.o_proj.weight"),
                     &[hidden, q_dim], quantize,
@@ -1073,8 +1023,12 @@ fn upload_norm_residual<B: GpuCore>(
     Ok(backend.upload_tensor(bytemuck::cast_slice(&bf16_out), shape, TensorDtype::BF16))
 }
 
-/// Upload a tensor, optionally quantising to Q4.
-fn upload_maybe_q4<B: GpuCore>(
+/// Upload a tensor, optionally quantising via the backend's quantisation format.
+///
+/// When `quantize` is true, delegates to `backend.quantize_upload()` which
+/// each backend can override to use its own format (e.g. Q4 for Metal,
+/// INT4 for CUDA).
+fn upload_maybe_quantized<B: GpuCore>(
     store: &TensorStore,
     backend: &B,
     name: &str,
@@ -1092,85 +1046,25 @@ fn upload_maybe_q4<B: GpuCore>(
         shape == expected_shape,
         "tensor '{name}' shape mismatch: expected {expected_shape:?}, got {shape:?}"
     );
-    anyhow::ensure!(
-        shape.len() == 2 && shape[1] % 32 == 0,
-        "Q4 quantisation requires 2D shape with K divisible by 32, got {shape:?}"
-    );
 
-    let q4_data = quantize_bf16_to_q4(view.data(), shape[0], shape[1]);
-    Ok(backend.upload_tensor(&q4_data, shape, TensorDtype::Q4))
+    Ok(backend.quantize_upload(view.data(), shape))
 }
 
-// ---------------------------------------------------------------------------
-// Q4 quantisation.
-// ---------------------------------------------------------------------------
-
-/// Quantise a bf16 weight matrix to block-wise Q4.
+/// Upload raw bf16 bytes, optionally quantising via the backend's format.
 ///
-/// Block layout (symmetric quantisation, block_size=32):
-///   For each block of 32 consecutive weights:
-///     scale = max(|w_i|) / 7.0           (maps [-max, max] to [-7, 7])
-///     q_i = clamp(round(w_i / scale), -8, 7)  (4-bit signed, range [-8, 7])
-///     stored as unsigned: u_i = q_i + 8  (range [0, 15], fits in 4 bits)
-///
-///   Output per block (20 bytes):
-///     [0..4]:   f32 scale (little-endian)
-///     [4..20]:  16 bytes, 2 packed nibbles each
-///               byte[i] = u[2i] | (u[2i+1] << 4)
-fn quantize_bf16_to_q4(bf16_data: &[u8], m: usize, k: usize) -> Vec<u8> {
-    assert_eq!(bf16_data.len(), m * k * 2);
-
-    // Try zero-copy cast first; fall back to a copy if the mmap slice
-    // isn't 2-byte aligned (can happen with some safetensors packing).
-    let owned_buf: Vec<bf16>;
-    let values: &[bf16] = match bytemuck::try_cast_slice(bf16_data) {
-        Ok(v) => v,
-        Err(_) => {
-            owned_buf = bf16_data
-                .chunks_exact(2)
-                .map(|c| bf16::from_le_bytes([c[0], c[1]]))
-                .collect();
-            &owned_buf
-        }
-    };
-    assert_eq!(values.len(), m * k);
-
-    let blocks_per_row = k / 32;
-    let mut out = vec![0u8; gpu::q4_byte_count(m, k)];
-
-    for row in 0..m {
-        for block in 0..blocks_per_row {
-            let src_offset = row * k + block * 32;
-            let dst_offset = (row * blocks_per_row + block) * 20;
-
-            // Find max absolute value in the block for scale computation.
-            let mut max_abs: f32 = 0.0;
-            for i in 0..32 {
-                let v = values[src_offset + i].to_f32().abs();
-                if v > max_abs {
-                    max_abs = v;
-                }
-            }
-            let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 7.0 };
-            let inv_scale = 1.0 / scale;
-
-            // Write scale.
-            out[dst_offset..dst_offset + 4].copy_from_slice(&scale.to_le_bytes());
-
-            // Quantise and pack pairs of weights into bytes.
-            for i in 0..16 {
-                let v0 = values[src_offset + i * 2].to_f32();
-                let v1 = values[src_offset + i * 2 + 1].to_f32();
-
-                let q0 = ((v0 * inv_scale).round() as i32).clamp(-8, 7) + 8;
-                let q1 = ((v1 * inv_scale).round() as i32).clamp(-8, 7) + 8;
-
-                out[dst_offset + 4 + i] = (q0 as u8) | ((q1 as u8) << 4);
-            }
-        }
+/// Like `upload_maybe_quantized` but for pre-sliced byte buffers (e.g. when
+/// splitting a fused QKV or MoE expert weight from a larger tensor).
+fn upload_raw_maybe_quantized<B: GpuCore>(
+    backend: &B,
+    bf16_data: &[u8],
+    shape: &[usize],
+    quantize: bool,
+) -> B::Tensor {
+    if quantize {
+        backend.quantize_upload(bf16_data, shape)
+    } else {
+        backend.upload_tensor(bf16_data, shape, TensorDtype::BF16)
     }
-
-    out
 }
 
 // ---------------------------------------------------------------------------

@@ -45,4 +45,22 @@ pub(crate) trait GpuCore: Send + Sync {
 
     /// Return the total byte count of a tensor's data.
     fn tensor_byte_count(&self, tensor: &Self::Tensor) -> usize;
+
+    /// Quantise bf16 weight data and upload to the GPU.
+    ///
+    /// Takes raw bf16 bytes for a 2D weight matrix [m, k] and returns a
+    /// quantised tensor in whatever format this backend's matmul kernels
+    /// expect.  The default implementation uses the Q4 block format
+    /// (see `gpu::quantize_bf16_to_q4`).
+    ///
+    /// Backends with a different quantisation format (e.g. CUDA with
+    /// CUTLASS INT4) override this to produce their own layout.
+    fn quantize_upload(&self, bf16_data: &[u8], shape: &[usize]) -> Self::Tensor {
+        assert!(
+            shape.len() == 2 && shape[1] % 32 == 0,
+            "quantize_upload requires 2D shape with K divisible by 32, got {shape:?}"
+        );
+        let q4_data = super::super::quantize_bf16_to_q4(bf16_data, shape[0], shape[1]);
+        self.upload_tensor(&q4_data, shape, TensorDtype::Q4)
+    }
 }
