@@ -594,7 +594,10 @@ pub(crate) fn final_norm_and_lm_head_prefill<B: GpuCore + GpuNorm + GpuMatmul>(
     backend.rms_norm_batch(&bufs.hidden, &weights.norm_weight, eps, &bufs.norm_buf, bs);
 
     // Extract last token's hidden state to single-token norm_buf.
-    let hidden_byte_size = hidden_size * 2; // bf16
+    // Hidden state tensors are always bf16 (the compute dtype for activations),
+    // but we use TensorDtype::BF16.byte_size() instead of hardcoding `* 2`
+    // so the assumption is explicit and grep-able, not a magic number.
+    let hidden_byte_size = hidden_size * crate::gpu::TensorDtype::BF16.byte_size();
     let full_tensor_bytes = backend.tensor_byte_count(&bufs.norm_buf);
     let mut host_buf = vec![0u8; full_tensor_bytes];
     backend.copy_to_host(&bufs.norm_buf, &mut host_buf);

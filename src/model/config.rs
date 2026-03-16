@@ -632,19 +632,30 @@ impl ModelConfig {
 
     /// Estimate total GPU memory for model weights in bytes.
     ///
-    /// Matches the loading logic in loader.rs: projection weights are Q4 when
-    /// `quantize` is true, everything else (embeddings, norms, biases, router
-    /// gates) stays BF16.
-    pub fn estimate_weight_bytes(&self, quantize: bool) -> usize {
+    /// Matches the loading logic in loader.rs: projection weights are quantised
+    /// when `quantize` is true, everything else (embeddings, norms, biases,
+    /// router gates) stays BF16.
+    ///
+    /// The `quantized_proj_bytes` closure returns the byte count for a quantised
+    /// [m, k] projection weight.  Callers pass `|m, k| backend.quantized_weight_bytes(m, k)`
+    /// so the estimate matches whatever quantisation format the backend uses —
+    /// without config needing to know the format itself.
+    pub fn estimate_weight_bytes(
+        &self,
+        quantize: bool,
+        quantized_proj_bytes: impl Fn(usize, usize) -> usize,
+    ) -> usize {
         let hidden = self.hidden_size;
         let q_dim = self.num_attention_heads * self.head_dim;
         let kv_dim = self.num_key_value_heads * self.head_dim;
         let inter = self.intermediate_size;
 
         // Helper: byte count for a [m, k] projection weight.
+        // When quantising, delegates to the backend-provided closure so the
+        // estimate matches the backend's actual quantisation format.
         let proj = |m: usize, k: usize| -> usize {
             if quantize {
-                crate::gpu::q4_byte_count(m, k)
+                quantized_proj_bytes(m, k)
             } else {
                 m * k * 2 // bf16
             }
@@ -725,8 +736,13 @@ impl ModelConfig {
     ///
     /// Uses 75% of available memory for KV cache, leaving headroom for scratch
     /// buffers, Metal overhead, and macOS.  Result is clamped to [256, 8192].
-    pub fn recommended_kv_blocks(&self, gpu_budget: u64, quantize: bool) -> usize {
-        let weight_bytes = self.estimate_weight_bytes(quantize) as u64;
+    pub fn recommended_kv_blocks(
+        &self,
+        gpu_budget: u64,
+        quantize: bool,
+        quantized_proj_bytes: impl Fn(usize, usize) -> usize,
+    ) -> usize {
+        let weight_bytes = self.estimate_weight_bytes(quantize, quantized_proj_bytes) as u64;
         // Reserve 512 MB for scratch buffers and Metal overhead.
         let scratch_overhead = 512 * 1024 * 1024u64;
         let available = gpu_budget.saturating_sub(weight_bytes + scratch_overhead);
@@ -1192,8 +1208,9 @@ mod tests {
     #[test]
     fn test_estimate_weight_bytes_sanity() {
         let Some(config) = load_config("llama-3.2-1b") else { return };
-        let bf16_bytes = config.estimate_weight_bytes(false);
-        let q4_bytes = config.estimate_weight_bytes(true);
+        let q4_proj = |m, k| crate::gpu::q4_byte_count(m, k);
+        let bf16_bytes = config.estimate_weight_bytes(false, &q4_proj);
+        let q4_bytes = config.estimate_weight_bytes(true, &q4_proj);
         // BF16 should be larger than Q4
         assert!(bf16_bytes > q4_bytes, "bf16={bf16_bytes} should be > q4={q4_bytes}");
         // Sanity: 1B model should be roughly 2GB bf16

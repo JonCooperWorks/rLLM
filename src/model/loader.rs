@@ -72,7 +72,7 @@ use safetensors::SafeTensors;
 
 use super::config::{ModelArch, ModelConfig};
 use super::tokenizer::Tokenizer;
-use crate::gpu::{self, GpuCore, TensorDtype};
+use crate::gpu::{GpuCore, TensorDtype};
 
 // ---------------------------------------------------------------------------
 // TensorStore — abstracts single-file vs sharded safetensors.

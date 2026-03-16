@@ -82,10 +82,10 @@ pub(crate) fn exec(args: BatchArgs) -> anyhow::Result<()> {
     );
 
     // Create paged KV pool: enough blocks for all prompts + generation.
-    // Each prompt needs ceil(prompt_len / 16) blocks for prefill, plus
-    // ceil(max_tokens / 16) blocks for generation.
-    let max_blocks_per_seq =
-        (512 + args.max_tokens + kv_cache::BLOCK_SIZE - 1) / kv_cache::BLOCK_SIZE;
+    // Each prompt needs blocks for prefill plus blocks for generation.
+    // Uses kv_cache::blocks_needed_for() to encapsulate block size arithmetic —
+    // callers shouldn't need to know the block size to estimate capacity.
+    let max_blocks_per_seq = kv_cache::blocks_needed_for(512 + args.max_tokens);
     let num_blocks = prompts.len() * max_blocks_per_seq;
     eprintln!(
         "KV pool: {} blocks ({} per sequence)",

@@ -73,4 +73,14 @@ pub(crate) trait GpuCore: Send + Sync {
         let q4_data = super::super::quantize_bf16_to_q4(bf16_data, shape[0], shape[1]);
         self.upload_tensor(&q4_data, shape, TensorDtype::Q4)
     }
+
+    /// Estimate the byte count of a 2D weight [m, k] after quantisation.
+    ///
+    /// Used by config.rs to predict GPU memory usage before loading weights.
+    /// Must match whatever format `quantize_upload` produces — the default
+    /// returns the Q4 byte count.  Backends with a different format override
+    /// both methods together.
+    fn quantized_weight_bytes(&self, m: usize, k: usize) -> usize {
+        super::super::q4_byte_count(m, k)
+    }
 }

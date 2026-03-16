@@ -40,6 +40,16 @@ pub(crate) const BLOCK_SIZE: usize = 16;
 /// MAX_BLOCKS_PER_SEQ * BLOCK_SIZE = 8192 * 16 = 131072 tokens = 128K context).
 pub(crate) const MAX_BLOCKS_PER_SEQ: usize = 8192;
 
+/// Number of blocks needed to store `token_count` tokens.
+///
+/// Module-level convenience function that encapsulates the block size so
+/// callers (scheduler, commands) don't need to import BLOCK_SIZE directly.
+/// This keeps the block size as an internal implementation detail of the
+/// KV cache module — if we ever change it, only this module needs updating.
+pub(crate) fn blocks_needed_for(token_count: usize) -> usize {
+    (token_count + BLOCK_SIZE - 1) / BLOCK_SIZE
+}
+
 /// A pool of KV cache blocks shared across all sequences.
 ///
 /// The pool owns the physical GPU memory for all K and V caches across all
@@ -115,9 +125,36 @@ impl<B: GpuCore> KvPool<B> {
     }
 
     /// Number of physical blocks in the pool.
-    #[allow(dead_code)]
     pub fn total_blocks(&self) -> usize {
         self.num_physical_blocks
+    }
+
+    /// Maximum number of token positions across the entire pool.
+    ///
+    /// Callers use this for status messages instead of computing
+    /// `num_blocks * BLOCK_SIZE` themselves — keeps the block size
+    /// encapsulated within the KV cache module.
+    pub fn max_tokens(&self) -> usize {
+        self.num_physical_blocks * BLOCK_SIZE
+    }
+
+    /// Total GPU memory used by this pool in bytes.
+    ///
+    /// Accounts for K + V pools across all layers.  Used for memory
+    /// reporting in commands and the API server.
+    pub fn total_memory_bytes(&self) -> usize {
+        // 2 (K+V) × num_layers × num_blocks × BLOCK_SIZE × kv_dim × 2 (bf16)
+        2 * self.num_layers * self.num_physical_blocks * BLOCK_SIZE * self.kv_dim * 2
+    }
+
+    /// Number of blocks needed to store `token_count` tokens.
+    ///
+    /// Encapsulates the `ceil(tokens / BLOCK_SIZE)` arithmetic so callers
+    /// (scheduler, commands) don't need to know the block size.
+    /// Delegates to the module-level `blocks_needed_for()` for convenience.
+    #[allow(dead_code)]
+    pub fn blocks_needed_for(token_count: usize) -> usize {
+        blocks_needed_for(token_count)
     }
 
     /// Allocate one physical block from the free list.  Returns None if OOM.

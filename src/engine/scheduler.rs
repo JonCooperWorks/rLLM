@@ -31,7 +31,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::gpu::GpuBackend;
-use crate::model::kv_cache::{BLOCK_SIZE, KvPool, SeqKvState};
+use crate::model::kv_cache::{self, KvPool, SeqKvState};
 
 /// Unique identifier for a sequence request.
 pub(crate) type SeqId = u64;
@@ -102,7 +102,9 @@ impl<B: GpuBackend> Scheduler<B> {
 
         while !self.waiting.is_empty() && self.active.len() < self.max_active {
             let (_, req) = self.waiting.front().unwrap();
-            let prompt_blocks = (req.prompt_tokens.len() + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            // Encapsulate block size arithmetic — the scheduler doesn't need
+            // to know the block size to check admission capacity.
+            let prompt_blocks = kv_cache::blocks_needed_for(req.prompt_tokens.len());
             if self.kv_pool.free_block_count() < prompt_blocks {
                 break;
             }
