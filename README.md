@@ -24,6 +24,29 @@ Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf
 
 Q4 quantization (`--quantize`) gives ~1.3-3.5x faster decode by reducing memory bandwidth. Mixtral 8x7B, Qwen3, and Qwen3.5 MoE models use Mixture of Experts with sparse activation (only a fraction of params active per token). Mixtral activates 2 of 8 experts (~12.9B of 46.7B active). Qwen3.5 also uses DeltaNet linear attention layers. Mixtral requires Q4 (bf16 would need ~87 GB). Large models (Gemma 3 27B, Phi-4, Qwen3/3.5 MoE) run in bf16 but are slow because the weights consume most of the 64 GB unified memory, leaving limited headroom for KV cache. Q4 is strongly recommended for models over ~8B params. Dynamic KV cache sizing automatically adjusts block count based on available GPU memory.
 
+**NVIDIA H100 80GB HBM3** — 3.35 TB/s bandwidth. Measured via CLI (`rllm run`), single run, 128 max tokens, prompt "The meaning of life is".
+
+| Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
+|---|---|---|---|---|---|
+| Llama 3.2 1B Instruct | 1.2B | 315 tok/s | 258 tok/s | 15 ms | 19 ms |
+| Llama 3.2 3B Instruct | 3.2B | 150 tok/s | 110 tok/s | 29 ms | 44 ms |
+| Qwen 2.5 3B Instruct | 3.1B | 127 tok/s | 101 tok/s | 25 ms | 35 ms |
+| Gemma 3 4B Instruct | 4.3B | 94 tok/s | 73 tok/s | 20 ms | 46 ms |
+| Qwen 2.5 7B Instruct | 7.6B | 97 tok/s | 55 tok/s | 43 ms | 89 ms |
+| Mistral 7B Instruct | 7.2B | 102 tok/s | 57 tok/s | 55 ms | 111 ms |
+| Llama 3.1 8B Instruct | 8.0B | 96 tok/s | 54 tok/s | 52 ms | 111 ms |
+| Qwen3.5 9B | ~9B | 76 tok/s | 47 tok/s | 876 ms | 863 ms |
+| Phi-4 | 14.7B | 59 tok/s | 30 tok/s | 78 ms | 171 ms |
+| Gemma 3 27B Instruct | 27.4B | 32 tok/s | 15 tok/s | 116 ms | 327 ms |
+| Qwen3.5 27B | ~27B | 29 tok/s | 16 tok/s | 2,100 ms | 2,300 ms |
+| Qwen3 Coder 30B-A3B Instruct | 30.5B (3.3B active) | 49 tok/s | 56 tok/s | 339 ms | 274 ms |
+| DeepSeek-R1-Distill-Qwen-32B | 32.8B | 29 tok/s | 14 tok/s | 139 ms | 355 ms |
+| Qwen3.5 35B-A3B | 35.1B (3.3B active) | 46 tok/s | 50 tok/s | 531 ms | 513 ms |
+| Mixtral 8x7B Instruct | 46.7B (12.9B active) | — | 32 tok/s | — | 939 ms |
+| Llama 3.1 70B Instruct | 70.6B | — | 7 tok/s | — | 884 ms |
+
+Mixtral and Llama 70B exceed 80 GB in bf16. MoE models (Qwen3 Coder, Qwen3.5 35B-A3B) can be faster in Q4 than bf16 because expert weights dominate bandwidth. Qwen3.5 models have high TTFT due to DeltaNet linear attention initialization overhead.
+
 ## Features
 
 - **Multi-architecture** — Llama 3, Qwen 2.5, Mistral, Mixtral 8x7B, Qwen3 MoE, Qwen3.5, Phi-4, and Gemma 3 from the same codebase
