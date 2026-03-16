@@ -109,6 +109,7 @@ pub(crate) struct MetalBackend {
     pub(crate) pipeline_copy_kv: metal::ComputePipelineState,
     pub(crate) pipeline_paged_copy_kv: metal::ComputePipelineState,
     pub(crate) pipeline_paged_attention: metal::ComputePipelineState,
+    pub(crate) pipeline_paged_attention_fused: metal::ComputePipelineState,
 
     // Phase 3: batched prefill pipelines.
     pub(crate) pipeline_gemm_bf16: metal::ComputePipelineState,
@@ -206,6 +207,12 @@ impl MetalBackend {
             &device,
             METAL_SOURCE_ATTENTION,
             "paged_attention",
+            &compile_opts,
+        )?;
+        let pipeline_paged_attention_fused = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_ATTENTION,
+            "paged_attention_fused",
             &compile_opts,
         )?;
 
@@ -321,6 +328,7 @@ impl MetalBackend {
             pipeline_copy_kv,
             pipeline_paged_copy_kv,
             pipeline_paged_attention,
+            pipeline_paged_attention_fused,
             pipeline_gemm_bf16,
             pipeline_gemm_q4,
             pipeline_rms_norm_batch,

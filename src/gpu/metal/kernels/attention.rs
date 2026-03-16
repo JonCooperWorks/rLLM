@@ -76,6 +76,18 @@ struct PagedCopyKvBatchParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct PagedAttentionFusedParams {
+    pos: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    block_size: u32,
+    window_size: u32,
+    attn_scale: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct PrefillAttentionParams {
     chunk_size: u32,
     start_pos: u32,
@@ -243,6 +255,49 @@ impl GpuAttention for MetalBackend {
             ],
             MTLSize::new(total, 1, 1),
             MTLSize::new(256.min(total), 1, 1),
+        );
+    }
+
+    fn paged_attention_fused(
+        &self,
+        q: &MetalTensor,
+        k: &MetalTensor,
+        v: &MetalTensor,
+        k_pool: &MetalTensor,
+        v_pool: &MetalTensor,
+        block_table: &MetalTensor,
+        out: &MetalTensor,
+        pos: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        window_size: u32,
+        attn_scale: f32,
+    ) {
+        let params = PagedAttentionFusedParams {
+            pos,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            block_size: crate::model::kv_cache::BLOCK_SIZE as u32,
+            window_size,
+            attn_scale,
+        };
+        let threads_per_group: u64 = 256;
+        self.dispatch_async(
+            &self.pipeline_paged_attention_fused,
+            &params,
+            &[
+                (&q.buffer, 1),
+                (&k.buffer, 2),
+                (&v.buffer, 3),
+                (&k_pool.buffer, 4),
+                (&v_pool.buffer, 5),
+                (&block_table.buffer, 6),
+                (&out.buffer, 7),
+            ],
+            MTLSize::new(num_heads as u64 * threads_per_group, 1, 1),
+            MTLSize::new(threads_per_group, 1, 1),
         );
     }
 
