@@ -1,11 +1,21 @@
 // ---------------------------------------------------------------------------
-// GpuCore — device management, tensor memory, and synchronisation.
+// GpuCore — device management, tensor memory, synchronisation, and
+// weight quantisation.
 //
 // This is the foundation trait that all other Gpu* traits extend.  It owns
 // the associated `Tensor` type and provides the basic infrastructure every
 // backend needs: device queries, tensor allocation/upload/download, and
 // the flush/submit sync primitives that control when the CPU blocks on
 // GPU work.
+//
+// Quantisation:
+//   `quantize_upload` converts bf16 weight data into the backend's preferred
+//   quantised format and uploads it in one step.  The default implementation
+//   uses the Q4 block format (see gpu/mod.rs::quantize_bf16_to_q4).  A CUDA
+//   backend could override this to produce CUTLASS INT4 or any other layout
+//   that its matmul kernels understand.  The loader calls this method instead
+//   of doing format-specific quantisation itself — so weight loading is
+//   backend-agnostic.
 //
 // Metal impl: gpu/metal/kernels/core.rs
 // ---------------------------------------------------------------------------
