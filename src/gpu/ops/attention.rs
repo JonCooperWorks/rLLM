@@ -81,6 +81,44 @@ pub(crate) trait GpuAttention: GpuCore {
         head_dim: u32,
     );
 
+    /// Fused KV cache write + paged attention in a single dispatch.
+    ///
+    /// Writes K and V into the paged cache and computes attention in one call.
+    /// The default implementation calls `copy_to_paged_kv_cache` (×2) then
+    /// `paged_attention` — three separate kernel launches.  Backends can
+    /// override this with a single fused kernel that:
+    ///   1. Loads the block table once (not three times)
+    ///   2. Keeps the current token's K/V in fast memory (threadgroup/shared)
+    ///      instead of writing to global memory and immediately re-reading
+    ///   3. Eliminates 2 kernel launch overheads per layer per token
+    ///
+    /// The fused path is a pure performance optimisation — the default gives
+    /// correct results on any backend without additional implementation work.
+    fn paged_attention_fused(
+        &self,
+        q: &Self::Tensor,
+        k: &Self::Tensor,
+        v: &Self::Tensor,
+        k_pool: &Self::Tensor,
+        v_pool: &Self::Tensor,
+        block_table: &Self::Tensor,
+        out: &Self::Tensor,
+        pos: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        window_size: u32,
+        attn_scale: f32,
+    ) {
+        self.copy_to_paged_kv_cache(k, k_pool, block_table, pos, num_kv_heads, head_dim);
+        self.copy_to_paged_kv_cache(v, v_pool, block_table, pos, num_kv_heads, head_dim);
+        self.paged_attention(
+            q, k_pool, v_pool, block_table, out,
+            pos + 1, num_heads, num_kv_heads, head_dim,
+            window_size, attn_scale,
+        );
+    }
+
     /// Causal prefill attention on dense Q/K/V tensors.
     fn prefill_attention(
         &self,

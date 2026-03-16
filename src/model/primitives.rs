@@ -193,6 +193,12 @@ pub(crate) fn apply_rope<B: GpuRope>(
 
 /// Write K/V to paged cache and compute attention.
 ///
+/// Delegates to `paged_attention_fused`, which backends can override with a
+/// single fused kernel.  The default implementation calls the 3 separate
+/// methods (copy K, copy V, attention) — correct everywhere, but backends
+/// that fuse the operation avoid re-reading the block table and keep the
+/// current token's K/V in fast memory.
+///
 /// `window_size`: sliding window size (0 = full context, attend to all positions).
 /// `attn_scale`: custom attention scale (0.0 = default 1/sqrt(head_dim)).
 /// Most models pass 0/0.0 for standard full-context attention with default scaling.
@@ -212,18 +218,11 @@ pub(crate) fn paged_kv_and_attention<B: GpuAttention>(
     window_size: u32,
     attn_scale: f32,
 ) {
-    backend.copy_to_paged_kv_cache(
-        k_buf, &pool.k_pool[layer_idx], &seq_state.block_table_gpu,
-        pos, num_kv_heads, head_dim,
-    );
-    backend.copy_to_paged_kv_cache(
-        v_buf, &pool.v_pool[layer_idx], &seq_state.block_table_gpu,
-        pos, num_kv_heads, head_dim,
-    );
-    backend.paged_attention(
-        q_buf, &pool.k_pool[layer_idx], &pool.v_pool[layer_idx],
+    backend.paged_attention_fused(
+        q_buf, k_buf, v_buf,
+        &pool.k_pool[layer_idx], &pool.v_pool[layer_idx],
         &seq_state.block_table_gpu, attn_out,
-        pos + 1, num_heads, num_kv_heads, head_dim,
+        pos, num_heads, num_kv_heads, head_dim,
         window_size, attn_scale,
     );
 }
