@@ -242,58 +242,51 @@ src/
 | Attention | Fused single-pass softmax+V, head_dim-specialised pipelines | 1.3-2.8x |
 | Batching | Continuous batching (N sequences share the GPU) | ~Nx |
 
-## Model Setup
+## Scripts
 
-Download models from [Hugging Face](https://huggingface.co) in safetensors format:
+The scripts make it easy to get running quickly on a rented GPU (e.g. Lambda, RunPod, Vast.ai) — install Rust, pull models, and benchmark in a few commands.
 
-```bash
-# Install the hf CLI
-curl -LsSf https://hf.co/cli/install.sh | bash
-
-# Download models
-hf download meta-llama/Llama-3.2-1B-Instruct --local-dir models/llama-3.2-1b-instruct
-hf download Qwen/Qwen2.5-7B-Instruct --local-dir models/qwen-2.5-7b-instruct
-hf download mistralai/Mistral-7B-Instruct-v0.3 --local-dir models/mistral-7b-instruct
-hf download google/gemma-3-4b-it --local-dir models/gemma-3-4b-it
-hf download microsoft/phi-4 --local-dir models/phi-4
-```
-
-<details>
-<summary>All supported model downloads</summary>
+| Script | Description |
+|---|---|
+| `scripts/install-rust.sh` | Installs Rust via rustup |
+| `scripts/download-models.sh` | Downloads all model weights from HuggingFace (handles auth, filters by tier) |
+| `scripts/benchmark.sh` | Runs each downloaded model in bf16 and Q4, outputs a Markdown results table |
 
 ```bash
-# Llama 3 — base models
-hf download meta-llama/Llama-3.2-1B --local-dir models/llama-3.2-1b
-hf download meta-llama/Llama-3.2-3B --local-dir models/llama-3.2-3b
-hf download meta-llama/Llama-3.1-8B --local-dir models/llama-3.1-8b
-
-# Llama 3 — instruct models
-hf download meta-llama/Llama-3.2-1B-Instruct --local-dir models/llama-3.2-1b-instruct
-hf download meta-llama/Llama-3.2-3B-Instruct --local-dir models/llama-3.2-3b-instruct
-hf download meta-llama/Llama-3.1-8B-Instruct --local-dir models/llama-3.1-8b-instruct
-
-# Mistral / Mixtral
-hf download mistralai/Mistral-7B-Instruct-v0.3 --local-dir models/mistral-7b-instruct
-hf download mistralai/Mixtral-8x7B-Instruct-v0.1 --local-dir models/mixtral-8x7b-instruct
-
-# Qwen
-hf download Qwen/Qwen2.5-3B-Instruct --local-dir models/qwen-2.5-3b-instruct
-hf download Qwen/Qwen2.5-7B-Instruct --local-dir models/qwen-2.5-7b-instruct
-hf download Qwen/Qwen3-Coder-30B-A3B-Instruct --local-dir models/qwen3-coder-30b-a3b-instruct
-
-# Gemma 3
-hf download google/gemma-3-4b-it --local-dir models/gemma-3-4b-it
-hf download google/gemma-3-27b-it --local-dir models/gemma-3-27b-it
-
-# Phi-4
-hf download microsoft/phi-4 --local-dir models/phi-4
-
-# DeepSeek R1 distilled
-hf download deepseek-ai/DeepSeek-R1-Distill-Qwen-32B --local-dir models/DeepSeek-R1-Distill-Qwen-32B
+# Quick setup on a fresh machine
+scripts/install-rust.sh
+scripts/download-models.sh --small
+cargo run --release -- run --model models/llama-3.2-1b-instruct --prompt "Hello" --chat
 ```
 
-</details>
+### Download models
 
-> **Note:** Llama, Gemma, and Mistral models are gated — accept the license on Hugging Face and run `hf auth login` before downloading. Qwen models are open access.
+```bash
+# Small tier — 1B–8B models (~100 GB)
+scripts/download-models.sh --small
+
+# Medium tier (default) — all models up to 35B (~500 GB)
+scripts/download-models.sh
+
+# Big tier — adds 70B+ models (~1 TB+)
+scripts/download-models.sh --big
+```
+
+Gated models (Llama, Gemma, Mistral) require a HuggingFace token — set `HF_TOKEN` or run `hf auth login` first. Qwen models are open access.
+
+### Benchmark
+
+```bash
+# Benchmark small models only
+scripts/benchmark.sh --small
+
+# Q4 only (for models that don't fit in VRAM as bf16)
+scripts/benchmark.sh --q4-only
+
+# Multiple runs for more stable numbers
+scripts/benchmark.sh --runs 3
+```
+
+Auto-detects the GPU (Apple Silicon or NVIDIA), runs each model in bf16 and Q4, and prints a Markdown table with tok/s and TTFT.
 
 Each model directory should contain `config.json`, `tokenizer.json`, and one or more `.safetensors` weight files.
