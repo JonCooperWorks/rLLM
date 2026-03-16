@@ -130,6 +130,7 @@ pub(crate) struct CudaBackend {
     pub(crate) fn_silu_elem: CudaFunction,
     pub(crate) fn_mul_elem: CudaFunction,
     pub(crate) fn_deltanet_step: CudaFunction,
+
 }
 
 impl CudaBackend {

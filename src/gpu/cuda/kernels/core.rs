@@ -10,6 +10,7 @@
 // unified memory, CUDA requires explicit host↔device copies.  `flush()`
 // synchronises the stream, ensuring all queued GPU work completes before
 // the CPU reads device data.
+//
 // ---------------------------------------------------------------------------
 
 use cudarc::driver::DevicePtr;
@@ -117,4 +118,9 @@ impl GpuCore for CudaBackend {
         self.stream.memcpy_dtoh(&tensor.buf, &mut dst[..byte_count])
             .expect("CUDA memcpy_dtoh failed");
     }
+
+    // quantize_upload: uses the default CPU quantization from GpuCore.
+    // GPU-side quantization was considered but doubles peak VRAM during loading
+    // (holds bf16 temp + Q4 output simultaneously), which causes OOM on models
+    // that nearly fill device memory.  CPU quantize + upload-Q4 only is safer.
 }

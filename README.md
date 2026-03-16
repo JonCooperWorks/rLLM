@@ -44,8 +44,9 @@ Q4 quantization (`--quantize`) gives ~1.3-3.5x faster decode by reducing memory 
 | Qwen3.5 35B-A3B | 35.1B (3.3B active) | 46 tok/s | 50 tok/s | 531 ms | 513 ms |
 | Mixtral 8x7B Instruct | 46.7B (12.9B active) | — | 32 tok/s | — | 939 ms |
 | Llama 3.1 70B Instruct | 70.6B | — | 7 tok/s | — | 884 ms |
+| Qwen 2.5 72B Instruct | 72.7B | — | 6.5 tok/s | — | 768 ms |
 
-Mixtral and Llama 70B exceed 80 GB in bf16. MoE models (Qwen3 Coder, Qwen3.5 35B-A3B) can be faster in Q4 than bf16 because expert weights dominate bandwidth. Qwen3.5 models have high TTFT due to DeltaNet linear attention initialization overhead.
+Mixtral, Llama 70B, and Qwen 72B exceed 80 GB in bf16. MoE models (Qwen3 Coder, Qwen3.5 35B-A3B) can be faster in Q4 than bf16 because expert weights dominate bandwidth. Qwen3.5 models have high TTFT due to DeltaNet linear attention initialization overhead.
 
 ## Features
 
