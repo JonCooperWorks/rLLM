@@ -121,8 +121,9 @@ impl GpuAttention for MetalBackend {
             attn_scale,
         };
         let threads_per_group: u64 = 256;
+        let pipeline = if head_dim > 128 { &self.pipeline_attention_hd256 } else { &self.pipeline_attention };
         self.dispatch_async(
-            &self.pipeline_attention,
+            pipeline,
             &params,
             &[
                 (&q.buffer, 1),
@@ -211,8 +212,9 @@ impl GpuAttention for MetalBackend {
             attn_scale,
         };
         let threads_per_group: u64 = 256;
+        let pipeline = if head_dim > 128 { &self.pipeline_paged_attention_hd256 } else { &self.pipeline_paged_attention };
         self.dispatch_async(
-            &self.pipeline_paged_attention,
+            pipeline,
             &params,
             &[
                 (&q.buffer, 1),
@@ -284,8 +286,9 @@ impl GpuAttention for MetalBackend {
             attn_scale,
         };
         let threads_per_group: u64 = 256;
+        let pipeline = if head_dim > 128 { &self.pipeline_paged_attention_fused_hd256 } else { &self.pipeline_paged_attention_fused };
         self.dispatch_async(
-            &self.pipeline_paged_attention_fused,
+            pipeline,
             &params,
             &[
                 (&q.buffer, 1),
@@ -326,8 +329,9 @@ impl GpuAttention for MetalBackend {
         };
         let threads_per_group: u64 = 256;
         let num_threadgroups = chunk_size as u64 * num_heads as u64;
+        let pipeline = if head_dim > 128 { &self.pipeline_prefill_attention_hd256 } else { &self.pipeline_prefill_attention };
         self.dispatch_async(
-            &self.pipeline_prefill_attention,
+            pipeline,
             &params,
             &[
                 (&q.buffer, 1),

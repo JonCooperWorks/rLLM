@@ -97,6 +97,8 @@ pub(crate) struct MetalBackend {
     pub(crate) pipeline_rope: metal::ComputePipelineState,
     #[allow(dead_code)]
     pub(crate) pipeline_attention: metal::ComputePipelineState,
+    #[allow(dead_code)]
+    pub(crate) pipeline_attention_hd256: metal::ComputePipelineState,
     pub(crate) pipeline_silu_mul: metal::ComputePipelineState,
     pub(crate) pipeline_gelu_mul: metal::ComputePipelineState,
     pub(crate) pipeline_scalar_mul: metal::ComputePipelineState,
@@ -109,7 +111,9 @@ pub(crate) struct MetalBackend {
     pub(crate) pipeline_copy_kv: metal::ComputePipelineState,
     pub(crate) pipeline_paged_copy_kv: metal::ComputePipelineState,
     pub(crate) pipeline_paged_attention: metal::ComputePipelineState,
+    pub(crate) pipeline_paged_attention_hd256: metal::ComputePipelineState,
     pub(crate) pipeline_paged_attention_fused: metal::ComputePipelineState,
+    pub(crate) pipeline_paged_attention_fused_hd256: metal::ComputePipelineState,
 
     // Phase 3: batched prefill pipelines.
     pub(crate) pipeline_gemm_bf16: metal::ComputePipelineState,
@@ -119,6 +123,7 @@ pub(crate) struct MetalBackend {
     pub(crate) pipeline_rope_batch: metal::ComputePipelineState,
     pub(crate) pipeline_paged_copy_kv_batch: metal::ComputePipelineState,
     pub(crate) pipeline_prefill_attention: metal::ComputePipelineState,
+    pub(crate) pipeline_prefill_attention_hd256: metal::ComputePipelineState,
 
     // MoE routing kernel.
     pub(crate) pipeline_top_k_softmax: metal::ComputePipelineState,
@@ -169,8 +174,19 @@ impl MetalBackend {
             "rotary_embedding",
             &compile_opts,
         )?;
+        // Compile attention kernels with two MAX_HEAD_DIM specialisations:
+        //   128 — covers Llama (64), Gemma 4B (96), Qwen/Mistral/Phi (128)
+        //   256 — covers Gemma 27B (256)
+        // The dispatch layer picks the right pipeline based on runtime head_dim.
+        // This avoids register pressure from oversized v_acc arrays: head_dim=64
+        // with MAX_HEAD_DIM=256 would waste 4x registers per thread.
+        let attn_src_128 = format!("#define MAX_HEAD_DIM 128\n{METAL_SOURCE_ATTENTION}");
+        let attn_src_256 = format!("#define MAX_HEAD_DIM 256\n{METAL_SOURCE_ATTENTION}");
+
         let pipeline_attention =
-            Self::make_pipeline(&device, METAL_SOURCE_ATTENTION, "attention", &compile_opts)?;
+            Self::make_pipeline(&device, &attn_src_128, "attention", &compile_opts)?;
+        let pipeline_attention_hd256 =
+            Self::make_pipeline(&device, &attn_src_256, "attention", &compile_opts)?;
         let pipeline_silu_mul =
             Self::make_pipeline(&device, METAL_SOURCE_ELEMENTWISE, "silu_mul", &compile_opts)?;
         let pipeline_gelu_mul =
@@ -193,25 +209,37 @@ impl MetalBackend {
             Self::make_pipeline(&device, METAL_SOURCE_EMBED, "embed_lookup", &compile_opts)?;
         let pipeline_copy_kv = Self::make_pipeline(
             &device,
-            METAL_SOURCE_ATTENTION,
+            &attn_src_128,
             "copy_to_kv_cache",
             &compile_opts,
         )?;
         let pipeline_paged_copy_kv = Self::make_pipeline(
             &device,
-            METAL_SOURCE_ATTENTION,
+            &attn_src_128,
             "copy_to_paged_kv_cache",
             &compile_opts,
         )?;
         let pipeline_paged_attention = Self::make_pipeline(
             &device,
-            METAL_SOURCE_ATTENTION,
+            &attn_src_128,
+            "paged_attention",
+            &compile_opts,
+        )?;
+        let pipeline_paged_attention_hd256 = Self::make_pipeline(
+            &device,
+            &attn_src_256,
             "paged_attention",
             &compile_opts,
         )?;
         let pipeline_paged_attention_fused = Self::make_pipeline(
             &device,
-            METAL_SOURCE_ATTENTION,
+            &attn_src_128,
+            "paged_attention_fused",
+            &compile_opts,
+        )?;
+        let pipeline_paged_attention_fused_hd256 = Self::make_pipeline(
+            &device,
+            &attn_src_256,
             "paged_attention_fused",
             &compile_opts,
         )?;
@@ -241,13 +269,19 @@ impl MetalBackend {
         )?;
         let pipeline_paged_copy_kv_batch = Self::make_pipeline(
             &device,
-            METAL_SOURCE_ATTENTION,
+            &attn_src_128,
             "copy_to_paged_kv_cache_batch",
             &compile_opts,
         )?;
         let pipeline_prefill_attention = Self::make_pipeline(
             &device,
-            METAL_SOURCE_ATTENTION,
+            &attn_src_128,
+            "prefill_attention",
+            &compile_opts,
+        )?;
+        let pipeline_prefill_attention_hd256 = Self::make_pipeline(
+            &device,
+            &attn_src_256,
             "prefill_attention",
             &compile_opts,
         )?;
@@ -317,6 +351,7 @@ impl MetalBackend {
             pipeline_matvec_q4,
             pipeline_rope,
             pipeline_attention,
+            pipeline_attention_hd256,
             pipeline_silu_mul,
             pipeline_gelu_mul,
             pipeline_scalar_mul,
@@ -328,7 +363,9 @@ impl MetalBackend {
             pipeline_copy_kv,
             pipeline_paged_copy_kv,
             pipeline_paged_attention,
+            pipeline_paged_attention_hd256,
             pipeline_paged_attention_fused,
+            pipeline_paged_attention_fused_hd256,
             pipeline_gemm_bf16,
             pipeline_gemm_q4,
             pipeline_rms_norm_batch,
@@ -336,6 +373,7 @@ impl MetalBackend {
             pipeline_rope_batch,
             pipeline_paged_copy_kv_batch,
             pipeline_prefill_attention,
+            pipeline_prefill_attention_hd256,
             pipeline_top_k_softmax,
             pipeline_conv1d_depthwise,
             pipeline_conv1d_shift,

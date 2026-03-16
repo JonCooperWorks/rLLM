@@ -88,9 +88,9 @@ impl Tokenizer {
             // <|endoftext|> (100257).  Uses tiktoken-based 100352-token vocab.
             ModelArch::Phi => (None, vec![100257, 100265]),
 
-            // Gemma 3: BOS=2 (<bos>).  Stop on <end_of_turn> (107) or <eos> (1).
+            // Gemma 3: BOS=2 (<bos>).  Stop on <end_of_turn> (106) or <eos> (1).
             // Gemma uses a 262144-token SentencePiece vocabulary.
-            ModelArch::Gemma3 => (Some(2), vec![1, 107]),
+            ModelArch::Gemma3 => (Some(2), vec![1, 106]),
         };
 
         Ok(Self {
@@ -193,5 +193,171 @@ impl Tokenizer {
     /// Used to stop the generation loop.
     pub fn is_eos(&self, token_id: u32) -> bool {
         self.eos_token_ids.contains(&token_id)
+    }
+
+    /// Decode tokens incrementally, simulating the streaming API path.
+    ///
+    /// Decodes the full `ids` buffer and returns only the text after
+    /// `prev_text_len` characters.  This is the pattern used by the API
+    /// server to avoid SentencePiece Strip decoder issues.
+    #[cfg(test)]
+    fn decode_incremental(&self, ids: &[u32], prev_text_len: usize) -> (String, usize) {
+        let full = self.decode(ids).unwrap();
+        let new_text = full[prev_text_len..].to_string();
+        (new_text, full.len())
+    }
+}
+
+// ===========================================================================
+// Tests — EOS token validation and incremental decode round-trip.
+//
+// These tests load actual model tokenizer files from disk to verify:
+//   1. Hardcoded EOS token IDs decode to the expected special token strings
+//   2. Incremental (token-by-token) decode preserves spaces correctly
+//
+// The incremental decode test catches the Mistral space-stripping bug:
+// SentencePiece's Strip decoder removes leading spaces when decoding
+// individual tokens, so we must decode the full buffer and diff.
+// ===========================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// Helper: load a tokenizer if the model directory exists on disk.
+    fn load_if_exists(model_dir: &str, arch: ModelArch) -> Option<Tokenizer> {
+        let path = Path::new("models").join(model_dir).join("tokenizer.json");
+        if path.exists() {
+            Some(Tokenizer::from_file(&path, arch).unwrap())
+        } else {
+            None
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // EOS token validation: verify hardcoded IDs match actual special tokens.
+    //
+    // For each model, encode the special token string (e.g. "<end_of_turn>")
+    // and check that the resulting token ID is in our EOS list.  This catches
+    // off-by-one errors like the Gemma 107→106 bug.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_eos_tokens_gemma3() {
+        let Some(tok) = load_if_exists("gemma-3-4b-it", ModelArch::Gemma3) else { return };
+        // <end_of_turn> should be token 106, and it should be EOS.
+        let ids = tok.inner.encode("<end_of_turn>", true).unwrap();
+        let eot_id = ids.get_ids().iter().find(|&&id| id != 2); // skip BOS=2
+        assert_eq!(eot_id, Some(&106), "Gemma <end_of_turn> should be token 106");
+        assert!(tok.is_eos(106), "Gemma token 106 should be EOS");
+        assert!(tok.is_eos(1), "Gemma token 1 (<eos>) should be EOS");
+        assert!(!tok.is_eos(107), "Gemma token 107 should NOT be EOS");
+    }
+
+    #[test]
+    fn test_eos_tokens_llama() {
+        let Some(tok) = load_if_exists("llama-3.2-1b-instruct", ModelArch::Llama) else { return };
+        let ids = tok.inner.encode("<|eot_id|>", true).unwrap();
+        assert!(ids.get_ids().contains(&128009), "Llama <|eot_id|> should be 128009");
+        assert!(tok.is_eos(128001), "Llama EOS token");
+        assert!(tok.is_eos(128009), "Llama EOT token");
+    }
+
+    #[test]
+    fn test_eos_tokens_mistral() {
+        let Some(tok) = load_if_exists("mistral-7b-instruct", ModelArch::Mistral) else { return };
+        assert!(tok.is_eos(2), "Mistral EOS=2");
+        // Token 2 should decode to </s>.
+        let text = tok.decode(&[2]).unwrap();
+        assert!(text.is_empty() || text == "</s>", "Mistral EOS decode: {text:?}");
+    }
+
+    #[test]
+    fn test_eos_tokens_qwen2() {
+        let Some(tok) = load_if_exists("qwen-2.5-3b-instruct", ModelArch::Qwen2) else { return };
+        let ids = tok.inner.encode("<|im_end|>", true).unwrap();
+        assert!(ids.get_ids().contains(&151645), "Qwen <|im_end|> should be 151645");
+        assert!(tok.is_eos(151643), "Qwen endoftext");
+        assert!(tok.is_eos(151645), "Qwen im_end");
+    }
+
+    #[test]
+    fn test_eos_tokens_phi() {
+        let Some(tok) = load_if_exists("phi-4", ModelArch::Phi) else { return };
+        assert!(tok.is_eos(100257), "Phi endoftext");
+        assert!(tok.is_eos(100265), "Phi im_end");
+    }
+
+    // -----------------------------------------------------------------------
+    // Incremental decode: simulate the API streaming path.
+    //
+    // Encode a sentence, then decode one token at a time using the
+    // incremental pattern (full-buffer decode, emit new chars).  The
+    // concatenated output must match a single-shot decode of all tokens.
+    //
+    // This catches the Mistral space-stripping bug where single-token
+    // decode(&[id]) strips leading spaces due to SentencePiece's Strip
+    // decoder step.
+    // -----------------------------------------------------------------------
+
+    fn check_incremental_decode(tok: &Tokenizer, text: &str) {
+        let ids = tok.inner.encode(text, false).unwrap();
+        let token_ids = ids.get_ids();
+
+        // Single-shot decode (ground truth).
+        let expected = tok.decode(token_ids).unwrap();
+
+        // Incremental decode: one token at a time, like the API server.
+        let mut buf: Vec<u32> = Vec::new();
+        let mut prev_len = 0;
+        let mut reconstructed = String::new();
+        for &id in token_ids {
+            buf.push(id);
+            let (new_text, new_len) = tok.decode_incremental(&buf, prev_len);
+            reconstructed.push_str(&new_text);
+            prev_len = new_len;
+        }
+
+        assert_eq!(
+            reconstructed, expected,
+            "incremental decode mismatch for {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_incremental_decode_mistral() {
+        let Some(tok) = load_if_exists("mistral-7b-instruct", ModelArch::Mistral) else { return };
+        // These strings have spaces that SentencePiece Strip would eat.
+        check_incremental_decode(&tok, "for number in range(1, 21):");
+        check_incremental_decode(&tok, "def hello_world():\n    print(\"Hello World\")");
+        check_incremental_decode(&tok, "The quick brown fox jumps over the lazy dog");
+    }
+
+    #[test]
+    fn test_incremental_decode_llama() {
+        let Some(tok) = load_if_exists("llama-3.2-1b-instruct", ModelArch::Llama) else { return };
+        check_incremental_decode(&tok, "for i in range(1, 21):");
+        check_incremental_decode(&tok, "The quick brown fox jumps over the lazy dog");
+    }
+
+    #[test]
+    fn test_incremental_decode_gemma() {
+        let Some(tok) = load_if_exists("gemma-3-4b-it", ModelArch::Gemma3) else { return };
+        check_incremental_decode(&tok, "for i in range(1, 21):");
+        check_incremental_decode(&tok, "The quick brown fox jumps over the lazy dog");
+    }
+
+    #[test]
+    fn test_incremental_decode_qwen() {
+        let Some(tok) = load_if_exists("qwen-2.5-3b-instruct", ModelArch::Qwen2) else { return };
+        check_incremental_decode(&tok, "for i in range(1, 21):");
+        check_incremental_decode(&tok, "The quick brown fox jumps over the lazy dog");
+    }
+
+    #[test]
+    fn test_incremental_decode_phi() {
+        let Some(tok) = load_if_exists("phi-4", ModelArch::Phi) else { return };
+        check_incremental_decode(&tok, "for i in range(1, 21):");
+        check_incremental_decode(&tok, "The quick brown fox jumps over the lazy dog");
     }
 }

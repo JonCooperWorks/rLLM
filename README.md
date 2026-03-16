@@ -8,18 +8,18 @@ Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf
 
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
-| Llama 3.2 1B Instruct | 1.2B | 124 tok/s | 183 tok/s | 85 ms | 74 ms |
-| Llama 3.2 3B Instruct | 3.2B | 61 tok/s | 117 tok/s | 349 ms | 250 ms |
-| Qwen 2.5 3B Instruct | 3.1B | 57 tok/s | 106 tok/s | 239 ms | 95 ms |
-| Qwen 2.5 7B Instruct | 7.6B | 31 tok/s | 69 tok/s | 623 ms | 226 ms |
-| Mistral 7B Instruct | 7.2B | 30 tok/s | 78 tok/s | 615 ms | 310 ms |
+| Llama 3.2 1B Instruct | 1.2B | 119 tok/s | 183 tok/s | 104 ms | 79 ms |
+| Llama 3.2 3B Instruct | 3.2B | 56 tok/s | 100 tok/s | 348 ms | 264 ms |
+| Qwen 2.5 3B Instruct | 3.1B | 53 tok/s | 91 tok/s | 127 ms | 84 ms |
+| Qwen 2.5 7B Instruct | 7.6B | 28 tok/s | 63 tok/s | 356 ms | 166 ms |
+| Mistral 7B Instruct | 7.2B | 30 tok/s | 75 tok/s | 535 ms | 311 ms |
 | Mixtral 8x7B Instruct | 46.7B (12.9B active) | — | 12 tok/s | — | 5,400 ms |
-| Llama 3.1 8B Instruct | 8.0B | 29 tok/s | 67 tok/s | 869 ms | 320 ms |
-| Gemma 3 4B Instruct | 4.3B | 47 tok/s | 79 tok/s | 397 ms | 318 ms |
+| Llama 3.1 8B Instruct | 8.0B | 27 tok/s | 59 tok/s | 474 ms | 324 ms |
+| Gemma 3 4B Instruct | 4.3B | 40 tok/s | 62 tok/s | 361 ms | 324 ms |
 | Gemma 3 27B Instruct | 27.4B | 2 tok/s | 7 tok/s | 50,000 ms | 4,300 ms |
 | Qwen3 Coder 30B-A3B Instruct | 30.5B (3.3B active) | 2 tok/s | 11 tok/s | 40,000 ms | 2,900 ms |
 | Qwen3.5 35B-A3B | 35.1B (3.3B active) | 5 tok/s | 16 tok/s | 44,600 ms | 2,000 ms |
-| Phi-4 | 14.7B | 6 tok/s | 42 tok/s | 5,300 ms | 741 ms |
+| Phi-4 | 14.7B | 6 tok/s | 37 tok/s | 5,300 ms | 638 ms |
 | DeepSeek-R1-Distill-Qwen-32B | 32.8B | — | 5 tok/s | — | 4,700 ms |
 
 Q4 quantization (`--quantize`) gives ~1.3-3.5x faster decode by reducing memory bandwidth. Mixtral 8x7B, Qwen3, and Qwen3.5 MoE models use Mixture of Experts with sparse activation (only a fraction of params active per token). Mixtral activates 2 of 8 experts (~12.9B of 46.7B active). Qwen3.5 also uses DeltaNet linear attention layers. Mixtral requires Q4 (bf16 would need ~87 GB). Large models (Gemma 3 27B, Phi-4, Qwen3/3.5 MoE) run in bf16 but are slow because the weights consume most of the 64 GB unified memory, leaving limited headroom for KV cache. Q4 is strongly recommended for models over ~8B params. Dynamic KV cache sizing automatically adjusts block count based on available GPU memory.
@@ -259,7 +259,7 @@ Server mode (rllm serve):
 | Weights | Q4 quantization | ~1.5x | 3.2x less memory bandwidth |
 | Prefill | Batched GEMM | 3-10x | Weight reuse: load once, compute B times |
 | KV cache | Paged allocation | — | On-demand blocks, no wasted memory |
-| Attention | Fused single-pass softmax+V | 1.3-2.8x | Eliminates Q·K recomputation, vectorised loads, shared Q, fused KV write |
+| Attention | Fused single-pass softmax+V | 1.3-2.8x | Eliminates Q·K recomputation, vectorised loads, shared Q, fused KV write, head_dim-specialised pipelines |
 | Batching | Continuous batching | ~Nx | N sequences share the GPU |
 
 ## Model Setup

@@ -43,10 +43,11 @@
 //   register file.  The Metal compiler may spill to stack for some threads,
 //   but M-series GPUs have fast L1-backed stack access.
 //
-// Shared memory budget:
-//   q_shared[64] = 256 bytes (Q vector, persistent during position loop)
-//   shared_reduce[512] = 2048 bytes (reused for max/sum reduction then V reduction)
-//   Total: 2304 bytes — well within the 32KB threadgroup memory limit.
+// Shared memory budget (MAX_HEAD_DIM=256):
+//   q_shared[256] = 1024 bytes (Q vector, persistent during position loop)
+//   shared_reduce[8 × 256] = 8192 bytes (reused for max/sum reduction then V reduction)
+//   Total: 9216 bytes — well within the 32KB threadgroup memory limit.
+//   For head_dim=64: effective usage is only ~2304 bytes (256 + 2048).
 //
 // Grouped-Query Attention (GQA):
 //   Llama 3.2 uses 32 query heads but only 8 KV heads — every 4 query heads
@@ -65,6 +66,38 @@
 
 #include <metal_stdlib>
 using namespace metal;
+
+// ---------------------------------------------------------------------------
+// Maximum head dimension supported by the attention kernels.
+//
+// Used to size threadgroup shared memory and per-thread register arrays at
+// compile time (Metal requires constant-size threadgroup allocations).
+// Supports all current architectures:
+//   64  — Llama 3.2 1B/3B
+//   96  — Gemma 3 4B
+//   128 — Qwen 2.5, Mistral, Llama 8B, Phi-4
+//   256 — Gemma 3 27B
+//
+// Shared memory budget at MAX_HEAD_DIM=256:
+//   q_shared[256]          = 1024 bytes
+//   shared_reduce[8 × 256] = 8192 bytes
+//   Total: 9216 bytes — well within the 32KB threadgroup limit.
+//
+// Register budget at MAX_HEAD_DIM=256:
+//   v_acc[64] × float4 = 256 floats × 4 bytes = 1024 bytes per thread.
+//   With 256 threads: 256KB total.  Apple Silicon has ~96KB per SIMD group
+//   (×8 = 768KB), so the compiler may spill a fraction to stack — acceptable
+//   since M-series GPUs have fast L1-backed stack access.
+// ---------------------------------------------------------------------------
+// MAX_HEAD_DIM is injected at compile time via string replacement in backend.rs.
+// Two variants are compiled: 128 (Llama, Qwen, Mistral, Phi) and 256 (Gemma).
+// See backend.rs for the compilation logic.
+#ifndef MAX_HEAD_DIM
+#define MAX_HEAD_DIM 128
+#endif
+constant constexpr uint MAX_HD = MAX_HEAD_DIM;
+constant constexpr uint MAX_HD_VEC4 = MAX_HD / 4;
+constant constexpr uint NUM_SIMD_GROUPS = 8;  // = 256 threads / 32 lanes
 
 // ---------------------------------------------------------------------------
 // Helper: compute vectorised Q·K dot product using float4/bfloat4 loads.
@@ -262,7 +295,7 @@ kernel void attention(
     // --- Load Q into threadgroup shared memory ---
     // All 256 threads will read Q repeatedly during the position loop.
     // Loading once into shared memory avoids redundant device memory reads.
-    threadgroup float q_shared[64];
+    threadgroup float q_shared[MAX_HD];
     if (tid < head_dim) {
         q_shared[tid] = float(q_ptr[tid]);
     }
@@ -273,9 +306,11 @@ kernel void attention(
     // maintains the FULL head_dim output vector in registers.  This is the
     // key difference from the old two-pass approach: we accumulate V weights
     // as we go, so we never need to recompute Q·K scores.
-    float4 v_acc[16] = {};  // 16 × float4 = 64 floats, zero-initialised
+    float4 v_acc[MAX_HD_VEC4] = {};  // head_dim floats as float4s, zero-initialised
     float local_max = -INFINITY;
     float local_sum_exp = 0.0f;
+
+    const uint hd4 = head_dim / 4;  // Number of float4 iterations for this model
 
     // --- Fused position loop: softmax + V accumulation in one pass ---
     for (uint pos = start + tid; pos < seq_len; pos += tg_size) {
@@ -284,30 +319,31 @@ kernel void attention(
         float score = dot_q_k(q_shared, k_vec, head_dim) * scale;
 
         // Online softmax update with V accumulator rescaling.
+        // When a new max is found, rescale existing accumulators and use
+        // weight=1.0 (since exp(score - new_max) = exp(0) = 1.0).
+        // Otherwise compute the exponential weight normally.
+        float weight;
         if (score > local_max) {
-            // New max found — rescale all existing V accumulators to maintain
-            // correct relative weights under the new max.
             float correction = exp(local_max - score);
-            for (uint i = 0; i < head_dim / 4; i++) {
+            for (uint i = 0; i < hd4; i++) {
                 v_acc[i] *= correction;
             }
             local_sum_exp = local_sum_exp * correction + 1.0f;
             local_max = score;
+            weight = 1.0f;
         } else {
-            local_sum_exp += exp(score - local_max);
+            weight = exp(score - local_max);
+            local_sum_exp += weight;
         }
-
-        // Accumulate weighted V vector (vectorised bfloat4 loads).
-        float weight = exp(score - local_max);
         device const bfloat* v_vec = v_cache + pos * kv_stride + kv_head * head_dim;
         device const bfloat4* v4 = (device const bfloat4*)v_vec;
-        for (uint i = 0; i < head_dim / 4; i++) {
+        for (uint i = 0; i < hd4; i++) {
             v_acc[i] += weight * float4(v4[i]);
         }
     }
 
     // --- Cross-thread softmax reduction ---
-    threadgroup float shared_reduce[512];
+    threadgroup float shared_reduce[NUM_SIMD_GROUPS * MAX_HD];
     float2 softmax_result = reduce_softmax(local_max, local_sum_exp, tid, tg_size, shared_reduce);
     float global_max = softmax_result.x;
     float total_sum = softmax_result.y;
@@ -447,16 +483,18 @@ kernel void paged_attention(
     device const bfloat* q_ptr = q + head_id * head_dim;
 
     // --- Load Q into threadgroup shared memory ---
-    threadgroup float q_shared[64];
+    threadgroup float q_shared[MAX_HD];
     if (tid < head_dim) {
         q_shared[tid] = float(q_ptr[tid]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // --- Per-thread V accumulators and online softmax state ---
-    float4 v_acc[16] = {};
+    float4 v_acc[MAX_HD_VEC4] = {};
     float local_max = -INFINITY;
     float local_sum_exp = 0.0f;
+
+    const uint hd4 = head_dim / 4;
 
     // --- Fused position loop with cached block table lookups ---
     // Track the current logical block to avoid redundant block_table[] reads.
@@ -483,7 +521,7 @@ kernel void paged_attention(
         // Online softmax update with V accumulator rescaling.
         if (score > local_max) {
             float correction = exp(local_max - score);
-            for (uint i = 0; i < head_dim / 4; i++) {
+            for (uint i = 0; i < hd4; i++) {
                 v_acc[i] *= correction;
             }
             local_sum_exp = local_sum_exp * correction + 1.0f;
@@ -496,13 +534,13 @@ kernel void paged_attention(
         float weight = exp(score - local_max);
         device const bfloat* v_vec = v_pool + pool_row * kv_dim + kv_head * head_dim;
         device const bfloat4* v4 = (device const bfloat4*)v_vec;
-        for (uint i = 0; i < head_dim / 4; i++) {
+        for (uint i = 0; i < hd4; i++) {
             v_acc[i] += weight * float4(v4[i]);
         }
     }
 
     // --- Cross-thread softmax reduction ---
-    threadgroup float shared_reduce[512];
+    threadgroup float shared_reduce[NUM_SIMD_GROUPS * MAX_HD];
     float2 softmax_result = reduce_softmax(local_max, local_sum_exp, tid, tg_size, shared_reduce);
     float global_max = softmax_result.x;
     float total_sum = softmax_result.y;
@@ -614,16 +652,18 @@ kernel void paged_attention_fused(
     device const bfloat* q_ptr = q + head_id * head_dim;
 
     // Load Q into shared memory.
-    threadgroup float q_shared[64];
+    threadgroup float q_shared[MAX_HD];
     if (tid < head_dim) {
         q_shared[tid] = float(q_ptr[tid]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Per-thread V accumulators and online softmax state.
-    float4 v_acc[16] = {};
+    float4 v_acc[MAX_HD_VEC4] = {};
     float local_max = -INFINITY;
     float local_sum_exp = 0.0f;
+
+    const uint hd4 = head_dim / 4;
 
     // Fused position loop with cached block table lookups.
     uint prev_logical_block = ~0u;
@@ -641,27 +681,33 @@ kernel void paged_attention_fused(
         device const bfloat* k_vec = k_pool + pool_row * kv_dim + kv_head * head_dim;
         float score = dot_q_k(q_shared, k_vec, head_dim) * scale;
 
+        // Online softmax update with V accumulator rescaling.
+        // When a new max is found, rescale existing accumulators and use
+        // weight=1.0 (since exp(score - new_max) = exp(0) = 1.0).
+        // Otherwise compute the exponential weight normally.
+        float weight;
         if (score > local_max) {
             float correction = exp(local_max - score);
-            for (uint i = 0; i < head_dim / 4; i++) {
+            for (uint i = 0; i < hd4; i++) {
                 v_acc[i] *= correction;
             }
             local_sum_exp = local_sum_exp * correction + 1.0f;
             local_max = score;
+            weight = 1.0f;
         } else {
-            local_sum_exp += exp(score - local_max);
+            weight = exp(score - local_max);
+            local_sum_exp += weight;
         }
 
-        float weight = exp(score - local_max);
         device const bfloat* v_vec = v_pool + pool_row * kv_dim + kv_head * head_dim;
         device const bfloat4* v4 = (device const bfloat4*)v_vec;
-        for (uint i = 0; i < head_dim / 4; i++) {
+        for (uint i = 0; i < hd4; i++) {
             v_acc[i] += weight * float4(v4[i]);
         }
     }
 
     // Cross-thread softmax reduction.
-    threadgroup float shared_reduce[512];
+    threadgroup float shared_reduce[NUM_SIMD_GROUPS * MAX_HD];
     float2 softmax_result = reduce_softmax(local_max, local_sum_exp, tid, tg_size, shared_reduce);
     float global_max = softmax_result.x;
     float total_sum = softmax_result.y;
@@ -729,7 +775,7 @@ kernel void copy_to_paged_kv_cache_batch(
 }
 
 // ===========================================================================
-// Causal prefill attention kernel.
+// Causal prefill attention kernel — fused single-pass softmax + V accumulation.
 //
 // LEARNING OVERVIEW
 //
@@ -761,14 +807,16 @@ kernel void copy_to_paged_kv_cache_batch(
 //   only itself; the last token sees the entire prompt.  This is the
 //   lower-triangular attention mask.
 //
+// Fused single-pass algorithm (same as decode kernels):
+//   Uses the same online softmax + V accumulation approach as the decode
+//   kernels.  All 256 threads cooperate over K positions, each maintaining
+//   per-thread V accumulators in registers.  This replaces the old two-pass
+//   approach that computed every Q·K dot product twice.
+//
 // Dispatch model:
 //   One threadgroup of 256 per (query_position, head).
 //   Grid: chunk_size * num_heads * 256.
 //   Each threadgroup computes attention for one query at one head.
-//
-// Same two-pass online softmax algorithm as the decode kernels:
-//   Pass 1: scan K positions to find (max, sum_exp) for softmax normalisation
-//   Pass 2: recompute scores and accumulate weighted V vectors
 // ===========================================================================
 
 struct PrefillAttentionParams {
@@ -825,82 +873,54 @@ kernel void prefill_attention(
     const uint attend_start = (params.window_size > 0 && attend_len > params.window_size)
                               ? (attend_len - params.window_size) : 0;
 
-    // -------------------------------------------------------------------
-    // Pass 1: Online softmax over K positions attend_start..attend_len-1.
-    // -------------------------------------------------------------------
+    // --- Load Q into threadgroup shared memory ---
+    threadgroup float q_shared[MAX_HD];
+    if (tid < head_dim) {
+        q_shared[tid] = float(q_ptr[tid]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- Per-thread V accumulators and online softmax state ---
+    float4 v_acc[MAX_HD_VEC4] = {};
     float local_max = -INFINITY;
     float local_sum_exp = 0.0f;
 
-    for (uint pos = attend_start + tid; pos < attend_len; pos += tg_size) {
-        device const bfloat* k_vec = k + pos * kv_stride + kv_head * head_dim;
-        float dot = 0.0f;
-        for (uint d = 0; d < head_dim; d++) {
-            dot += float(q_ptr[d]) * float(k_vec[d]);
-        }
-        float score = dot * scale;
+    const uint hd4 = head_dim / 4;
 
+    // --- Fused position loop: softmax + V accumulation in one pass ---
+    for (uint pos = attend_start + tid; pos < attend_len; pos += tg_size) {
+        // Vectorised Q·K dot product from shared memory.
+        device const bfloat* k_vec = k + pos * kv_stride + kv_head * head_dim;
+        float score = dot_q_k(q_shared, k_vec, head_dim) * scale;
+
+        // Online softmax update with V accumulator rescaling.
         if (score > local_max) {
-            local_sum_exp = local_sum_exp * exp(local_max - score) + 1.0f;
+            float correction = exp(local_max - score);
+            for (uint i = 0; i < hd4; i++) {
+                v_acc[i] *= correction;
+            }
+            local_sum_exp = local_sum_exp * correction + 1.0f;
             local_max = score;
         } else {
             local_sum_exp += exp(score - local_max);
         }
-    }
 
-    // Cross-thread reduction for max.
-    threadgroup float shared[64];
-    uint simd_group_id = tid / 32;
-    uint simd_lane_id = tid % 32;
-
-    float smax = simd_max(local_max);
-    if (simd_lane_id == 0) shared[simd_group_id] = smax;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (simd_group_id == 0) {
-        uint num_groups = (tg_size + 31) / 32;
-        float val = (simd_lane_id < num_groups) ? shared[simd_lane_id] : -INFINITY;
-        val = simd_max(val);
-        if (simd_lane_id == 0) shared[0] = val;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float global_max = shared[0];
-
-    // Adjust and reduce sum_exp.
-    local_sum_exp *= exp(local_max - global_max);
-
-    float ssum = simd_sum(local_sum_exp);
-    if (simd_lane_id == 0) shared[32 + simd_group_id] = ssum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (simd_group_id == 0) {
-        uint num_groups = (tg_size + 31) / 32;
-        float val = (simd_lane_id < num_groups) ? shared[32 + simd_lane_id] : 0.0f;
-        val = simd_sum(val);
-        if (simd_lane_id == 0) shared[0] = val;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float total_sum = shared[0];
-    float inv_sum = 1.0f / total_sum;
-
-    // -------------------------------------------------------------------
-    // Pass 2: Weighted sum of V vectors.
-    // -------------------------------------------------------------------
-    device bfloat* out_ptr = output + qi * q_stride + head_id * head_dim;
-
-    for (uint d = tid; d < head_dim; d += tg_size) {
-        float acc = 0.0f;
-        for (uint pos = attend_start; pos < attend_len; pos++) {
-            device const bfloat* k_vec = k + pos * kv_stride + kv_head * head_dim;
-            float dot = 0.0f;
-            for (uint dd = 0; dd < head_dim; dd++) {
-                dot += float(q_ptr[dd]) * float(k_vec[dd]);
-            }
-            float score = dot * scale;
-            float weight = exp(score - global_max) * inv_sum;
-
-            device const bfloat* v_vec = v + pos * kv_stride + kv_head * head_dim;
-            acc += weight * float(v_vec[d]);
+        // Accumulate weighted V vector (vectorised bfloat4 loads).
+        float weight = exp(score - local_max);
+        device const bfloat* v_vec = v + pos * kv_stride + kv_head * head_dim;
+        device const bfloat4* v4 = (device const bfloat4*)v_vec;
+        for (uint i = 0; i < hd4; i++) {
+            v_acc[i] += weight * float4(v4[i]);
         }
-        out_ptr[d] = bfloat(acc);
     }
+
+    // --- Cross-thread softmax reduction ---
+    threadgroup float shared_reduce[NUM_SIMD_GROUPS * MAX_HD];
+    float2 softmax_result = reduce_softmax(local_max, local_sum_exp, tid, tg_size, shared_reduce);
+    float global_max = softmax_result.x;
+    float total_sum = softmax_result.y;
+
+    // --- Reduce V accumulators across threads and write output ---
+    device bfloat* out_ptr = output + qi * q_stride + head_id * head_dim;
+    reduce_v_and_write(v_acc, local_max, global_max, total_sum, tid, tg_size, head_dim, shared_reduce, out_ptr);
 }

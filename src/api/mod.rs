@@ -275,6 +275,14 @@ struct RequestContext {
     response_tx: tokio::sync::mpsc::Sender<InferenceEvent>,
     prompt_token_count: usize,
     generated_count: usize,
+    /// Running buffer of all generated token IDs for this sequence.
+    /// Used for incremental decoding: we decode the full buffer each step
+    /// and emit only the new characters.  This avoids SentencePiece Strip
+    /// decoder issues where single-token decode strips leading spaces
+    /// (affects Mistral/Mixtral).
+    token_ids: Vec<u32>,
+    /// Number of characters already sent to the client.
+    prev_text_len: usize,
 }
 
 /// Spawn the inference worker thread that owns all GPU state.
@@ -375,6 +383,8 @@ fn spawn_worker(model_dir: PathBuf, quantize: bool) -> anyhow::Result<WorkerHand
                             response_tx: req.response_tx,
                             prompt_token_count,
                             generated_count: 0,
+                            token_ids: Vec::new(),
+                            prev_text_len: 0,
                         },
                     );
                 }
@@ -391,6 +401,8 @@ fn spawn_worker(model_dir: PathBuf, quantize: bool) -> anyhow::Result<WorkerHand
                                     response_tx: req.response_tx,
                                     prompt_token_count,
                                     generated_count: 0,
+                                    token_ids: Vec::new(),
+                                    prev_text_len: 0,
                                 },
                             );
                         }
@@ -419,7 +431,13 @@ fn spawn_worker(model_dir: PathBuf, quantize: bool) -> anyhow::Result<WorkerHand
 
                 for &(seq_id, token_id) in &step_output.tokens {
                     if let Some(ctx) = registry.get_mut(&seq_id) {
-                        let text = eng.tokenizer.decode(&[token_id]).unwrap_or_default();
+                        // Incremental decode: decode all tokens so far, emit the new
+                        // characters.  This ensures SentencePiece decoders (Mistral,
+                        // Mixtral) see the full token context for correct spacing.
+                        ctx.token_ids.push(token_id);
+                        let full_text = eng.tokenizer.decode(&ctx.token_ids).unwrap_or_default();
+                        let text = full_text[ctx.prev_text_len..].to_string();
+                        ctx.prev_text_len = full_text.len();
                         ctx.generated_count += 1;
                         if ctx
                             .response_tx
