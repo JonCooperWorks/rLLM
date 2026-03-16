@@ -1,10 +1,26 @@
 # rLLM
 
-Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf16 and Q4 quantization, multi-architecture support (Llama 3, Qwen 2.5, Mistral, Mixtral 8x7B, Qwen3 MoE, Qwen3.5, Phi-4, Gemma 3, DeepSeek-R1-Distill). Paged KV cache, batched prefill (GEMM), continuous batching. No frameworks, no GGML — just raw GPU compute.
+A learning project for understanding GPU programming and LLM inference from the ground up. Built from scratch in Rust with no frameworks or GGML — just raw GPU compute. The codebase is heavily annotated as an educational exercise, explaining *why* things work the way they do, not just *what* they do.
 
-## Performance
+## Backends
 
-**Apple M4 Max** — 16-core CPU, 40-core GPU, 64 GB unified memory, 546 GB/s bandwidth. Measured via CLI (`rllm run --chat`), single run.
+| Platform | Backend | Status |
+|---|---|---|
+| macOS / Apple Silicon | **Metal** | Full support — SIMD-cooperative matmul, async command buffer dispatch |
+| Linux / NVIDIA | **CUDA** | Shader ports of Metal kernels |
+
+Platform selection uses OS-conditional compilation (`#[cfg(target_os)]`) — no feature flags. Model code is generic over a `GpuBackend` trait with an associated `Tensor` type, so the same forward pass runs on either backend.
+
+## Supported Models
+
+Llama 3, Qwen 2.5, Mistral, Mixtral 8x7B, Qwen3 MoE, Qwen3.5, Phi-4, Gemma 3, DeepSeek-R1-Distill — all from the same codebase with bf16 and Q4 quantization.
+
+## Benchmarks
+
+<details>
+<summary><b>Apple M4 Max</b> — 16-core CPU, 40-core GPU, 64 GB unified, 546 GB/s</summary>
+
+Measured via `rllm run --chat`, single run.
 
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
@@ -13,18 +29,23 @@ Minimal LLM inference engine written from scratch in Rust. Metal GPU backend, bf
 | Qwen 2.5 3B Instruct | 3.1B | 53 tok/s | 91 tok/s | 127 ms | 84 ms |
 | Qwen 2.5 7B Instruct | 7.6B | 28 tok/s | 63 tok/s | 356 ms | 166 ms |
 | Mistral 7B Instruct | 7.2B | 30 tok/s | 75 tok/s | 535 ms | 311 ms |
-| Mixtral 8x7B Instruct | 46.7B (12.9B active) | — | 12 tok/s | — | 5,400 ms |
 | Llama 3.1 8B Instruct | 8.0B | 27 tok/s | 59 tok/s | 474 ms | 324 ms |
 | Gemma 3 4B Instruct | 4.3B | 40 tok/s | 62 tok/s | 361 ms | 324 ms |
+| Phi-4 | 14.7B | 6 tok/s | 37 tok/s | 5,300 ms | 638 ms |
 | Gemma 3 27B Instruct | 27.4B | 2 tok/s | 7 tok/s | 50,000 ms | 4,300 ms |
 | Qwen3 Coder 30B-A3B Instruct | 30.5B (3.3B active) | 2 tok/s | 11 tok/s | 40,000 ms | 2,900 ms |
-| Qwen3.5 35B-A3B | 35.1B (3.3B active) | 5 tok/s | 16 tok/s | 44,600 ms | 2,000 ms |
-| Phi-4 | 14.7B | 6 tok/s | 37 tok/s | 5,300 ms | 638 ms |
 | DeepSeek-R1-Distill-Qwen-32B | 32.8B | — | 5 tok/s | — | 4,700 ms |
+| Qwen3.5 35B-A3B | 35.1B (3.3B active) | 5 tok/s | 16 tok/s | 44,600 ms | 2,000 ms |
+| Mixtral 8x7B Instruct | 46.7B (12.9B active) | — | 12 tok/s | — | 5,400 ms |
 
-Q4 quantization (`--quantize`) gives ~1.3-3.5x faster decode by reducing memory bandwidth. Mixtral 8x7B, Qwen3, and Qwen3.5 MoE models use Mixture of Experts with sparse activation (only a fraction of params active per token). Mixtral activates 2 of 8 experts (~12.9B of 46.7B active). Qwen3.5 also uses DeltaNet linear attention layers. Mixtral requires Q4 (bf16 would need ~87 GB). Large models (Gemma 3 27B, Phi-4, Qwen3/3.5 MoE) run in bf16 but are slow because the weights consume most of the 64 GB unified memory, leaving limited headroom for KV cache. Q4 is strongly recommended for models over ~8B params. Dynamic KV cache sizing automatically adjusts block count based on available GPU memory.
+Q4 quantization (`--quantize`) gives ~1.3-3.5x faster decode by reducing memory bandwidth. Mixtral requires Q4 (bf16 would need ~87 GB). Q4 is strongly recommended for models over ~8B params. Large models (Gemma 3 27B, Phi-4, Qwen3/3.5 MoE) run in bf16 but are slow because the weights consume most of the 64 GB unified memory. Dynamic KV cache sizing automatically adjusts block count based on available GPU memory.
 
-**NVIDIA H100 80GB HBM3** — 3.35 TB/s bandwidth. Measured via CLI (`rllm run`), single run, 128 max tokens, prompt "The meaning of life is".
+</details>
+
+<details>
+<summary><b>NVIDIA H100 80GB HBM3</b> — 3.35 TB/s bandwidth</summary>
+
+Measured via `rllm run`, single run, 128 max tokens.
 
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
@@ -48,62 +69,52 @@ Q4 quantization (`--quantize`) gives ~1.3-3.5x faster decode by reducing memory 
 
 Mixtral, Llama 70B, and Qwen 72B exceed 80 GB in bf16. MoE models (Qwen3 Coder, Qwen3.5 35B-A3B) can be faster in Q4 than bf16 because expert weights dominate bandwidth. Qwen3.5 models have high TTFT due to DeltaNet linear attention initialization overhead.
 
+</details>
+
 ## Features
 
 - **Multi-architecture** — Llama 3, Qwen 2.5, Mistral, Mixtral 8x7B, Qwen3 MoE, Qwen3.5, Phi-4, and Gemma 3 from the same codebase
-- **Metal GPU backend** — SIMD-cooperative matmul, async command buffer dispatch
+- **Metal + CUDA backends** — SIMD-cooperative matmul, async command buffer dispatch
 - **Batched prefill** — GEMM-based prompt processing (3-10x faster than token-by-token)
 - **Paged KV cache** — on-demand block allocation, shared across sequences
 - **Continuous batching** — concurrent multi-sequence inference via engine/scheduler
 - **Q4 quantization** — 4-bit block quantization on load (~3.2x memory reduction)
-- **bf16 inference** — native half-precision on Apple Silicon
-- **Safetensors loading** — single and multi-shard weight files
-- **BPE tokenizer** — HuggingFace-compatible tokenizer.json
+- **bf16 inference** — native half-precision compute
 - **Mixture of Experts** — top-k expert routing with per-token dispatch (Mixtral, Qwen3 MoE)
-- **Chat templates** — Llama 3, ChatML (Qwen), Mistral/Mixtral, Phi, and Gemma instruct formats with `--chat`
-- **Temperature + top-p sampling** — configurable via `--temperature` and `--top-p`
-- **Streaming output** — tokens printed as generated
 - **API server** — OpenAI and Anthropic compatible HTTP endpoints with SSE streaming
+- **Chat templates** — Llama 3, ChatML (Qwen), Mistral/Mixtral, Phi, and Gemma instruct formats
+- **Temperature + top-p sampling** — configurable via `--temperature` and `--top-p`
 
 ## Usage
 
-### CLI inference
+### CLI
 
-```
+```bash
+# Text completion
 cargo run --release -- run --model models/llama-3.2-1b --prompt "The meaning of life is" --max-tokens 128
-```
 
-With Q4 quantization:
-
-```
+# With Q4 quantization
 cargo run --release -- run --model models/llama-3.2-1b --prompt "The meaning of life is" --max-tokens 128 --quantize
-```
 
-Chat mode (instruct models — auto-detects chat template per architecture):
+# Chat mode (auto-detects template per architecture)
+cargo run --release -- run --model models/llama-3.2-3b-instruct --prompt "Write a fibonacci function" --chat --temperature 0
 
-```
-cargo run --release -- run --model models/llama-3.2-3b-instruct --prompt "Write a Python program that adds 4 numbers" --chat --temperature 0
-cargo run --release -- run --model models/qwen-2.5-7b-instruct --prompt "Explain hash maps" --chat --temperature 0
-cargo run --release -- run --model models/mistral-7b-instruct --prompt "Explain what a hash map is" --chat --temperature 0
-cargo run --release -- run --model models/mixtral-8x7b-instruct --prompt "Write a fibonacci function" --chat --quantize --temperature 0
-cargo run --release -- run --model models/qwen3-coder-30b-a3b-instruct --prompt "Write a fibonacci function" --chat --quantize --temperature 0
-```
-
-Continuous batching (multiple prompts from a file):
-
-```
+# Continuous batching (multiple prompts from a file)
 cargo run --release -- batch --model models/llama-3.2-1b --batch-file test_prompts.txt --max-tokens 64
 ```
 
-### API server
+### API Server
 
-Start an OpenAI/Anthropic-compatible API server (TLS required by default — see [TLS](#tls) section):
+Start an OpenAI/Anthropic-compatible server:
 
-```
+```bash
 cargo run --release -- serve --model models/llama-3.2-1b-instruct --port 8080 --dangerous-no-tls
 ```
 
-**Server options:**
+Works as a drop-in backend for any tool that speaks the OpenAI or Anthropic API — just point it at `http://localhost:8080`.
+
+<details>
+<summary>Server options</summary>
 
 | Flag | Default | Description |
 |---|---|---|
@@ -118,7 +129,10 @@ cargo run --release -- serve --model models/llama-3.2-1b-instruct --port 8080 --
 | `--cert-cache-dir` | `.rllm-certs` | Cache directory for Let's Encrypt certs |
 | `--dangerous-no-tls` | off | Allow serving over plain HTTP |
 
-The server exposes these endpoints:
+</details>
+
+<details>
+<summary>Endpoints</summary>
 
 | Endpoint | Method | Description |
 |---|---|---|
@@ -128,11 +142,15 @@ The server exposes these endpoints:
 | `/v1/messages` | POST | Anthropic messages |
 | `/health` | GET | Health check |
 
-All POST endpoints support `"stream": true` for Server-Sent Events (SSE) streaming.
+All POST endpoints support `"stream": true` for SSE streaming.
 
-**OpenAI chat completion:**
+</details>
+
+<details>
+<summary>curl examples</summary>
 
 ```bash
+# OpenAI chat completion
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -140,11 +158,8 @@ curl http://localhost:8080/v1/chat/completions \
     "max_tokens": 64,
     "temperature": 0
   }'
-```
 
-**OpenAI chat completion (streaming):**
-
-```bash
+# OpenAI chat completion (streaming)
 curl -N http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -152,19 +167,13 @@ curl -N http://localhost:8080/v1/chat/completions \
     "max_tokens": 256,
     "stream": true
   }'
-```
 
-**OpenAI text completion:**
-
-```bash
+# OpenAI text completion
 curl http://localhost:8080/v1/completions \
   -H "Content-Type: application/json" \
   -d '{"prompt": "The capital of France is", "max_tokens": 32}'
-```
 
-**Anthropic messages:**
-
-```bash
+# Anthropic messages
 curl http://localhost:8080/v1/messages \
   -H "Content-Type: application/json" \
   -d '{
@@ -174,167 +183,117 @@ curl http://localhost:8080/v1/messages \
   }'
 ```
 
-**Anthropic messages (streaming):**
+</details>
 
-```bash
-curl -N http://localhost:8080/v1/messages \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [{"role": "user", "content": "Hello"}],
-    "max_tokens": 64,
-    "stream": true
-  }'
-```
+<details>
+<summary>TLS</summary>
 
-The server works as a drop-in backend for any tool that speaks the OpenAI or Anthropic API — just change the base URL to `http://localhost:8080`.
-
-### TLS
-
-The server requires TLS by default. To run without TLS (e.g. local development), pass `--dangerous-no-tls`:
-
-```
-cargo run --release -- serve --model models/llama-3.2-1b-instruct --port 8080 --dangerous-no-tls
-```
-
-HTTPS is supported via two modes:
+The server requires TLS by default. Use `--dangerous-no-tls` for local development.
 
 **Manual certificates:**
 
-```
+```bash
 cargo run --release -- serve --model models/llama-3.2-1b-instruct \
   --cert /path/to/cert.pem --private-key /path/to/key.pem --port 443
 ```
 
 **Let's Encrypt (automatic):**
 
-```
+```bash
 cargo run --release -- serve --model models/llama-3.2-1b-instruct \
   --letsencrypt --domain example.com --port 443
 ```
 
-Let's Encrypt uses TLS-ALPN-01 challenge validation — no separate port 80 needed. Certificates are automatically provisioned and renewed, cached to `.rllm-certs/` by default (configurable via `--cert-cache-dir`). Optionally pass `--letsencrypt-email` for expiry notifications.
+Uses TLS-ALPN-01 challenge validation — no separate port 80 needed. Certificates are automatically provisioned and renewed, cached to `.rllm-certs/` by default.
+
+</details>
 
 ## Architecture
 
 ```
 src/
-├── main.rs              — CLI entry point (parse args, dispatch)
-├── commands/
-│   ├── mod.rs           — Command enum (Run | Batch | Serve)
-│   ├── run.rs           — Single-prompt inference
-│   ├── batch.rs         — Batched inference from file
-│   └── serve.rs         — API server CLI args + launch
+├── main.rs              — CLI entry point
+├── commands/            — run (single prompt), batch (multi-prompt), serve (API server)
 ├── model/
 │   ├── mod.rs           — Transformer forward pass (single-token + batched prefill)
 │   ├── config.rs        — HuggingFace config.json parsing, ModelArch detection
 │   ├── loader.rs        — Safetensors loading, Q4 on-load quantization
 │   ├── tokenizer.rs     — BPE tokenizer with per-model special tokens
-│   ├── chat.rs          — Chat template formatter (Llama 3, ChatML, Mistral, Phi, Gemma)
+│   ├── chat.rs          — Chat template formatter
 │   ├── kv_cache.rs      — Paged KV cache (block pool + per-sequence state)
 │   └── sampler.rs       — Temperature + top-p sampling
-├── engine/
-│   ├── mod.rs           — Continuous batching loop (scheduler + model)
-│   └── scheduler.rs     — Sequence management, FCFS admission
-├── api/
-│   ├── mod.rs           — HTTP server setup, inference worker thread
-│   ├── openai.rs        — OpenAI-compatible handlers (chat/completions/models)
-│   ├── anthropic.rs     — Anthropic-compatible handler (messages)
-│   └── tls.rs           — TLS support (manual certs + Let's Encrypt)
+├── engine/              — Continuous batching loop + FCFS scheduler
+├── api/                 — axum HTTP server, OpenAI + Anthropic handlers, TLS
 └── gpu/
     ├── mod.rs           — GpuBackend trait (platform-generic interface)
-    ├── metal/           — Metal backend + compute shaders
-    │   ├── mod.rs         — dispatch, pipeline management
-    │   ├── matmul.metal   — SIMD-cooperative matvec + GEMM (bf16 + Q4)
-    │   ├── attention.metal — fused single-pass attention (flat, paged, fused KV+attend, prefill)
-    │   ├── rms_norm.metal  — single + batched RMSNorm
-    │   ├── rope.metal      — single + batched RoPE
-    │   ├── embed.metal     — single + batched embedding lookup
-    │   └── elementwise.metal — add, SwiGLU
-    └── cuda/            — CUDA backend (stubs + shader ports)
-        ├── mod.rs         — stubbed trait impls (unreachable!())
-        └── shaders/       — .cu shader ports of Metal kernels
+    ├── metal/           — Metal backend + .metal compute shaders
+    └── cuda/            — CUDA backend + .cu shader ports
 ```
 
-Model code is generic over a `GpuBackend` trait with an associated `Tensor` type. Platform selection uses OS-conditional compilation — Metal on macOS, CUDA on Linux. Llama, Qwen, Mistral, and Phi share the same forward pass primitives; differences are in weight loading (Phi uses fused qkv/gate_up tensors split on load), QKV bias (Qwen 2.5 only), and chat template. Mistral is architecturally identical to Llama and re-exports its forward pass directly. Mixtral 8x7B combines Mistral's attention with 8-expert MoE FFN (top-2 routing). Gemma 3 has a dedicated forward pass with sandwich norms (4 RMSNorm per layer), GeGLU activation, sliding window attention, QK-norm, and dual RoPE bases. Qwen3 MoE and Qwen 3.5 use Mixture of Experts with shared routing primitives.
+### Optimisation Stack
 
-### Inference pipeline
-
-```
-Single-sequence mode (rllm run):
-  load model → create paged KV pool + prefill buffers
-  → encode prompt → batched GEMM prefill → decode loop (stream tokens)
-
-Batch mode (rllm batch):
-  load model → create KV pool + scheduler + engine
-  → submit all prompts → engine.step() loop until all sequences complete
-
-Server mode (rllm serve):
-  spawn worker thread (owns backend + model + KV pool)
-  → start axum HTTP server on tokio runtime
-  → per request: handler → channel → worker (prefill + decode) → stream tokens back
-```
-
-### Optimisation stack
-
-| Layer | Technique | Speedup | Why |
-|---|---|---|---|
-| Matmul | SIMD-cooperative (32 threads/row) | ~2x | Coalesced reads, hardware `simd_sum` |
-| Dispatch | Async command buffers | ~4x | Eliminates 144 GPU syncs per token |
-| Weights | Q4 quantization | ~1.5x | 3.2x less memory bandwidth |
-| Prefill | Batched GEMM | 3-10x | Weight reuse: load once, compute B times |
-| KV cache | Paged allocation | — | On-demand blocks, no wasted memory |
-| Attention | Fused single-pass softmax+V | 1.3-2.8x | Eliminates Q·K recomputation, vectorised loads, shared Q, fused KV write, head_dim-specialised pipelines |
-| Batching | Continuous batching | ~Nx | N sequences share the GPU |
+| Layer | Technique | Speedup |
+|---|---|---|
+| Matmul | SIMD-cooperative (32 threads/row, hardware `simd_sum`) | ~2x |
+| Dispatch | Async command buffers (eliminates GPU syncs per token) | ~4x |
+| Weights | Q4 quantization (3.2x less memory bandwidth) | ~1.5x |
+| Prefill | Batched GEMM (load weights once, compute B times) | 3-10x |
+| KV cache | Paged allocation (on-demand blocks, no waste) | — |
+| Attention | Fused single-pass softmax+V, head_dim-specialised pipelines | 1.3-2.8x |
+| Batching | Continuous batching (N sequences share the GPU) | ~Nx |
 
 ## Model Setup
 
-Models are downloaded from [Hugging Face](https://huggingface.co) in safetensors format. Install the [`hf` CLI](https://huggingface.co/docs/huggingface_hub/en/guides/cli):
+Download models from [Hugging Face](https://huggingface.co) in safetensors format:
 
 ```bash
-# macOS / Linux
+# Install the hf CLI
 curl -LsSf https://hf.co/cli/install.sh | bash
 
-# or via pip
-pip install huggingface_hub
+# Download models
+hf download meta-llama/Llama-3.2-1B-Instruct --local-dir models/llama-3.2-1b-instruct
+hf download Qwen/Qwen2.5-7B-Instruct --local-dir models/qwen-2.5-7b-instruct
+hf download mistralai/Mistral-7B-Instruct-v0.3 --local-dir models/mistral-7b-instruct
+hf download google/gemma-3-4b-it --local-dir models/gemma-3-4b-it
+hf download microsoft/phi-4 --local-dir models/phi-4
 ```
 
-Then download models into a `models/` directory:
+<details>
+<summary>All supported model downloads</summary>
 
 ```bash
-# Llama 3 — base models (text completion)
+# Llama 3 — base models
 hf download meta-llama/Llama-3.2-1B --local-dir models/llama-3.2-1b
 hf download meta-llama/Llama-3.2-3B --local-dir models/llama-3.2-3b
 hf download meta-llama/Llama-3.1-8B --local-dir models/llama-3.1-8b
 
-# Llama 3 — instruct models (chat / instruction following)
+# Llama 3 — instruct models
 hf download meta-llama/Llama-3.2-1B-Instruct --local-dir models/llama-3.2-1b-instruct
 hf download meta-llama/Llama-3.2-3B-Instruct --local-dir models/llama-3.2-3b-instruct
 hf download meta-llama/Llama-3.1-8B-Instruct --local-dir models/llama-3.1-8b-instruct
 
-# Mistral 7B — instruct model (architecturally identical to Llama)
+# Mistral / Mixtral
 hf download mistralai/Mistral-7B-Instruct-v0.3 --local-dir models/mistral-7b-instruct
-
-# Mixtral 8x7B — sparse MoE (8 experts, top-2 routing, ~87 GB download, Q4 recommended)
 hf download mistralai/Mixtral-8x7B-Instruct-v0.1 --local-dir models/mixtral-8x7b-instruct
 
-# Qwen 2.5 — instruct models
+# Qwen
 hf download Qwen/Qwen2.5-3B-Instruct --local-dir models/qwen-2.5-3b-instruct
 hf download Qwen/Qwen2.5-7B-Instruct --local-dir models/qwen-2.5-7b-instruct
-
-# Qwen3 MoE — 30.5B total, 3.3B active per token (~61 GB download)
 hf download Qwen/Qwen3-Coder-30B-A3B-Instruct --local-dir models/qwen3-coder-30b-a3b-instruct
 
-# Gemma 3 — instruct models (sandwich norms, GeGLU, sliding window attention)
+# Gemma 3
 hf download google/gemma-3-4b-it --local-dir models/gemma-3-4b-it
 hf download google/gemma-3-27b-it --local-dir models/gemma-3-27b-it
 
-# Phi-4 — 14.7B dense (~28 GB download)
+# Phi-4
 hf download microsoft/phi-4 --local-dir models/phi-4
 
-# DeepSeek R1 distilled — 32.8B dense (~61 GB download)
+# DeepSeek R1 distilled
 hf download deepseek-ai/DeepSeek-R1-Distill-Qwen-32B --local-dir models/DeepSeek-R1-Distill-Qwen-32B
 ```
 
-> **Note:** Llama, Gemma, and Mistral models are gated — you'll need to accept the license on Hugging Face and authenticate with `hf auth login` before downloading. Qwen models are open access (Apache-2.0).
+</details>
+
+> **Note:** Llama, Gemma, and Mistral models are gated — accept the license on Hugging Face and run `hf auth login` before downloading. Qwen models are open access.
 
 Each model directory should contain `config.json`, `tokenizer.json`, and one or more `.safetensors` weight files.
