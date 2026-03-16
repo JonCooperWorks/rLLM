@@ -207,7 +207,7 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
         //
         // Extract each token's hidden state from the batched buffer,
         // run MoE routing + expert FFNs, and write back.
-        let hidden_byte_size = m.config.hidden_size * 2; // bf16
+        let hidden_byte_size = m.config.hidden_size * crate::gpu::TensorDtype::BF16.byte_size();
         let full_bytes = m.backend.tensor_byte_count(&bufs.hidden);
         let mut host_hidden = vec![0u8; full_bytes];
         m.backend.copy_to_host(&bufs.hidden, &mut host_hidden);

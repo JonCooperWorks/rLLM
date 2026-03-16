@@ -391,7 +391,7 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
             // Extract each token's hidden state, run DeltaNet single-token
             // forward, and write results back.  Similar to MoE prefill in
             // qwen3_moe.rs — inherently sequential for recurrent layers.
-            let hidden_byte_size = m.config.hidden_size * 2; // bf16
+            let hidden_byte_size = m.config.hidden_size * crate::gpu::TensorDtype::BF16.byte_size();
             let full_bytes = m.backend.tensor_byte_count(&bufs.hidden);
             let mut host_hidden = vec![0u8; full_bytes];
 
@@ -524,7 +524,7 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
             // picks different experts), so we round-trip through host memory.
             // Dense models can use batched GEMM for the entire prefill chunk.
             if m.config.is_moe() {
-                let hidden_byte_size = m.config.hidden_size * 2; // bf16
+                let hidden_byte_size = m.config.hidden_size * crate::gpu::TensorDtype::BF16.byte_size();
                 let full_bytes = m.backend.tensor_byte_count(&bufs.hidden);
                 let mut host_hidden = vec![0u8; full_bytes];
                 m.backend.copy_to_host(&bufs.hidden, &mut host_hidden);
