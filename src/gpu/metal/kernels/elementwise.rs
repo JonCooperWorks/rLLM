@@ -64,6 +64,14 @@ struct SiluMulClampParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct GptOssGatedActParams {
+    size: u32,
+    alpha: f32,
+    limit: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct TopKParams {
     num_experts: u32,
     k: u32,
@@ -199,6 +207,25 @@ impl GpuElementwise for MetalBackend {
         let params = SiluMulClampParams { size, limit };
         self.dispatch_async(
             &self.pipeline_silu_mul_clamp,
+            &params,
+            &[(&gate.buffer, 1), (&up.buffer, 2), (&out.buffer, 3)],
+            MTLSize::new(size as u64, 1, 1),
+            MTLSize::new(256.min(size as u64), 1, 1),
+        );
+    }
+
+    fn gpt_oss_gated_act(
+        &self,
+        gate: &MetalTensor,
+        up: &MetalTensor,
+        out: &MetalTensor,
+        size: u32,
+        alpha: f32,
+        limit: f32,
+    ) {
+        let params = GptOssGatedActParams { size, alpha, limit };
+        self.dispatch_async(
+            &self.pipeline_gpt_oss_gated_act,
             &params,
             &[(&gate.buffer, 1), (&up.buffer, 2), (&out.buffer, 3)],
             MTLSize::new(size as u64, 1, 1),

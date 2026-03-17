@@ -142,6 +142,7 @@ pub(crate) struct MetalBackend {
 
     // GPT-OSS kernels.
     pub(crate) pipeline_silu_mul_clamp: metal::ComputePipelineState,
+    pub(crate) pipeline_gpt_oss_gated_act: metal::ComputePipelineState,
     pub(crate) pipeline_rope_yarn: metal::ComputePipelineState,
     pub(crate) pipeline_rope_yarn_batch: metal::ComputePipelineState,
 
@@ -354,6 +355,12 @@ impl MetalBackend {
             "silu_mul_clamp",
             &compile_opts,
         )?;
+        let pipeline_gpt_oss_gated_act = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_ELEMENTWISE,
+            "gpt_oss_gated_act",
+            &compile_opts,
+        )?;
         let pipeline_rope_yarn = Self::make_pipeline(
             &device,
             METAL_SOURCE_ROPE,
@@ -411,6 +418,7 @@ impl MetalBackend {
             pipeline_deltanet_step,
             pipeline_rope_partial,
             pipeline_silu_mul_clamp,
+            pipeline_gpt_oss_gated_act,
             pipeline_rope_yarn,
             pipeline_rope_yarn_batch,
             current_cmd: std::sync::Mutex::new(None),

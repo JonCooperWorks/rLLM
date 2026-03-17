@@ -148,7 +148,7 @@ pub(crate) fn forward_single_impl<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + G
             m.backend, &m.k_buf, &m.v_buf, &m.q_buf, &m.attn_out,
             pool, seq_state, layer_idx, pos,
             d.num_heads, d.num_kv_heads, d.head_dim,
-            0, 0.0, // No sliding window, default attention scale.
+            0, 0.0, None, // No sliding window, default attention scale, no sinks.
         );
         primitives::o_proj_residual(
             m.backend, layer, &m.attn_out, &m.norm_buf, &m.hidden, d.hidden_size,
@@ -214,7 +214,7 @@ pub(crate) fn forward_prefill_impl<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
         primitives::paged_kv_and_prefill_attention(
             m.backend, bufs, pool, seq_state, layer_idx,
             bs, start_pos, d.num_heads, d.num_kv_heads, d.head_dim,
-            0, 0.0,
+            0, 0.0, None,
         );
         primitives::o_proj_residual_batch(m.backend, layer, bufs, bs, d.hidden_size);
 

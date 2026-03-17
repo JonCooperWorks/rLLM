@@ -254,6 +254,14 @@ pub(crate) struct LayerWeights<B: GpuCore> {
     // Other architectures have NO bias on O-proj.
     pub o_proj_bias: Option<B::Tensor>, // [hidden_size], or None
 
+    // --- Attention sinks (GPT-OSS only) ---
+    //
+    // Per-head scalar logits that participate in the attention softmax as extra
+    // entries but have no associated V vector.  They absorb probability mass,
+    // effectively gating how much the actual KV content contributes.
+    // Without sinks, GPT-OSS produces gibberish.
+    pub sinks: Option<B::Tensor>, // [num_attention_heads], or None
+
     // --- QK-norm (Qwen 3 MoE only) ---
     //
     // Learning note: QK-norm applies per-head RMSNorm to Q and K projections
@@ -351,22 +359,6 @@ const FP4_E2M1_LUT: [f32; 16] = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,    // positive (sign=0)
     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0, // negative (sign=1)
 ];
-
-/// Transpose a row-major bf16 matrix from [rows, cols] to [cols, rows].
-///
-/// MXFP4 weights are stored transposed relative to HuggingFace convention:
-/// on-disk `[in_features, out_features]` but the model expects `[out_features, in_features]`.
-fn transpose_bf16(data: &[u8], rows: usize, cols: usize) -> Vec<u8> {
-    let src: &[half::bf16] = bytemuck::cast_slice(data);
-    assert_eq!(src.len(), rows * cols);
-    let mut dst = vec![half::bf16::ZERO; rows * cols];
-    for r in 0..rows {
-        for c in 0..cols {
-            dst[c * rows + r] = src[r * cols + c];
-        }
-    }
-    bytemuck::cast_slice(&dst).to_vec()
-}
 
 /// Decode an E8M0 scale byte to f32.
 ///
@@ -701,12 +693,25 @@ pub(crate) fn load_weights<B: GpuCore>(
                         gu_rows, hidden, block_size,
                     );
 
-                    // Split gate [moe_inter, hidden] and up [moe_inter, hidden].
-                    let gate_bytes = moe_inter * hidden * 2;
-                    let gate_raw = &gu_bf16[..gate_bytes];
-                    let up_raw = &gu_bf16[gate_bytes..2 * gate_bytes];
-                    let gate_t = upload_raw_maybe_quantized(backend, gate_raw, &[moe_inter, hidden], quantize);
-                    let up_t = upload_raw_maybe_quantized(backend, up_raw, &[moe_inter, hidden], quantize);
+                    // De-interleave gate and up from fused gate_up_proj.
+                    //
+                    // GPT-OSS gate_up_proj is [2*moe_inter, hidden] with interleaved rows:
+                    //   row 0 = gate[0], row 1 = up[0], row 2 = gate[1], row 3 = up[1], ...
+                    // We need to extract even rows → gate [moe_inter, hidden]
+                    //                  odd rows  → up   [moe_inter, hidden]
+                    let row_bytes = hidden * 2; // bf16
+                    let mut gate_raw = vec![0u8; moe_inter * row_bytes];
+                    let mut up_raw = vec![0u8; moe_inter * row_bytes];
+                    for r in 0..moe_inter {
+                        let even_start = (2 * r) * row_bytes;
+                        let odd_start = (2 * r + 1) * row_bytes;
+                        gate_raw[r * row_bytes..(r + 1) * row_bytes]
+                            .copy_from_slice(&gu_bf16[even_start..even_start + row_bytes]);
+                        up_raw[r * row_bytes..(r + 1) * row_bytes]
+                            .copy_from_slice(&gu_bf16[odd_start..odd_start + row_bytes]);
+                    }
+                    let gate_t = upload_raw_maybe_quantized(backend, &gate_raw, &[moe_inter, hidden], quantize);
+                    let up_t = upload_raw_maybe_quantized(backend, &up_raw, &[moe_inter, hidden], quantize);
 
                     // Dequant down: on-disk [hidden, moe_inter] → our convention [hidden, moe_inter] = [out, in].
                     let d_b_off = j * down_blocks_per_expert;
@@ -718,17 +723,22 @@ pub(crate) fn load_weights<B: GpuCore>(
                     );
                     let down_t = upload_raw_maybe_quantized(backend, &down_bf16, &[hidden, moe_inter], quantize);
 
-                    // Expert biases — split fused gate_up_bias into separate gate and up.
+                    // Expert biases — de-interleave fused gate_up_bias into separate gate and up.
+                    //
+                    // The bias is [2*moe_inter] with interleaved elements:
+                    //   [gate[0], up[0], gate[1], up[1], ...]
+                    // Extract even indices → gate bias, odd indices → up bias.
                     let (gate_bias, up_bias) = if let Some(ref bias) = gu_bias_data {
                         let off = j * gu_bias_per_expert;
                         let bias_slice = &bias[off..off + gu_bias_per_expert];
-                        // Each element is bf16 (2 bytes), so split at moe_inter * 2 bytes.
-                        let gate_bytes = moe_inter * 2;
-                        let gate_part = &bias_slice[..gate_bytes];
-                        let up_part = &bias_slice[gate_bytes..];
+                        let bias_bf16: &[u16] = bytemuck::cast_slice(bias_slice);
+                        let gate_vals: Vec<u16> = (0..moe_inter).map(|i| bias_bf16[2 * i]).collect();
+                        let up_vals: Vec<u16> = (0..moe_inter).map(|i| bias_bf16[2 * i + 1]).collect();
+                        let gate_bytes: &[u8] = bytemuck::cast_slice(&gate_vals);
+                        let up_bytes: &[u8] = bytemuck::cast_slice(&up_vals);
                         (
-                            Some(backend.upload_tensor(gate_part, &[moe_inter], TensorDtype::BF16)),
-                            Some(backend.upload_tensor(up_part, &[moe_inter], TensorDtype::BF16)),
+                            Some(backend.upload_tensor(gate_bytes, &[moe_inter], TensorDtype::BF16)),
+                            Some(backend.upload_tensor(up_bytes, &[moe_inter], TensorDtype::BF16)),
                         )
                     } else {
                         (None, None)
@@ -1191,6 +1201,19 @@ pub(crate) fn load_weights<B: GpuCore>(
             None
         };
 
+        // Attention sinks (GPT-OSS only): per-head scalar logits [num_attention_heads].
+        let sinks = if is_gpt_oss {
+            let num_q_heads = config.num_attention_heads;
+            Some(upload_tensor(
+                &store,
+                backend,
+                &format!("{prefix}.self_attn.sinks"),
+                &[num_q_heads],
+            )?)
+        } else {
+            None
+        };
+
         layers.push(LayerWeights {
             input_layernorm: upload_norm(
                 &format!("{prefix}.input_layernorm.weight"),
@@ -1201,6 +1224,7 @@ pub(crate) fn load_weights<B: GpuCore>(
             v_proj,
             o_proj,
             o_proj_bias,
+            sinks,
             q_bias,
             k_bias,
             v_bias,

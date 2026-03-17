@@ -252,6 +252,47 @@ kernel void silu_mul_clamp(
 }
 
 // ---------------------------------------------------------------------------
+// GPT-OSS gated activation: out[i] = (clamp(up[i], -limit, limit) + 1) *
+//                                      clamp(gate[i], -inf, limit) *
+//                                      sigmoid(clamp(gate[i], -inf, limit) * alpha)
+//
+// This is NOT standard SwiGLU.  Key differences:
+//   1. Uses gate * sigmoid(gate * alpha) instead of gate * sigmoid(gate) (silu)
+//   2. Clamps gate (upper only) and up (both bounds) BEFORE activation
+//   3. Adds 1 to up: (up + 1) * glu, not up * glu
+//
+// The alpha=1.702 makes the sigmoid steeper (closer to a step function).
+// The (up + 1) bias means even when up=0, the output equals the gated value.
+// ---------------------------------------------------------------------------
+
+struct GptOssGatedActParams {
+    uint size;
+    float alpha;
+    float limit;
+};
+
+kernel void gpt_oss_gated_act(
+    constant GptOssGatedActParams& params [[buffer(0)]],
+    device const bfloat* gate             [[buffer(1)]],
+    device const bfloat* up               [[buffer(2)]],
+    device bfloat* output                 [[buffer(3)]],
+    uint gid                              [[thread_position_in_grid]]
+) {
+    if (gid >= params.size) return;
+    float g = float(gate[gid]);
+    float u = float(up[gid]);
+
+    // Separate clamping: gate has upper-only clamp, up has both bounds.
+    float g_c = min(g, params.limit);
+    float u_c = clamp(u, -params.limit, params.limit);
+
+    // Gated activation: gate * sigmoid(gate * alpha).
+    float glu = g_c / (1.0f + exp(-g_c * params.alpha));
+
+    output[gid] = bfloat((u_c + 1.0f) * glu);
+}
+
+// ---------------------------------------------------------------------------
 // GPU-side top-k selection with softmax for MoE expert routing.
 //
 // Replaces the CPU-side routing path that required one GPU→CPU sync per layer

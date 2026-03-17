@@ -63,6 +63,7 @@ struct PagedAttentionParams {
     block_size: u32,
     window_size: u32,
     attn_scale: f32,
+    has_sinks: u32,
 }
 
 #[repr(C)]
@@ -84,6 +85,7 @@ struct PagedAttentionFusedParams {
     block_size: u32,
     window_size: u32,
     attn_scale: f32,
+    has_sinks: u32,
 }
 
 #[repr(C)]
@@ -96,6 +98,7 @@ struct PrefillAttentionParams {
     head_dim: u32,
     window_size: u32,
     attn_scale: f32,
+    has_sinks: u32,
 }
 
 impl GpuAttention for MetalBackend {
@@ -201,6 +204,7 @@ impl GpuAttention for MetalBackend {
         head_dim: u32,
         window_size: u32,
         attn_scale: f32,
+        sinks: Option<&MetalTensor>,
     ) {
         let params = PagedAttentionParams {
             seq_len,
@@ -210,7 +214,12 @@ impl GpuAttention for MetalBackend {
             block_size: crate::model::kv_cache::BLOCK_SIZE as u32,
             window_size,
             attn_scale,
+            has_sinks: if sinks.is_some() { 1 } else { 0 },
         };
+        // Sinks buffer: always bind a valid buffer.  When has_sinks=0 the kernel
+        // ignores it, but Metal requires a valid binding.  Use the output buffer
+        // as a harmless dummy when sinks are absent.
+        let sinks_buf = sinks.map(|s| &s.buffer).unwrap_or(&out.buffer);
         let threads_per_group: u64 = 256;
         let pipeline = if head_dim > 128 { &self.pipeline_paged_attention_hd256 } else { &self.pipeline_paged_attention };
         self.dispatch_async(
@@ -222,6 +231,7 @@ impl GpuAttention for MetalBackend {
                 (&v_pool.buffer, 3),
                 (&block_table.buffer, 4),
                 (&out.buffer, 5),
+                (sinks_buf, 6),
             ],
             MTLSize::new(num_heads as u64 * threads_per_group, 1, 1),
             MTLSize::new(threads_per_group, 1, 1),
@@ -275,6 +285,7 @@ impl GpuAttention for MetalBackend {
         head_dim: u32,
         window_size: u32,
         attn_scale: f32,
+        sinks: Option<&MetalTensor>,
     ) {
         let params = PagedAttentionFusedParams {
             pos,
@@ -284,7 +295,9 @@ impl GpuAttention for MetalBackend {
             block_size: crate::model::kv_cache::BLOCK_SIZE as u32,
             window_size,
             attn_scale,
+            has_sinks: if sinks.is_some() { 1 } else { 0 },
         };
+        let sinks_buf = sinks.map(|s| &s.buffer).unwrap_or(&out.buffer);
         let threads_per_group: u64 = 256;
         let pipeline = if head_dim > 128 { &self.pipeline_paged_attention_fused_hd256 } else { &self.pipeline_paged_attention_fused };
         self.dispatch_async(
@@ -298,6 +311,7 @@ impl GpuAttention for MetalBackend {
                 (&v_pool.buffer, 5),
                 (&block_table.buffer, 6),
                 (&out.buffer, 7),
+                (sinks_buf, 8),
             ],
             MTLSize::new(num_heads as u64 * threads_per_group, 1, 1),
             MTLSize::new(threads_per_group, 1, 1),
@@ -317,6 +331,7 @@ impl GpuAttention for MetalBackend {
         head_dim: u32,
         window_size: u32,
         attn_scale: f32,
+        sinks: Option<&MetalTensor>,
     ) {
         let params = PrefillAttentionParams {
             chunk_size,
@@ -326,7 +341,9 @@ impl GpuAttention for MetalBackend {
             head_dim,
             window_size,
             attn_scale,
+            has_sinks: if sinks.is_some() { 1 } else { 0 },
         };
+        let sinks_buf = sinks.map(|s| &s.buffer).unwrap_or(&out.buffer);
         let threads_per_group: u64 = 256;
         let num_threadgroups = chunk_size as u64 * num_heads as u64;
         let pipeline = if head_dim > 128 { &self.pipeline_prefill_attention_hd256 } else { &self.pipeline_prefill_attention };
@@ -338,6 +355,7 @@ impl GpuAttention for MetalBackend {
                 (&k.buffer, 2),
                 (&v.buffer, 3),
                 (&out.buffer, 4),
+                (sinks_buf, 5),
             ],
             MTLSize::new(num_threadgroups * threads_per_group, 1, 1),
             MTLSize::new(threads_per_group, 1, 1),

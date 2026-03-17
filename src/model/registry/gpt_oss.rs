@@ -11,7 +11,7 @@
 //   - 24 layers, hidden_size=2880, head_dim=64
 //   - 64 query heads, 8 KV heads → q_dim=4096 (≠ hidden_size)
 //   - 32 experts per layer, top-4 routing with router bias
-//   - Clamped SwiGLU: clamp(silu(gate) * up, -limit, limit) with limit=7.0
+//   - GPT-OSS gated activation: (clamp(up,-7,7)+1) * clamp(gate,max=7) * σ(gate×1.702)
 //   - QKV AND O-proj bias on all attention projections
 //   - Expert biases: per-expert gate, up, and down biases
 //   - Alternating sliding_attention (window=128) / full_attention layers
@@ -20,14 +20,15 @@
 //
 // Key differences from Qwen3 MoE (closest existing architecture):
 //   1. All projections have bias (QKV + O-proj + router + expert FFN)
-//   2. Clamped SwiGLU instead of standard SwiGLU
-//   3. YaRN RoPE instead of standard RoPE
-//   4. Sliding window attention on alternating layers
-//   5. q_dim ≠ hidden_size (4096 vs 2880)
+//   2. Non-standard gated activation (NOT SwiGLU — uses alpha=1.702 sigmoid)
+//   3. Interleaved gate/up weights (even/odd rows, not first-half/second-half)
+//   4. YaRN RoPE instead of standard RoPE
+//   5. Sliding window attention on alternating layers
+//   6. q_dim ≠ hidden_size (4096 vs 2880)
 //
 // Related files:
 //   Config:      model/config.rs (GptOss variant)
-//   Loader:      model/loader.rs (MXFP4 dequant, expert biases)
+//   Loader:      model/loader.rs (MXFP4 dequant, expert biases, de-interleaving)
 //   Primitives:  model/primitives.rs (biased MoE dispatch, YaRN RoPE)
 //   Dispatch:    model/mod.rs (forward_single/prefill_paged arms)
 // ===========================================================================
@@ -41,7 +42,7 @@ use crate::model::profile::{self, Component};
 use crate::model::{Model, PrefillBuffers};
 
 // ---------------------------------------------------------------------------
-// MoE FFN block: biased dispatch with router bias, expert biases, clamped SwiGLU.
+// MoE FFN block: biased dispatch with GPT-OSS gated activation.
 // ---------------------------------------------------------------------------
 
 fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
@@ -95,6 +96,16 @@ pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
     let swiglu_limit = m.config.swiglu_limit as f32;
     let rope_scaling = m.config.rope_scaling.as_ref();
 
+    // YaRN attention scaling: HF multiplies cos/sin by attention_scaling, which
+    // effectively scales Q·K by attention_scaling².  Instead of modifying the RoPE
+    // kernel, we fold this into the attention scale factor.
+    let attn_scale = rope_scaling
+        .map(|rs| {
+            let s = rs.attention_scaling() as f32;
+            s * s / (d.head_dim as f32).sqrt()
+        })
+        .unwrap_or(0.0);
+
     let t = profile::begin(m.backend);
     primitives::embed_token(m.backend, &m.weights, token_id, &m.hidden, d.hidden_size);
     profile::record(m.backend, t, Component::Embed);
@@ -142,7 +153,8 @@ pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
             m.backend, &m.k_buf, &m.v_buf, &m.q_buf, &m.attn_out,
             pool, seq_state, layer_idx, pos,
             d.num_heads, d.num_kv_heads, d.head_dim,
-            window_size, 0.0,
+            window_size, attn_scale,
+            layer.sinks.as_ref(),
         );
 
         // O projection with bias + residual.
@@ -190,6 +202,14 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
     let swiglu_limit = m.config.swiglu_limit as f32;
     let rope_scaling = m.config.rope_scaling.as_ref();
 
+    // YaRN attention scaling (see forward_single_paged for explanation).
+    let attn_scale = rope_scaling
+        .map(|rs| {
+            let s = rs.attention_scaling() as f32;
+            s * s / (d.head_dim as f32).sqrt()
+        })
+        .unwrap_or(0.0);
+
     primitives::upload_prefill_inputs(m.backend, bufs, tokens, start_pos, bs);
     primitives::embed_batch(m.backend, &m.weights, bufs, bs, d.hidden_size);
 
@@ -200,6 +220,7 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
         m.backend.rms_norm_batch(
             &bufs.hidden, &layer.input_layernorm, d.eps, &bufs.norm_buf, bs,
         );
+
         primitives::qkv_projection_batch_qdim(
             m.backend, layer, bufs, bs, d.q_dim, d.hidden_size, d.kv_dim,
         );
@@ -232,7 +253,8 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
         primitives::paged_kv_and_prefill_attention(
             m.backend, bufs, pool, seq_state, layer_idx,
             bs, start_pos, d.num_heads, d.num_kv_heads, d.head_dim,
-            window_size, 0.0,
+            window_size, attn_scale,
+            layer.sinks.as_ref(),
         );
 
         // O projection with bias (batched) + residual.

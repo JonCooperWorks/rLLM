@@ -324,7 +324,7 @@ pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
                 &m.q_buf, &pool.k_pool[kv_idx], &pool.v_pool[kv_idx],
                 &seq_state.block_table_gpu, &m.attn_out,
                 pos + 1, d.num_heads, d.num_kv_heads, d.head_dim,
-                0, 0.0,
+                0, 0.0, None,
             );
 
             if has_output_gate {
@@ -507,7 +507,7 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
             m.backend.prefill_attention(
                 &bufs.q_buf, &bufs.k_buf, &bufs.v_buf, &bufs.attn_out,
                 bs, start_pos, d.num_heads, d.num_kv_heads, d.head_dim,
-                0, 0.0,
+                0, 0.0, None,
             );
             // GQA output gate (batched): attn_out = attn_out * sigmoid(z).
             if has_output_gate {

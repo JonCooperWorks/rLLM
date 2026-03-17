@@ -13,7 +13,7 @@ Platform selection uses OS-conditional compilation (`#[cfg(target_os)]`) — no 
 
 ## Supported Models
 
-Llama 3, Qwen 2.5, Mistral, Mixtral 8x7B, Qwen3 MoE, Qwen3.5, Phi-4, Gemma 3, DeepSeek-R1-Distill — all from the same codebase with bf16 and Q4 quantization.
+Llama 3, Qwen 2.5, Mistral, Mixtral 8x7B, Qwen3 MoE, Qwen3.5, Phi-4, Gemma 3, DeepSeek-R1-Distill, GPT-OSS-20B — all from the same codebase with bf16 and Q4 quantization.
 
 ## Benchmarks
 
@@ -36,6 +36,7 @@ Measured via `rllm run --chat`, single run.
 | Qwen3 Coder 30B-A3B Instruct | 30.5B (3.3B active) | 2 tok/s | 11 tok/s | 40,000 ms | 2,900 ms |
 | DeepSeek-R1-Distill-Qwen-32B | 32.8B | — | 5 tok/s | — | 4,700 ms |
 | Qwen3.5 35B-A3B | 35.1B (3.3B active) | 5 tok/s | 16 tok/s | 44,600 ms | 2,000 ms |
+| GPT-OSS 20B | 20.0B (3.6B active) | 6 tok/s | 34 tok/s | 4,800 ms | 425 ms |
 | Mixtral 8x7B Instruct | 46.7B (12.9B active) | — | 12 tok/s | — | 5,400 ms |
 
 Q4 quantization (`--quantize`) gives ~1.3-3.5x faster decode by reducing memory bandwidth. Mixtral requires Q4 (bf16 would need ~87 GB). Q4 is strongly recommended for models over ~8B params. Large models (Gemma 3 27B, Phi-4, Qwen3/3.5 MoE) run in bf16 but are slow because the weights consume most of the 64 GB unified memory. Dynamic KV cache sizing automatically adjusts block count based on available GPU memory.
@@ -74,16 +75,17 @@ Q4 is slower than bf16 for decode on H100 — unlike Apple Silicon where Q4 is a
 
 ## Features
 
-- **Multi-architecture** — Llama 3, Qwen 2.5, Mistral, Mixtral 8x7B, Qwen3 MoE, Qwen3.5, Phi-4, and Gemma 3 from the same codebase
+- **Multi-architecture** — Llama 3, Qwen 2.5, Mistral, Mixtral 8x7B, Qwen3 MoE, Qwen3.5, Phi-4, Gemma 3, and GPT-OSS-20B from the same codebase
 - **Metal + CUDA backends** — SIMD-cooperative matmul, async command buffer dispatch
 - **Batched prefill** — GEMM-based prompt processing (3-10x faster than token-by-token)
 - **Paged KV cache** — on-demand block allocation, shared across sequences
 - **Continuous batching** — concurrent multi-sequence inference via engine/scheduler
 - **Q4 quantization** — 4-bit block quantization on load (~3.2x memory reduction)
 - **bf16 inference** — native half-precision compute
-- **Mixture of Experts** — top-k expert routing with per-token dispatch (Mixtral, Qwen3 MoE)
+- **Mixture of Experts** — top-k expert routing with per-token dispatch (Mixtral, Qwen3 MoE, GPT-OSS)
+- **MXFP4 dequantization** — microscaling FP4 (E2M1 + E8M0 scales) weight loading for GPT-OSS
 - **API server** — OpenAI and Anthropic compatible HTTP endpoints with SSE streaming
-- **Chat templates** — Llama 3, ChatML (Qwen), Mistral/Mixtral, Phi, and Gemma instruct formats
+- **Chat templates** — Llama 3, ChatML (Qwen/GPT-OSS), Mistral/Mixtral, Phi, and Gemma instruct formats
 - **Temperature + top-p sampling** — configurable via `--temperature` and `--top-p`
 
 ## Usage

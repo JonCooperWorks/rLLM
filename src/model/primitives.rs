@@ -218,13 +218,14 @@ pub(crate) fn paged_kv_and_attention<B: GpuAttention>(
     head_dim: u32,
     window_size: u32,
     attn_scale: f32,
+    sinks: Option<&B::Tensor>,
 ) {
     backend.paged_attention_fused(
         q_buf, k_buf, v_buf,
         &pool.k_pool[layer_idx], &pool.v_pool[layer_idx],
         &seq_state.block_table_gpu, attn_out,
         pos, num_heads, num_kv_heads, head_dim,
-        window_size, attn_scale,
+        window_size, attn_scale, sinks,
     );
 }
 
@@ -523,6 +524,7 @@ pub(crate) fn paged_kv_and_prefill_attention<B: GpuAttention>(
     head_dim: u32,
     window_size: u32,
     attn_scale: f32,
+    sinks: Option<&B::Tensor>,
 ) {
     backend.copy_to_paged_kv_cache_batch(
         &bufs.k_buf, &pool.k_pool[layer_idx], &seq_state.block_table_gpu,
@@ -535,7 +537,7 @@ pub(crate) fn paged_kv_and_prefill_attention<B: GpuAttention>(
     backend.prefill_attention(
         &bufs.q_buf, &bufs.k_buf, &bufs.v_buf, &bufs.attn_out,
         bs, start_pos, num_heads, num_kv_heads, head_dim,
-        window_size, attn_scale,
+        window_size, attn_scale, sinks,
     );
 }
 
@@ -641,12 +643,12 @@ pub(crate) fn o_proj_residual_qdim_biased<B: GpuMatmul + GpuElementwise>(
     backend.add(hidden, norm_buf, hidden, hidden_size);
 }
 
-/// MoE expert dispatch with router bias, expert biases, and clamped SwiGLU.
+/// MoE expert dispatch with router bias, expert biases, and GPT-OSS gated activation.
 ///
 /// Extends the standard `moe_expert_dispatch` with:
 ///   1. Router bias added after router matmul (before top-k)
 ///   2. Expert gate/up biases added after gate/up matmuls
-///   3. Clamped SwiGLU: clamp(silu(gate) * up, -limit, limit)
+///   3. GPT-OSS activation: (clamp(up,-lim,lim)+1) * clamp(gate,max=lim) * sigmoid(gate*alpha)
 ///   4. Expert down_bias added after down matmul
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn moe_expert_dispatch_biased<B: GpuMatmul + GpuElementwise>(
@@ -709,9 +711,10 @@ pub(crate) fn moe_expert_dispatch_biased<B: GpuMatmul + GpuElementwise>(
             backend.add(moe_up_buf, u_bias, moe_up_buf, moe_inter);
         }
 
-        // Clamped SwiGLU activation.
+        // GPT-OSS gated activation: NOT standard SwiGLU.
+        // Uses alpha=1.702 (fixed by architecture), asymmetric clamping, and (up+1) offset.
         if swiglu_limit > 0.0 {
-            backend.silu_mul_clamp(moe_gate_buf, moe_up_buf, moe_gate_buf, moe_inter, swiglu_limit);
+            backend.gpt_oss_gated_act(moe_gate_buf, moe_up_buf, moe_gate_buf, moe_inter, 1.702, swiglu_limit);
         } else {
             backend.silu_mul(moe_gate_buf, moe_up_buf, moe_gate_buf, moe_inter);
         }
@@ -728,7 +731,7 @@ pub(crate) fn moe_expert_dispatch_biased<B: GpuMatmul + GpuElementwise>(
     }
 }
 
-/// MoE FFN block with biased dispatch: norm → route → biased dispatch → residual.
+/// MoE FFN block with biased dispatch + GPT-OSS activation: norm → route → dispatch → residual.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn moe_ffn_block_biased<B: GpuNorm + GpuMatmul + GpuElementwise>(
     backend: &B,

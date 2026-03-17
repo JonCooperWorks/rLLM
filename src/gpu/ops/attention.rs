@@ -54,6 +54,11 @@ pub(crate) trait GpuAttention: GpuCore {
     );
 
     /// Paged attention: softmax(Q·K^T/scale)·V through block table indirection.
+    ///
+    /// `sinks`: optional per-head attention sink logits [num_heads].  When Some,
+    /// each head's sink value participates in the softmax as an extra entry that
+    /// absorbs probability mass but has no associated V vector.  Models without
+    /// sinks pass None.
     fn paged_attention(
         &self,
         q: &Self::Tensor,
@@ -67,6 +72,7 @@ pub(crate) trait GpuAttention: GpuCore {
         head_dim: u32,
         window_size: u32,
         attn_scale: f32,
+        sinks: Option<&Self::Tensor>,
     );
 
     /// Batched paged KV cache write: N vectors at different positions.
@@ -109,13 +115,14 @@ pub(crate) trait GpuAttention: GpuCore {
         head_dim: u32,
         window_size: u32,
         attn_scale: f32,
+        sinks: Option<&Self::Tensor>,
     ) {
         self.copy_to_paged_kv_cache(k, k_pool, block_table, pos, num_kv_heads, head_dim);
         self.copy_to_paged_kv_cache(v, v_pool, block_table, pos, num_kv_heads, head_dim);
         self.paged_attention(
             q, k_pool, v_pool, block_table, out,
             pos + 1, num_heads, num_kv_heads, head_dim,
-            window_size, attn_scale,
+            window_size, attn_scale, sinks,
         );
     }
 
@@ -133,5 +140,6 @@ pub(crate) trait GpuAttention: GpuCore {
         head_dim: u32,
         window_size: u32,
         attn_scale: f32,
+        sinks: Option<&Self::Tensor>,
     );
 }

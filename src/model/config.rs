@@ -528,6 +528,25 @@ pub struct RopeScaling {
     pub beta_slow: f64,
 }
 
+impl RopeScaling {
+    /// YaRN attention scaling factor.
+    ///
+    /// HuggingFace's YaRN implementation scales the cos/sin values by an
+    /// `attention_scaling` factor, effectively multiplying all Q·K dot products
+    /// by `attention_scaling²`.  This compensates for the reduced effective
+    /// context length after frequency interpolation.
+    ///
+    /// Formula: `0.1 * ln(factor) + 1.0` (from the YaRN paper, Section 3.3).
+    /// Returns 1.0 for non-YaRN scaling types.
+    pub fn attention_scaling(&self) -> f64 {
+        if self.rope_type == "yarn" && self.factor > 1.0 {
+            0.1 * self.factor.ln() + 1.0
+        } else {
+            1.0
+        }
+    }
+}
+
 impl ModelConfig {
     /// Load config from a JSON file.
     ///

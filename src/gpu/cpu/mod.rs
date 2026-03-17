@@ -272,6 +272,29 @@ impl GpuElementwise for CpuBackend {
         write_bf16(out, &result);
     }
 
+    fn gpt_oss_gated_act(
+        &self,
+        gate: &CpuTensor,
+        up: &CpuTensor,
+        out: &CpuTensor,
+        size: u32,
+        alpha: f32,
+        limit: f32,
+    ) {
+        let n = size as usize;
+        let g = read_bf16(gate, n);
+        let u = read_bf16(up, n);
+        let result: Vec<f32> = g.iter().zip(u.iter())
+            .map(|(gi, ui)| {
+                let g_c = gi.min(limit);
+                let u_c = ui.clamp(-limit, limit);
+                let glu = g_c / (1.0 + (-g_c * alpha).exp());
+                (u_c + 1.0) * glu
+            })
+            .collect();
+        write_bf16(out, &result);
+    }
+
     fn top_k_softmax(&self, logits: &CpuTensor, output: &CpuTensor, num_experts: u32, k: u32) {
         let n = num_experts as usize;
         let kk = k as usize;
@@ -638,7 +661,7 @@ impl GpuAttention for CpuBackend {
         write_bytes_at(pool, dst_offset, &src.data[..kv_dim * 2]);
     }
 
-    fn paged_attention(&self, q: &CpuTensor, k_pool: &CpuTensor, v_pool: &CpuTensor, block_table: &CpuTensor, out: &CpuTensor, seq_len: u32, num_heads: u32, num_kv_heads: u32, head_dim: u32, window_size: u32, attn_scale: f32) {
+    fn paged_attention(&self, q: &CpuTensor, k_pool: &CpuTensor, v_pool: &CpuTensor, block_table: &CpuTensor, out: &CpuTensor, seq_len: u32, num_heads: u32, num_kv_heads: u32, head_dim: u32, window_size: u32, attn_scale: f32, sinks: Option<&CpuTensor>) {
         let sl = seq_len as usize;
         let nh = num_heads as usize;
         let nkv = num_kv_heads as usize;
@@ -678,18 +701,31 @@ impl GpuAttention for CpuBackend {
                 scores[s] = dot * attn_scale;
             }
 
-            // Softmax
-            let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            // Attention sinks: include per-head sink logit as extra softmax entry.
+            // The sink has no V vector — it just absorbs probability mass.
+            let sink_score = sinks.map(|s| {
+                let sink_data = read_bf16(s, nh);
+                sink_data[h]
+            });
+
+            // Softmax (including sink if present)
+            let mut max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            if let Some(ss) = sink_score {
+                max_score = max_score.max(ss);
+            }
             let mut sum = 0.0f32;
             for s in scores.iter_mut() {
                 *s = (*s - max_score).exp();
                 sum += *s;
             }
+            if let Some(ss) = sink_score {
+                sum += (ss - max_score).exp();
+            }
             for s in scores.iter_mut() {
                 *s /= sum;
             }
 
-            // Weighted sum of V (paged)
+            // Weighted sum of V (paged) — sink weight is excluded (no V vector).
             let mut head_out = vec![0.0f32; hd];
             for s in 0..effective_len {
                 let pos = start + s;
@@ -712,7 +748,7 @@ impl GpuAttention for CpuBackend {
         unimplemented!("CpuBackend::copy_to_paged_kv_cache_batch")
     }
 
-    fn prefill_attention(&self, q: &CpuTensor, k: &CpuTensor, v: &CpuTensor, out: &CpuTensor, chunk_size: u32, _start_pos: u32, num_heads: u32, num_kv_heads: u32, head_dim: u32, window_size: u32, attn_scale: f32) {
+    fn prefill_attention(&self, q: &CpuTensor, k: &CpuTensor, v: &CpuTensor, out: &CpuTensor, chunk_size: u32, _start_pos: u32, num_heads: u32, num_kv_heads: u32, head_dim: u32, window_size: u32, attn_scale: f32, sinks: Option<&CpuTensor>) {
         let cs = chunk_size as usize;
         let nh = num_heads as usize;
         let nkv = num_kv_heads as usize;
@@ -756,18 +792,30 @@ impl GpuAttention for CpuBackend {
                     scores[s] = dot * scale;
                 }
 
-                // Softmax
-                let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                // Attention sinks: include per-head sink logit in softmax.
+                let sink_score = sinks.map(|s| {
+                    let sink_data = read_bf16(s, nh);
+                    sink_data[h]
+                });
+
+                // Softmax (including sink if present)
+                let mut max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                if let Some(ss) = sink_score {
+                    max_score = max_score.max(ss);
+                }
                 let mut sum = 0.0f32;
                 for s in scores.iter_mut() {
                     *s = (*s - max_score).exp();
                     sum += *s;
                 }
+                if let Some(ss) = sink_score {
+                    sum += (ss - max_score).exp();
+                }
                 for s in scores.iter_mut() {
                     *s /= sum;
                 }
 
-                // Weighted sum of V
+                // Weighted sum of V — sink weight is excluded (no V vector).
                 let out_offset = qi * q_stride + h * hd;
                 for s in 0..effective_len {
                     let pos = attend_start + s;
@@ -1662,11 +1710,11 @@ mod tests {
 
             let cq = cpu.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
             let cout = cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            cpu.paged_attention(&cq, &ck_pool, &cv_pool, &cbt, &cout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+            cpu.paged_attention(&cq, &ck_pool, &cv_pool, &cbt, &cout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
 
             let mq = metal.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
             let mout = metal.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            metal.paged_attention(&mq, &mk_pool, &mv_pool, &mbt, &mout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+            metal.paged_attention(&mq, &mk_pool, &mv_pool, &mbt, &mout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
 
             assert_tensors_close(&cpu, &cout, &metal, &mout, (num_heads * head_dim) as usize, 0.15, "paged_attn_hd64");
         }
@@ -1715,11 +1763,11 @@ mod tests {
 
             let cq = cpu.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
             let cout = cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            cpu.paged_attention(&cq, &ck_pool, &cv_pool, &cbt, &cout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+            cpu.paged_attention(&cq, &ck_pool, &cv_pool, &cbt, &cout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
 
             let mq = metal.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
             let mout = metal.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            metal.paged_attention(&mq, &mk_pool, &mv_pool, &mbt, &mout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+            metal.paged_attention(&mq, &mk_pool, &mv_pool, &mbt, &mout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
 
             assert_tensors_close(&cpu, &cout, &metal, &mout, (num_heads * head_dim) as usize, 0.15, "paged_attn_hd128");
         }
@@ -1760,13 +1808,13 @@ mod tests {
                 let ck = cpu.upload_tensor(&k_data, &[kv_dim], TensorDtype::BF16);
                 let cv_in = cpu.upload_tensor(&v_data, &[kv_dim], TensorDtype::BF16);
                 let cout = cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-                cpu.paged_attention_fused(&cq, &ck, &cv_in, &ck_pool, &cv_pool, &cbt, &cout, pos, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+                cpu.paged_attention_fused(&cq, &ck, &cv_in, &ck_pool, &cv_pool, &cbt, &cout, pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
 
                 let mq = metal.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
                 let mk = metal.upload_tensor(&k_data, &[kv_dim], TensorDtype::BF16);
                 let mv_in = metal.upload_tensor(&v_data, &[kv_dim], TensorDtype::BF16);
                 let mout = metal.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-                metal.paged_attention_fused(&mq, &mk, &mv_in, &mk_pool, &mv_pool, &mbt, &mout, pos, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+                metal.paged_attention_fused(&mq, &mk, &mv_in, &mk_pool, &mv_pool, &mbt, &mout, pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
 
                 if pos == 9 {
                     assert_tensors_close(&cpu, &cout, &metal, &mout, (num_heads * head_dim) as usize, 0.15, "paged_attn_fused_hd64");
@@ -1809,13 +1857,13 @@ mod tests {
                 let ck = cpu.upload_tensor(&k_data, &[kv_dim], TensorDtype::BF16);
                 let cv_in = cpu.upload_tensor(&v_data, &[kv_dim], TensorDtype::BF16);
                 let cout = cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-                cpu.paged_attention_fused(&cq, &ck, &cv_in, &ck_pool, &cv_pool, &cbt, &cout, pos, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+                cpu.paged_attention_fused(&cq, &ck, &cv_in, &ck_pool, &cv_pool, &cbt, &cout, pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
 
                 let mq = metal.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
                 let mk = metal.upload_tensor(&k_data, &[kv_dim], TensorDtype::BF16);
                 let mv_in = metal.upload_tensor(&v_data, &[kv_dim], TensorDtype::BF16);
                 let mout = metal.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-                metal.paged_attention_fused(&mq, &mk, &mv_in, &mk_pool, &mv_pool, &mbt, &mout, pos, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+                metal.paged_attention_fused(&mq, &mk, &mv_in, &mk_pool, &mv_pool, &mbt, &mout, pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
 
                 if pos == 9 {
                     assert_tensors_close(&cpu, &cout, &metal, &mout, (num_heads * head_dim) as usize, 0.15, "paged_attn_fused_hd128");
@@ -1846,13 +1894,13 @@ mod tests {
             let ck = cpu.upload_tensor(&k_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
             let cv = cpu.upload_tensor(&v_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
             let cout = cpu.alloc_tensor(&[chunk_size as usize, q_stride], TensorDtype::BF16);
-            cpu.prefill_attention(&cq, &ck, &cv, &cout, chunk_size, start_pos, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+            cpu.prefill_attention(&cq, &ck, &cv, &cout, chunk_size, start_pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
 
             let mq = metal.upload_tensor(&q_data, &[chunk_size as usize, q_stride], TensorDtype::BF16);
             let mk = metal.upload_tensor(&k_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
             let mv = metal.upload_tensor(&v_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
             let mout = metal.alloc_tensor(&[chunk_size as usize, q_stride], TensorDtype::BF16);
-            metal.prefill_attention(&mq, &mk, &mv, &mout, chunk_size, start_pos, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+            metal.prefill_attention(&mq, &mk, &mv, &mout, chunk_size, start_pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
 
             assert_tensors_close(&cpu, &cout, &metal, &mout, chunk_size as usize * q_stride, 0.15, "prefill_attn_hd64");
         }
@@ -1880,13 +1928,13 @@ mod tests {
             let ck = cpu.upload_tensor(&k_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
             let cv = cpu.upload_tensor(&v_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
             let cout = cpu.alloc_tensor(&[chunk_size as usize, q_stride], TensorDtype::BF16);
-            cpu.prefill_attention(&cq, &ck, &cv, &cout, chunk_size, start_pos, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+            cpu.prefill_attention(&cq, &ck, &cv, &cout, chunk_size, start_pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
 
             let mq = metal.upload_tensor(&q_data, &[chunk_size as usize, q_stride], TensorDtype::BF16);
             let mk = metal.upload_tensor(&k_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
             let mv = metal.upload_tensor(&v_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
             let mout = metal.alloc_tensor(&[chunk_size as usize, q_stride], TensorDtype::BF16);
-            metal.prefill_attention(&mq, &mk, &mv, &mout, chunk_size, start_pos, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+            metal.prefill_attention(&mq, &mk, &mv, &mout, chunk_size, start_pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
 
             assert_tensors_close(&cpu, &cout, &metal, &mout, chunk_size as usize * q_stride, 0.15, "prefill_attn_hd128");
         }
@@ -2436,11 +2484,11 @@ mod tests {
 
             let cq = cpu.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
             let cout = cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            cpu.paged_attention(&cq, &ck_pool, &cv_pool, &cbt, &cout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+            cpu.paged_attention(&cq, &ck_pool, &cv_pool, &cbt, &cout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
 
             let gq = cuda.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
             let gout = cuda.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            cuda.paged_attention(&gq, &gk_pool, &gv_pool, &gbt, &gout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+            cuda.paged_attention(&gq, &gk_pool, &gv_pool, &gbt, &gout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
 
             assert_tensors_close_bf16(&cpu, &cout, &cuda, &gout, (num_heads * head_dim) as usize, 0.15, "paged_attn_hd128");
         }
@@ -2479,13 +2527,13 @@ mod tests {
                 let ck = cpu.upload_tensor(&k_data, &[kv_dim], TensorDtype::BF16);
                 let cv_in = cpu.upload_tensor(&v_data, &[kv_dim], TensorDtype::BF16);
                 let cout = cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-                cpu.paged_attention_fused(&cq, &ck, &cv_in, &ck_pool, &cv_pool, &cbt, &cout, pos, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+                cpu.paged_attention_fused(&cq, &ck, &cv_in, &ck_pool, &cv_pool, &cbt, &cout, pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
 
                 let gq = cuda.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
                 let gk = cuda.upload_tensor(&k_data, &[kv_dim], TensorDtype::BF16);
                 let gv_in = cuda.upload_tensor(&v_data, &[kv_dim], TensorDtype::BF16);
                 let gout = cuda.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-                cuda.paged_attention_fused(&gq, &gk, &gv_in, &gk_pool, &gv_pool, &gbt, &gout, pos, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+                cuda.paged_attention_fused(&gq, &gk, &gv_in, &gk_pool, &gv_pool, &gbt, &gout, pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
 
                 if pos == 9 {
                     assert_tensors_close_bf16(&cpu, &cout, &cuda, &gout, (num_heads * head_dim) as usize, 0.15, "paged_attn_fused_hd128");
@@ -2515,13 +2563,13 @@ mod tests {
             let ck = cpu.upload_tensor(&k_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
             let cv = cpu.upload_tensor(&v_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
             let cout = cpu.alloc_tensor(&[chunk_size as usize, q_stride], TensorDtype::BF16);
-            cpu.prefill_attention(&cq, &ck, &cv, &cout, chunk_size, start_pos, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+            cpu.prefill_attention(&cq, &ck, &cv, &cout, chunk_size, start_pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
 
             let gq = cuda.upload_tensor(&q_data, &[chunk_size as usize, q_stride], TensorDtype::BF16);
             let gk = cuda.upload_tensor(&k_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
             let gv = cuda.upload_tensor(&v_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
             let gout = cuda.alloc_tensor(&[chunk_size as usize, q_stride], TensorDtype::BF16);
-            cuda.prefill_attention(&gq, &gk, &gv, &gout, chunk_size, start_pos, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+            cuda.prefill_attention(&gq, &gk, &gv, &gout, chunk_size, start_pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
 
             assert_tensors_close_bf16(&cpu, &cout, &cuda, &gout, chunk_size as usize * q_stride, 0.15, "prefill_attn_hd128");
         }

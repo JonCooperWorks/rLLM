@@ -455,6 +455,7 @@ struct PagedAttentionParams {
     uint block_size;    // = 16
     uint window_size;   // Sliding window (0 = full context).
     float attn_scale;   // Custom scale (0 = default 1/√head_dim).
+    uint has_sinks;     // 0 = no sinks, 1 = sinks buffer present (attention sinks).
 };
 
 kernel void paged_attention(
@@ -464,6 +465,7 @@ kernel void paged_attention(
     device const bfloat* v_pool          [[buffer(3)]],  // [num_blocks * block_size, kv_dim]
     device const uint* block_table       [[buffer(4)]],  // [max_blocks_per_seq]
     device bfloat* output                [[buffer(5)]],  // [num_heads, head_dim]
+    device const bfloat* sinks           [[buffer(6)]],  // [num_heads] — attention sink logits (ignored when has_sinks=0)
     uint head_id                         [[threadgroup_position_in_grid]],
     uint tid                             [[thread_position_in_threadgroup]],
     uint tg_size                         [[threads_per_threadgroup]]
@@ -539,6 +541,23 @@ kernel void paged_attention(
         }
     }
 
+    // --- Attention sinks: add sink score to softmax denominator ---
+    // Sinks are per-head scalar logits that participate in softmax but have no
+    // associated V vector.  They absorb probability mass, gating how much the
+    // actual KV content contributes.  Only thread 0 processes the sink to avoid
+    // double-counting across the 256 cooperating threads.
+    if (params.has_sinks && tid == 0) {
+        float sink_score = float(sinks[head_id]);
+        if (sink_score > local_max) {
+            float correction = exp(local_max - sink_score);
+            for (uint i = 0; i < hd4; i++) v_acc[i] *= correction;
+            local_sum_exp = local_sum_exp * correction + 1.0f;
+            local_max = sink_score;
+        } else {
+            local_sum_exp += exp(sink_score - local_max);
+        }
+    }
+
     // --- Cross-thread softmax reduction ---
     threadgroup float shared_reduce[NUM_SIMD_GROUPS * MAX_HD];
     float2 softmax_result = reduce_softmax(local_max, local_sum_exp, tid, tg_size, shared_reduce);
@@ -592,6 +611,7 @@ struct PagedAttentionFusedParams {
     uint block_size;    // = 16
     uint window_size;   // Sliding window (0 = full context).
     float attn_scale;   // Custom scale (0 = default 1/√head_dim).
+    uint has_sinks;     // 0 = no sinks, 1 = sinks buffer present (attention sinks).
 };
 
 kernel void paged_attention_fused(
@@ -603,6 +623,7 @@ kernel void paged_attention_fused(
     device bfloat* v_pool                [[buffer(5)]],  // [num_blocks * block_size, kv_dim]
     device const uint* block_table       [[buffer(6)]],  // [max_blocks_per_seq]
     device bfloat* output                [[buffer(7)]],  // [num_heads, head_dim]
+    device const bfloat* sinks           [[buffer(8)]],  // [num_heads] — attention sink logits (ignored when has_sinks=0)
     uint head_id                         [[threadgroup_position_in_grid]],
     uint tid                             [[thread_position_in_threadgroup]],
     uint tg_size                         [[threads_per_threadgroup]]
@@ -703,6 +724,19 @@ kernel void paged_attention_fused(
         device const bfloat4* v4 = (device const bfloat4*)v_vec;
         for (uint i = 0; i < hd4; i++) {
             v_acc[i] += weight * float4(v4[i]);
+        }
+    }
+
+    // Attention sinks (see paged_attention kernel for detailed comments).
+    if (params.has_sinks && tid == 0) {
+        float sink_score = float(sinks[head_id]);
+        if (sink_score > local_max) {
+            float correction = exp(local_max - sink_score);
+            for (uint i = 0; i < hd4; i++) v_acc[i] *= correction;
+            local_sum_exp = local_sum_exp * correction + 1.0f;
+            local_max = sink_score;
+        } else {
+            local_sum_exp += exp(sink_score - local_max);
         }
     }
 
@@ -827,6 +861,7 @@ struct PrefillAttentionParams {
     uint head_dim;      // Dimension per head (64).
     uint window_size;   // Sliding window (0 = full causal attention).
     float attn_scale;   // Custom scale (0 = default 1/√head_dim).
+    uint has_sinks;     // 0 = no sinks, 1 = sinks buffer present (attention sinks).
 };
 
 kernel void prefill_attention(
@@ -835,6 +870,7 @@ kernel void prefill_attention(
     device const bfloat* k       [[buffer(2)]],  // [chunk_size, num_kv_heads * head_dim]
     device const bfloat* v       [[buffer(3)]],  // [chunk_size, num_kv_heads * head_dim]
     device bfloat* output        [[buffer(4)]],  // [chunk_size, num_heads * head_dim]
+    device const bfloat* sinks   [[buffer(5)]],  // [num_heads] — attention sink logits (ignored when has_sinks=0)
     uint tg_id                   [[threadgroup_position_in_grid]],
     uint tid                     [[thread_position_in_threadgroup]],
     uint tg_size                 [[threads_per_threadgroup]]
@@ -911,6 +947,19 @@ kernel void prefill_attention(
         device const bfloat4* v4 = (device const bfloat4*)v_vec;
         for (uint i = 0; i < hd4; i++) {
             v_acc[i] += weight * float4(v4[i]);
+        }
+    }
+
+    // Attention sinks (see paged_attention kernel for detailed comments).
+    if (params.has_sinks && tid == 0) {
+        float sink_score = float(sinks[head_id]);
+        if (sink_score > local_max) {
+            float correction = exp(local_max - sink_score);
+            for (uint i = 0; i < hd4; i++) v_acc[i] *= correction;
+            local_sum_exp = local_sum_exp * correction + 1.0f;
+            local_max = sink_score;
+        } else {
+            local_sum_exp += exp(sink_score - local_max);
         }
     }
 

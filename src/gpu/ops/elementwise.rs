@@ -66,6 +66,19 @@ pub(crate) trait GpuElementwise: GpuCore {
         limit: f32,
     );
 
+    /// GPT-OSS gated activation: (clamp(up,-lim,lim) + 1) * clamp(gate,max=lim) * sigmoid(gate*alpha)
+    ///
+    /// NOT standard SwiGLU — uses scaled sigmoid, gate-only upper clamp, and (up + 1) offset.
+    fn gpt_oss_gated_act(
+        &self,
+        gate: &Self::Tensor,
+        up: &Self::Tensor,
+        out: &Self::Tensor,
+        size: u32,
+        alpha: f32,
+        limit: f32,
+    );
+
     /// GPU-side top-k selection with softmax for MoE expert routing.
     fn top_k_softmax(
         &self,

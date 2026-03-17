@@ -164,7 +164,7 @@ pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
             m.backend, &m.k_buf, &m.v_buf, &m.q_buf, &m.attn_out,
             pool, seq_state, layer_idx, pos,
             d.num_heads, d.num_kv_heads, d.head_dim,
-            window_size, attn_scale,
+            window_size, attn_scale, None,
         );
 
         // O projection into norm_buf (reused as scratch).
@@ -282,7 +282,7 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
         primitives::paged_kv_and_prefill_attention(
             m.backend, bufs, pool, seq_state, layer_idx,
             bs, start_pos, d.num_heads, d.num_kv_heads, d.head_dim,
-            window_size, attn_scale,
+            window_size, attn_scale, None,
         );
 
         // O projection (batched): O weight [hidden_size, q_dim].

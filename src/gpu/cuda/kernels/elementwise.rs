@@ -253,6 +253,18 @@ impl GpuElementwise for CudaBackend {
         }.expect("mul launch failed");
     }
 
+    fn gpt_oss_gated_act(
+        &self,
+        _gate: &CudaTensor,
+        _up: &CudaTensor,
+        _out: &CudaTensor,
+        _size: u32,
+        _alpha: f32,
+        _limit: f32,
+    ) {
+        unreachable!("CUDA gpt_oss_gated_act not yet implemented");
+    }
+
     fn top_k_softmax(
         &self,
         logits: &CudaTensor,

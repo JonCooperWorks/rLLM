@@ -62,6 +62,7 @@ struct PagedAttentionParams {
     block_size: u32,
     window_size: u32,
     attn_scale: f32,
+    has_sinks: u32,
 }
 unsafe impl DeviceRepr for PagedAttentionParams {}
 
@@ -75,6 +76,7 @@ struct PagedAttentionFusedParams {
     block_size: u32,
     window_size: u32,
     attn_scale: f32,
+    has_sinks: u32,
 }
 unsafe impl DeviceRepr for PagedAttentionFusedParams {}
 
@@ -98,6 +100,7 @@ struct PrefillAttentionParams {
     head_dim: u32,
     window_size: u32,
     attn_scale: f32,
+    has_sinks: u32,
 }
 unsafe impl DeviceRepr for PrefillAttentionParams {}
 
@@ -202,6 +205,7 @@ impl GpuAttention for CudaBackend {
         head_dim: u32,
         window_size: u32,
         attn_scale: f32,
+        sinks: Option<&CudaTensor>,
     ) {
         let params = PagedAttentionParams {
             seq_len,
@@ -211,7 +215,9 @@ impl GpuAttention for CudaBackend {
             block_size: crate::model::kv_cache::BLOCK_SIZE as u32,
             window_size,
             attn_scale,
+            has_sinks: if sinks.is_some() { 1 } else { 0 },
         };
+        let sinks_buf = sinks.map(|s| &s.buf).unwrap_or(&out.buf);
         let func = if head_dim > 128 { &self.fn_paged_attention_hd256 } else { &self.fn_paged_attention };
         let cfg = CudaBackend::cfg_blocks(num_heads, 256);
         unsafe {
@@ -222,6 +228,7 @@ impl GpuAttention for CudaBackend {
                 .arg(&v_pool.buf)
                 .arg(&block_table.buf)
                 .arg(&out.buf)
+                .arg(sinks_buf)
                 .launch(cfg)
         }.expect("paged_attention launch failed");
     }
@@ -272,6 +279,7 @@ impl GpuAttention for CudaBackend {
         head_dim: u32,
         window_size: u32,
         attn_scale: f32,
+        sinks: Option<&CudaTensor>,
     ) {
         let params = PagedAttentionFusedParams {
             pos,
@@ -281,7 +289,9 @@ impl GpuAttention for CudaBackend {
             block_size: crate::model::kv_cache::BLOCK_SIZE as u32,
             window_size,
             attn_scale,
+            has_sinks: if sinks.is_some() { 1 } else { 0 },
         };
+        let sinks_buf = sinks.map(|s| &s.buf).unwrap_or(&out.buf);
         let func = if head_dim > 128 {
             &self.fn_paged_attention_fused_hd256
         } else {
@@ -298,6 +308,7 @@ impl GpuAttention for CudaBackend {
                 .arg(&v_pool.buf)
                 .arg(&block_table.buf)
                 .arg(&out.buf)
+                .arg(sinks_buf)
                 .launch(cfg)
         }.expect("paged_attention_fused launch failed");
     }
@@ -315,6 +326,7 @@ impl GpuAttention for CudaBackend {
         head_dim: u32,
         window_size: u32,
         attn_scale: f32,
+        sinks: Option<&CudaTensor>,
     ) {
         let params = PrefillAttentionParams {
             chunk_size,
@@ -324,7 +336,9 @@ impl GpuAttention for CudaBackend {
             head_dim,
             window_size,
             attn_scale,
+            has_sinks: if sinks.is_some() { 1 } else { 0 },
         };
+        let sinks_buf = sinks.map(|s| &s.buf).unwrap_or(&out.buf);
         let num_blocks = chunk_size * num_heads;
         let func = if head_dim > 128 {
             &self.fn_prefill_attention_hd256
@@ -339,6 +353,7 @@ impl GpuAttention for CudaBackend {
                 .arg(&k.buf)
                 .arg(&v.buf)
                 .arg(&out.buf)
+                .arg(sinks_buf)
                 .launch(cfg)
         }.expect("prefill_attention launch failed");
     }
