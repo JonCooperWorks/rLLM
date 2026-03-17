@@ -66,6 +66,7 @@ Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Measured via `rl
 | Mixtral 8x7B Instruct | 46.7B (12.9B active) | 61 tok/s | 45 tok/s | 254 ms | 710 ms |
 | Llama 3.1 70B Instruct | 70.6B | — | 11 tok/s | — | 427 ms |
 | Qwen 2.5 72B Instruct | 72.7B | — | 11 tok/s | — | 379 ms |
+| Qwen3.5 122B-A10B | ~122B (~10B active) | — | 22 tok/s | — | 864 ms |
 
 Q4 is slower than bf16 for decode on H100 — unlike Apple Silicon where Q4 is always faster. The H100's 3.35 TB/s HBM3 bandwidth is so high that bf16 matvec already finishes quickly, and Q4 dequantisation adds ~5 ALU ops per weight (mask, shift, int subtract, int-to-float, scale multiply) that eat into the 3.2x bandwidth savings. For models up to ~14B, the weight working set fits largely in the 50 MB L2 cache, shrinking the bandwidth advantage further. Q4 still wins on memory capacity (Llama 70B and Qwen 72B don't fit in 94 GB as bf16) and on TTFT where it halves prefill data movement. On Apple Silicon (546 GB/s), the system is 6x more memory-bound so Q4's bandwidth reduction dominates and Q4 is faster across the board. MoE models (Qwen3 Coder, Mixtral) are a middle ground — the small expert matrices are cache-friendly in both formats, but Q4 lets larger MoE models fit in VRAM.
 
