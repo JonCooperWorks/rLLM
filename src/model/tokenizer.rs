@@ -167,10 +167,14 @@ impl Tokenizer {
                     chat::Message {
                         role: "system".into(),
                         content: sys.to_string(),
+                        tool_calls: None,
+                        tool_call_id: None,
                     },
                     chat::Message {
                         role: "user".into(),
                         content: prompt.to_string(),
+                        tool_calls: None,
+                        tool_call_id: None,
                     },
                 ];
                 let formatted = chat::format_chat(arch, &messages);

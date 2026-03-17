@@ -19,6 +19,15 @@
 //      event contains one token as a JSON chunk.  The final event is
 //      `data: [DONE]`.  This is how ChatGPT shows text appearing in real-time.
 //
+// Tool calling (function calling):
+//   Clients can pass `tools` (an array of function definitions) in the
+//   chat completion request.  Tool definitions are injected into the
+//   system prompt using the model's native format (see model/tools.rs).
+//   After generation, the output is parsed for tool call markers.  If
+//   found, the response includes `tool_calls` on the assistant message
+//   and `finish_reason: "tool_calls"`.  The client can then send results
+//   back as messages with `role: "tool"`.
+//
 // OpenAI SSE format:
 //   Each event is: `data: {json}\n\n`
 //   The JSON contains a "delta" with the new content (one token).
@@ -38,6 +47,7 @@ use axum::response::{IntoResponse, Json, Response};
 
 use super::{InferenceEvent, ServerState, StopReason, WorkerRequest};
 use crate::model::chat::Message;
+use crate::model::tools::{self, ToolDefinition};
 
 // ---------------------------------------------------------------------------
 // Request types (deserialized from JSON).
@@ -56,6 +66,12 @@ pub(crate) struct ChatCompletionRequest {
     pub top_p: f32,
     #[serde(default)]
     pub stream: bool,
+    /// Tool definitions the model may call (OpenAI function calling).
+    #[serde(default)]
+    pub tools: Option<Vec<ToolDefinition>>,
+    /// Controls tool calling behaviour: "auto" (default), "none", or "required".
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 #[derive(serde::Deserialize)]
@@ -100,8 +116,20 @@ struct ChatCompletionResponse {
 #[derive(serde::Serialize)]
 struct ChatChoice {
     index: u32,
-    message: Message,
+    message: ChatResponseMessage,
     finish_reason: Option<String>,
+}
+
+/// Response message — differs from the input Message because the OpenAI API
+/// uses separate serialisation for the assistant's output (content may be null
+/// when tool_calls are present).
+#[derive(serde::Serialize)]
+struct ChatResponseMessage {
+    role: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<tools::ToolCall>>,
 }
 
 #[derive(serde::Serialize)]
@@ -136,7 +164,42 @@ fn finish_reason_str(reason: StopReason) -> &'static str {
     match reason {
         StopReason::EndOfSequence => "stop",
         StopReason::MaxTokens => "length",
+        StopReason::ToolCalls => "tool_calls",
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tool injection helper: prepend tool definitions to the system message.
+// ---------------------------------------------------------------------------
+
+/// Inject tool definitions into the message list by appending to the system
+/// message (or creating one if absent).  Returns the modified message list.
+fn inject_tools(
+    mut messages: Vec<Message>,
+    tools: &[ToolDefinition],
+    arch: crate::model::config::ModelArch,
+) -> Vec<Message> {
+    let tool_prompt = tools::format_tool_system_prompt(arch, tools);
+    if tool_prompt.is_empty() {
+        return messages;
+    }
+
+    // Find existing system message and append, or create a new one.
+    if let Some(sys_msg) = messages.iter_mut().find(|m| m.role == "system") {
+        sys_msg.content.push_str(&tool_prompt);
+    } else {
+        messages.insert(
+            0,
+            Message {
+                role: "system".into(),
+                content: tool_prompt,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        );
+    }
+
+    messages
 }
 
 // ---------------------------------------------------------------------------
@@ -148,10 +211,26 @@ pub(crate) async fn chat_completions(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, StatusCode> {
+    let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+
+    // If tool_choice is "none", strip tools so the model won't be prompted.
+    let tools_disabled = req
+        .tool_choice
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| s == "none");
+
+    // Inject tool definitions into the system message.
+    let messages = if has_tools && !tools_disabled {
+        inject_tools(req.messages, req.tools.as_ref().unwrap(), state.arch)
+    } else {
+        req.messages
+    };
+
     // Tokenize on the async handler thread (CPU-only, doesn't block GPU).
     let prompt_tokens = state
         .tokenizer
-        .encode_messages(&req.messages, state.arch)
+        .encode_messages(&messages, state.arch)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let (response_tx, response_rx) = tokio::sync::mpsc::channel(64);
@@ -172,40 +251,69 @@ pub(crate) async fn chat_completions(
             std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
         })?;
 
-    if req.stream {
+    // For non-streaming with tools, we need to collect all text to detect
+    // tool calls.  For streaming without tools, we can stream directly.
+    // For streaming WITH tools, we also collect first then emit.
+    if req.stream && !has_tools {
         Ok(chat_completions_stream(state, response_rx).await)
     } else {
-        Ok(chat_completions_blocking(state, response_rx).await)
+        Ok(chat_completions_blocking(state, response_rx, has_tools && !tools_disabled).await)
     }
 }
 
-/// Non-streaming: collect all tokens, return complete JSON response.
+/// Non-streaming: collect all tokens, detect tool calls, return complete JSON response.
 async fn chat_completions_blocking(
     state: Arc<ServerState>,
     mut response_rx: tokio::sync::mpsc::Receiver<InferenceEvent>,
+    check_tools: bool,
 ) -> Response {
     let mut text = String::new();
     let mut prompt_tokens = 0usize;
     let mut completion_tokens = 0usize;
-    let mut finish_reason = "length";
+    let mut stop_reason = StopReason::MaxTokens;
 
     while let Some(event) = response_rx.recv().await {
         match event {
             InferenceEvent::Token { text: t } => text.push_str(&t),
             InferenceEvent::Done {
-                stop_reason,
+                stop_reason: sr,
                 prompt_tokens: pt,
                 completion_tokens: ct,
             } => {
                 prompt_tokens = pt;
                 completion_tokens = ct;
-                finish_reason = finish_reason_str(stop_reason);
+                stop_reason = sr;
             }
             InferenceEvent::Error(e) => {
                 return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e);
             }
         }
     }
+
+    // Check for tool calls in the generated text.
+    let (content, tool_calls) = if check_tools {
+        let (cleaned, calls) = tools::parse_tool_calls(state.arch, &text);
+        if !calls.is_empty() {
+            (cleaned, Some(calls))
+        } else {
+            (text, None)
+        }
+    } else {
+        (text, None)
+    };
+
+    let finish_reason = if tool_calls.is_some() {
+        StopReason::ToolCalls
+    } else {
+        stop_reason
+    };
+
+    // OpenAI convention: content is null when only tool calls are present.
+    let content = if tool_calls.is_some() && content.is_empty() {
+        None
+    } else {
+        Some(content)
+    };
 
     Json(ChatCompletionResponse {
         id: format!("chatcmpl-{}", super::generate_id()),
@@ -214,11 +322,12 @@ async fn chat_completions_blocking(
         model: state.model_name.clone(),
         choices: vec![ChatChoice {
             index: 0,
-            message: Message {
-                role: "assistant".into(),
-                content: text,
+            message: ChatResponseMessage {
+                role: "assistant",
+                content,
+                tool_calls,
             },
-            finish_reason: Some(finish_reason.to_string()),
+            finish_reason: Some(finish_reason_str(finish_reason).to_string()),
         }],
         usage: Usage {
             prompt_tokens,
@@ -504,6 +613,49 @@ mod tests {
         assert!((req.temperature - 1.0).abs() < 0.001);
         assert!((req.top_p - 0.9).abs() < 0.001);
         assert!(!req.stream);
+        assert!(req.tools.is_none());
+        assert!(req.tool_choice.is_none());
+    }
+
+    #[test]
+    fn test_chat_request_with_tools() {
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Weather?"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+                }
+            }],
+            "tool_choice": "auto"
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        let tools = req.tools.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "get_weather");
+        assert_eq!(req.tool_choice.unwrap().as_str(), Some("auto"));
+    }
+
+    #[test]
+    fn test_chat_request_tool_message() {
+        let json = r#"{
+            "messages": [
+                {"role": "user", "content": "Weather?"},
+                {"role": "assistant", "content": null, "tool_calls": [{"id": "call_123", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"SF\"}"}}]},
+                {"role": "tool", "tool_call_id": "call_123", "content": "Sunny, 72F"}
+            ]
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.messages.len(), 3);
+        // Assistant message with null content deserializes to empty string.
+        assert_eq!(req.messages[1].content, "");
+        assert!(req.messages[1].tool_calls.is_some());
+        // Tool result message.
+        assert_eq!(req.messages[2].role, "tool");
+        assert_eq!(req.messages[2].tool_call_id.as_deref(), Some("call_123"));
+        assert_eq!(req.messages[2].content, "Sunny, 72F");
     }
 
     #[test]
@@ -529,6 +681,7 @@ mod tests {
     fn test_finish_reason_str_values() {
         assert_eq!(finish_reason_str(StopReason::EndOfSequence), "stop");
         assert_eq!(finish_reason_str(StopReason::MaxTokens), "length");
+        assert_eq!(finish_reason_str(StopReason::ToolCalls), "tool_calls");
     }
 
     #[test]
@@ -540,9 +693,10 @@ mod tests {
             model: "test-model".into(),
             choices: vec![ChatChoice {
                 index: 0,
-                message: Message {
-                    role: "assistant".into(),
-                    content: "Hello!".into(),
+                message: ChatResponseMessage {
+                    role: "assistant",
+                    content: Some("Hello!".into()),
+                    tool_calls: None,
                 },
                 finish_reason: Some("stop".into()),
             }],
@@ -557,6 +711,46 @@ mod tests {
         assert_eq!(json["choices"][0]["message"]["content"], "Hello!");
         assert_eq!(json["choices"][0]["finish_reason"], "stop");
         assert_eq!(json["usage"]["total_tokens"], 15);
+        // tool_calls should be absent (not null) when None.
+        assert!(json["choices"][0]["message"].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn test_chat_response_with_tool_calls() {
+        let response = ChatCompletionResponse {
+            id: "chatcmpl-test456".into(),
+            object: "chat.completion",
+            created: 1234567890,
+            model: "test-model".into(),
+            choices: vec![ChatChoice {
+                index: 0,
+                message: ChatResponseMessage {
+                    role: "assistant",
+                    content: None,
+                    tool_calls: Some(vec![tools::ToolCall {
+                        id: "call_abc".into(),
+                        type_: "function".into(),
+                        function: tools::FunctionCall {
+                            name: "get_weather".into(),
+                            arguments: "{\"city\":\"SF\"}".into(),
+                        },
+                    }]),
+                },
+                finish_reason: Some("tool_calls".into()),
+            }],
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                total_tokens: 30,
+            },
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["choices"][0]["finish_reason"], "tool_calls");
+        assert!(json["choices"][0]["message"]["content"].is_null());
+        let tc = &json["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(tc["id"], "call_abc");
+        assert_eq!(tc["type"], "function");
+        assert_eq!(tc["function"]["name"], "get_weather");
     }
 
     #[test]
