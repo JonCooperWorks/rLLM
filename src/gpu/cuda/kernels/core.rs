@@ -90,6 +90,11 @@ impl GpuCore for CudaBackend {
             src.len(),
             byte_count
         );
+        // Bind this device's CUDA context to the calling thread.
+        // Required for multi-GPU: the main thread may call this for any device,
+        // and the raw memcpy needs the correct context to be active.
+        self.ctx.bind_to_thread().expect("CUDA bind_to_thread failed");
+
         // Use raw driver API since we have &CudaTensor (immutable) but need
         // to write to the device buffer.  This is safe because:
         //   1. We're the only writer (single stream, serialised dispatch)
@@ -105,6 +110,8 @@ impl GpuCore for CudaBackend {
     }
 
     fn copy_to_host(&self, tensor: &CudaTensor, dst: &mut [u8]) {
+        // Bind context for multi-GPU support.
+        self.ctx.bind_to_thread().expect("CUDA bind_to_thread failed");
         // Synchronise to ensure all GPU work is complete before reading.
         self.flush();
 

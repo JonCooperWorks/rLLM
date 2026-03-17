@@ -82,6 +82,26 @@ impl Dims {
             rope_theta: config.rope_theta as f32,
         }
     }
+
+    /// Extract TP-aware dimensions: heads and intermediate size are divided
+    /// by `world_size`, but hidden_size and head_dim remain full.
+    pub fn from_config_tp(config: &ModelConfig, world_size: usize) -> Self {
+        let num_heads = config.num_attention_heads / world_size;
+        let num_kv_heads = config.num_key_value_heads / world_size;
+        let head_dim = config.head_dim; // NOT divided
+
+        Self {
+            hidden_size: config.hidden_size as u32, // NOT divided
+            num_heads: num_heads as u32,
+            num_kv_heads: num_kv_heads as u32,
+            head_dim: head_dim as u32,
+            inter_size: (config.intermediate_size / world_size) as u32,
+            q_dim: (num_heads * head_dim) as u32,
+            kv_dim: (num_kv_heads * head_dim) as u32,
+            eps: config.rms_norm_eps as f32,
+            rope_theta: config.rope_theta as f32,
+        }
+    }
 }
 
 // ===========================================================================

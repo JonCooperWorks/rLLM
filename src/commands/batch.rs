@@ -55,6 +55,10 @@ pub(crate) struct BatchArgs {
         requires = "chat"
     )]
     system: String,
+
+    /// Tensor parallelism: number of GPUs to use (default 1).
+    #[arg(long, default_value = "1")]
+    tp: usize,
 }
 
 pub(crate) fn exec(args: BatchArgs) -> anyhow::Result<()> {

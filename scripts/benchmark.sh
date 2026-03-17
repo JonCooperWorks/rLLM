@@ -28,6 +28,7 @@ RUNS=1
 SKIP_BF16=false
 SKIP_Q4=false
 QUANTIZE_ONLY=false
+TP=1
 MAX_TOKENS="${RLLM_BENCH_TOKENS:-128}"
 PROMPT="${RLLM_BENCH_PROMPT:-The meaning of life is}"
 
@@ -39,10 +40,14 @@ for arg in "$@"; do
     --quantize)  SKIP_BF16=true; QUANTIZE_ONLY=true ;;
     --q4-only)   SKIP_BF16=true ;;
     --bf16-only) SKIP_Q4=true ;;
+    --tp)        shift_next=tp ;;
     --runs)      shift_next=runs ;;
     *)
       if [[ "${shift_next:-}" == "runs" ]]; then
         RUNS="$arg"
+        shift_next=""
+      elif [[ "${shift_next:-}" == "tp" ]]; then
+        TP="$arg"
         shift_next=""
       else
         DEST="$arg"
@@ -122,7 +127,7 @@ run_one() {
   local tmpfile
   tmpfile=$(mktemp)
 
-  local cmd=("$RLLM" run --model "$model_dir" --prompt "$PROMPT" --max-tokens "$MAX_TOKENS" --temperature 0)
+  local cmd=("$RLLM" run --model "$model_dir" --prompt "$PROMPT" --max-tokens "$MAX_TOKENS" --temperature 0 --tp "$TP")
   if [[ -n "$quantize_flag" ]]; then
     cmd+=(--quantize)
   fi

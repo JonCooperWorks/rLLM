@@ -43,6 +43,7 @@
 
 pub(crate) mod ops;
 pub(crate) mod parallel;
+pub(crate) mod multi_gpu;
 
 pub(crate) use ops::{
     GpuAllReduce, GpuAttention, GpuCore, GpuDeltaNet, GpuElementwise, GpuEmbed, GpuMatmul,
@@ -217,6 +218,26 @@ pub(crate) fn quantize_bf16_to_q4(bf16_data: &[u8], m: usize, k: usize) -> Vec<u
 #[cfg(any(target_os = "macos", feature = "cuda"))]
 pub(crate) fn create_backend() -> anyhow::Result<Backend> {
     Backend::new()
+}
+
+/// Create multiple GPU backends for tensor parallelism.
+///
+/// When `world_size == 1`, returns a single backend (no NCCL overhead).
+/// When `world_size > 1`, initializes NCCL communicators and creates one
+/// backend per device, each with its own CUDA context and stream.
+#[cfg(feature = "cuda")]
+pub(crate) fn create_backends(world_size: usize) -> anyhow::Result<Vec<Backend>> {
+    if world_size == 1 {
+        return Ok(vec![Backend::new()?]);
+    }
+
+    let comms = cuda::nccl::init_nccl_comms(world_size)?;
+
+    (0..world_size)
+        .map(|rank| {
+            Backend::new_with_device(rank, rank, world_size, Some(comms[rank].clone()))
+        })
+        .collect()
 }
 
 #[cfg(not(any(target_os = "macos", feature = "cuda")))]

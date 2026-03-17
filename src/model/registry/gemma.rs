@@ -55,7 +55,7 @@ use crate::gpu::{
     GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
 };
 use crate::model::kv_cache::{KvPool, SeqKvState};
-use crate::model::primitives::{self, Dims};
+use crate::model::primitives;
 use crate::model::profile::{self, Component};
 use crate::model::{Model, PrefillBuffers};
 
@@ -109,7 +109,7 @@ pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
     pool: &KvPool<B>,
     seq_state: &SeqKvState<B>,
 ) -> anyhow::Result<()> {
-    let d = Dims::from_config(&m.config);
+    let d = m.dims();
     let pos = seq_state.seq_len as u32;
     let uses_geglu = m.config.uses_geglu();
 
@@ -242,7 +242,7 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
     seq_state: &SeqKvState<B>,
     bufs: &PrefillBuffers<B>,
 ) -> anyhow::Result<()> {
-    let d = Dims::from_config(&m.config);
+    let d = m.dims();
     let bs = tokens.len() as u32;
     let start_pos = seq_state.seq_len as u32;
     let uses_geglu = m.config.uses_geglu();

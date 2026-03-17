@@ -557,11 +557,13 @@ pub(crate) fn load_weights<B: GpuCore>(
 ) -> anyhow::Result<ModelWeights<B>> {
     // Sharding support: when provided, each weight is sliced to this rank's
     // portion before uploading to GPU.  For world_size=1 the plan has no
-    // entries, so all weights pass through unmodified.  The actual byte-level
-    // slicing is performed inside upload_tensor / upload_maybe_quantized
-    // when sharding is fully wired up in a future change.  For now, the
-    // parameter is threaded through so call sites can start passing plans.
-    let _ = sharding;
+    // entries, so all weights pass through unmodified.
+    //
+    // Implementation: upload_sharded() wraps upload_maybe_quantized with
+    // sharding logic — it slices the weight bytes according to the plan
+    // before uploading.  Non-sharded weights (norms, embeddings when
+    // replicated) use the regular upload_tensor/upload_maybe_quantized.
+
     // Load safetensors file(s) — handles both single-file and sharded models.
     let (mmaps, weight_map) = load_safetensors_files(model_dir)?;
 
@@ -611,10 +613,10 @@ pub(crate) fn load_weights<B: GpuCore>(
 
         let norms = load_layer_norms(&store, backend, &prefix, config, &hints)?;
         let attn = load_attention_weights(
-            &store, backend, &prefix, config, &hints, i, is_deltanet_layer, quantize,
+            &store, backend, &prefix, config, &hints, i, is_deltanet_layer, quantize, sharding,
         )?;
         let ffn = load_ffn_weights(
-            &store, backend, &prefix, config, &hints, i, quantize,
+            &store, backend, &prefix, config, &hints, i, quantize, sharding,
         )?;
 
         layers.push(LayerWeights {
@@ -754,6 +756,7 @@ fn load_attention_weights<B: GpuCore>(
     layer_idx: usize,
     is_deltanet_layer: bool,
     quantize: bool,
+    sharding: Option<&crate::gpu::parallel::ShardingPlan>,
 ) -> anyhow::Result<AttentionLoaded<B>> {
     let hidden = config.hidden_size;
     let q_dim = config.num_attention_heads * config.head_dim;
@@ -820,7 +823,7 @@ fn load_attention_weights<B: GpuCore>(
         } else if hints.has_fused_qkv {
             load_fused_qkv_attention(store, backend, prefix, hidden, q_dim, kv_dim, quantize)?
         } else {
-            load_standard_attention(store, backend, prefix, config, hidden, q_dim, kv_dim, quantize)?
+            load_standard_attention(store, backend, prefix, config, hidden, q_dim, kv_dim, quantize, sharding)?
         };
 
     // O-proj bias (GPT-OSS only).
@@ -1046,6 +1049,7 @@ fn load_standard_attention<B: GpuCore>(
     q_dim: usize,
     kv_dim: usize,
     quantize: bool,
+    sharding: Option<&crate::gpu::parallel::ShardingPlan>,
 ) -> anyhow::Result<(
     B::Tensor, B::Tensor, B::Tensor, B::Tensor,         // q, k, v, o
     Option<B::Tensor>, Option<B::Tensor>,                 // in_proj_qkv, in_proj_a
@@ -1093,27 +1097,27 @@ fn load_standard_attention<B: GpuCore>(
         let z_tensor = upload_raw_maybe_quantized(backend, &z_raw, &[q_dim, hidden], quantize);
         (q_tensor, Some(z_tensor))
     } else {
-        let qp = upload_maybe_quantized(
+        let qp = upload_sharded(
             store, backend,
             &format!("{prefix}.self_attn.q_proj.weight"),
-            &[q_dim, hidden], quantize,
+            &[q_dim, hidden], quantize, sharding,
         )?;
         (qp, None)
     };
-    let kp = upload_maybe_quantized(
+    let kp = upload_sharded(
         store, backend,
         &format!("{prefix}.self_attn.k_proj.weight"),
-        &[kv_dim, hidden], quantize,
+        &[kv_dim, hidden], quantize, sharding,
     )?;
-    let vp = upload_maybe_quantized(
+    let vp = upload_sharded(
         store, backend,
         &format!("{prefix}.self_attn.v_proj.weight"),
-        &[kv_dim, hidden], quantize,
+        &[kv_dim, hidden], quantize, sharding,
     )?;
-    let op = upload_maybe_quantized(
+    let op = upload_sharded(
         store, backend,
         &format!("{prefix}.self_attn.o_proj.weight"),
-        &[hidden, q_dim], quantize,
+        &[hidden, q_dim], quantize, sharding,
     )?;
     Ok((qp, kp, vp, op, None, None, None, None, None, None,
         None, None, None, z_proj))
@@ -1134,12 +1138,13 @@ fn load_ffn_weights<B: GpuCore>(
     hints: &LoaderHints,
     layer_idx: usize,
     quantize: bool,
+    sharding: Option<&crate::gpu::parallel::ShardingPlan>,
 ) -> anyhow::Result<FfnLoaded<B>> {
     let hidden = config.hidden_size;
     let inter = config.intermediate_size;
 
     if config.is_moe() {
-        load_moe_ffn_weights(store, backend, prefix, config, hints, layer_idx, quantize)
+        load_moe_ffn_weights(store, backend, prefix, config, hints, layer_idx, quantize, sharding)
     } else if hints.has_fused_qkv {
         // -----------------------------------------------------------------
         // Phi FFN: fused gate_up_proj → split into separate gate and up.
@@ -1183,20 +1188,20 @@ fn load_ffn_weights<B: GpuCore>(
         })
     } else {
         // Dense FFN: standard gate/up/down projections.
-        let gate = upload_maybe_quantized(
+        let gate = upload_sharded(
             store, backend,
             &format!("{prefix}.mlp.gate_proj.weight"),
-            &[inter, hidden], quantize,
+            &[inter, hidden], quantize, sharding,
         )?;
-        let up = upload_maybe_quantized(
+        let up = upload_sharded(
             store, backend,
             &format!("{prefix}.mlp.up_proj.weight"),
-            &[inter, hidden], quantize,
+            &[inter, hidden], quantize, sharding,
         )?;
-        let down = upload_maybe_quantized(
+        let down = upload_sharded(
             store, backend,
             &format!("{prefix}.mlp.down_proj.weight"),
-            &[hidden, inter], quantize,
+            &[hidden, inter], quantize, sharding,
         )?;
         Ok(FfnLoaded {
             gate_proj: gate, up_proj: up, down_proj: down,
@@ -1221,6 +1226,7 @@ fn load_moe_ffn_weights<B: GpuCore>(
     hints: &LoaderHints,
     layer_idx: usize,
     quantize: bool,
+    _sharding: Option<&crate::gpu::parallel::ShardingPlan>,
 ) -> anyhow::Result<FfnLoaded<B>> {
     let hidden = config.hidden_size;
     let moe_inter = config.moe_intermediate_size;
@@ -1689,6 +1695,52 @@ fn upload_raw_maybe_quantized<B: GpuCore>(
     } else {
         backend.upload_tensor(bf16_data, shape, TensorDtype::BF16)
     }
+}
+
+/// Upload a weight tensor with optional sharding.
+///
+/// If a sharding plan is provided and has a non-Replicated entry for this
+/// weight, the raw bytes are sliced to this rank's portion before uploading.
+/// Otherwise falls through to the regular upload path.
+fn upload_sharded<B: GpuCore>(
+    store: &TensorStore,
+    backend: &B,
+    name: &str,
+    expected_shape: &[usize],
+    quantize: bool,
+    sharding: Option<&crate::gpu::parallel::ShardingPlan>,
+) -> anyhow::Result<B::Tensor> {
+    use crate::gpu::parallel::{SplitDimension, slice_tensor_data};
+
+    if let Some(plan) = sharding {
+        if let Some(ws) = plan.get(name) {
+            if !matches!(ws.split, SplitDimension::Replicated) {
+                // Read raw bytes from safetensors.
+                let view = store.tensor(name)?;
+                let data = view.data();
+
+                // Determine bytes per element from the file's dtype.
+                let bpe = match view.dtype() {
+                    safetensors::Dtype::BF16 => 2,
+                    safetensors::Dtype::F32 => 4,
+                    other => anyhow::bail!("unsupported dtype {:?} for sharded tensor '{name}'", other),
+                };
+
+                // Slice to this rank's shard.
+                let (sliced, shard_shape) = slice_tensor_data(
+                    data, &ws.original_shape, &ws.split,
+                    plan.device.rank, plan.device.world_size, bpe,
+                );
+
+                // Upload the sliced data (optionally quantized).
+                return Ok(upload_raw_maybe_quantized(
+                    backend, &sliced, &shard_shape, quantize,
+                ));
+            }
+        }
+    }
+    // Fallback: no sharding or Replicated — use regular upload.
+    upload_maybe_quantized(store, backend, name, expected_shape, quantize)
 }
 
 // ---------------------------------------------------------------------------

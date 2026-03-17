@@ -85,6 +85,11 @@ pub(crate) struct CudaBackend {
     pub(crate) stream: Arc<CudaStream>,
     pub(crate) name: String,
 
+    // Multi-GPU tensor parallelism fields.
+    pub(crate) rank: usize,
+    pub(crate) world_size: usize,
+    pub(crate) nccl_comm: Option<Arc<super::nccl::NcclComm>>,
+
     // Compiled kernel functions — one per kernel entry point.
     pub(crate) fn_rms_norm: CudaFunction,
     pub(crate) fn_rms_norm_batch: CudaFunction,
@@ -139,9 +144,20 @@ pub(crate) struct CudaBackend {
 }
 
 impl CudaBackend {
+    /// Single-GPU convenience constructor (rank=0, world_size=1, no NCCL).
     pub fn new() -> anyhow::Result<Self> {
-        let ctx = CudaContext::new(0)
-            .map_err(|e| anyhow!("failed to create CUDA context: {e}"))?;
+        Self::new_with_device(0, 0, 1, None)
+    }
+
+    /// Multi-GPU constructor: creates a backend for a specific device with NCCL.
+    pub fn new_with_device(
+        device_id: usize,
+        rank: usize,
+        world_size: usize,
+        nccl_comm: Option<Arc<super::nccl::NcclComm>>,
+    ) -> anyhow::Result<Self> {
+        let ctx = CudaContext::new(device_id)
+            .map_err(|e| anyhow!("failed to create CUDA context on device {device_id}: {e}"))?;
         let stream = ctx.default_stream();
 
         // Query device name via the CudaContext API.
@@ -201,6 +217,9 @@ impl CudaBackend {
             ctx,
             stream,
             name,
+            rank,
+            world_size,
+            nccl_comm,
 
             // RMSNorm
             fn_rms_norm: func(&mod_rms_norm, "rms_norm")?,

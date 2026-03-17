@@ -1,0 +1,227 @@
+// ===========================================================================
+// Multi-GPU inference orchestrator for tensor parallelism.
+//
+// Manages N GPU backends (one per rank), each with its own:
+//   - CudaBackend with NCCL communicator
+//   - Model weights (sharded according to ShardingPlan)
+//   - KV cache (per-rank, with kv_dim / world_size heads)
+//   - Scratch buffers (TP-aware sizing)
+//
+// The forward pass fans out to all ranks in parallel using
+// std::thread::scope.  Each rank runs the same model forward pass
+// with its own sharded weights.  AllReduce calls (wired into
+// primitives.rs) synchronize partial results via NCCL.
+//
+// Only rank 0's logits are used for sampling — all ranks produce
+// identical logits after the final AllReduce.
+// ===========================================================================
+
+#[cfg(feature = "cuda")]
+pub(crate) mod tp {
+    use std::path::Path;
+
+    use crate::gpu::cuda::CudaBackend;
+    use crate::gpu::parallel::{DeviceConfig, ParallelStrategy, ShardingPlan};
+    use crate::gpu::{GpuBackend, GpuCore, TensorDtype};
+    use crate::model::config::ModelConfig;
+    use crate::model::kv_cache::{KvPool, SeqKvState};
+    use crate::model::loader::{self, ModelWeights};
+    use crate::model::{Model, PrefillBuffers};
+
+    /// Per-rank inference state: backend, model, KV cache, prefill buffers.
+    ///
+    /// The backend is boxed for a stable heap address (Model borrows it).
+    /// Safety: backend outlives model (both in RankState, drop order is
+    /// fields top-down in declaration order).
+    pub(crate) struct RankState {
+        // Order matters for drop: model must drop before backend.
+        pub model: Model<'static, CudaBackend>,
+        pub prefill_bufs: PrefillBuffers<CudaBackend>,
+        pub kv_pool: KvPool<CudaBackend>,
+        pub seq_state: SeqKvState<CudaBackend>,
+        // Backend is kept alive by the 'static lifetime trick below.
+        _backend: Box<CudaBackend>,
+    }
+
+    /// Multi-GPU inference controller.
+    pub(crate) struct MultiGpuInference {
+        pub ranks: Vec<RankState>,
+        pub config: ModelConfig,
+        pub world_size: usize,
+    }
+
+    impl MultiGpuInference {
+        /// Create multi-GPU inference with `world_size` GPUs.
+        pub fn new(
+            model_dir: &Path,
+            config: ModelConfig,
+            quantize: bool,
+            world_size: usize,
+            num_blocks: usize,
+        ) -> anyhow::Result<Self> {
+            let backends = crate::gpu::create_backends(world_size)?;
+
+            let mut ranks = Vec::with_capacity(world_size);
+
+            for (rank, backend) in backends.into_iter().enumerate() {
+                let backend = Box::new(backend);
+
+                // Create sharding plan for this rank.
+                let device = DeviceConfig {
+                    world_size,
+                    rank,
+                    strategy: ParallelStrategy::TensorParallel,
+                };
+                let plan = ShardingPlan::derive(&config, device, false)?;
+
+                // Load sharded weights.
+                let weights = loader::load_weights(
+                    &*backend,
+                    model_dir,
+                    &config,
+                    quantize,
+                    Some(&plan),
+                )?;
+
+                if rank == 0 {
+                    eprintln!(
+                        "weights loaded{} (rank 0/{})",
+                        if quantize { " (Q4)" } else { "" },
+                        world_size,
+                    );
+                }
+
+                // TP-aware KV cache: each rank has kv_dim / world_size heads.
+                let kv_dim = (config.num_key_value_heads / world_size) * config.head_dim;
+                let num_kv_layers = config.num_kv_layers();
+                let kv_pool = KvPool::new(&*backend, num_blocks, kv_dim, num_kv_layers);
+                let seq_state = kv_pool.new_sequence(&*backend);
+
+                // TP-aware scratch buffers.
+                let prefill_bufs = PrefillBuffers::new_tp(&*backend, &config, 4096, world_size);
+
+                // Safety: we transmute the backend lifetime to 'static.
+                // The backend is boxed and stored in the same struct, so it
+                // outlives the model.  This is the same pattern used by many
+                // self-referential struct solutions.
+                let backend_ref: &'static CudaBackend = unsafe {
+                    &*(&*backend as *const CudaBackend)
+                };
+
+                let model = Model::new_tp(
+                    config.clone(),
+                    weights,
+                    backend_ref,
+                    world_size,
+                )?;
+
+                ranks.push(RankState {
+                    model,
+                    prefill_bufs,
+                    kv_pool,
+                    seq_state,
+                    _backend: backend,
+                });
+            }
+
+            Ok(Self {
+                ranks,
+                config,
+                world_size,
+            })
+        }
+
+        /// Run a single-token forward pass on all ranks in parallel.
+        pub fn forward_single_paged(&self, token_id: u32) -> anyhow::Result<()> {
+            if self.world_size == 1 {
+                let r = &self.ranks[0];
+                return r.model.forward_single_paged(
+                    token_id, &r.kv_pool, &r.seq_state,
+                );
+            }
+
+            // Fan out to all ranks.
+            std::thread::scope(|s| {
+                let handles: Vec<_> = self.ranks.iter().map(|rank| {
+                    s.spawn(move || {
+                        rank.model.forward_single_paged(
+                            token_id, &rank.kv_pool, &rank.seq_state,
+                        )
+                    })
+                }).collect();
+
+                for h in handles {
+                    h.join().unwrap()?;
+                }
+                Ok(())
+            })
+        }
+
+        /// Run batched prefill on all ranks in parallel.
+        pub fn forward_prefill_paged(&self, tokens: &[u32]) -> anyhow::Result<()> {
+            if self.world_size == 1 {
+                let r = &self.ranks[0];
+                return r.model.forward_prefill_paged(
+                    tokens, &r.kv_pool, &r.seq_state, &r.prefill_bufs,
+                );
+            }
+
+            std::thread::scope(|s| {
+                let handles: Vec<_> = self.ranks.iter().map(|rank| {
+                    s.spawn(move || {
+                        rank.model.forward_prefill_paged(
+                            tokens, &rank.kv_pool, &rank.seq_state, &rank.prefill_bufs,
+                        )
+                    })
+                }).collect();
+
+                for h in handles {
+                    h.join().unwrap()?;
+                }
+                Ok(())
+            })
+        }
+
+        /// Get rank 0's logits (all ranks have identical logits after AllReduce).
+        pub fn logits(&self) -> &<CudaBackend as GpuCore>::Tensor {
+            self.ranks[0].model.logits()
+        }
+
+        /// Get rank 0's backend (for sampling, etc.).
+        pub fn backend(&self) -> &CudaBackend {
+            self.ranks[0].model.backend
+        }
+
+        /// Ensure KV slots on all ranks.
+        pub fn ensure_slot(&mut self) -> anyhow::Result<()> {
+            for rank in &mut self.ranks {
+                rank.seq_state.ensure_slot(&mut rank.kv_pool)?;
+                rank.seq_state.sync_block_table(rank.model.backend);
+            }
+            Ok(())
+        }
+
+        /// Ensure KV slots for prefill on all ranks.
+        pub fn ensure_slots(&mut self, count: usize) -> anyhow::Result<()> {
+            for rank in &mut self.ranks {
+                rank.seq_state.ensure_slots(&mut rank.kv_pool, count)?;
+                rank.seq_state.sync_block_table(rank.model.backend);
+            }
+            Ok(())
+        }
+
+        /// Advance KV state on all ranks.
+        pub fn advance(&mut self) {
+            for rank in &mut self.ranks {
+                rank.seq_state.advance();
+            }
+        }
+
+        /// Advance KV state by count on all ranks.
+        pub fn advance_by(&mut self, count: usize) {
+            for rank in &mut self.ranks {
+                rank.seq_state.advance_by(count);
+            }
+        }
+    }
+}

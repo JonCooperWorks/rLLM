@@ -53,9 +53,17 @@ pub(crate) struct RunArgs {
         requires = "chat"
     )]
     system: String,
+
+    /// Tensor parallelism: number of GPUs to use (default 1).
+    #[arg(long, default_value = "1")]
+    tp: usize,
 }
 
 pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
+    if args.tp > 1 {
+        return exec_multi_gpu(args);
+    }
+
     // --- Load GPU backend + model ---
     let backend = gpu::create_backend()?;
     eprintln!("gpu: {}", backend.device_name());
@@ -78,13 +86,6 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
     }
 
     // --- Create model + paged KV cache + prefill buffers ---
-    //
-    // The model holds weights and single-token scratch buffers (for decode).
-    // The paged KV cache allocates memory on demand in 16-token blocks —
-    // no wasted memory for short sequences, and it enables batched prefill.
-    //
-    // PrefillBuffers are batch-sized scratch tensors (up to 4096 tokens)
-    // used by the GEMM-based prefill forward pass.  Allocated once, reused.
     let model = model::Model::new(config.clone(), weights, &backend)?;
 
     // Dynamic KV cache sizing based on remaining GPU memory.
@@ -109,8 +110,6 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
     );
 
     // --- Encode prompt ---
-    // In chat mode, wraps the prompt in the model's chat template (auto-detected
-    // from the architecture).  Without --chat, encodes the raw prompt directly.
     let system = args.chat.then(|| args.system.as_str());
     let prompt_tokens = tokenizer.encode_prompt(&args.prompt, arch, system)?;
     if args.chat {
@@ -123,15 +122,6 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
     );
 
     // --- Prefill ---
-    // Process the entire prompt in one batched forward pass using GEMM.
-    //
-    //   ensure_slots: pre-allocates enough physical KV blocks for the whole
-    //     prompt (ceil(prompt_len / 16) blocks from the free list).
-    //   sync_block_table: uploads the logical→physical block mapping to GPU
-    //     so the attention kernel can find the right memory locations.
-    //   forward_prefill_paged: the actual GEMM-based forward pass — all
-    //     projections use mat-mat instead of mat-vec.
-    //   advance_by: records that these positions are now filled in the cache.
     let prefill_start = std::time::Instant::now();
     seq_state.ensure_slots(&mut kv_pool, prompt_tokens.len())?;
     seq_state.sync_block_table(&backend);
@@ -148,12 +138,6 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
     );
 
     // --- Generation loop ---
-    // Sample the first token from the prefill logits, then enter the
-    // autoregressive decode loop: forward → sample → print → repeat.
-    //
-    // Generation is memory-bound (mat-vec), not compute-bound (mat-mat),
-    // because each token is a single vector — no batch dimension to amortise
-    // the weight matrix loads.  This is inherent to autoregressive decoding.
     let gen_start = std::time::Instant::now();
     let mut gen_count: usize = 0;
     let mut rng = rand::rng();
@@ -169,19 +153,16 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
             break;
         }
         gen_count += 1;
-        // Decode and print the token immediately (streaming output).
         let text = tokenizer.decode(&[next_token])?;
         print!("{text}");
         io::stdout().flush()?;
 
-        // Single-token forward pass into the paged KV cache.
         seq_state.ensure_slot(&mut kv_pool)?;
         seq_state.sync_block_table(&backend);
         model.forward_single_paged(next_token, &kv_pool, &seq_state)?;
         seq_state.advance();
         crate::model::profile::tick();
 
-        // Sample the next token from the updated logits.
         next_token = sampler::sample(
             &backend,
             model.logits(),
@@ -199,4 +180,113 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+
+/// Multi-GPU inference path (--tp > 1).
+#[cfg(feature = "cuda")]
+fn exec_multi_gpu(args: RunArgs) -> anyhow::Result<()> {
+    use crate::gpu::multi_gpu::tp::MultiGpuInference;
+
+    let tp = args.tp;
+    eprintln!("tensor parallelism: {} GPUs", tp);
+
+    // Load config and tokenizer (these don't need GPU).
+    let config = model::config::ModelConfig::from_file(&args.model.join("config.json"))?;
+    let arch = config.arch()?;
+    let tokenizer = model::tokenizer::Tokenizer::from_file(&args.model.join("tokenizer.json"), arch)?;
+
+    eprintln!(
+        "loaded config: {:?}, {} layers, {} heads, hidden_size={}",
+        arch, config.num_hidden_layers, config.num_attention_heads, config.hidden_size
+    );
+
+    // Estimate KV blocks — use 256 as reasonable default for TP.
+    let num_blocks = 256;
+
+    let mut multi = MultiGpuInference::new(
+        &args.model, config.clone(), args.quantize, tp, num_blocks,
+    )?;
+    eprintln!("multi-GPU inference ready ({} ranks)", tp);
+
+    // Log sampling strategy.
+    if args.temperature == 0.0 {
+        eprintln!("sampling: greedy (temperature=0)");
+    } else {
+        eprintln!("sampling: temperature={}, top_p={}", args.temperature, args.top_p);
+    }
+
+    // --- Encode prompt ---
+    let system = args.chat.then(|| args.system.as_str());
+    let prompt_tokens = tokenizer.encode_prompt(&args.prompt, arch, system)?;
+    if args.chat {
+        eprintln!("chat template applied ({:?})", arch);
+    }
+    eprintln!(
+        "prompt tokens: {:?} ({})",
+        &prompt_tokens,
+        prompt_tokens.len()
+    );
+
+    // --- Prefill ---
+    let prefill_start = std::time::Instant::now();
+    multi.ensure_slots(prompt_tokens.len())?;
+    multi.forward_prefill_paged(&prompt_tokens)?;
+    multi.advance_by(prompt_tokens.len());
+
+    let prefill_elapsed = prefill_start.elapsed();
+    let prefill_tps = prompt_tokens.len() as f64 / prefill_elapsed.as_secs_f64();
+    eprintln!(
+        "prefill: {} tokens in {:.1?} ({:.1} tok/s)",
+        prompt_tokens.len(),
+        prefill_elapsed,
+        prefill_tps
+    );
+
+    // --- Generation loop ---
+    let gen_start = std::time::Instant::now();
+    let mut gen_count: usize = 0;
+    let mut rng = rand::rng();
+    let mut next_token = sampler::sample(
+        multi.backend(),
+        multi.logits(),
+        args.temperature,
+        args.top_p,
+        &mut rng,
+    )?;
+    for _ in 0..args.max_tokens {
+        if tokenizer.is_eos(next_token) {
+            break;
+        }
+        gen_count += 1;
+        let text = tokenizer.decode(&[next_token])?;
+        print!("{text}");
+        io::stdout().flush()?;
+
+        multi.ensure_slot()?;
+        multi.forward_single_paged(next_token)?;
+        multi.advance();
+        crate::model::profile::tick();
+
+        next_token = sampler::sample(
+            multi.backend(),
+            multi.logits(),
+            args.temperature,
+            args.top_p,
+            &mut rng,
+        )?;
+    }
+    println!();
+    let gen_elapsed = gen_start.elapsed();
+    let gen_tps = gen_count as f64 / gen_elapsed.as_secs_f64();
+    eprintln!(
+        "generation: {} tokens in {:.1?} ({:.1} tok/s)",
+        gen_count, gen_elapsed, gen_tps
+    );
+
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn exec_multi_gpu(_args: RunArgs) -> anyhow::Result<()> {
+    anyhow::bail!("multi-GPU tensor parallelism requires the cuda feature")
 }

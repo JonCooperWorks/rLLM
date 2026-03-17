@@ -15,6 +15,7 @@
 
 mod backend;
 mod kernels;
+pub(crate) mod nccl;
 mod tensor;
 
 pub(crate) use backend::CudaBackend;

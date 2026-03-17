@@ -47,7 +47,7 @@ use crate::gpu::{
     GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
 };
 use crate::model::kv_cache::{KvPool, SeqKvState};
-use crate::model::primitives::{self, Dims};
+use crate::model::primitives;
 use crate::model::profile::{self, Component};
 use crate::model::{Model, PrefillBuffers};
 
@@ -114,7 +114,7 @@ pub(crate) fn forward_single_impl<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + G
     seq_state: &SeqKvState<B>,
     features: &ArchFeatures,
 ) -> anyhow::Result<()> {
-    let d = Dims::from_config(&m.config);
+    let d = m.dims();
     let pos = seq_state.seq_len as u32;
 
     let t = profile::begin(m.backend);
@@ -127,16 +127,16 @@ pub(crate) fn forward_single_impl<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + G
         // --- Attention sub-block ---
         let t = profile::begin(m.backend);
         m.backend.rms_norm(&m.hidden, &layer.input_layernorm, d.eps, &m.norm_buf);
-        primitives::qkv_projection(
+        primitives::qkv_projection_qdim(
             m.backend, layer, &m.norm_buf, &m.q_buf, &m.k_buf, &m.v_buf,
-            d.hidden_size, d.kv_dim,
+            d.q_dim, d.hidden_size, d.kv_dim,
         );
 
         // QKV bias: the one line that separates Qwen from Llama/Phi.
         if features.has_qkv_bias {
-            primitives::apply_qkv_bias(
+            primitives::apply_qkv_bias_qdim(
                 m.backend, layer, &m.q_buf, &m.k_buf, &m.v_buf,
-                d.hidden_size, d.kv_dim,
+                d.q_dim, d.kv_dim,
             );
         }
 
@@ -150,8 +150,9 @@ pub(crate) fn forward_single_impl<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + G
             d.num_heads, d.num_kv_heads, d.head_dim,
             0, 0.0, None, // No sliding window, default attention scale, no sinks.
         );
-        primitives::o_proj_residual(
-            m.backend, layer, &m.attn_out, &m.norm_buf, &m.hidden, d.hidden_size,
+        primitives::o_proj_residual_qdim(
+            m.backend, layer, &m.attn_out, &m.norm_buf, &m.hidden,
+            d.hidden_size, d.q_dim,
         );
         profile::record(m.backend, t, Component::Attention);
 
@@ -183,7 +184,7 @@ pub(crate) fn forward_prefill_impl<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
     bufs: &PrefillBuffers<B>,
     features: &ArchFeatures,
 ) -> anyhow::Result<()> {
-    let d = Dims::from_config(&m.config);
+    let d = m.dims();
     let bs = tokens.len() as u32;
     let start_pos = seq_state.seq_len as u32;
 
@@ -196,14 +197,14 @@ pub(crate) fn forward_prefill_impl<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
         m.backend.rms_norm_batch(
             &bufs.hidden, &layer.input_layernorm, d.eps, &bufs.norm_buf, bs,
         );
-        primitives::qkv_projection_batch(
-            m.backend, layer, bufs, bs, d.hidden_size, d.kv_dim,
+        primitives::qkv_projection_batch_qdim(
+            m.backend, layer, bufs, bs, d.q_dim, d.hidden_size, d.kv_dim,
         );
 
         // QKV bias (batched): broadcast-add [dim] bias across [batch_size, dim].
         if features.has_qkv_bias {
-            primitives::apply_qkv_bias_batch(
-                m.backend, layer, bufs, bs, d.hidden_size, d.kv_dim,
+            primitives::apply_qkv_bias_batch_qdim(
+                m.backend, layer, bufs, bs, d.q_dim, d.kv_dim,
             );
         }
 
@@ -216,7 +217,7 @@ pub(crate) fn forward_prefill_impl<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
             bs, start_pos, d.num_heads, d.num_kv_heads, d.head_dim,
             0, 0.0, None,
         );
-        primitives::o_proj_residual_batch(m.backend, layer, bufs, bs, d.hidden_size);
+        primitives::o_proj_residual_batch_qdim(m.backend, layer, bufs, bs, d.hidden_size, d.q_dim);
 
         // FFN sub-block.
         primitives::ffn_block_batch(

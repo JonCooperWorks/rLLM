@@ -56,6 +56,10 @@ pub(crate) struct ServeArgs {
     /// Allow running without TLS (plain HTTP).  Required when no TLS config is set.
     #[arg(long)]
     pub dangerous_no_tls: bool,
+
+    /// Tensor parallelism: number of GPUs to use (default 1).
+    #[arg(long, default_value = "1")]
+    pub tp: usize,
 }
 
 pub(crate) fn exec(args: ServeArgs) -> anyhow::Result<()> {

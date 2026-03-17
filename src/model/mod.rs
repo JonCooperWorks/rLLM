@@ -112,6 +112,9 @@ pub(crate) struct Model<'a, B: GpuCore> {
     /// Which architecture's forward pass to use.
     arch: ModelArch,
 
+    /// Tensor parallelism world size (1 = single GPU).
+    pub(crate) world_size: usize,
+
     // -----------------------------------------------------------------------
     // KV cache: either flat or paged.
     // -----------------------------------------------------------------------
@@ -235,6 +238,36 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
         Self::new_with_kv_mode(config, weights, backend, kv_mode)
     }
 
+    /// Create a model with TP-aware scratch buffer sizing.
+    ///
+    /// For `world_size > 1`, Q/KV/attention/FFN scratch buffers are sized
+    /// for the per-rank dimensions (heads / world_size, inter / world_size),
+    /// while hidden and logits buffers remain full-sized.
+    pub fn new_tp(
+        config: ModelConfig,
+        weights: ModelWeights<B>,
+        backend: &'a B,
+        world_size: usize,
+    ) -> anyhow::Result<Self> {
+        if world_size == 1 {
+            return Self::new(config, weights, backend);
+        }
+
+        // Flat KV cache not used for TP — the multi-GPU orchestrator manages
+        // paged KV pools externally.  Use a minimal flat cache as placeholder.
+        let kv_dim = (config.num_key_value_heads / world_size) * config.head_dim;
+        let num_kv_layers = config.num_kv_layers();
+        let mut k_cache = Vec::with_capacity(num_kv_layers);
+        let mut v_cache = Vec::with_capacity(num_kv_layers);
+        for _ in 0..num_kv_layers {
+            k_cache.push(backend.alloc_tensor(&[1, kv_dim], TensorDtype::BF16));
+            v_cache.push(backend.alloc_tensor(&[1, kv_dim], TensorDtype::BF16));
+        }
+        let kv_mode = KvMode::Flat { k_cache, v_cache, pos: 0 };
+
+        Self::new_with_kv_mode_tp(config, weights, backend, kv_mode, world_size)
+    }
+
     /// Internal: create model with a specific KV mode.
     fn new_with_kv_mode(
         config: ModelConfig,
@@ -351,6 +384,7 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
             weights,
             backend,
             arch,
+            world_size: 1,
             kv_mode,
             hidden: hidden_buf,
             norm_buf,
@@ -379,9 +413,104 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
         })
     }
 
+    /// Internal: create model with TP-aware scratch buffer sizing.
+    ///
+    /// Identical to `new_with_kv_mode` but Q/KV/attn/FFN buffers are sized
+    /// for `world_size`-way tensor parallelism.
+    fn new_with_kv_mode_tp(
+        config: ModelConfig,
+        weights: ModelWeights<B>,
+        backend: &'a B,
+        kv_mode: KvMode<B>,
+        world_size: usize,
+    ) -> anyhow::Result<Self> {
+        if world_size <= 1 {
+            return Self::new_with_kv_mode(config, weights, backend, kv_mode);
+        }
+
+        let arch = config.arch()?;
+        let hidden = config.hidden_size;
+        let q_dim = (config.num_attention_heads / world_size) * config.head_dim;
+        let kv_dim = (config.num_key_value_heads / world_size) * config.head_dim;
+        let inter = config.effective_intermediate_size() / world_size;
+        let vocab = config.vocab_size;
+
+        // Allocate scratch buffers — TP-aware sizes.
+        let hidden_buf = backend.alloc_tensor(&[hidden], TensorDtype::BF16);
+        let norm_buf = backend.alloc_tensor(&[hidden], TensorDtype::BF16);
+        let q_buf = backend.alloc_tensor(&[q_dim], TensorDtype::BF16);
+        let k_buf = backend.alloc_tensor(&[kv_dim], TensorDtype::BF16);
+        let v_buf = backend.alloc_tensor(&[kv_dim], TensorDtype::BF16);
+        let attn_out = backend.alloc_tensor(&[q_dim], TensorDtype::BF16);
+        let gate_buf = backend.alloc_tensor(&[inter], TensorDtype::BF16);
+        let up_buf = backend.alloc_tensor(&[inter], TensorDtype::BF16);
+        let logits_buf = backend.alloc_tensor(&[vocab], TensorDtype::BF16);
+
+        // MoE buffers: TP splits each expert's weights, so moe_inter is divided.
+        let (router_logits, moe_gate_buf, moe_up_buf, moe_output, routing_output) =
+            if config.is_moe() {
+                let moe_inter = config.moe_intermediate_size / world_size;
+                let k = config.num_experts_per_tok;
+                (
+                    Some(backend.alloc_tensor(&[config.num_experts], TensorDtype::F32)),
+                    Some(backend.alloc_tensor(&[moe_inter], TensorDtype::BF16)),
+                    Some(backend.alloc_tensor(&[moe_inter], TensorDtype::BF16)),
+                    Some(backend.alloc_tensor(&[hidden], TensorDtype::BF16)),
+                    Some(backend.alloc_tensor(&[2 * k], TensorDtype::F32)),
+                )
+            } else {
+                (None, None, None, None, None)
+            };
+
+        let kv_layer_map = config.kv_layer_map();
+
+        Ok(Self {
+            config,
+            weights,
+            backend,
+            arch,
+            world_size,
+            kv_mode,
+            hidden: hidden_buf,
+            norm_buf,
+            q_buf,
+            k_buf,
+            v_buf,
+            attn_out,
+            gate_buf,
+            up_buf,
+            logits_buf,
+            router_logits,
+            moe_gate_buf,
+            moe_up_buf,
+            moe_output,
+            routing_output,
+            // DeltaNet not yet supported for TP.
+            deltanet_states: None,
+            deltanet_conv_history: None,
+            dn_qkv_buf: None,
+            dn_alpha_buf: None,
+            dn_beta_buf: None,
+            dn_z_buf: None,
+            dn_conv_out: None,
+            dn_attn_out: None,
+            dn_norm_out: None,
+            kv_layer_map,
+        })
+    }
+
     /// Accessor for config (needed by engine for buffer allocation).
     pub fn config(&self) -> &ModelConfig {
         &self.config
+    }
+
+    /// Get TP-aware dimensions for the forward pass.
+    pub fn dims(&self) -> primitives::Dims {
+        if self.world_size > 1 {
+            primitives::Dims::from_config_tp(&self.config, self.world_size)
+        } else {
+            primitives::Dims::from_config(&self.config)
+        }
     }
 }
 
@@ -516,10 +645,15 @@ pub(crate) struct PrefillBuffers<B: GpuCore> {
 
 impl<B: GpuCore> PrefillBuffers<B> {
     pub fn new(backend: &B, config: &ModelConfig, max_chunk: usize) -> Self {
+        Self::new_tp(backend, config, max_chunk, 1)
+    }
+
+    /// TP-aware prefill buffer allocation.
+    pub fn new_tp(backend: &B, config: &ModelConfig, max_chunk: usize, world_size: usize) -> Self {
         let hidden = config.hidden_size;
-        let q_dim = config.num_attention_heads * config.head_dim;
-        let kv_dim = config.num_key_value_heads * config.head_dim;
-        let inter = config.effective_intermediate_size();
+        let q_dim = (config.num_attention_heads / world_size) * config.head_dim;
+        let kv_dim = (config.num_key_value_heads / world_size) * config.head_dim;
+        let inter = config.effective_intermediate_size() / world_size;
 
         Self {
             hidden: backend.alloc_tensor(&[max_chunk, hidden], TensorDtype::BF16),

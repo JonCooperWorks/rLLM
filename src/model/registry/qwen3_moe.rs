@@ -100,7 +100,7 @@ pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
     pool: &KvPool<B>,
     seq_state: &SeqKvState<B>,
 ) -> anyhow::Result<()> {
-    let d = Dims::from_config(&m.config);
+    let d = m.dims();
     let pos = seq_state.seq_len as u32;
     let moe_inter = m.config.moe_intermediate_size as u32;
     let num_experts = m.config.num_experts;
@@ -189,7 +189,7 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
     seq_state: &SeqKvState<B>,
     bufs: &PrefillBuffers<B>,
 ) -> anyhow::Result<()> {
-    let d = Dims::from_config(&m.config);
+    let d = m.dims();
     let bs = tokens.len() as u32;
     let start_pos = seq_state.seq_len as u32;
     let moe_inter = m.config.moe_intermediate_size as u32;
