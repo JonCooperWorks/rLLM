@@ -117,7 +117,7 @@ if [[ "$TIER" == "medium" || "$TIER" == "big" ]]; then
 
     # DeepSeek R1 distill
     "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
-
+    "openai/gpt-oss-20b"
   )
 fi
 
@@ -136,6 +136,7 @@ if [[ "$TIER" == "big" ]]; then
 
     # Qwen 3.5 122B MoE — 122B total (10B active), largest MoE we test
     "Qwen/Qwen3.5-122B-A10B"
+    "openai/gpt-oss-120b"
   )
 fi
 
