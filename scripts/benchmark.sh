@@ -95,6 +95,7 @@ MEDIUM_MODELS=(
   "qwen3-coder-30b-a3b-instruct"
   "qwen3.5-35b-a3b"
   "deepseek-r1-distill-qwen-32b"
+  "openai/gpt-oss-20b"
 )
 
 BIG_MODELS=(
@@ -102,6 +103,7 @@ BIG_MODELS=(
   "qwen2.5-72b-instruct"
   "qwen3.5-122b-a10b"
   "mixtral-8x22b-instruct-v0.1"
+  "openai/gpt-oss-120b"
 )
 
 MODELS=("${SMALL_MODELS[@]}")
