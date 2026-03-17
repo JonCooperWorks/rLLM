@@ -614,7 +614,7 @@ pub(crate) fn load_weights<B: GpuCore>(
             &store, backend, &prefix, config, &hints, i, is_deltanet_layer, quantize,
         )?;
         let ffn = load_ffn_weights(
-            &store, backend, &prefix, config, &hints, arch, i, quantize,
+            &store, backend, &prefix, config, &hints, i, quantize,
         )?;
 
         layers.push(LayerWeights {
@@ -1132,7 +1132,6 @@ fn load_ffn_weights<B: GpuCore>(
     prefix: &str,
     config: &ModelConfig,
     hints: &LoaderHints,
-    arch: ModelArch,
     layer_idx: usize,
     quantize: bool,
 ) -> anyhow::Result<FfnLoaded<B>> {
@@ -1140,7 +1139,7 @@ fn load_ffn_weights<B: GpuCore>(
     let inter = config.intermediate_size;
 
     if config.is_moe() {
-        load_moe_ffn_weights(store, backend, prefix, config, hints, arch, layer_idx, quantize)
+        load_moe_ffn_weights(store, backend, prefix, config, hints, layer_idx, quantize)
     } else if hints.has_fused_qkv {
         // -----------------------------------------------------------------
         // Phi FFN: fused gate_up_proj → split into separate gate and up.
@@ -1220,7 +1219,6 @@ fn load_moe_ffn_weights<B: GpuCore>(
     prefix: &str,
     config: &ModelConfig,
     hints: &LoaderHints,
-    arch: ModelArch,
     layer_idx: usize,
     quantize: bool,
 ) -> anyhow::Result<FfnLoaded<B>> {
@@ -1357,10 +1355,6 @@ fn load_moe_ffn_weights<B: GpuCore>(
     } else {
         (None, None, None, None)
     };
-
-    // Suppress unused variable warning — arch is used only for hints which
-    // are already computed.  Kept in signature for future per-arch extensions.
-    let _ = arch;
 
     Ok(FfnLoaded {
         gate_proj: dummy, up_proj: dummy2, down_proj: dummy3,
