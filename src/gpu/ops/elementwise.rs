@@ -55,6 +55,17 @@ pub(crate) trait GpuElementwise: GpuCore {
     /// Element-wise multiply (bf16).
     fn mul(&self, a: &Self::Tensor, b: &Self::Tensor, out: &Self::Tensor, size: u32);
 
+    /// Clamped SwiGLU: out[i] = clamp(silu(gate[i]) * up[i], -limit, limit).
+    /// Used by GPT-OSS which applies swiglu_limit=7.0 to stabilize MoE training.
+    fn silu_mul_clamp(
+        &self,
+        gate: &Self::Tensor,
+        up: &Self::Tensor,
+        out: &Self::Tensor,
+        size: u32,
+        limit: f32,
+    );
+
     /// GPU-side top-k selection with softmax for MoE expert routing.
     fn top_k_softmax(
         &self,

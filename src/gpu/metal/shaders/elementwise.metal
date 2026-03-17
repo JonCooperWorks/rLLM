@@ -224,6 +224,34 @@ kernel void fill_zero(
 }
 
 // ---------------------------------------------------------------------------
+// Clamped SwiGLU activation: out[i] = clamp(silu(gate[i]) * up[i], -limit, limit)
+//
+// Used by GPT-OSS which applies swiglu_limit=7.0 to stabilize MoE expert
+// outputs during training.  The clamp prevents extreme activation magnitudes
+// from destabilizing the residual stream.
+// ---------------------------------------------------------------------------
+
+struct SiluMulClampParams {
+    uint size;
+    float limit;
+};
+
+kernel void silu_mul_clamp(
+    constant SiluMulClampParams& params [[buffer(0)]],
+    device const bfloat* gate           [[buffer(1)]],
+    device const bfloat* up             [[buffer(2)]],
+    device bfloat* output               [[buffer(3)]],
+    uint gid                            [[thread_position_in_grid]]
+) {
+    if (gid >= params.size) return;
+    float g = float(gate[gid]);
+    float u = float(up[gid]);
+    float silu = g / (1.0f + exp(-g));
+    float result = silu * u;
+    output[gid] = bfloat(clamp(result, -params.limit, params.limit));
+}
+
+// ---------------------------------------------------------------------------
 // GPU-side top-k selection with softmax for MoE expert routing.
 //
 // Replaces the CPU-side routing path that required one GPU→CPU sync per layer

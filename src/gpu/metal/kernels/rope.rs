@@ -52,6 +52,34 @@ struct RopePartialParams {
     rotary_dim: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RopeYarnParams {
+    pos: u32,
+    rope_theta: f32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+    original_max_pos: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RopeYarnBatchParams {
+    batch_size: u32,
+    rope_theta: f32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+    original_max_pos: u32,
+}
+
 impl GpuRope for MetalBackend {
     fn rope(
         &self,
@@ -136,6 +164,78 @@ impl GpuRope for MetalBackend {
             &[(&q.buffer, 1), (&k.buffer, 2)],
             MTLSize::new(total_pairs as u64, 1, 1),
             MTLSize::new(256.min(total_pairs as u64), 1, 1),
+        );
+    }
+
+    fn rope_yarn(
+        &self,
+        q: &MetalTensor,
+        k: &MetalTensor,
+        pos: u32,
+        rope_theta: f32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        original_max_pos: u32,
+    ) {
+        let params = RopeYarnParams {
+            pos,
+            rope_theta,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            factor,
+            beta_fast,
+            beta_slow,
+            original_max_pos,
+        };
+        let total_pairs = (num_heads + num_kv_heads) * (head_dim / 2);
+        self.dispatch_async(
+            &self.pipeline_rope_yarn,
+            &params,
+            &[(&q.buffer, 1), (&k.buffer, 2)],
+            MTLSize::new(total_pairs as u64, 1, 1),
+            MTLSize::new(256.min(total_pairs as u64), 1, 1),
+        );
+    }
+
+    fn rope_yarn_batch(
+        &self,
+        q: &MetalTensor,
+        k: &MetalTensor,
+        positions: &MetalTensor,
+        rope_theta: f32,
+        batch_size: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        original_max_pos: u32,
+    ) {
+        let params = RopeYarnBatchParams {
+            batch_size,
+            rope_theta,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            factor,
+            beta_fast,
+            beta_slow,
+            original_max_pos,
+        };
+        let pairs_per_token = (num_heads + num_kv_heads) * (head_dim / 2);
+        let total = batch_size as u64 * pairs_per_token as u64;
+        self.dispatch_async(
+            &self.pipeline_rope_yarn_batch,
+            &params,
+            &[(&q.buffer, 1), (&k.buffer, 2), (&positions.buffer, 3)],
+            MTLSize::new(total, 1, 1),
+            MTLSize::new(256.min(total), 1, 1),
         );
     }
 }

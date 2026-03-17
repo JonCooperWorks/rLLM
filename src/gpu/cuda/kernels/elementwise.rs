@@ -68,6 +68,14 @@ struct TopKParams {
 }
 unsafe impl DeviceRepr for TopKParams {}
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SiluMulClampParams {
+    size: u32,
+    limit: f32,
+}
+unsafe impl DeviceRepr for SiluMulClampParams {}
+
 impl GpuElementwise for CudaBackend {
     fn silu_mul(&self, gate: &CudaTensor, up: &CudaTensor, out: &CudaTensor, size: u32) {
         let params = ElemParams { size };
@@ -208,6 +216,27 @@ impl GpuElementwise for CudaBackend {
                 .arg(&out.buf)
                 .launch(cfg)
         }.expect("silu launch failed");
+    }
+
+    fn silu_mul_clamp(
+        &self,
+        gate: &CudaTensor,
+        up: &CudaTensor,
+        out: &CudaTensor,
+        size: u32,
+        limit: f32,
+    ) {
+        let params = SiluMulClampParams { size, limit };
+        let block = 256.min(size);
+        let cfg = CudaBackend::cfg_1d(size, block);
+        unsafe {
+            self.stream.launch_builder(&self.fn_silu_mul_clamp)
+                .arg(&params)
+                .arg(&gate.buf)
+                .arg(&up.buf)
+                .arg(&out.buf)
+                .launch(cfg)
+        }.expect("silu_mul_clamp launch failed");
     }
 
     fn mul(&self, a: &CudaTensor, b: &CudaTensor, out: &CudaTensor, size: u32) {

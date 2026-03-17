@@ -18,6 +18,7 @@
 use crate::gpu::{
     GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
 };
+use crate::model::config::RopeScaling;
 use crate::model::config::ModelConfig;
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::loader::{ExpertWeights, LayerWeights, ModelWeights};
@@ -612,4 +613,236 @@ pub(crate) fn final_norm_and_lm_head_prefill<B: GpuCore + GpuNorm + GpuMatmul>(
 
     let lm_head_weight = weights.lm_head.as_ref().unwrap_or(&weights.embed_tokens);
     backend.matmul(lm_head_weight, norm_buf, logits_buf, vocab_size, hidden_size as u32);
+}
+
+// ===========================================================================
+// GPT-OSS biased primitives.
+//
+// GPT-OSS-20B has bias on all projections (QKV, O-proj, router, expert FFN).
+// These primitives extend the standard ones with bias-add steps.
+// ===========================================================================
+
+/// O projection + O-proj bias + residual add.
+/// For models with q_dim ≠ hidden_size and O-proj bias (GPT-OSS).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn o_proj_residual_qdim_biased<B: GpuMatmul + GpuElementwise>(
+    backend: &B,
+    layer: &LayerWeights<B>,
+    attn_out: &B::Tensor,
+    norm_buf: &B::Tensor,
+    hidden: &B::Tensor,
+    hidden_size: u32,
+    q_dim: u32,
+) {
+    backend.matmul(&layer.o_proj, attn_out, norm_buf, hidden_size, q_dim);
+    if let Some(ref o_bias) = layer.o_proj_bias {
+        backend.add(norm_buf, o_bias, norm_buf, hidden_size);
+    }
+    backend.add(hidden, norm_buf, hidden, hidden_size);
+}
+
+/// MoE expert dispatch with router bias, expert biases, and clamped SwiGLU.
+///
+/// Extends the standard `moe_expert_dispatch` with:
+///   1. Router bias added after router matmul (before top-k)
+///   2. Expert gate/up biases added after gate/up matmuls
+///   3. Clamped SwiGLU: clamp(silu(gate) * up, -limit, limit)
+///   4. Expert down_bias added after down matmul
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn moe_expert_dispatch_biased<B: GpuMatmul + GpuElementwise>(
+    backend: &B,
+    router_gate: &B::Tensor,
+    router_bias: Option<&B::Tensor>,
+    experts: &[ExpertWeights<B>],
+    // Buffers
+    norm_buf: &B::Tensor,
+    moe_gate_buf: &B::Tensor,
+    moe_up_buf: &B::Tensor,
+    moe_output: &B::Tensor,
+    routing_output: &B::Tensor,
+    down_buf: &B::Tensor,
+    // Dimensions
+    hidden_size: u32,
+    moe_inter: u32,
+    num_experts: usize,
+    num_experts_per_tok: usize,
+    swiglu_limit: f32,
+) {
+    // Router matmul → per-expert scores.
+    backend.matmul(router_gate, norm_buf, moe_gate_buf, num_experts as u32, hidden_size);
+
+    // Router bias (GPT-OSS).
+    if let Some(bias) = router_bias {
+        backend.add(moe_gate_buf, bias, moe_gate_buf, num_experts as u32);
+    }
+
+    // GPU-side top-k + softmax.
+    backend.top_k_softmax(moe_gate_buf, routing_output, num_experts as u32, num_experts_per_tok as u32);
+
+    // Read routing results to CPU.
+    let k = num_experts_per_tok;
+    let routing_bytes = k * 2 * 4;
+    let buf_bytes = backend.tensor_byte_count(routing_output);
+    let mut routing_buf = vec![0u8; buf_bytes];
+    backend.copy_to_host(routing_output, &mut routing_buf);
+    let routing_data: &[f32] = bytemuck::cast_slice(&routing_buf[..routing_bytes]);
+
+    let selected: Vec<(usize, f32)> = (0..k)
+        .map(|i| (routing_data[2 * i] as usize, routing_data[2 * i + 1]))
+        .collect();
+
+    // Zero the accumulator, then run each selected expert's FFN.
+    backend.fill_zero(moe_output, hidden_size);
+
+    for &(expert_idx, routing_weight) in &selected {
+        let expert = &experts[expert_idx];
+
+        // Gate and up projections.
+        backend.matmul(&expert.gate_proj, norm_buf, moe_gate_buf, moe_inter, hidden_size);
+        backend.matmul(&expert.up_proj, norm_buf, moe_up_buf, moe_inter, hidden_size);
+
+        // Expert gate and up biases (split during loading).
+        if let Some(ref g_bias) = expert.gate_bias {
+            backend.add(moe_gate_buf, g_bias, moe_gate_buf, moe_inter);
+        }
+        if let Some(ref u_bias) = expert.up_bias {
+            backend.add(moe_up_buf, u_bias, moe_up_buf, moe_inter);
+        }
+
+        // Clamped SwiGLU activation.
+        if swiglu_limit > 0.0 {
+            backend.silu_mul_clamp(moe_gate_buf, moe_up_buf, moe_gate_buf, moe_inter, swiglu_limit);
+        } else {
+            backend.silu_mul(moe_gate_buf, moe_up_buf, moe_gate_buf, moe_inter);
+        }
+
+        // Down projection.
+        backend.matmul(&expert.down_proj, moe_gate_buf, down_buf, hidden_size, moe_inter);
+
+        // Expert down bias.
+        if let Some(ref d_bias) = expert.down_bias {
+            backend.add(down_buf, d_bias, down_buf, hidden_size);
+        }
+
+        backend.scale_add(moe_output, down_buf, routing_weight, hidden_size);
+    }
+}
+
+/// MoE FFN block with biased dispatch: norm → route → biased dispatch → residual.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn moe_ffn_block_biased<B: GpuNorm + GpuMatmul + GpuElementwise>(
+    backend: &B,
+    post_attn_norm: &B::Tensor,
+    router_gate: &B::Tensor,
+    router_bias: Option<&B::Tensor>,
+    experts: &[ExpertWeights<B>],
+    hidden: &B::Tensor,
+    norm_buf: &B::Tensor,
+    moe_gate_buf: &B::Tensor,
+    moe_up_buf: &B::Tensor,
+    moe_output: &B::Tensor,
+    routing_output: &B::Tensor,
+    down_buf: &B::Tensor,
+    eps: f32,
+    hidden_size: u32,
+    moe_inter: u32,
+    num_experts: usize,
+    num_experts_per_tok: usize,
+    swiglu_limit: f32,
+) {
+    backend.rms_norm(hidden, post_attn_norm, eps, norm_buf);
+    moe_expert_dispatch_biased(
+        backend, router_gate, router_bias, experts,
+        norm_buf, moe_gate_buf, moe_up_buf, moe_output, routing_output, down_buf,
+        hidden_size, moe_inter, num_experts, num_experts_per_tok, swiglu_limit,
+    );
+    backend.add(hidden, moe_output, hidden, hidden_size);
+}
+
+// ===========================================================================
+// YaRN RoPE primitives.
+// ===========================================================================
+
+/// Apply YaRN RoPE to Q and K buffers.
+pub(crate) fn apply_rope_yarn<B: GpuRope>(
+    backend: &B,
+    q_buf: &B::Tensor,
+    k_buf: &B::Tensor,
+    pos: u32,
+    rope_theta: f32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    scaling: &RopeScaling,
+) {
+    backend.rope_yarn(
+        q_buf, k_buf, pos, rope_theta,
+        num_heads, num_kv_heads, head_dim,
+        scaling.factor as f32,
+        scaling.beta_fast as f32,
+        scaling.beta_slow as f32,
+        scaling.original_max_position_embeddings as u32,
+    );
+}
+
+/// Batched YaRN RoPE for prefill.
+pub(crate) fn apply_rope_yarn_batch<B: GpuRope>(
+    backend: &B,
+    bufs: &PrefillBuffers<B>,
+    rope_theta: f32,
+    bs: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    scaling: &RopeScaling,
+) {
+    backend.rope_yarn_batch(
+        &bufs.q_buf, &bufs.k_buf, &bufs.positions,
+        rope_theta, bs, num_heads, num_kv_heads, head_dim,
+        scaling.factor as f32,
+        scaling.beta_fast as f32,
+        scaling.beta_slow as f32,
+        scaling.original_max_position_embeddings as u32,
+    );
+}
+
+/// Apply QKV bias for models where q_dim ≠ hidden_size (e.g. GPT-OSS: q_dim=4096, hidden=2880).
+pub(crate) fn apply_qkv_bias_qdim<B: GpuElementwise>(
+    backend: &B,
+    layer: &LayerWeights<B>,
+    q_buf: &B::Tensor,
+    k_buf: &B::Tensor,
+    v_buf: &B::Tensor,
+    q_dim: u32,
+    kv_dim: u32,
+) {
+    if let Some(ref q_bias) = layer.q_bias {
+        backend.add(q_buf, q_bias, q_buf, q_dim);
+    }
+    if let Some(ref k_bias) = layer.k_bias {
+        backend.add(k_buf, k_bias, k_buf, kv_dim);
+    }
+    if let Some(ref v_bias) = layer.v_bias {
+        backend.add(v_buf, v_bias, v_buf, kv_dim);
+    }
+}
+
+/// Batched QKV bias for models where q_dim ≠ hidden_size.
+pub(crate) fn apply_qkv_bias_batch_qdim<B: GpuElementwise>(
+    backend: &B,
+    layer: &LayerWeights<B>,
+    bufs: &PrefillBuffers<B>,
+    bs: u32,
+    q_dim: u32,
+    kv_dim: u32,
+) {
+    if let Some(ref q_bias) = layer.q_bias {
+        backend.bias_add_batch(&bufs.q_buf, q_bias, &bufs.q_buf, bs, q_dim);
+    }
+    if let Some(ref k_bias) = layer.k_bias {
+        backend.bias_add_batch(&bufs.k_buf, k_bias, &bufs.k_buf, bs, kv_dim);
+    }
+    if let Some(ref v_bias) = layer.v_bias {
+        backend.bias_add_batch(&bufs.v_buf, v_bias, &bufs.v_buf, bs, kv_dim);
+    }
 }

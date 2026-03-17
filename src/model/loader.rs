@@ -213,6 +213,15 @@ pub(crate) struct ExpertWeights<B: GpuCore> {
     pub gate_proj: B::Tensor, // [moe_inter, hidden_size]
     pub up_proj: B::Tensor,   // [moe_inter, hidden_size]
     pub down_proj: B::Tensor, // [hidden_size, moe_inter]
+
+    // --- Expert biases (GPT-OSS only) ---
+    //
+    // GPT-OSS expert weights have per-expert bias vectors stored as fused tensors
+    // across all experts in the safetensors file.  During loading, the fused
+    // gate_up_bias [2*moe_inter] is split into separate gate and up biases.
+    pub gate_bias: Option<B::Tensor>, // [moe_inter], or None
+    pub up_bias: Option<B::Tensor>,   // [moe_inter], or None
+    pub down_bias: Option<B::Tensor>, // [hidden_size], or None
 }
 
 /// Weights for a single transformer layer.
@@ -239,6 +248,12 @@ pub(crate) struct LayerWeights<B: GpuCore> {
     pub k_bias: Option<B::Tensor>, // [kv_dim], or None for Llama
     pub v_bias: Option<B::Tensor>, // [kv_dim], or None for Llama
 
+    // --- O-proj bias (GPT-OSS only) ---
+    //
+    // GPT-OSS has bias on the output projection: attn_out = O @ attn + o_bias.
+    // Other architectures have NO bias on O-proj.
+    pub o_proj_bias: Option<B::Tensor>, // [hidden_size], or None
+
     // --- QK-norm (Qwen 3 MoE only) ---
     //
     // Learning note: QK-norm applies per-head RMSNorm to Q and K projections
@@ -260,6 +275,7 @@ pub(crate) struct LayerWeights<B: GpuCore> {
     // When present, the dense gate/up/down fields above are unused dummy
     // tensors.  The forward pass dispatches to MoE routing instead.
     pub router_gate: Option<B::Tensor>,            // [num_experts, hidden_size]
+    pub router_bias: Option<B::Tensor>,            // [num_experts], GPT-OSS only
     pub experts: Option<Vec<ExpertWeights<B>>>,     // num_experts expert FFNs
 
     // --- DeltaNet attention (Qwen 3.5 linear attention layers only) ---
@@ -303,6 +319,106 @@ pub(crate) struct LayerWeights<B: GpuCore> {
     pub shared_expert_up_proj: Option<B::Tensor>,    // [shared_inter, hidden_size]
     pub shared_expert_down_proj: Option<B::Tensor>,  // [hidden_size, shared_inter]
     pub shared_expert_gate: Option<B::Tensor>,       // [1, hidden_size] — scalar gate weight
+}
+
+// ---------------------------------------------------------------------------
+// MXFP4 dequantization — converts microscaling FP4 packed format to bf16.
+//
+// MXFP4 (Microscaling FP4) stores weights using 4-bit FP (E2M1 format):
+//   - 1 sign bit, 2 exponent bits, 1 mantissa bit → 16 distinct values
+//   - Two values packed per byte (low nibble = even index, high nibble = odd)
+//   - Block scaling: every `block_size` elements share one scale factor
+//
+// Layout on disk (for a weight of shape [rows, cols]):
+//   blocks: [rows, cols/2] bytes (packed pairs)
+//   scales: [rows, cols/block_size] bf16 scale factors
+//   bias:   [rows] bf16 per-row bias (optional, added after dequant)
+//
+// FP4 E2M1 encoding:
+//   nibble  value       nibble  value
+//   0b0000   0.0        0b1000  -0.0
+//   0b0001   0.5        0b1001  -0.5
+//   0b0010   1.0        0b1010  -1.0
+//   0b0011   1.5        0b1011  -1.5
+//   0b0100   2.0        0b1100  -2.0
+//   0b0101   3.0        0b1101  -3.0
+//   0b0110   4.0        0b1110  -4.0
+//   0b0111   6.0        0b1111  -6.0
+// ---------------------------------------------------------------------------
+
+/// Lookup table: FP4 E2M1 nibble → f32 value.
+const FP4_E2M1_LUT: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,    // positive (sign=0)
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0, // negative (sign=1)
+];
+
+/// Transpose a row-major bf16 matrix from [rows, cols] to [cols, rows].
+///
+/// MXFP4 weights are stored transposed relative to HuggingFace convention:
+/// on-disk `[in_features, out_features]` but the model expects `[out_features, in_features]`.
+fn transpose_bf16(data: &[u8], rows: usize, cols: usize) -> Vec<u8> {
+    let src: &[half::bf16] = bytemuck::cast_slice(data);
+    assert_eq!(src.len(), rows * cols);
+    let mut dst = vec![half::bf16::ZERO; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            dst[c * rows + r] = src[r * cols + c];
+        }
+    }
+    bytemuck::cast_slice(&dst).to_vec()
+}
+
+/// Decode an E8M0 scale byte to f32.
+///
+/// E8M0 is an 8-bit exponent-only format used by MXFP4 for per-block scales:
+///   value = 2^(byte - 127)
+/// Special cases: 0 → 0.0, 255 → NaN.
+#[inline]
+fn e8m0_to_f32(byte: u8) -> f32 {
+    match byte {
+        0 => 0.0,
+        255 => f32::NAN,
+        e => f32::from_bits((e as u32) << 23), // 2^(e-127) via IEEE 754
+    }
+}
+
+/// Dequantize MXFP4 packed blocks to bf16 using per-block E8M0 scaling.
+///
+/// Arguments:
+///   - `blocks`: packed fp4 data, 2 values per byte, shape [rows, cols/2]
+///   - `scales`: E8M0 block scales (1 byte each), shape [rows, num_scale_blocks]
+///   - `rows`, `cols`: logical weight shape
+///   - `block_size`: number of elements per scale block (typically 32)
+///
+/// Returns: bf16 bytes for [rows, cols] weight tensor.
+fn dequantize_mxfp4(
+    blocks: &[u8],
+    scales: &[u8],
+    rows: usize,
+    cols: usize,
+    block_size: usize,
+) -> Vec<u8> {
+    let num_scale_blocks = (cols + block_size - 1) / block_size;
+    let mut out = vec![half::bf16::ZERO; rows * cols];
+
+    for r in 0..rows {
+        let row_block_offset = r * (cols / 2);
+        let row_scale_offset = r * num_scale_blocks;
+        for c in 0..cols {
+            let byte_idx = row_block_offset + c / 2;
+            let nibble = if c % 2 == 0 {
+                blocks[byte_idx] & 0x0F // low nibble
+            } else {
+                (blocks[byte_idx] >> 4) & 0x0F // high nibble
+            };
+            let fp4_val = FP4_E2M1_LUT[nibble as usize];
+            let scale_idx = row_scale_offset + c / block_size;
+            let scale = e8m0_to_f32(scales[scale_idx]);
+            out[r * cols + c] = half::bf16::from_f32(fp4_val * scale);
+        }
+    }
+
+    bytemuck::cast_slice(&out).to_vec()
 }
 
 /// Load all model weights from safetensors file(s) into GPU memory.
@@ -382,6 +498,10 @@ pub(crate) fn load_weights<B: GpuCore>(
     // so the effective scale starts at 1.0 and learns from there.
     let residual_norm = matches!(arch, ModelArch::Qwen3_5 | ModelArch::Gemma3);
     let is_gemma3 = matches!(arch, ModelArch::Gemma3);
+    let is_gpt_oss = matches!(arch, ModelArch::GptOss);
+    let has_o_proj_bias = arch.has_o_proj_bias();
+    let has_router_bias = arch.has_router_bias();
+    let _has_expert_bias = arch.has_expert_bias();
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for i in 0..config.num_hidden_layers {
         let prefix = format!("{wp}layers.{i}");
@@ -456,7 +576,7 @@ pub(crate) fn load_weights<B: GpuCore>(
         //   Format 2 is detected by the presence of the fused tensor name.
         let has_shared_expert = config.has_shared_expert();
         let shared_inter = config.shared_expert_intermediate_size;
-        let (gate_proj, up_proj, down_proj, router_gate, experts,
+        let (gate_proj, up_proj, down_proj, router_gate, router_bias_weight, experts,
          shared_expert_gate_proj, shared_expert_up_proj, shared_expert_down_proj,
          shared_expert_gate) = if is_moe {
             // Dummy tensors for the dense FFN fields (never accessed by MoE forward pass).
@@ -467,10 +587,15 @@ pub(crate) fn load_weights<B: GpuCore>(
             // Router gate: [num_experts, hidden_size].  Stays bf16 — routing
             // accuracy matters more than speed here (it's a single small matmul).
             //
-            // Mixtral uses `block_sparse_moe.gate` instead of `mlp.gate`.
+            // Router naming varies by architecture:
+            //   Mixtral:  block_sparse_moe.gate.weight
+            //   GPT-OSS: mlp.router.weight (+ mlp.router.bias)
+            //   Others:   mlp.gate.weight
             let is_mixtral = matches!(arch, ModelArch::Mixtral);
             let router_name = if is_mixtral {
                 format!("{prefix}.block_sparse_moe.gate.weight")
+            } else if is_gpt_oss {
+                format!("{prefix}.mlp.router.weight")
             } else {
                 format!("{prefix}.mlp.gate.weight")
             };
@@ -481,11 +606,152 @@ pub(crate) fn load_weights<B: GpuCore>(
                 &[num_experts, hidden],
             )?;
 
+            // Router bias (GPT-OSS only).
+            let router_bias_tensor = if has_router_bias {
+                Some(upload_tensor(
+                    &store,
+                    backend,
+                    &format!("{prefix}.mlp.router.bias"),
+                    &[num_experts],
+                )?)
+            } else {
+                None
+            };
+
+            // Detect MXFP4 format (GPT-OSS) by looking for packed blocks tensor.
+            let mxfp4_name = format!("{prefix}.mlp.experts.gate_up_proj_blocks");
+            let is_mxfp4 = store.tensor(&mxfp4_name).is_ok();
+
             // Detect fused vs per-expert format.
             let fused_name = format!("{prefix}.mlp.experts.gate_up_proj");
-            let is_fused = store.tensor(&fused_name).is_ok();
+            let is_fused = !is_mxfp4 && store.tensor(&fused_name).is_ok();
 
-            let expert_vec = if is_fused {
+            let expert_vec = if is_mxfp4 {
+                // -----------------------------------------------------------
+                // MXFP4 format (GPT-OSS): weights stored as packed fp4 blocks
+                // with per-block bf16 scales and optional per-expert biases.
+                //
+                // Tensors:
+                //   gate_up_proj_blocks: [num_experts, 2*moe_inter, hidden/2]  (packed nibbles)
+                //   gate_up_proj_scales: [num_experts, 2*moe_inter, num_blocks] (bf16)
+                //   gate_up_proj_bias:   [num_experts, 2*moe_inter]  (bf16, optional)
+                //   down_proj_blocks:    [num_experts, hidden, moe_inter/2]
+                //   down_proj_scales:    [num_experts, hidden, num_blocks]
+                //   down_proj_bias:      [num_experts, hidden]  (bf16, optional)
+                //
+                // We dequant each expert's slice to bf16, then optionally Q4.
+                // -----------------------------------------------------------
+                let block_size = 32usize; // MXFP4 standard block size
+
+                let gu_blocks_view = store.tensor(&mxfp4_name)?;
+                let gu_scales_view = store.tensor(
+                    &format!("{prefix}.mlp.experts.gate_up_proj_scales"),
+                )?;
+                let gu_blocks_data = gu_blocks_view.data();
+                let gu_scales_data = gu_scales_view.data();
+
+                let down_blocks_view = store.tensor(
+                    &format!("{prefix}.mlp.experts.down_proj_blocks"),
+                )?;
+                let down_scales_view = store.tensor(
+                    &format!("{prefix}.mlp.experts.down_proj_scales"),
+                )?;
+                let down_blocks_data = down_blocks_view.data();
+                let down_scales_data = down_scales_view.data();
+
+                // Optional biases.
+                let gu_bias_name = format!("{prefix}.mlp.experts.gate_up_proj_bias");
+                let gu_bias_data = store.tensor(&gu_bias_name).ok().map(|v| v.data().to_vec());
+                let down_bias_name = format!("{prefix}.mlp.experts.down_proj_bias");
+                let down_bias_data = store.tensor(&down_bias_name).ok().map(|v| v.data().to_vec());
+
+                // Per-expert byte sizes for slicing fused tensors.
+                let gu_rows = 2 * moe_inter;
+                let gu_blocks_per_expert = gu_rows * (hidden / 2);
+                let gu_num_scale_blocks = (hidden + block_size - 1) / block_size;
+                let gu_scales_per_expert = gu_rows * gu_num_scale_blocks; // E8M0: 1 byte each
+
+                let down_rows = hidden;
+                let down_blocks_per_expert = down_rows * (moe_inter / 2);
+                let down_num_scale_blocks = (moe_inter + block_size - 1) / block_size;
+                let down_scales_per_expert = down_rows * down_num_scale_blocks; // E8M0: 1 byte each
+
+                let gu_bias_per_expert = gu_rows * 2; // bf16
+                let down_bias_per_expert = down_rows * 2; // bf16
+
+                let mut experts = Vec::with_capacity(num_experts);
+                for j in 0..num_experts {
+                    // Dequant gate_up: on-disk [2*moe_inter, hidden] after unpacking MXFP4.
+                    //
+                    // MXFP4 stores weights transposed relative to HuggingFace convention:
+                    //   On-disk blocks shape: [experts, 2*moe_inter, blocks, bytes] → dequant → [2*moe_inter, hidden]
+                    //   HF model sees: [experts, hidden, 2*moe_inter] (via x @ W, not W @ x)
+                    //
+                    // Our matmul convention: y = W @ x with W = [out, in].
+                    // So we need gate = [moe_inter, hidden] and up = [moe_inter, hidden].
+                    //
+                    // The on-disk [2*moe_inter, hidden] is exactly [out, in] for our convention.
+                    // (HF transposes it to [in, out] for torch's x @ W.T convention.)
+                    // Split first half = gate [moe_inter, hidden], second half = up [moe_inter, hidden].
+                    let gu_b_off = j * gu_blocks_per_expert;
+                    let gu_s_off = j * gu_scales_per_expert;
+                    let gu_bf16 = dequantize_mxfp4(
+                        &gu_blocks_data[gu_b_off..gu_b_off + gu_blocks_per_expert],
+                        &gu_scales_data[gu_s_off..gu_s_off + gu_scales_per_expert],
+                        gu_rows, hidden, block_size,
+                    );
+
+                    // Split gate [moe_inter, hidden] and up [moe_inter, hidden].
+                    let gate_bytes = moe_inter * hidden * 2;
+                    let gate_raw = &gu_bf16[..gate_bytes];
+                    let up_raw = &gu_bf16[gate_bytes..2 * gate_bytes];
+                    let gate_t = upload_raw_maybe_quantized(backend, gate_raw, &[moe_inter, hidden], quantize);
+                    let up_t = upload_raw_maybe_quantized(backend, up_raw, &[moe_inter, hidden], quantize);
+
+                    // Dequant down: on-disk [hidden, moe_inter] → our convention [hidden, moe_inter] = [out, in].
+                    let d_b_off = j * down_blocks_per_expert;
+                    let d_s_off = j * down_scales_per_expert;
+                    let down_bf16 = dequantize_mxfp4(
+                        &down_blocks_data[d_b_off..d_b_off + down_blocks_per_expert],
+                        &down_scales_data[d_s_off..d_s_off + down_scales_per_expert],
+                        down_rows, moe_inter, block_size,
+                    );
+                    let down_t = upload_raw_maybe_quantized(backend, &down_bf16, &[hidden, moe_inter], quantize);
+
+                    // Expert biases — split fused gate_up_bias into separate gate and up.
+                    let (gate_bias, up_bias) = if let Some(ref bias) = gu_bias_data {
+                        let off = j * gu_bias_per_expert;
+                        let bias_slice = &bias[off..off + gu_bias_per_expert];
+                        // Each element is bf16 (2 bytes), so split at moe_inter * 2 bytes.
+                        let gate_bytes = moe_inter * 2;
+                        let gate_part = &bias_slice[..gate_bytes];
+                        let up_part = &bias_slice[gate_bytes..];
+                        (
+                            Some(backend.upload_tensor(gate_part, &[moe_inter], TensorDtype::BF16)),
+                            Some(backend.upload_tensor(up_part, &[moe_inter], TensorDtype::BF16)),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    let down_bias = if let Some(ref bias) = down_bias_data {
+                        let off = j * down_bias_per_expert;
+                        let bias_slice = &bias[off..off + down_bias_per_expert];
+                        Some(backend.upload_tensor(bias_slice, &[down_rows], TensorDtype::BF16))
+                    } else {
+                        None
+                    };
+
+                    experts.push(ExpertWeights {
+                        gate_proj: gate_t,
+                        up_proj: up_t,
+                        down_proj: down_t,
+                        gate_bias,
+                        up_bias,
+                        down_bias,
+                    });
+                }
+                experts
+            } else if is_fused {
                 // Fused format (Qwen3.5): gate_up_proj [num_experts, 2*moe_inter, hidden]
                 // and down_proj [num_experts, hidden, moe_inter].
                 // Split into per-expert tensors during loading.
@@ -526,6 +792,9 @@ pub(crate) fn load_weights<B: GpuCore>(
                         gate_proj: gate_t,
                         up_proj: up_t,
                         down_proj: down_t,
+                        gate_bias: None,
+                        up_bias: None,
+                        down_bias: None,
                     });
                 }
                 experts
@@ -569,6 +838,9 @@ pub(crate) fn load_weights<B: GpuCore>(
                             &down_name,
                             &[hidden, moe_inter], quantize,
                         )?,
+                        gate_bias: None,
+                        up_bias: None,
+                        down_bias: None,
                     });
                 }
                 experts
@@ -577,7 +849,7 @@ pub(crate) fn load_weights<B: GpuCore>(
                 eprintln!(
                     "  loading {} experts per layer (moe_inter={}){}",
                     num_experts, moe_inter,
-                    if is_fused { " [fused format]" } else { "" },
+                    if is_mxfp4 { " [MXFP4 format]" } else if is_fused { " [fused format]" } else { "" },
                 );
             }
 
@@ -611,7 +883,7 @@ pub(crate) fn load_weights<B: GpuCore>(
                 (None, None, None, None)
             };
 
-            (dummy, dummy2, dummy3, Some(router), Some(expert_vec),
+            (dummy, dummy2, dummy3, Some(router), router_bias_tensor, Some(expert_vec),
              se_gate_proj, se_up_proj, se_down_proj, se_gate)
         } else if has_fused_qkv {
             // -----------------------------------------------------------------
@@ -650,7 +922,7 @@ pub(crate) fn load_weights<B: GpuCore>(
                 &[hidden, inter],
                 quantize,
             )?;
-            (gate, up, down, None, None, None, None, None, None)
+            (gate, up, down, None, None, None, None, None, None, None)
         } else {
             // Dense FFN: standard gate/up/down projections.
             let gate = upload_maybe_quantized(
@@ -674,7 +946,7 @@ pub(crate) fn load_weights<B: GpuCore>(
                 &[hidden, inter],
                 quantize,
             )?;
-            (gate, up, down, None, None, None, None, None, None)
+            (gate, up, down, None, None, None, None, None, None, None)
         };
 
         // Load attention weights: DeltaNet layers use linear_attn namespace,
@@ -907,6 +1179,18 @@ pub(crate) fn load_weights<B: GpuCore>(
             (None, None)
         };
 
+        // O-proj bias (GPT-OSS only).
+        let o_proj_bias = if has_o_proj_bias {
+            Some(upload_tensor(
+                &store,
+                backend,
+                &format!("{prefix}.self_attn.o_proj.bias"),
+                &[hidden],
+            )?)
+        } else {
+            None
+        };
+
         layers.push(LayerWeights {
             input_layernorm: upload_norm(
                 &format!("{prefix}.input_layernorm.weight"),
@@ -916,6 +1200,7 @@ pub(crate) fn load_weights<B: GpuCore>(
             k_proj,
             v_proj,
             o_proj,
+            o_proj_bias,
             q_bias,
             k_bias,
             v_bias,
@@ -929,6 +1214,7 @@ pub(crate) fn load_weights<B: GpuCore>(
             up_proj,
             down_proj,
             router_gate,
+            router_bias: router_bias_weight,
             experts,
             pre_feedforward_layernorm: pre_ffn_norm,
             post_feedforward_layernorm: post_ffn_norm,
@@ -1123,4 +1409,137 @@ pub(crate) fn load_model<B: GpuCore>(
         tokenizer,
         weights,
     })
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fp4_e2m1_lut() {
+        // Verify the FP4 E2M1 lookup table values.
+        assert_eq!(FP4_E2M1_LUT[0b0000], 0.0);
+        assert_eq!(FP4_E2M1_LUT[0b0001], 0.5);
+        assert_eq!(FP4_E2M1_LUT[0b0010], 1.0);
+        assert_eq!(FP4_E2M1_LUT[0b0011], 1.5);
+        assert_eq!(FP4_E2M1_LUT[0b0100], 2.0);
+        assert_eq!(FP4_E2M1_LUT[0b0101], 3.0);
+        assert_eq!(FP4_E2M1_LUT[0b0110], 4.0);
+        assert_eq!(FP4_E2M1_LUT[0b0111], 6.0);
+        assert_eq!(FP4_E2M1_LUT[0b1000], -0.0);
+        assert_eq!(FP4_E2M1_LUT[0b1001], -0.5);
+        assert_eq!(FP4_E2M1_LUT[0b1010], -1.0);
+        assert_eq!(FP4_E2M1_LUT[0b1111], -6.0);
+    }
+
+    #[test]
+    fn test_e8m0_to_f32() {
+        assert_eq!(e8m0_to_f32(0), 0.0);
+        assert_eq!(e8m0_to_f32(127), 1.0);   // 2^(127-127) = 2^0
+        assert_eq!(e8m0_to_f32(128), 2.0);   // 2^(128-127) = 2^1
+        assert_eq!(e8m0_to_f32(126), 0.5);   // 2^(126-127) = 2^-1
+        assert_eq!(e8m0_to_f32(129), 4.0);   // 2^(129-127) = 2^2
+        assert_eq!(e8m0_to_f32(130), 8.0);   // 2^(130-127) = 2^3
+        assert!(e8m0_to_f32(255).is_nan());
+    }
+
+    #[test]
+    fn test_dequantize_mxfp4_basic() {
+        // 1 row, 4 columns, block_size=4 (1 E8M0 scale per row).
+        // Packed: 2 bytes for 4 values (low + high nibble per byte).
+        //   byte 0: nibble 0b0010 (1.0), nibble 0b0100 (2.0) → packed 0x42
+        //   byte 1: nibble 0b0101 (3.0), nibble 0b0000 (0.0) → packed 0x05
+        let blocks: Vec<u8> = vec![0x42, 0x05];
+        // E8M0 scale = 2.0 → exponent byte = 128.
+        let scales: Vec<u8> = vec![128];
+
+        let result = dequantize_mxfp4(&blocks, &scales, 1, 4, 4);
+        let bf16_values: &[half::bf16] = bytemuck::cast_slice(&result);
+        let f32_values: Vec<f32> = bf16_values.iter().map(|v| v.to_f32()).collect();
+
+        // Expected: [1.0 * 2.0, 2.0 * 2.0, 3.0 * 2.0, 0.0 * 2.0] = [2.0, 4.0, 6.0, 0.0]
+        assert_eq!(f32_values.len(), 4);
+        assert!((f32_values[0] - 2.0).abs() < 0.1, "val[0]={}", f32_values[0]);
+        assert!((f32_values[1] - 4.0).abs() < 0.1, "val[1]={}", f32_values[1]);
+        assert!((f32_values[2] - 6.0).abs() < 0.1, "val[2]={}", f32_values[2]);
+        assert!((f32_values[3] - 0.0).abs() < 0.1, "val[3]={}", f32_values[3]);
+    }
+
+    #[test]
+    fn test_dequantize_mxfp4_negative_values() {
+        // 1 row, 2 columns, block_size=2.
+        // byte 0: nibble 0b1001 (-0.5), nibble 0b1010 (-1.0) → packed 0xA9
+        let blocks: Vec<u8> = vec![0xA9];
+        // E8M0 scale = 1.0 → exponent byte = 127.
+        let scales: Vec<u8> = vec![127];
+
+        let result = dequantize_mxfp4(&blocks, &scales, 1, 2, 2);
+        let bf16_values: &[half::bf16] = bytemuck::cast_slice(&result);
+        let f32_values: Vec<f32> = bf16_values.iter().map(|v| v.to_f32()).collect();
+
+        assert!((f32_values[0] - (-0.5)).abs() < 0.1, "val[0]={}", f32_values[0]);
+        assert!((f32_values[1] - (-1.0)).abs() < 0.1, "val[1]={}", f32_values[1]);
+    }
+
+    #[test]
+    fn test_dequantize_mxfp4_multi_row() {
+        // 2 rows, 4 columns, block_size=4.
+        // Row 0: all 0b0010 (1.0) → packed 0x22, 0x22; scale 1.0 → output [1,1,1,1]
+        // Row 1: all 0b0110 (4.0) → packed 0x66, 0x66; scale 0.5 → output [2,2,2,2]
+        let blocks: Vec<u8> = vec![0x22, 0x22, 0x66, 0x66];
+        // E8M0: scale=1.0 → 127, scale=0.5 → 126
+        let scales: Vec<u8> = vec![127, 126];
+
+        let result = dequantize_mxfp4(&blocks, &scales, 2, 4, 4);
+        let bf16_values: &[half::bf16] = bytemuck::cast_slice(&result);
+        let f32_values: Vec<f32> = bf16_values.iter().map(|v| v.to_f32()).collect();
+
+        assert_eq!(f32_values.len(), 8);
+        for i in 0..4 {
+            assert!((f32_values[i] - 1.0).abs() < 0.1, "row0[{i}]={}", f32_values[i]);
+        }
+        for i in 4..8 {
+            assert!((f32_values[i] - 2.0).abs() < 0.1, "row1[{i}]={}", f32_values[i]);
+        }
+    }
+
+    /// Regression test: MXFP4 scale slicing must use E8M0 (1 byte/scale),
+    /// not bf16 (2 bytes/scale).  With bf16 sizing, this panics because the
+    /// computed slice length is 2× the actual data.
+    #[test]
+    fn test_mxfp4_scale_slice_sizes_e8m0() {
+        // Simulate GPT-OSS dimensions for one expert:
+        //   gate_up: [5760, 2880] → rows=5760, cols=2880, block_size=32
+        //   num_scale_blocks = 2880/32 = 90
+        //   scales_per_expert = 5760 * 90 = 518_400 bytes (E8M0)
+        //   blocks_per_expert = 5760 * (2880/2) = 8_294_400 bytes (packed nibbles)
+        let rows = 5760usize;
+        let cols = 2880usize;
+        let block_size = 32usize;
+        let num_experts = 2; // use 2 to test slicing, not 32 (too much memory)
+
+        let num_scale_blocks = (cols + block_size - 1) / block_size; // 90
+        let scales_per_expert = rows * num_scale_blocks;             // 518_400
+        let blocks_per_expert = rows * (cols / 2);                   // 8_294_400
+
+        // Allocate fused tensors for all experts.
+        let all_blocks = vec![0x22u8; num_experts * blocks_per_expert];
+        let all_scales = vec![127u8; num_experts * scales_per_expert]; // E8M0 = 1.0
+
+        // This should NOT panic — the old bf16 code computed scales_per_expert * 2,
+        // which would be 1_036_800 and exceed the buffer.
+        for j in 0..num_experts {
+            let b_off = j * blocks_per_expert;
+            let s_off = j * scales_per_expert;
+            let _result = dequantize_mxfp4(
+                &all_blocks[b_off..b_off + blocks_per_expert],
+                &all_scales[s_off..s_off + scales_per_expert],
+                rows, cols, block_size,
+            );
+        }
+    }
 }

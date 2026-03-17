@@ -55,6 +55,36 @@ struct RopePartialParams {
 }
 unsafe impl DeviceRepr for RopePartialParams {}
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RopeYarnParams {
+    pos: u32,
+    rope_theta: f32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+    original_max_pos: u32,
+}
+unsafe impl DeviceRepr for RopeYarnParams {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RopeYarnBatchParams {
+    batch_size: u32,
+    rope_theta: f32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+    original_max_pos: u32,
+}
+unsafe impl DeviceRepr for RopeYarnBatchParams {}
+
 impl GpuRope for CudaBackend {
     fn rope(
         &self,
@@ -147,5 +177,82 @@ impl GpuRope for CudaBackend {
                 .arg(&k.buf)
                 .launch(cfg)
         }.expect("rope_partial launch failed");
+    }
+
+    fn rope_yarn(
+        &self,
+        q: &CudaTensor,
+        k: &CudaTensor,
+        pos: u32,
+        rope_theta: f32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        original_max_pos: u32,
+    ) {
+        let params = RopeYarnParams {
+            pos,
+            rope_theta,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            factor,
+            beta_fast,
+            beta_slow,
+            original_max_pos,
+        };
+        let total_pairs = (num_heads + num_kv_heads) * (head_dim / 2);
+        let block = 256.min(total_pairs);
+        let cfg = CudaBackend::cfg_1d(total_pairs, block);
+        unsafe {
+            self.stream.launch_builder(&self.fn_rope_yarn)
+                .arg(&params)
+                .arg(&q.buf)
+                .arg(&k.buf)
+                .launch(cfg)
+        }.expect("rope_yarn launch failed");
+    }
+
+    fn rope_yarn_batch(
+        &self,
+        q: &CudaTensor,
+        k: &CudaTensor,
+        positions: &CudaTensor,
+        rope_theta: f32,
+        batch_size: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        original_max_pos: u32,
+    ) {
+        let params = RopeYarnBatchParams {
+            batch_size,
+            rope_theta,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            factor,
+            beta_fast,
+            beta_slow,
+            original_max_pos,
+        };
+        let pairs_per_token = (num_heads + num_kv_heads) * (head_dim / 2);
+        let total = batch_size * pairs_per_token;
+        let block = 256.min(total);
+        let cfg = CudaBackend::cfg_1d(total, block);
+        unsafe {
+            self.stream.launch_builder(&self.fn_rope_yarn_batch)
+                .arg(&params)
+                .arg(&q.buf)
+                .arg(&k.buf)
+                .arg(&positions.buf)
+                .launch(cfg)
+        }.expect("rope_yarn_batch launch failed");
     }
 }

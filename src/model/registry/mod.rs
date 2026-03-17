@@ -18,6 +18,7 @@
 // ===========================================================================
 
 pub(crate) mod gemma;
+pub(crate) mod gpt_oss;
 pub(crate) mod llama;
 pub(crate) mod mistral;
 pub(crate) mod mixtral;

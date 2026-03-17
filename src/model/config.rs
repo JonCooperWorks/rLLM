@@ -125,6 +125,26 @@ pub enum ModelArch {
     /// No QKV bias, no QK-norm.  Chat template uses `<|im_start|>`/`<|im_sep|>`
     /// markers (similar to ChatML but with a separator token).
     Phi,
+    /// GPT-OSS family (OpenAI, 20B sparse MoE).
+    ///
+    /// Learning note: GPT-OSS-20B is a 20B-parameter Mixture-of-Experts model
+    /// with only 3.6B parameters active per token (32 experts, top-4 routing).
+    ///
+    /// Key differences from other MoE models:
+    ///   1. **QKV AND O-proj bias**: all projection layers have learned bias,
+    ///      including the output projection (unique among supported architectures).
+    ///   2. **Router bias**: the MoE router gate has a bias vector (uncommon).
+    ///   3. **Clamped SwiGLU**: `clamp(silu(gate) * up, -limit, limit)` with
+    ///      `swiglu_limit=7.0` to bound expert activations.
+    ///   4. **MXFP4 expert weights**: experts stored as microscaling FP4 on disk,
+    ///      dequantized to bf16 during loading (then optionally Q4 quantized).
+    ///   5. **Sliding window attention**: alternating local (128-token window) and
+    ///      global (full context) layers, same mechanism as Gemma 3.
+    ///   6. **Expert biases**: per-expert gate_up and down projections have bias.
+    ///   7. **YaRN RoPE**: extended context via YaRN frequency scaling.
+    ///   8. **q_dim ≠ hidden_size**: 64×64=4096 attention dim vs 2880 hidden.
+    ///   9. **Attention sinks**: per-layer learned sink tokens for efficient attention.
+    GptOss,
     /// Gemma 3 family (Google, 1B, 4B, 12B, 27B).
     ///
     /// Learning note: Gemma 3 shares the Llama backbone (GQA, RoPE, gated FFN)
@@ -176,9 +196,34 @@ impl ModelArch {
     pub fn has_qkv_bias(&self) -> bool {
         match self {
             ModelArch::Llama | ModelArch::Mistral | ModelArch::Mixtral | ModelArch::Phi | ModelArch::Gemma3 => false,
-            ModelArch::Qwen2 => true,
+            ModelArch::Qwen2 | ModelArch::GptOss => true,
             ModelArch::Qwen3Moe | ModelArch::Qwen3_5 => false,
         }
+    }
+
+    /// Whether the O (output) projection has a bias vector.
+    ///
+    /// Learning note: most transformer architectures omit bias from the output
+    /// projection.  GPT-OSS-20B is the exception — it has bias on ALL projections
+    /// (Q, K, V, and O).
+    pub fn has_o_proj_bias(&self) -> bool {
+        matches!(self, ModelArch::GptOss)
+    }
+
+    /// Whether the MoE router gate has a bias vector.
+    ///
+    /// Learning note: most MoE models (Mixtral, Qwen3-MoE) have a simple linear
+    /// router: logits = W @ hidden.  GPT-OSS adds a bias: logits = W @ hidden + b.
+    pub fn has_router_bias(&self) -> bool {
+        matches!(self, ModelArch::GptOss)
+    }
+
+    /// Whether MoE expert FFN projections have bias vectors.
+    ///
+    /// Learning note: GPT-OSS expert gate_up and down projections both have
+    /// per-expert bias, which is stored as a fused tensor across all experts.
+    pub fn has_expert_bias(&self) -> bool {
+        matches!(self, ModelArch::GptOss)
     }
 
     /// Whether Q and K projections have per-head RMSNorm applied before RoPE.
@@ -190,7 +235,7 @@ impl ModelArch {
     /// rely on the implicit normalisation from RMSNorm on the hidden state.
     pub fn has_qk_norm(&self) -> bool {
         match self {
-            ModelArch::Llama | ModelArch::Mistral | ModelArch::Mixtral | ModelArch::Qwen2 | ModelArch::Phi => false,
+            ModelArch::Llama | ModelArch::Mistral | ModelArch::Mixtral | ModelArch::Qwen2 | ModelArch::Phi | ModelArch::GptOss => false,
             ModelArch::Gemma3 => true,  // Both 4B and 27B have q_norm/k_norm weights
             ModelArch::Qwen3_5 => true,  // GQA layers have QK-norm
             ModelArch::Qwen3Moe => true,
@@ -219,8 +264,9 @@ impl ModelArch {
             "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => Ok(ModelArch::Qwen3_5),
             "phi3" | "phi4" => Ok(ModelArch::Phi),
             "gemma3_text" | "gemma3" => Ok(ModelArch::Gemma3),
+            "gpt_oss" => Ok(ModelArch::GptOss),
             other => anyhow::bail!(
-                "unsupported model_type '{}' (expected 'llama', 'mistral', 'mixtral', 'qwen2', 'qwen3_moe', 'qwen3_5', 'phi3', or 'gemma3_text')",
+                "unsupported model_type '{}' (expected 'llama', 'mistral', 'mixtral', 'qwen2', 'qwen3_moe', 'qwen3_5', 'phi3', 'gemma3_text', or 'gpt_oss')",
                 other
             ),
         }
@@ -302,8 +348,14 @@ pub struct ModelConfig {
     pub num_experts: usize,
     /// How many experts are activated (routed to) per token.
     /// Qwen3-Coder-30B-A3B: top-8 experts selected per token.
+    /// GPT-OSS-20B: top-4 experts (uses `experts_per_token` in config.json;
+    /// handled by post-processing since both field names may coexist).
     #[serde(default)]
     pub num_experts_per_tok: usize,
+    /// Alternative field name used by GPT-OSS for num_experts_per_tok.
+    /// Merged into num_experts_per_tok during from_file().
+    #[serde(default)]
+    experts_per_token: usize,
     /// Hidden dimension of each expert's FFN (gate/up/down projections).
     /// Much smaller than `intermediate_size` because there are many experts.
     /// Qwen3-Coder-30B-A3B: 768 per expert (vs 6144 dense intermediate_size).
@@ -410,6 +462,13 @@ pub struct ModelConfig {
     #[serde(default)]
     pub hidden_activation: String,
 
+    /// SwiGLU activation clamp limit (GPT-OSS-20B).
+    /// When > 0, the SwiGLU output is clamped to [-limit, limit] before the
+    /// down projection.  This bounds expert activations to prevent outliers.
+    /// Default 0.0 = no clamping (standard SwiGLU for Llama/Qwen/etc.).
+    #[serde(default)]
+    pub swiglu_limit: f64,
+
     // --- Weight prefix ---
     // Multimodal models (Qwen 3.5) prefix layer weights with
     // "model.language_model." instead of "model.".  This field is set
@@ -459,6 +518,14 @@ pub struct RopeScaling {
     /// Training context length before scaling was applied (Llama 3 only).
     #[serde(default)]
     pub original_max_position_embeddings: usize,
+    /// YaRN: controls wavelength threshold for high-frequency dimensions.
+    /// Dimensions with wavelength < 2π/beta_fast use standard RoPE (no scaling).
+    #[serde(default)]
+    pub beta_fast: f64,
+    /// YaRN: controls wavelength threshold for low-frequency dimensions.
+    /// Dimensions with wavelength > 2π/beta_slow get full linear scaling.
+    #[serde(default)]
+    pub beta_slow: f64,
 }
 
 impl ModelConfig {
@@ -531,10 +598,19 @@ impl ModelConfig {
         let mut config: Self = serde_json::from_value(config_value)?;
         config.weight_prefix = weight_prefix;
 
-        // Mixtral: expert FFN size equals intermediate_size (no separate
-        // moe_intermediate_size field in config.json).  Map it so the MoE
-        // code path can uniformly use moe_intermediate_size.
-        if config.model_type == "mixtral" && config.moe_intermediate_size == 0 && config.num_experts > 0 {
+        // GPT-OSS uses `experts_per_token` instead of `num_experts_per_tok`.
+        // Both may coexist in the config; prefer num_experts_per_tok if set.
+        if config.num_experts_per_tok == 0 && config.experts_per_token > 0 {
+            config.num_experts_per_tok = config.experts_per_token;
+        }
+
+        // Mixtral and GPT-OSS: expert FFN size equals intermediate_size (no
+        // separate moe_intermediate_size field in config.json).  Map it so the
+        // MoE code path can uniformly use moe_intermediate_size.
+        if (config.model_type == "mixtral" || config.model_type == "gpt_oss")
+            && config.moe_intermediate_size == 0
+            && config.num_experts > 0
+        {
             config.moe_intermediate_size = config.intermediate_size;
         }
 
@@ -691,9 +767,13 @@ impl ModelConfig {
                 layer += hidden * 2; // post_feedforward_layernorm
             }
 
-            // QKV bias (BF16, only Qwen2).
+            // QKV bias (BF16, Qwen2 and GPT-OSS).
             if self.arch().map_or(false, |a| a.has_qkv_bias()) {
                 layer += (q_dim + kv_dim + kv_dim) * 2;
+            }
+            // O-proj bias (BF16, GPT-OSS only).
+            if self.arch().map_or(false, |a| a.has_o_proj_bias()) {
+                layer += hidden * 2;
             }
 
             // QK-norm weights (BF16, only Qwen3 MoE).
@@ -705,12 +785,20 @@ impl ModelConfig {
             if self.is_moe() {
                 // Router gate (always BF16).
                 layer += self.num_experts * hidden * 2;
+                // Router bias (GPT-OSS: [num_experts] bf16).
+                if self.arch().map_or(false, |a| a.has_router_bias()) {
+                    layer += self.num_experts * 2;
+                }
                 // Expert weights (Q4 or BF16).
                 let moe_inter = self.moe_intermediate_size;
                 let per_expert = proj(moe_inter, hidden) // gate_proj
                     + proj(moe_inter, hidden)             // up_proj
                     + proj(hidden, moe_inter);            // down_proj
                 layer += self.num_experts * per_expert;
+                // Expert biases (GPT-OSS: gate_bias + up_bias + down_bias per expert, bf16).
+                if self.arch().map_or(false, |a| a.has_expert_bias()) {
+                    layer += self.num_experts * (2 * moe_inter + hidden) * 2;
+                }
                 // Shared expert (if present).
                 if self.has_shared_expert() {
                     let se = self.shared_expert_intermediate_size;
@@ -1219,6 +1307,46 @@ mod tests {
     }
 
     #[test]
+    fn test_model_arch_gpt_oss() {
+        assert_eq!(ModelArch::from_model_type("gpt_oss").unwrap(), ModelArch::GptOss);
+        assert!(ModelArch::GptOss.has_qkv_bias());
+        assert!(ModelArch::GptOss.has_o_proj_bias());
+        assert!(ModelArch::GptOss.has_router_bias());
+        assert!(ModelArch::GptOss.has_expert_bias());
+        assert!(!ModelArch::GptOss.has_qk_norm());
+        assert!(!ModelArch::GptOss.has_fused_qkv());
+    }
+
+    #[test]
+    fn test_parse_gpt_oss_config() {
+        let Some(config) = load_config("gpt-oss-20b") else { return; };
+        assert_eq!(config.arch().unwrap(), ModelArch::GptOss);
+        assert_eq!(config.hidden_size, 2880);
+        assert_eq!(config.num_hidden_layers, 24);
+        assert_eq!(config.num_attention_heads, 64);
+        assert_eq!(config.num_key_value_heads, 8);
+        assert_eq!(config.head_dim, 64);
+        assert_eq!(config.num_experts, 32);
+        assert_eq!(config.num_experts_per_tok, 4);
+        assert_eq!(config.moe_intermediate_size, 2880); // filled from intermediate_size
+        assert_eq!(config.vocab_size, 201088);
+        assert_eq!(config.sliding_window, 128);
+        assert!((config.swiglu_limit - 7.0).abs() < 0.01);
+        assert!(config.is_moe());
+        // YaRN rope scaling.
+        let rs = config.rope_scaling.as_ref().expect("rope_scaling should be present");
+        assert_eq!(rs.rope_type, "yarn");
+        assert!((rs.factor - 32.0).abs() < 0.01);
+        assert_eq!(rs.original_max_position_embeddings, 4096);
+        assert!((rs.beta_fast - 32.0).abs() < 0.01);
+        assert!((rs.beta_slow - 1.0).abs() < 0.01);
+        // Alternating sliding/full attention layers.
+        assert_eq!(config.layer_types.len(), 24);
+        assert!(config.is_sliding_attention_layer(0));
+        assert!(!config.is_sliding_attention_layer(1));
+    }
+
+    #[test]
     fn test_num_heads_per_kv_group() {
         let mut config = minimal_config();
         config.num_attention_heads = 32;
@@ -1244,6 +1372,7 @@ mod tests {
             rope_scaling: None,
             num_experts: 0,
             num_experts_per_tok: 0,
+            experts_per_token: 0,
             moe_intermediate_size: 0,
             shared_expert_intermediate_size: 0,
             linear_num_key_heads: 0,
@@ -1260,6 +1389,7 @@ mod tests {
             sliding_window_pattern: 0,
             query_pre_attn_scalar: 0.0,
             rope_local_base_freq: 0.0,
+            swiglu_limit: 0.0,
             hidden_activation: String::new(),
             weight_prefix: "model.".to_string(),
         }

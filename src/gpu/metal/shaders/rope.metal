@@ -279,3 +279,198 @@ kernel void rotary_embedding_partial(
     data[idx_a] = bfloat(a * cos_val - b * sin_val);
     data[idx_b] = bfloat(a * sin_val + b * cos_val);
 }
+
+// ===========================================================================
+// YaRN RoPE — Yet another RoPE extensioN for extended context lengths.
+//
+// LEARNING OVERVIEW
+//
+// What YaRN does:
+//   Standard RoPE breaks when you use positions beyond the training context
+//   length — the rotation angles become too large and attention patterns
+//   degrade.  YaRN fixes this by applying frequency-dependent interpolation:
+//
+//   - Low-frequency pairs (slow rotators): fully interpolated by `factor`
+//     → these encode long-range position info, must be scaled down
+//   - High-frequency pairs (fast rotators): kept at original frequency
+//     → these encode local position info, no scaling needed
+//   - Mid-range: smooth linear ramp between the two extremes
+//
+//   The `beta_slow` and `beta_fast` parameters control the frequency
+//   boundaries of this ramp.  A pair's "wavelength" (2π / freq) determines
+//   which regime it falls into.
+//
+// Key formulas:
+//   inv_freq_base = 1 / (theta ^ (2*i/D))
+//   wavelength = 2π / inv_freq_base
+//   low_freq_wavelen = original_max_pos / beta_slow
+//   high_freq_wavelen = original_max_pos / beta_fast
+//
+//   if wavelength < high_freq_wavelen:  inv_freq = inv_freq_base (no change)
+//   elif wavelength > low_freq_wavelen: inv_freq = inv_freq_base / factor
+//   else: smooth linear ramp between the two
+//
+//   angle = position * inv_freq  (same rotation as standard RoPE)
+//
+// Reference: https://arxiv.org/abs/2309.00071 (YaRN paper)
+// ===========================================================================
+
+struct RopeYarnParams {
+    uint pos;
+    float rope_theta;
+    uint num_heads;
+    uint num_kv_heads;
+    uint head_dim;
+    float factor;
+    float beta_fast;
+    float beta_slow;
+    uint original_max_pos;
+};
+
+kernel void rotary_embedding_yarn(
+    constant RopeYarnParams& params [[buffer(0)]],
+    device bfloat* q                [[buffer(1)]],
+    device bfloat* k                [[buffer(2)]],
+    uint gid                        [[thread_position_in_grid]]
+) {
+    const uint half_dim = params.head_dim / 2;
+    const uint q_pairs = params.num_heads * half_dim;
+    const uint total_pairs = q_pairs + params.num_kv_heads * half_dim;
+
+    if (gid >= total_pairs) return;
+
+    device bfloat* data;
+    uint pair_within;
+    if (gid < q_pairs) {
+        data = q;
+        pair_within = gid;
+    } else {
+        data = k;
+        pair_within = gid - q_pairs;
+    }
+
+    uint head_idx = pair_within / half_dim;
+    uint pair_in_head = pair_within % half_dim;
+
+    // Base inverse frequency.
+    float freq_exp = 2.0f * float(pair_in_head) / float(params.head_dim);
+    float inv_freq_base = 1.0f / pow(params.rope_theta, freq_exp);
+
+    // YaRN frequency-dependent interpolation.
+    float wavelength = 6.283185307f / inv_freq_base;  // 2π / inv_freq
+    float low_freq_wavelen = float(params.original_max_pos) / params.beta_slow;
+    float high_freq_wavelen = float(params.original_max_pos) / params.beta_fast;
+
+    float inv_freq;
+    if (wavelength < high_freq_wavelen) {
+        // High frequency: no interpolation needed.
+        inv_freq = inv_freq_base;
+    } else if (wavelength > low_freq_wavelen) {
+        // Low frequency: full interpolation.
+        inv_freq = inv_freq_base / params.factor;
+    } else {
+        // Mid-range: smooth linear ramp.
+        float smooth = (low_freq_wavelen / wavelength - 1.0f)
+                     / (params.beta_fast / params.beta_slow - 1.0f);
+        inv_freq = (1.0f - smooth) * (inv_freq_base / params.factor)
+                 + smooth * inv_freq_base;
+    }
+
+    float angle = float(params.pos) * inv_freq;
+    float cos_val = cos(angle);
+    float sin_val = sin(angle);
+
+    uint head_offset = head_idx * params.head_dim;
+    uint idx_a = head_offset + pair_in_head;
+    uint idx_b = head_offset + pair_in_head + half_dim;
+    float a = float(data[idx_a]);
+    float b = float(data[idx_b]);
+    data[idx_a] = bfloat(a * cos_val - b * sin_val);
+    data[idx_b] = bfloat(a * sin_val + b * cos_val);
+}
+
+// ===========================================================================
+// Batched YaRN RoPE for prefill (per-token positions).
+// Same YaRN frequency scaling as above, but with per-token position array.
+// ===========================================================================
+
+struct RopeYarnBatchParams {
+    uint batch_size;
+    float rope_theta;
+    uint num_heads;
+    uint num_kv_heads;
+    uint head_dim;
+    float factor;
+    float beta_fast;
+    float beta_slow;
+    uint original_max_pos;
+};
+
+kernel void rotary_embedding_yarn_batch(
+    constant RopeYarnBatchParams& params [[buffer(0)]],
+    device bfloat* q                     [[buffer(1)]],
+    device bfloat* k                     [[buffer(2)]],
+    device const uint* positions         [[buffer(3)]],
+    uint gid                             [[thread_position_in_grid]]
+) {
+    const uint half_dim = params.head_dim / 2;
+    const uint q_pairs = params.num_heads * half_dim;
+    const uint k_pairs = params.num_kv_heads * half_dim;
+    const uint pairs_per_token = q_pairs + k_pairs;
+    const uint total = params.batch_size * pairs_per_token;
+
+    if (gid >= total) return;
+
+    uint batch = gid / pairs_per_token;
+    uint within = gid % pairs_per_token;
+    uint pos = positions[batch];
+
+    device bfloat* data;
+    uint pair_within;
+    uint q_dim = params.num_heads * params.head_dim;
+    uint k_dim = params.num_kv_heads * params.head_dim;
+
+    if (within < q_pairs) {
+        data = q + batch * q_dim;
+        pair_within = within;
+    } else {
+        data = k + batch * k_dim;
+        pair_within = within - q_pairs;
+    }
+
+    uint head_idx = pair_within / half_dim;
+    uint pair_in_head = pair_within % half_dim;
+
+    // Base inverse frequency.
+    float freq_exp = 2.0f * float(pair_in_head) / float(params.head_dim);
+    float inv_freq_base = 1.0f / pow(params.rope_theta, freq_exp);
+
+    // YaRN frequency-dependent interpolation.
+    float wavelength = 6.283185307f / inv_freq_base;
+    float low_freq_wavelen = float(params.original_max_pos) / params.beta_slow;
+    float high_freq_wavelen = float(params.original_max_pos) / params.beta_fast;
+
+    float inv_freq;
+    if (wavelength < high_freq_wavelen) {
+        inv_freq = inv_freq_base;
+    } else if (wavelength > low_freq_wavelen) {
+        inv_freq = inv_freq_base / params.factor;
+    } else {
+        float smooth = (low_freq_wavelen / wavelength - 1.0f)
+                     / (params.beta_fast / params.beta_slow - 1.0f);
+        inv_freq = (1.0f - smooth) * (inv_freq_base / params.factor)
+                 + smooth * inv_freq_base;
+    }
+
+    float angle = float(pos) * inv_freq;
+    float cos_val = cos(angle);
+    float sin_val = sin(angle);
+
+    uint head_offset = head_idx * params.head_dim;
+    uint idx_a = head_offset + pair_in_head;
+    uint idx_b = head_offset + pair_in_head + half_dim;
+    float a = float(data[idx_a]);
+    float b = float(data[idx_b]);
+    data[idx_a] = bfloat(a * cos_val - b * sin_val);
+    data[idx_b] = bfloat(a * sin_val + b * cos_val);
+}

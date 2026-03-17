@@ -91,6 +91,10 @@ impl Tokenizer {
             // Gemma 3: BOS=2 (<bos>).  Stop on <end_of_turn> (106) or <eos> (1).
             // Gemma uses a 262144-token SentencePiece vocabulary.
             ModelArch::Gemma3 => (Some(2), vec![1, 106]),
+
+            // GPT-OSS-20B: no BOS.  eos_token_id=200002 from config.json.
+            // Uses a 201088-token vocabulary.
+            ModelArch::GptOss => (None, vec![200002]),
         };
 
         Ok(Self {

@@ -131,6 +131,10 @@ pub(crate) struct CudaBackend {
     pub(crate) fn_mul_elem: CudaFunction,
     pub(crate) fn_deltanet_step: CudaFunction,
 
+    // GPT-OSS kernels.
+    pub(crate) fn_silu_mul_clamp: CudaFunction,
+    pub(crate) fn_rope_yarn: CudaFunction,
+    pub(crate) fn_rope_yarn_batch: CudaFunction,
 }
 
 impl CudaBackend {
@@ -251,6 +255,11 @@ impl CudaBackend {
             fn_silu_elem: func(&mod_deltanet, "silu_elementwise")?,
             fn_mul_elem: func(&mod_deltanet, "mul_elementwise")?,
             fn_deltanet_step: func(&mod_deltanet, "deltanet_step")?,
+
+            // GPT-OSS kernels.
+            fn_silu_mul_clamp: func(&mod_elementwise, "silu_mul_clamp")?,
+            fn_rope_yarn: func(&mod_rope, "rotary_embedding_yarn")?,
+            fn_rope_yarn_batch: func(&mod_rope, "rotary_embedding_yarn_batch")?,
         })
     }
 

@@ -191,3 +191,151 @@ extern "C" __global__ void rotary_embedding_partial(
     data[idx_a] = __float2bfloat16(a * cos_val - b * sin_val);
     data[idx_b] = __float2bfloat16(a * sin_val + b * cos_val);
 }
+
+// ===========================================================================
+// YaRN RoPE — frequency-dependent interpolation for extended context.
+// ===========================================================================
+
+struct RopeYarnParams {
+    unsigned int pos;
+    float rope_theta;
+    unsigned int num_heads;
+    unsigned int num_kv_heads;
+    unsigned int head_dim;
+    float factor;
+    float beta_fast;
+    float beta_slow;
+    unsigned int original_max_pos;
+};
+
+extern "C" __global__ void rotary_embedding_yarn(
+    const RopeYarnParams params,
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k
+) {
+    const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int half_dim = params.head_dim / 2;
+    const unsigned int q_pairs = params.num_heads * half_dim;
+    const unsigned int total_pairs = q_pairs + params.num_kv_heads * half_dim;
+    if (gid >= total_pairs) return;
+
+    __nv_bfloat16* data;
+    unsigned int pair_within;
+    if (gid < q_pairs) {
+        data = q;
+        pair_within = gid;
+    } else {
+        data = k;
+        pair_within = gid - q_pairs;
+    }
+
+    unsigned int head_idx = pair_within / half_dim;
+    unsigned int pair_in_head = pair_within % half_dim;
+
+    float freq_exp = 2.0f * (float)pair_in_head / (float)params.head_dim;
+    float inv_freq_base = 1.0f / powf(params.rope_theta, freq_exp);
+    float wavelength = 6.283185307f / inv_freq_base;
+    float low_freq_wavelen = (float)params.original_max_pos / params.beta_slow;
+    float high_freq_wavelen = (float)params.original_max_pos / params.beta_fast;
+
+    float inv_freq;
+    if (wavelength < high_freq_wavelen) {
+        inv_freq = inv_freq_base;
+    } else if (wavelength > low_freq_wavelen) {
+        inv_freq = inv_freq_base / params.factor;
+    } else {
+        float smooth = (low_freq_wavelen / wavelength - 1.0f)
+                     / (params.beta_fast / params.beta_slow - 1.0f);
+        inv_freq = (1.0f - smooth) * (inv_freq_base / params.factor)
+                 + smooth * inv_freq_base;
+    }
+
+    float angle = (float)params.pos * inv_freq;
+    float cos_val = cosf(angle);
+    float sin_val = sinf(angle);
+
+    unsigned int head_offset = head_idx * params.head_dim;
+    unsigned int idx_a = head_offset + pair_in_head;
+    unsigned int idx_b = head_offset + pair_in_head + half_dim;
+    float a = __bfloat162float(data[idx_a]);
+    float b = __bfloat162float(data[idx_b]);
+    data[idx_a] = __float2bfloat16(a * cos_val - b * sin_val);
+    data[idx_b] = __float2bfloat16(a * sin_val + b * cos_val);
+}
+
+struct RopeYarnBatchParams {
+    unsigned int batch_size;
+    float rope_theta;
+    unsigned int num_heads;
+    unsigned int num_kv_heads;
+    unsigned int head_dim;
+    float factor;
+    float beta_fast;
+    float beta_slow;
+    unsigned int original_max_pos;
+};
+
+extern "C" __global__ void rotary_embedding_yarn_batch(
+    const RopeYarnBatchParams params,
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k,
+    const unsigned int* __restrict__ positions
+) {
+    const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int half_dim = params.head_dim / 2;
+    const unsigned int q_pairs = params.num_heads * half_dim;
+    const unsigned int k_pairs = params.num_kv_heads * half_dim;
+    const unsigned int pairs_per_token = q_pairs + k_pairs;
+    const unsigned int total = params.batch_size * pairs_per_token;
+    if (gid >= total) return;
+
+    unsigned int batch = gid / pairs_per_token;
+    unsigned int within = gid % pairs_per_token;
+    unsigned int pos = positions[batch];
+
+    __nv_bfloat16* data;
+    unsigned int pair_within;
+    unsigned int q_dim = params.num_heads * params.head_dim;
+    unsigned int k_dim = params.num_kv_heads * params.head_dim;
+
+    if (within < q_pairs) {
+        data = q + batch * q_dim;
+        pair_within = within;
+    } else {
+        data = k + batch * k_dim;
+        pair_within = within - q_pairs;
+    }
+
+    unsigned int head_idx = pair_within / half_dim;
+    unsigned int pair_in_head = pair_within % half_dim;
+
+    float freq_exp = 2.0f * (float)pair_in_head / (float)params.head_dim;
+    float inv_freq_base = 1.0f / powf(params.rope_theta, freq_exp);
+    float wavelength = 6.283185307f / inv_freq_base;
+    float low_freq_wavelen = (float)params.original_max_pos / params.beta_slow;
+    float high_freq_wavelen = (float)params.original_max_pos / params.beta_fast;
+
+    float inv_freq;
+    if (wavelength < high_freq_wavelen) {
+        inv_freq = inv_freq_base;
+    } else if (wavelength > low_freq_wavelen) {
+        inv_freq = inv_freq_base / params.factor;
+    } else {
+        float smooth = (low_freq_wavelen / wavelength - 1.0f)
+                     / (params.beta_fast / params.beta_slow - 1.0f);
+        inv_freq = (1.0f - smooth) * (inv_freq_base / params.factor)
+                 + smooth * inv_freq_base;
+    }
+
+    float angle = (float)pos * inv_freq;
+    float cos_val = cosf(angle);
+    float sin_val = sinf(angle);
+
+    unsigned int head_offset = head_idx * params.head_dim;
+    unsigned int idx_a = head_offset + pair_in_head;
+    unsigned int idx_b = head_offset + pair_in_head + half_dim;
+    float a = __bfloat162float(data[idx_a]);
+    float b = __bfloat162float(data[idx_b]);
+    data[idx_a] = __float2bfloat16(a * cos_val - b * sin_val);
+    data[idx_b] = __float2bfloat16(a * sin_val + b * cos_val);
+}

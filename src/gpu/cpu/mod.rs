@@ -259,6 +259,19 @@ impl GpuElementwise for CpuBackend {
         write_bf16(out, &result);
     }
 
+    fn silu_mul_clamp(&self, gate: &CpuTensor, up: &CpuTensor, out: &CpuTensor, size: u32, limit: f32) {
+        let n = size as usize;
+        let g = read_bf16(gate, n);
+        let u = read_bf16(up, n);
+        let result: Vec<f32> = g.iter().zip(u.iter())
+            .map(|(gi, ui)| {
+                let silu = gi / (1.0 + (-gi).exp());
+                (silu * ui).clamp(-limit, limit)
+            })
+            .collect();
+        write_bf16(out, &result);
+    }
+
     fn top_k_softmax(&self, logits: &CpuTensor, output: &CpuTensor, num_experts: u32, k: u32) {
         let n = num_experts as usize;
         let kk = k as usize;
@@ -445,6 +458,95 @@ impl GpuRope for CpuBackend {
             }
         }
         write_bf16(k, &k_data);
+    }
+
+    fn rope_yarn(
+        &self,
+        q: &CpuTensor,
+        k: &CpuTensor,
+        pos: u32,
+        rope_theta: f32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        original_max_pos: u32,
+    ) {
+        let hd = head_dim as usize;
+        let half_dim = hd / 2;
+
+        // Helper: compute YaRN-scaled inv_freq for a pair index.
+        let yarn_inv_freq = |pair: usize| -> f32 {
+            let freq_exp = 2.0 * pair as f32 / head_dim as f32;
+            let inv_freq_base = 1.0 / rope_theta.powf(freq_exp);
+            let wavelength = 2.0 * std::f32::consts::PI / inv_freq_base;
+            let low_freq_wavelen = original_max_pos as f32 / beta_slow;
+            let high_freq_wavelen = original_max_pos as f32 / beta_fast;
+
+            if wavelength < high_freq_wavelen {
+                inv_freq_base
+            } else if wavelength > low_freq_wavelen {
+                inv_freq_base / factor
+            } else {
+                let smooth = (low_freq_wavelen / wavelength - 1.0)
+                    / (beta_fast / beta_slow - 1.0);
+                (1.0 - smooth) * (inv_freq_base / factor) + smooth * inv_freq_base
+            }
+        };
+
+        // Apply to Q heads.
+        let q_total = num_heads as usize * hd;
+        let mut q_data = read_bf16(q, q_total);
+        for h in 0..num_heads as usize {
+            let base = h * hd;
+            for pair in 0..half_dim {
+                let inv_freq = yarn_inv_freq(pair);
+                let angle = pos as f32 * inv_freq;
+                let (sin_a, cos_a) = angle.sin_cos();
+                let a = q_data[base + pair];
+                let b = q_data[base + pair + half_dim];
+                q_data[base + pair] = a * cos_a - b * sin_a;
+                q_data[base + pair + half_dim] = a * sin_a + b * cos_a;
+            }
+        }
+        write_bf16(q, &q_data);
+
+        // Apply to K heads.
+        let k_total = num_kv_heads as usize * hd;
+        let mut k_data = read_bf16(k, k_total);
+        for h in 0..num_kv_heads as usize {
+            let base = h * hd;
+            for pair in 0..half_dim {
+                let inv_freq = yarn_inv_freq(pair);
+                let angle = pos as f32 * inv_freq;
+                let (sin_a, cos_a) = angle.sin_cos();
+                let a = k_data[base + pair];
+                let b = k_data[base + pair + half_dim];
+                k_data[base + pair] = a * cos_a - b * sin_a;
+                k_data[base + pair + half_dim] = a * sin_a + b * cos_a;
+            }
+        }
+        write_bf16(k, &k_data);
+    }
+
+    fn rope_yarn_batch(
+        &self,
+        _q: &CpuTensor,
+        _k: &CpuTensor,
+        _positions: &CpuTensor,
+        _rope_theta: f32,
+        _batch_size: u32,
+        _num_heads: u32,
+        _num_kv_heads: u32,
+        _head_dim: u32,
+        _factor: f32,
+        _beta_fast: f32,
+        _beta_slow: f32,
+        _original_max_pos: u32,
+    ) {
+        unimplemented!("CpuBackend::rope_yarn_batch")
     }
 }
 
@@ -1194,6 +1296,68 @@ mod tests {
         b.attention(&q, &k_cache, &v_cache, &out, 1, 1, 1, 2, 0, scale);
         // With seq_len=1, softmax([score]) = [1.0], so output = V = [3, 4]
         assert_bf16_close(&out, &[3.0, 4.0], 0.1);
+    }
+
+    // -----------------------------------------------------------------------
+    // GPT-OSS specific: silu_mul_clamp + rope_yarn tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_silu_mul_clamp() {
+        let b = CpuBackend;
+        // Large gate values should be clamped.
+        let gate = b.upload_tensor(&bf16_bytes(&[0.0, 1.0, 10.0, -10.0]), &[4], TensorDtype::BF16);
+        let up = b.upload_tensor(&bf16_bytes(&[1.0, 1.0, 1.0, 1.0]), &[4], TensorDtype::BF16);
+        let out = b.alloc_tensor(&[4], TensorDtype::BF16);
+        b.silu_mul_clamp(&gate, &up, &out, 4, 2.0);
+        let result = read_bf16(&out, 4);
+        // silu(0)*1 = 0, silu(1)*1 ≈ 0.731, silu(10)*1 ≈ 10 (clamped to 2.0),
+        // silu(-10)*1 ≈ 0 (stays within [-2, 2])
+        assert!((result[0] - 0.0).abs() < 0.05, "silu_clamp[0]={}", result[0]);
+        assert!((result[1] - 0.731).abs() < 0.05, "silu_clamp[1]={}", result[1]);
+        assert!((result[2] - 2.0).abs() < 0.05, "silu_clamp[2]={} should be clamped to 2.0", result[2]);
+        assert!(result[3].abs() < 0.05, "silu_clamp[3]={} should be near 0", result[3]);
+    }
+
+    #[test]
+    fn test_silu_mul_clamp_no_clamp() {
+        let b = CpuBackend;
+        // With a high limit, results should match silu_mul.
+        let gate = b.upload_tensor(&bf16_bytes(&[0.0, 1.0, 2.0]), &[3], TensorDtype::BF16);
+        let up = b.upload_tensor(&bf16_bytes(&[1.0, 1.0, 1.0]), &[3], TensorDtype::BF16);
+        let out_clamped = b.alloc_tensor(&[3], TensorDtype::BF16);
+        let out_plain = b.alloc_tensor(&[3], TensorDtype::BF16);
+        b.silu_mul_clamp(&gate, &up, &out_clamped, 3, 100.0);
+        b.silu_mul(&gate, &up, &out_plain, 3);
+        let clamped = read_bf16(&out_clamped, 3);
+        let plain = read_bf16(&out_plain, 3);
+        for i in 0..3 {
+            assert!((clamped[i] - plain[i]).abs() < 0.05,
+                "silu_mul_clamp with high limit should match silu_mul: [{}] {} vs {}", i, clamped[i], plain[i]);
+        }
+    }
+
+    #[test]
+    fn test_rope_yarn_position_zero() {
+        let b = CpuBackend;
+        // At position 0, YaRN RoPE should be identity (same as standard RoPE).
+        let q = b.upload_tensor(&bf16_bytes(&[1.0, 2.0, 3.0, 4.0]), &[4], TensorDtype::BF16);
+        let k = b.upload_tensor(&bf16_bytes(&[5.0, 6.0, 7.0, 8.0]), &[4], TensorDtype::BF16);
+        b.rope_yarn(&q, &k, 0, 10000.0, 1, 1, 4, 32.0, 32.0, 1.0, 4096);
+        assert_bf16_close(&q, &[1.0, 2.0, 3.0, 4.0], 0.02);
+        assert_bf16_close(&k, &[5.0, 6.0, 7.0, 8.0], 0.02);
+    }
+
+    #[test]
+    fn test_rope_yarn_modifies_at_nonzero_position() {
+        let b = CpuBackend;
+        let original = [1.0f32, 2.0, 3.0, 4.0];
+        let q = b.upload_tensor(&bf16_bytes(&original), &[4], TensorDtype::BF16);
+        let k = b.upload_tensor(&bf16_bytes(&[1.0, 0.0, 0.0, 0.0]), &[4], TensorDtype::BF16);
+        b.rope_yarn(&q, &k, 5, 10000.0, 1, 1, 4, 32.0, 32.0, 1.0, 4096);
+        let q_after = read_bf16(&q, 4);
+        let differs = q_after.iter().zip(original.iter()).any(|(a, o)| (a - o).abs() > 0.01);
+        assert!(differs, "YaRN RoPE at pos=5 should modify values");
     }
 
     // -----------------------------------------------------------------------

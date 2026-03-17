@@ -140,6 +140,11 @@ pub(crate) struct MetalBackend {
     pub(crate) pipeline_deltanet_step: metal::ComputePipelineState,
     pub(crate) pipeline_rope_partial: metal::ComputePipelineState,
 
+    // GPT-OSS kernels.
+    pub(crate) pipeline_silu_mul_clamp: metal::ComputePipelineState,
+    pub(crate) pipeline_rope_yarn: metal::ComputePipelineState,
+    pub(crate) pipeline_rope_yarn_batch: metal::ComputePipelineState,
+
     // Batched command encoding state.
     //
     // Instead of creating and committing a command buffer per kernel dispatch,
@@ -342,6 +347,26 @@ impl MetalBackend {
             &compile_opts,
         )?;
 
+        // GPT-OSS kernels.
+        let pipeline_silu_mul_clamp = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_ELEMENTWISE,
+            "silu_mul_clamp",
+            &compile_opts,
+        )?;
+        let pipeline_rope_yarn = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_ROPE,
+            "rotary_embedding_yarn",
+            &compile_opts,
+        )?;
+        let pipeline_rope_yarn_batch = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_ROPE,
+            "rotary_embedding_yarn_batch",
+            &compile_opts,
+        )?;
+
         Ok(Self {
             device,
             queue,
@@ -385,6 +410,9 @@ impl MetalBackend {
             pipeline_mul_elem,
             pipeline_deltanet_step,
             pipeline_rope_partial,
+            pipeline_silu_mul_clamp,
+            pipeline_rope_yarn,
+            pipeline_rope_yarn_batch,
             current_cmd: std::sync::Mutex::new(None),
         })
     }

@@ -135,6 +135,28 @@ extern "C" __global__ void fill_zero(
     dst[gid] = __float2bfloat16(0.0f);
 }
 
+// Clamped SwiGLU: out[i] = clamp(silu(gate[i]) * up[i], -limit, limit)
+struct SiluMulClampParams {
+    unsigned int size;
+    float limit;
+};
+
+extern "C" __global__ void silu_mul_clamp(
+    const SiluMulClampParams params,
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ up,
+    __nv_bfloat16* __restrict__ output
+) {
+    const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= params.size) return;
+    float g = __bfloat162float(gate[gid]);
+    float u = __bfloat162float(up[gid]);
+    float silu = g / (1.0f + expf(-g));
+    float result = silu * u;
+    result = fminf(fmaxf(result, -params.limit), params.limit);
+    output[gid] = __float2bfloat16(result);
+}
+
 // GPU-side top-k selection with softmax for MoE routing.
 struct TopKParams {
     unsigned int num_experts;

@@ -431,6 +431,7 @@ impl<'a, B: GpuBackend> Model<'a, B> {
     ) -> anyhow::Result<()> {
         match self.arch {
             ModelArch::Gemma3 => registry::gemma::forward_single_paged(self, token_id, pool, seq_state),
+            ModelArch::GptOss => registry::gpt_oss::forward_single_paged(self, token_id, pool, seq_state),
             ModelArch::Llama => registry::llama::forward_single_paged(self, token_id, pool, seq_state),
             ModelArch::Mistral => registry::mistral::forward_single_paged(self, token_id, pool, seq_state),
             ModelArch::Mixtral => registry::mixtral::forward_single_paged(self, token_id, pool, seq_state),
@@ -460,6 +461,7 @@ impl<'a, B: GpuBackend> Model<'a, B> {
     ) -> anyhow::Result<()> {
         match self.arch {
             ModelArch::Gemma3 => registry::gemma::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
+            ModelArch::GptOss => registry::gpt_oss::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
             ModelArch::Llama => registry::llama::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
             ModelArch::Mistral => registry::mistral::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
             ModelArch::Mixtral => registry::mixtral::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
