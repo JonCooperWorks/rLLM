@@ -49,25 +49,25 @@ Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Measured via `rl
 
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
-| Llama 3.2 1B Instruct | 1.2B | 326 tok/s | 258 tok/s | 14 ms | 19 ms |
-| Llama 3.2 3B Instruct | 3.2B | 149 tok/s | 110 tok/s | 27 ms | 44 ms |
-| Qwen 2.5 3B Instruct | 3.1B | 125 tok/s | 101 tok/s | 23 ms | 35 ms |
-| Gemma 3 4B Instruct | 4.3B | 93 tok/s | 73 tok/s | 20 ms | 46 ms |
-| Qwen 2.5 7B Instruct | 7.6B | 97 tok/s | 55 tok/s | 33 ms | 89 ms |
-| Mistral 7B Instruct | 7.2B | 100 tok/s | 57 tok/s | 53 ms | 111 ms |
-| Llama 3.1 8B Instruct | 8.0B | 94 tok/s | 54 tok/s | 58 ms | 111 ms |
-| Qwen3.5 9B | ~9B | 77 tok/s | 47 tok/s | 236 ms | 863 ms |
-| Phi-4 | 14.7B | 58 tok/s | 30 tok/s | 78 ms | 171 ms |
-| Gemma 3 27B Instruct | 27.4B | 31 tok/s | 15 tok/s | 143 ms | 327 ms |
-| Qwen3.5 27B | ~27B | 28 tok/s | 16 tok/s | 625 ms | 2,300 ms |
-| Qwen3 Coder 30B-A3B Instruct | 30.5B (3.3B active) | 49 tok/s | 56 tok/s | 158 ms | 274 ms |
-| DeepSeek-R1-Distill-Qwen-32B | 32.8B | 28 tok/s | 14 tok/s | 166 ms | 355 ms |
-| Qwen3.5 35B-A3B | 35.1B (3.3B active) | 46 tok/s | 50 tok/s | 221 ms | 513 ms |
-| Mixtral 8x7B Instruct | 46.7B (12.9B active) | 61 tok/s | 32 tok/s | 254 ms | 939 ms |
-| Llama 3.1 70B Instruct | 70.6B | — | 7 tok/s | — | 884 ms |
-| Qwen 2.5 72B Instruct | 72.7B | — | 6.5 tok/s | — | 768 ms |
+| Llama 3.2 1B Instruct | 1.2B | 326 tok/s | 253 tok/s | 14 ms | 9 ms |
+| Llama 3.2 3B Instruct | 3.2B | 149 tok/s | 116 tok/s | 27 ms | 22 ms |
+| Qwen 2.5 3B Instruct | 3.1B | 125 tok/s | 99 tok/s | 23 ms | 19 ms |
+| Gemma 3 4B Instruct | 4.3B | 93 tok/s | 76 tok/s | 20 ms | 25 ms |
+| Qwen 2.5 7B Instruct | 7.6B | 97 tok/s | 74 tok/s | 33 ms | 39 ms |
+| Mistral 7B Instruct | 7.2B | 100 tok/s | 74 tok/s | 53 ms | 49 ms |
+| Llama 3.1 8B Instruct | 8.0B | 94 tok/s | 71 tok/s | 58 ms | 49 ms |
+| Qwen3.5 9B | ~9B | 77 tok/s | 60 tok/s | 236 ms | 250 ms |
+| Phi-4 | 14.7B | 58 tok/s | 44 tok/s | 78 ms | 76 ms |
+| Gemma 3 27B Instruct | 27.4B | 31 tok/s | 24 tok/s | 143 ms | 160 ms |
+| Qwen3.5 27B | ~27B | 28 tok/s | 22 tok/s | 625 ms | 1,800 ms |
+| Qwen3 Coder 30B-A3B Instruct | 30.5B (3.3B active) | 49 tok/s | 54 tok/s | 158 ms | 157 ms |
+| DeepSeek-R1-Distill-Qwen-32B | 32.8B | 28 tok/s | 21 tok/s | 166 ms | 165 ms |
+| Qwen3.5 35B-A3B | 35.1B (3.3B active) | 46 tok/s | 38 tok/s | 221 ms | 244 ms |
+| Mixtral 8x7B Instruct | 46.7B (12.9B active) | 61 tok/s | 45 tok/s | 254 ms | 710 ms |
+| Llama 3.1 70B Instruct | 70.6B | — | 11 tok/s | — | 427 ms |
+| Qwen 2.5 72B Instruct | 72.7B | — | 11 tok/s | — | 379 ms |
 
-Llama 70B and Qwen 72B exceed 94 GB in bf16. MoE models (Qwen3 Coder, Qwen3.5 35B-A3B) can be faster in Q4 than bf16 because expert weights dominate bandwidth. Qwen3.5 models have high TTFT due to DeltaNet linear attention initialization overhead.
+Q4 is slower than bf16 for decode on H100 — unlike Apple Silicon where Q4 is always faster. The H100's 3.35 TB/s HBM3 bandwidth is so high that bf16 matvec already finishes quickly, and Q4 dequantisation adds ~5 ALU ops per weight (mask, shift, int subtract, int-to-float, scale multiply) that eat into the 3.2x bandwidth savings. For models up to ~14B, the weight working set fits largely in the 50 MB L2 cache, shrinking the bandwidth advantage further. Q4 still wins on memory capacity (Llama 70B and Qwen 72B don't fit in 94 GB as bf16) and on TTFT where it halves prefill data movement. On Apple Silicon (546 GB/s), the system is 6x more memory-bound so Q4's bandwidth reduction dominates and Q4 is faster across the board. MoE models (Qwen3 Coder, Mixtral) are a middle ground — the small expert matrices are cache-friendly in both formats, but Q4 lets larger MoE models fit in VRAM.
 
 </details>
 
