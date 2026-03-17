@@ -13,7 +13,7 @@ Platform selection uses OS-conditional compilation (`#[cfg(target_os)]`) — no 
 
 ## Supported Models
 
-Llama 3, Qwen 2.5, Mistral, Mixtral 8x7B, Qwen3 MoE, Qwen3.5, Phi-4, Gemma 3, DeepSeek-R1-Distill, GPT-OSS-20B — all from the same codebase with bf16 and Q4 quantization.
+Llama 3, Qwen 2.5, Mistral, Mixtral 8x7B, Qwen3 MoE, Qwen3.5, Phi-4, Gemma 3, DeepSeek-R1-Distill, GPT-OSS — all from the same codebase with bf16 and Q4 quantization.
 
 ## Benchmarks
 
@@ -88,7 +88,7 @@ Q4 is slower than bf16 for decode on H100 — unlike Apple Silicon where Q4 is a
 
 ## Features
 
-- **Multi-architecture** — Llama 3, Qwen 2.5, Mistral, Mixtral 8x7B, Qwen3 MoE, Qwen3.5, Phi-4, Gemma 3, and GPT-OSS-20B from the same codebase
+- **Multi-architecture** — Llama 3, Qwen 2.5, Mistral, Mixtral 8x7B, Qwen3 MoE, Qwen3.5, Phi-4, Gemma 3, DeepSeek-R1-Distill, and GPT-OSS from the same codebase
 - **Metal + CUDA backends** — SIMD-cooperative matmul, async command buffer dispatch
 - **Batched prefill** — GEMM-based prompt processing (3-10x faster than token-by-token)
 - **Paged KV cache** — on-demand block allocation, shared across sequences

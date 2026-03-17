@@ -108,6 +108,8 @@ pub(crate) enum StopReason {
     EndOfSequence,
     /// Reached the max_tokens limit.
     MaxTokens,
+    /// Model produced tool calls (detected during post-processing).
+    ToolCalls,
 }
 
 /// Shared state accessible by all axum handlers via `State(Arc<ServerState>)`.

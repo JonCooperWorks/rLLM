@@ -65,6 +65,7 @@ pub(crate) mod profile;
 pub(crate) mod registry;
 pub(crate) mod sampler;
 pub(crate) mod tokenizer;
+pub(crate) mod tools;
 
 use self::config::{ModelArch, ModelConfig};
 use self::kv_cache::{KvPool, SeqKvState};

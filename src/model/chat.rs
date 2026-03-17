@@ -56,6 +56,7 @@
 // ===========================================================================
 
 use super::config::ModelArch;
+use super::tools::{self, ToolCall};
 
 /// A single message in a chat conversation.
 ///
@@ -63,10 +64,30 @@ use super::config::ModelArch;
 ///   - "system":    instructions for the model's behaviour
 ///   - "user":      the human's message
 ///   - "assistant": the model's response (for multi-turn conversations)
+///   - "tool":      result from a tool call (paired with tool_call_id)
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Message {
     pub role: String,
+    /// Message text.  May be empty for assistant tool-call-only messages
+    /// (OpenAI sends content=null when the model only produces tool calls).
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub content: String,
+    /// Tool calls made by the assistant (only present on role="assistant" messages).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// ID of the tool call this message is responding to (only on role="tool" messages).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+/// Deserialize a string that may be null (e.g. OpenAI sends content=null
+/// for assistant messages that only contain tool calls).
+fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Option::<String>::deserialize(deserializer).map(|o| o.unwrap_or_default())
 }
 
 /// Format messages using the correct chat template for the model architecture.
@@ -104,6 +125,15 @@ fn format_llama3(messages: &[Message]) -> String {
     // Including it in the template would produce a duplicate BOS.
 
     for msg in messages {
+        if msg.role == "tool" {
+            // Tool results use the "ipython" role in Llama's template.
+            out.push_str(&tools::format_tool_result_llama(
+                msg.tool_call_id.as_deref().unwrap_or(""),
+                &msg.content,
+            ));
+            continue;
+        }
+
         // Role header: <|start_header_id|>role<|end_header_id|>\n\n
         out.push_str("<|start_header_id|>");
         out.push_str(&msg.role);
@@ -136,6 +166,11 @@ fn format_chatml(messages: &[Message]) -> String {
     // when encoding with add_special_tokens=true.
 
     for msg in messages {
+        if msg.role == "tool" {
+            out.push_str(&tools::format_tool_result_chatml(&msg.content));
+            continue;
+        }
+
         // <|im_start|>role\ncontent<|im_end|>\n
         out.push_str("<|im_start|>");
         out.push_str(&msg.role);
@@ -168,6 +203,11 @@ fn format_gemma3(messages: &[Message]) -> String {
     let mut out = String::with_capacity(512);
 
     for msg in messages {
+        if msg.role == "tool" {
+            out.push_str(&tools::format_tool_result_gemma(&msg.content));
+            continue;
+        }
+
         out.push_str("<start_of_turn>");
         // Gemma uses "model" for the assistant role.
         let role = if msg.role == "assistant" { "model" } else { &msg.role };
@@ -202,6 +242,11 @@ fn format_phi(messages: &[Message]) -> String {
     let mut out = String::with_capacity(512);
 
     for msg in messages {
+        if msg.role == "tool" {
+            out.push_str(&tools::format_tool_result_phi(&msg.content));
+            continue;
+        }
+
         out.push_str("<|im_start|>");
         out.push_str(&msg.role);
         out.push_str("<|im_sep|>\n");
@@ -255,6 +300,9 @@ fn format_mistral(messages: &[Message]) -> String {
                 out.push_str(&msg.content);
                 out.push_str("</s>");
             }
+            "tool" => {
+                out.push_str(&tools::format_tool_result_mistral(&msg.content));
+            }
             _ => {}
         }
     }
@@ -270,6 +318,8 @@ mod tests {
         Message {
             role: role.to_string(),
             content: content.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
