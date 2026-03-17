@@ -470,16 +470,16 @@ impl ShardingPlan {
                     SplitDimension::Column,
                     [lqkv_dim, hidden],
                 );
-                // in_proj_a, in_proj_b: per-head gates → Column
+                // in_proj_a, in_proj_b: per-V-head gates → Column
                 add(
                     format!("{layer}.linear_attn.in_proj_a.weight"),
                     SplitDimension::Column,
-                    [config.linear_num_key_heads, hidden],
+                    [config.linear_num_value_heads, hidden],
                 );
                 add(
                     format!("{layer}.linear_attn.in_proj_b.weight"),
                     SplitDimension::Column,
-                    [config.linear_num_key_heads, hidden],
+                    [config.linear_num_value_heads, hidden],
                 );
                 // in_proj_z: output gate, split by v_dim
                 add(
@@ -487,32 +487,34 @@ impl ShardingPlan {
                     SplitDimension::Column,
                     [lv_dim, hidden],
                 );
-                // linear_out_proj: [hidden, v_dim] → Row (requires AllReduce)
+                // out_proj: [hidden, v_dim] → Row (requires AllReduce)
                 add(
-                    format!("{layer}.linear_attn.linear_out_proj.weight"),
+                    format!("{layer}.linear_attn.out_proj.weight"),
                     SplitDimension::Row,
                     [hidden, lv_dim],
                 );
-                // conv1d_weight: depthwise, channels = heads → Column
+                // conv1d_weight: depthwise, channels = conv_dim → Column
+                // Safetensors shape is [conv_dim, 1, kernel_size] but we treat as
+                // [conv_dim, kernel_size] for 2D slicing (middle dim is 1).
                 add(
                     format!("{layer}.linear_attn.conv1d.weight"),
                     SplitDimension::Column,
-                    [lk_dim, config.linear_conv_kernel_dim],
+                    [lqkv_dim, config.linear_conv_kernel_dim],
                 );
-                // a_log, dt_bias: per-head parameters → Column
+                // A_log, dt_bias: per-V-head parameters → Column
                 add(
-                    format!("{layer}.linear_attn.a_log"),
+                    format!("{layer}.linear_attn.A_log"),
                     SplitDimension::Column,
-                    [config.linear_num_key_heads, 1],
+                    [config.linear_num_value_heads, 1],
                 );
                 add(
                     format!("{layer}.linear_attn.dt_bias"),
                     SplitDimension::Column,
-                    [config.linear_num_key_heads, 1],
+                    [config.linear_num_value_heads, 1],
                 );
-                // linear_norm: per-head-dim, shared → Replicated
+                // norm: per-head-dim, shared → Replicated
                 add(
-                    format!("{layer}.linear_attn.linear_norm.weight"),
+                    format!("{layer}.linear_attn.norm.weight"),
                     SplitDimension::Replicated,
                     [config.linear_value_head_dim, 1],
                 );
@@ -943,7 +945,7 @@ mod tests {
         assert_eq!(qkv.original_shape, [1536, 2048]);
         assert_eq!(qkv.shard_shape, [768, 2048]);
 
-        // in_proj_a: [num_key_heads=4, hidden=2048] → Column → shard [2, 2048]
+        // in_proj_a: [num_value_heads=4, hidden=2048] → Column → shard [2, 2048]
         let a = plan.get("model.layers.0.linear_attn.in_proj_a.weight").unwrap();
         assert_eq!(a.split, SplitDimension::Column);
         assert_eq!(a.original_shape, [4, 2048]);
@@ -960,8 +962,8 @@ mod tests {
         assert_eq!(z.original_shape, [512, 2048]);
         assert_eq!(z.shard_shape, [256, 2048]);
 
-        // linear_out_proj: [hidden=2048, v_dim=512] → Row → shard [2048, 256]
-        let out = plan.get("model.layers.0.linear_attn.linear_out_proj.weight").unwrap();
+        // out_proj: [hidden=2048, v_dim=512] → Row → shard [2048, 256]
+        let out = plan.get("model.layers.0.linear_attn.out_proj.weight").unwrap();
         assert_eq!(out.split, SplitDimension::Row);
         assert_eq!(out.original_shape, [2048, 512]);
         assert_eq!(out.shard_shape, [2048, 256]);

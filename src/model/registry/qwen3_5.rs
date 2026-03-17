@@ -80,16 +80,17 @@ fn dn_layer_index(config: &crate::model::config::ModelConfig, layer_idx: usize) 
 }
 
 /// Run the DeltaNet attention sub-block for a single token.
-fn deltanet_attention_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuDeltaNet>(
+fn deltanet_attention_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuDeltaNet + GpuAllReduce>(
     m: &Model<'_, B>,
     layer_idx: usize,
     d: &Dims,
 ) {
     let layer = &m.weights.layers[layer_idx];
 
-    // DeltaNet dimensions.
-    let num_qk_heads = m.config.linear_num_key_heads as u32;
-    let num_v_heads = m.config.linear_num_value_heads as u32;
+    // DeltaNet dimensions (TP-aware: divide heads by world_size).
+    let ws = m.world_size as u32;
+    let num_qk_heads = m.config.linear_num_key_heads as u32 / ws;
+    let num_v_heads = m.config.linear_num_value_heads as u32 / ws;
     let hd = m.config.linear_key_head_dim as u32;
     let qk_dim = num_qk_heads * hd;
     let v_dim = num_v_heads * m.config.linear_value_head_dim as u32;
@@ -161,8 +162,9 @@ fn deltanet_attention_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + 
     m.backend.silu(z_buf, z_buf, v_dim);
     m.backend.mul(norm_out, z_buf, attn_out, v_dim);
 
-    // Step 10: Output projection + residual add.
+    // Step 10: Output projection + AllReduce (row-split) + residual add.
     m.backend.matmul(out_proj, attn_out, &m.norm_buf, d.hidden_size, v_dim);
+    m.backend.all_reduce_sum(&m.norm_buf, d.hidden_size); // no-op when world_size=1
     m.backend.add(&m.hidden, &m.norm_buf, &m.hidden, d.hidden_size);
 }
 

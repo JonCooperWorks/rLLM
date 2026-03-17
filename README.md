@@ -76,6 +76,18 @@ Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Measured via `rl
 </details>
 
 <details>
+<summary><b>2× NVIDIA A100-SXM4-80GB (TP=2)</b> — 2× 2.0 TB/s bandwidth</summary>
+
+Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Tensor parallelism across 2 GPUs via NCCL. Measured via `rllm run --tp 2`, single run, 128 max tokens.
+
+| Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
+|---|---|---|---|---|---|
+| Qwen3.5 9B | ~9B | 62 tok/s | — | — | — |
+| Llama 3.1 70B Instruct | 70.6B | 13.5 tok/s | 11.1 tok/s | 457 ms | 564 ms |
+
+</details>
+
+<details>
 <summary><b>NVIDIA H100 NVL 94 GB HBM3</b> — 3.35 TB/s bandwidth</summary>
 
 Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Measured via `rllm run`, single run, 128 max tokens.

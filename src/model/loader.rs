@@ -895,11 +895,49 @@ fn load_deltanet_attention<B: GpuCore>(
     let conv_dim = fused_dim; // Conv1D applied to concatenated QKV
     let kernel_size = config.linear_conv_kernel_dim;
 
-    let qkv = upload_sharded(
-        store, backend,
-        &format!("{prefix}.linear_attn.in_proj_qkv.weight"),
-        &[fused_dim, hidden], quantize, sharding,
-    )?;
+    // Fused QKV: [qk_dim + qk_dim + v_dim, hidden].
+    // Simple column split is WRONG when qk_dim ≠ v_dim — it would mix Q/K/V
+    // components across ranks.  Instead, split each component by its head count
+    // and re-concatenate: [Q_shard, K_shard, V_shard] per rank.
+    let qkv_name = format!("{prefix}.linear_attn.in_proj_qkv.weight");
+    let qkv = if let Some(plan) = sharding {
+        if let Some(ws) = plan.get(&qkv_name) {
+            if !matches!(ws.split, crate::gpu::parallel::SplitDimension::Replicated) {
+                let view = store.tensor(&qkv_name)?;
+                let data = view.data();
+                let bpe = 2usize; // bf16
+                let row_bytes = hidden * bpe;
+                let ws_val = plan.device.world_size;
+                let rank = plan.device.rank;
+
+                // Split each component independently by heads.
+                let qk_rows_per_rank = qk_dim / ws_val;
+                let v_rows_per_rank = v_dim / ws_val;
+                let shard_rows = qk_rows_per_rank * 2 + v_rows_per_rank;
+                let mut shard_data = Vec::with_capacity(shard_rows * row_bytes);
+
+                // Q shard: rows [rank*qk_per_rank .. (rank+1)*qk_per_rank]
+                let q_start = rank * qk_rows_per_rank * row_bytes;
+                shard_data.extend_from_slice(&data[q_start..q_start + qk_rows_per_rank * row_bytes]);
+
+                // K shard: rows [qk_dim + rank*qk_per_rank .. qk_dim + (rank+1)*qk_per_rank]
+                let k_start = (qk_dim + rank * qk_rows_per_rank) * row_bytes;
+                shard_data.extend_from_slice(&data[k_start..k_start + qk_rows_per_rank * row_bytes]);
+
+                // V shard: rows [2*qk_dim + rank*v_per_rank .. 2*qk_dim + (rank+1)*v_per_rank]
+                let v_start = (2 * qk_dim + rank * v_rows_per_rank) * row_bytes;
+                shard_data.extend_from_slice(&data[v_start..v_start + v_rows_per_rank * row_bytes]);
+
+                upload_raw_maybe_quantized(backend, &shard_data, &[shard_rows, hidden], quantize)
+            } else {
+                upload_maybe_quantized(store, backend, &qkv_name, &[fused_dim, hidden], quantize)?
+            }
+        } else {
+            upload_maybe_quantized(store, backend, &qkv_name, &[fused_dim, hidden], quantize)?
+        }
+    } else {
+        upload_maybe_quantized(store, backend, &qkv_name, &[fused_dim, hidden], quantize)?
+    };
     let a = upload_sharded(
         store, backend,
         &format!("{prefix}.linear_attn.in_proj_a.weight"),
@@ -916,11 +954,45 @@ fn load_deltanet_attention<B: GpuCore>(
         &[v_dim, hidden], quantize, sharding,
     )?;
     // Conv1D: depthwise, shape [channels, 1, kernel_size] in safetensors.
-    let conv = upload_tensor(
-        store, backend,
-        &format!("{prefix}.linear_attn.conv1d.weight"),
-        &[conv_dim, 1, kernel_size],
-    )?;
+    // Channels are [Q, K, V] concatenated — same layout as in_proj_qkv.
+    // For TP, must split each component by its head count, not simple column split.
+    let conv_name = format!("{prefix}.linear_attn.conv1d.weight");
+    let conv = if let Some(plan) = sharding {
+        if let Some(ws) = plan.get(&conv_name) {
+            if !matches!(ws.split, crate::gpu::parallel::SplitDimension::Replicated) {
+                let view = store.tensor(&conv_name)?;
+                let data = view.data();
+                let bpe = 2usize; // bf16
+                let ws_val = plan.device.world_size;
+                let rank = plan.device.rank;
+                // Each channel row is [1 * kernel_size] elements.
+                let chan_bytes = kernel_size * bpe;
+
+                let qk_chans_per_rank = qk_dim / ws_val;
+                let v_chans_per_rank = v_dim / ws_val;
+                let shard_chans = qk_chans_per_rank * 2 + v_chans_per_rank;
+                let mut shard_data = Vec::with_capacity(shard_chans * chan_bytes);
+
+                // Q channels
+                let q_start = rank * qk_chans_per_rank * chan_bytes;
+                shard_data.extend_from_slice(&data[q_start..q_start + qk_chans_per_rank * chan_bytes]);
+                // K channels
+                let k_start = (qk_dim + rank * qk_chans_per_rank) * chan_bytes;
+                shard_data.extend_from_slice(&data[k_start..k_start + qk_chans_per_rank * chan_bytes]);
+                // V channels
+                let v_start = (2 * qk_dim + rank * v_chans_per_rank) * chan_bytes;
+                shard_data.extend_from_slice(&data[v_start..v_start + v_chans_per_rank * chan_bytes]);
+
+                backend.upload_tensor(&shard_data, &[shard_chans, 1, kernel_size], TensorDtype::BF16)
+            } else {
+                upload_tensor(store, backend, &conv_name, &[conv_dim, 1, kernel_size])?
+            }
+        } else {
+            upload_tensor(store, backend, &conv_name, &[conv_dim, 1, kernel_size])?
+        }
+    } else {
+        upload_tensor(store, backend, &conv_name, &[conv_dim, 1, kernel_size])?
+    };
     let out = upload_sharded(
         store, backend,
         &format!("{prefix}.linear_attn.out_proj.weight"),
@@ -931,24 +1003,57 @@ fn load_deltanet_attention<B: GpuCore>(
     //   A_log [num_v_heads] — log decay rates (stored f32, kept f32)
     //   dt_bias [num_v_heads] — timestep bias (stored bf16, converted to f32)
     //   norm.weight [value_head_dim] — output norm weight (stored f32, converted to bf16)
-    let a_log_tensor = upload_tensor(
-        store, backend,
-        &format!("{prefix}.linear_attn.A_log"),
-        &[config.linear_num_value_heads],
-    )?;
+    let num_v_heads = config.linear_num_value_heads;
+    let a_log_name = format!("{prefix}.linear_attn.A_log");
+    let a_log_tensor = if let Some(plan) = sharding {
+        if let Some(ws) = plan.get(&a_log_name) {
+            if !matches!(ws.split, crate::gpu::parallel::SplitDimension::Replicated) {
+                let view = store.tensor(&a_log_name)?;
+                let per_rank = num_v_heads / plan.device.world_size;
+                let start = plan.device.rank * per_rank * 4; // f32
+                let end = start + per_rank * 4;
+                backend.upload_tensor(&view.data()[start..end], &[per_rank], TensorDtype::F32)
+            } else {
+                upload_tensor(store, backend, &a_log_name, &[num_v_heads])?
+            }
+        } else {
+            upload_tensor(store, backend, &a_log_name, &[num_v_heads])?
+        }
+    } else {
+        upload_tensor(store, backend, &a_log_name, &[num_v_heads])?
+    };
     // dt_bias: convert bf16 → f32 for precision in decay gate computation.
-    let dt_bias_view = store.tensor(
-        &format!("{prefix}.linear_attn.dt_bias"),
-    )?;
+    let dt_bias_name = format!("{prefix}.linear_attn.dt_bias");
+    let dt_bias_view = store.tensor(&dt_bias_name)?;
     let dt_bias_f32: Vec<f32> = bytemuck::cast_slice::<u8, half::bf16>(dt_bias_view.data())
         .iter()
         .map(|v| v.to_f32())
         .collect();
-    let dt_bias_tensor = backend.upload_tensor(
-        bytemuck::cast_slice(&dt_bias_f32),
-        &[config.linear_num_value_heads],
-        TensorDtype::F32,
-    );
+    let dt_bias_tensor = if let Some(plan) = sharding {
+        if let Some(ws) = plan.get(&dt_bias_name) {
+            if !matches!(ws.split, crate::gpu::parallel::SplitDimension::Replicated) {
+                let per_rank = num_v_heads / plan.device.world_size;
+                let start = plan.device.rank * per_rank;
+                let shard: &[f32] = &dt_bias_f32[start..start + per_rank];
+                backend.upload_tensor(bytemuck::cast_slice(shard), &[per_rank], TensorDtype::F32)
+            } else {
+                backend.upload_tensor(
+                    bytemuck::cast_slice(&dt_bias_f32),
+                    &[num_v_heads], TensorDtype::F32,
+                )
+            }
+        } else {
+            backend.upload_tensor(
+                bytemuck::cast_slice(&dt_bias_f32),
+                &[num_v_heads], TensorDtype::F32,
+            )
+        }
+    } else {
+        backend.upload_tensor(
+            bytemuck::cast_slice(&dt_bias_f32),
+            &[num_v_heads], TensorDtype::F32,
+        )
+    };
     // norm.weight: convert f32 → bf16 for compatibility with rms_norm_batch.
     // Note: linear_attn.norm uses Qwen3_5MoeRMSNormGated which does NOT
     // use residual form — weights are initialized to ones, not zeros.
@@ -1084,18 +1189,28 @@ fn load_standard_attention<B: GpuCore>(
         let hd_bytes = head_dim * row_bytes;
         let num_heads = config.num_attention_heads;
 
+        // For TP, only deinterleave this rank's heads.
+        let (start_head, end_head) = if let Some(plan) = sharding {
+            let hpr = num_heads / plan.device.world_size;
+            (plan.device.rank * hpr, (plan.device.rank + 1) * hpr)
+        } else {
+            (0, num_heads)
+        };
+        let shard_heads = end_head - start_head;
+        let shard_q_dim = shard_heads * head_dim;
+
         // Deinterleave: for each head, first head_dim rows are Q,
         // next head_dim rows are gate.
-        let mut q_raw = Vec::with_capacity(q_dim * row_bytes);
-        let mut z_raw = Vec::with_capacity(q_dim * row_bytes);
-        for h in 0..num_heads {
+        let mut q_raw = Vec::with_capacity(shard_q_dim * row_bytes);
+        let mut z_raw = Vec::with_capacity(shard_q_dim * row_bytes);
+        for h in start_head..end_head {
             let base = h * 2 * hd_bytes;
             q_raw.extend_from_slice(&raw[base..base + hd_bytes]);
             z_raw.extend_from_slice(&raw[base + hd_bytes..base + 2 * hd_bytes]);
         }
 
-        let q_tensor = upload_raw_maybe_quantized(backend, &q_raw, &[q_dim, hidden], quantize);
-        let z_tensor = upload_raw_maybe_quantized(backend, &z_raw, &[q_dim, hidden], quantize);
+        let q_tensor = upload_raw_maybe_quantized(backend, &q_raw, &[shard_q_dim, hidden], quantize);
+        let z_tensor = upload_raw_maybe_quantized(backend, &z_raw, &[shard_q_dim, hidden], quantize);
         (q_tensor, Some(z_tensor))
     } else {
         let qp = upload_sharded(

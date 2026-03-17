@@ -434,14 +434,29 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
         let kv_dim = (config.num_key_value_heads / world_size) * config.head_dim;
         let inter = config.effective_intermediate_size() / world_size;
         let vocab = config.vocab_size;
+        let is_hybrid = config.is_hybrid_deltanet();
+
+        // For hybrid models, scratch buffers must be sized for the max dimension
+        // across both layer types (DeltaNet and GQA), with TP-aware splitting.
+        let (eff_q_dim, eff_kv_dim, eff_attn_dim) = if is_hybrid {
+            let dn_qk_dim = (config.linear_num_key_heads / world_size) * config.linear_key_head_dim;
+            let dn_v_dim = (config.linear_num_value_heads / world_size) * config.linear_value_head_dim;
+            (
+                q_dim.max(dn_qk_dim),
+                kv_dim.max(dn_qk_dim),
+                q_dim.max(dn_v_dim),
+            )
+        } else {
+            (q_dim, kv_dim, q_dim)
+        };
 
         // Allocate scratch buffers — TP-aware sizes.
         let hidden_buf = backend.alloc_tensor(&[hidden], TensorDtype::BF16);
         let norm_buf = backend.alloc_tensor(&[hidden], TensorDtype::BF16);
-        let q_buf = backend.alloc_tensor(&[q_dim], TensorDtype::BF16);
-        let k_buf = backend.alloc_tensor(&[kv_dim], TensorDtype::BF16);
-        let v_buf = backend.alloc_tensor(&[kv_dim], TensorDtype::BF16);
-        let attn_out = backend.alloc_tensor(&[q_dim], TensorDtype::BF16);
+        let q_buf = backend.alloc_tensor(&[eff_q_dim], TensorDtype::BF16);
+        let k_buf = backend.alloc_tensor(&[eff_kv_dim], TensorDtype::BF16);
+        let v_buf = backend.alloc_tensor(&[eff_kv_dim], TensorDtype::BF16);
+        let attn_out = backend.alloc_tensor(&[eff_attn_dim], TensorDtype::BF16);
         let gate_buf = backend.alloc_tensor(&[inter], TensorDtype::BF16);
         let up_buf = backend.alloc_tensor(&[inter], TensorDtype::BF16);
         let logits_buf = backend.alloc_tensor(&[vocab], TensorDtype::BF16);
@@ -461,6 +476,52 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
             } else {
                 (None, None, None, None, None)
             };
+
+        // DeltaNet state and scratch buffers: TP-aware sizes.
+        let (deltanet_states, deltanet_conv_history, dn_qkv_buf, dn_alpha_buf,
+             dn_beta_buf, dn_z_buf, dn_conv_out, dn_attn_out, dn_norm_out) = if is_hybrid {
+            let num_qk_heads = config.linear_num_key_heads / world_size;
+            let num_v_heads = config.linear_num_value_heads / world_size;
+            let hd = config.linear_key_head_dim;
+            let v_per_qk = num_v_heads / num_qk_heads;
+            let v_dim = num_v_heads * config.linear_value_head_dim;
+            let qk_dim = num_qk_heads * hd;
+            let conv_dim = qk_dim * 2 + v_dim;
+            let kernel_size = config.linear_conv_kernel_dim;
+
+            let num_dn_layers = config.layer_types.iter()
+                .filter(|t| t.as_str() == "linear_attention").count();
+            let state_size = num_qk_heads * v_per_qk * hd * hd;
+            let mut states = Vec::with_capacity(num_dn_layers);
+            let mut conv_histories = Vec::with_capacity(num_dn_layers);
+            for _ in 0..num_dn_layers {
+                states.push(backend.alloc_tensor(&[state_size], TensorDtype::F32));
+                conv_histories.push(backend.alloc_tensor(
+                    &[(kernel_size - 1) * conv_dim],
+                    TensorDtype::BF16,
+                ));
+            }
+            for s in &states {
+                backend.fill_zero(s, state_size as u32);
+            }
+            for h in &conv_histories {
+                backend.fill_zero(h, ((kernel_size - 1) * conv_dim) as u32);
+            }
+
+            (
+                Some(states),
+                Some(conv_histories),
+                Some(backend.alloc_tensor(&[conv_dim], TensorDtype::BF16)),
+                Some(backend.alloc_tensor(&[num_v_heads], TensorDtype::F32)),
+                Some(backend.alloc_tensor(&[num_v_heads], TensorDtype::F32)),
+                Some(backend.alloc_tensor(&[v_dim], TensorDtype::BF16)),
+                Some(backend.alloc_tensor(&[conv_dim], TensorDtype::BF16)),
+                Some(backend.alloc_tensor(&[v_dim], TensorDtype::BF16)),
+                Some(backend.alloc_tensor(&[v_dim], TensorDtype::BF16)),
+            )
+        } else {
+            (None, None, None, None, None, None, None, None, None)
+        };
 
         let kv_layer_map = config.kv_layer_map();
 
@@ -485,16 +546,15 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
             moe_up_buf,
             moe_output,
             routing_output,
-            // DeltaNet not yet supported for TP.
-            deltanet_states: None,
-            deltanet_conv_history: None,
-            dn_qkv_buf: None,
-            dn_alpha_buf: None,
-            dn_beta_buf: None,
-            dn_z_buf: None,
-            dn_conv_out: None,
-            dn_attn_out: None,
-            dn_norm_out: None,
+            deltanet_states,
+            deltanet_conv_history,
+            dn_qkv_buf,
+            dn_alpha_buf,
+            dn_beta_buf,
+            dn_z_buf,
+            dn_conv_out,
+            dn_attn_out,
+            dn_norm_out,
             kv_layer_map,
         })
     }

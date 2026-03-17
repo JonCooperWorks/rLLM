@@ -8,8 +8,9 @@
 #
 # Options:
 #   --small    only benchmark 1B–8B models
-#   --medium   add medium-tier models (default)
-#   --big      add 70B+ models
+#   --medium   small + medium-tier models (default)
+#   --big      only 70B+ models
+#   --all      all tiers
 #   --quantize only run Q4 for each model (compact Q4-only table)
 #   --q4-only  skip bf16 runs (useful for models that don't fit in VRAM)
 #   --bf16-only skip Q4 runs
@@ -37,6 +38,7 @@ for arg in "$@"; do
     --small)     TIER="small" ;;
     --medium)    TIER="medium" ;;
     --big)       TIER="big" ;;
+    --all)       TIER="all" ;;
     --quantize)  SKIP_BF16=true; QUANTIZE_ONLY=true ;;
     --q4-only)   SKIP_BF16=true ;;
     --bf16-only) SKIP_Q4=true ;;
@@ -111,13 +113,16 @@ BIG_MODELS=(
   "openai/gpt-oss-120b"
 )
 
-MODELS=("${SMALL_MODELS[@]}")
-if [[ "$TIER" == "medium" || "$TIER" == "big" ]]; then
-  MODELS+=("${MEDIUM_MODELS[@]}")
-fi
-if [[ "$TIER" == "big" ]]; then
-  MODELS+=("${BIG_MODELS[@]}")
-fi
+case "$TIER" in
+  small)
+    MODELS=("${SMALL_MODELS[@]}") ;;
+  medium)
+    MODELS=("${SMALL_MODELS[@]}" "${MEDIUM_MODELS[@]}") ;;
+  big)
+    MODELS=("${BIG_MODELS[@]}") ;;
+  all)
+    MODELS=("${SMALL_MODELS[@]}" "${MEDIUM_MODELS[@]}" "${BIG_MODELS[@]}") ;;
+esac
 
 # ---- Helper: run one benchmark and extract metrics -----------------------
 # Outputs: gen_tps prefill_tps ttft_ms
