@@ -46,7 +46,7 @@ Q4 quantization (`--quantize`) gives ~1.3-3.5x faster decode by reducing memory 
 <details>
 <summary><b>NVIDIA RTX PRO 6000 Blackwell</b> — 96 GB GDDR7, 1.53 TB/s bandwidth</summary>
 
-Measured via `rllm run`, 3 runs averaged, 128 max tokens.
+Measured via `rllm run --chat`, 3 runs averaged, 128 max tokens.
 
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|

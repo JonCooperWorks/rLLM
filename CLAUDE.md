@@ -18,6 +18,7 @@ GpuAttention     — attention + KV cache
 GpuElementwise   — activations, arithmetic, MoE routing
 GpuEmbed         — embedding lookup
 GpuDeltaNet      — Qwen 3.5 linear attention kernels
+GpuAllReduce     — collective communication for tensor parallelism
 ```
 
 All extend `GpuCore` (which owns the associated `Tensor` type).  `GpuBackend` is a blanket
@@ -35,6 +36,59 @@ metal/
 └── shaders/       — .metal shader sources (embedded via include_str!)
 ```
 
+### Models (`src/model/registry/`)
+
+Nine model families, each implementing a forward pass generic over `B: GpuBackend`:
+
+```
+llama.rs       — Llama 3.x
+qwen.rs        — Qwen 2.5
+qwen3_moe.rs   — Qwen 3 Mixture-of-Experts
+qwen3_5.rs     — Qwen 3.5 hybrid (DeltaNet + GQA)
+phi.rs         — Phi
+gemma.rs       — Gemma 3
+mistral.rs     — Mistral
+mixtral.rs     — Mixtral (MoE)
+gpt_oss.rs     — GPT Open Source
+```
+
+Config parsing: `src/model/config.rs` (`ModelArch` enum).
+Weight loading: `src/model/loader.rs` (safetensors, single + multi-shard, Q4 on-load).
+
+### Inference Engine (`src/engine/`)
+
+```
+engine/
+├── mod.rs         — inference engine with continuous batching
+└── scheduler.rs   — multi-sequence scheduler + paged KV cache
+```
+
+Prefill and decode phases are separated.  `src/model/kv_cache.rs` implements a paged KV cache
+with block tables and a shared `KvPool` across concurrent sequences.
+
+### API Server (`src/api/`)
+
+OpenAI- and Anthropic-compatible HTTP API:
+
+```
+api/
+├── mod.rs         — server impl, continuous batching via tokio + worker threads
+├── openai.rs      — /v1/chat/completions, /v1/completions, /v1/models
+├── anthropic.rs   — /v1/messages
+└── tls.rs         — TLS support (manual certs, Let's Encrypt)
+```
+
+Tool/function calling lives in `src/model/tools.rs` with architecture-specific prompt formatting
+and output parsing (Llama 3.1, Qwen, Mistral, Anthropic formats).
+
+### CLI Commands (`src/commands/`)
+
+```
+rllm run    — single-prompt inference
+rllm batch  — batched inference from file
+rllm serve  — HTTP API server
+```
+
 ### Adding a New Kernel Family
 
 1. Create the trait in `gpu/ops/new_family.rs`
@@ -48,8 +102,17 @@ metal/
 
 ### Adding a New Model
 
-Models live in `src/model/`.  Each model implements a forward pass generic over `B: GpuBackend`.
-Config parsing goes in `src/config.rs`.  Weight loading goes in `src/loader.rs`.
+1. **`src/model/config.rs`**: Add `ModelArch` variant + `from_model_type()` case + feature
+   methods (e.g. `has_qkv_bias()`) if the new arch has novel traits.
+2. **`src/model/loader.rs`**: Set the right flags in `LoaderHints::new()`.  If the model
+   uses standard weight formats, zero additional loader code is needed.  Novel formats
+   (like MXFP4) get their own helper function (see `load_mxfp4_experts()`).
+3. **`src/model/registry/new_model.rs`**: Forward pass implementation.  Standard dense
+   transformers can delegate to `registry/llama.rs` via `ArchFeatures`.
+4. **`src/model/mod.rs`**: Add dispatch arms in `forward_single_paged()` and
+   `forward_prefill_paged()`.
+5. **`src/model/chat.rs`**: Add chat template match arm (or reuse ChatML).
+6. **`src/model/tools.rs`**: Add tool-call format match arm if applicable.
 
 ## Code Style
 
@@ -65,7 +128,8 @@ Config parsing goes in `src/config.rs`.  Weight loading goes in `src/loader.rs`.
 ## Platform
 
 - macOS: Metal backend (`src/gpu/metal/`)
-- Linux: CUDA backend (`src/gpu/cuda/`) — currently stubbed with `unreachable!()`
+- Linux: CUDA backend (`src/gpu/cuda/`) — NVRTC runtime compilation, async streams
+- Tests: CPU backend (`src/gpu/cpu/`) — reference impl in pure Rust
 - `gpu::Backend` type alias in `src/gpu/mod.rs` resolves to the platform-specific backend
 
 ## Q4 Quantization Format

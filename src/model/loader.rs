@@ -61,6 +61,19 @@
 //   block-wise 4-bit quantisation during loading.  This reduces memory ~3.2×
 //   and speeds up matmul by reducing memory bandwidth.  Norm weights and the
 //   embedding table stay in bf16.
+//
+// Architecture-specific loading:
+//   Each architecture has quirks in its weight format (QKV bias, fused
+//   projections, MoE expert layouts, etc.).  Rather than scattering these
+//   conditionals throughout the loader, we consolidate them in LoaderHints:
+//   a struct of booleans computed once from ModelArch at the top of
+//   load_weights().  The per-layer loading is then split into three focused
+//   helpers — load_attention_weights, load_ffn_weights, load_layer_norms —
+//   each of which reads from LoaderHints to handle architecture differences.
+//
+//   Adding a new architecture means: set the right flags in LoaderHints::new().
+//   If the new arch uses standard weight formats, zero additional loader code
+//   is needed.  Novel formats (like MXFP4) get their own helper function.
 // ===========================================================================
 
 use std::collections::HashMap;
@@ -413,6 +426,122 @@ fn dequantize_mxfp4(
     bytemuck::cast_slice(&out).to_vec()
 }
 
+// ---------------------------------------------------------------------------
+// LoaderHints — consolidates architecture-specific loading flags.
+//
+// Rather than scattering `matches!(arch, ...)` conditionals throughout the
+// loader, we compute all architecture-dependent booleans once up front.
+// Each helper function receives `&LoaderHints` and branches on these flags.
+//
+// Adding a new architecture: set the appropriate flags in LoaderHints::new().
+// If the new arch uses standard weight formats (no fused projections, no
+// novel quantisation), no additional loader code is needed — just set the
+// flags and the existing helpers handle the rest.
+// ---------------------------------------------------------------------------
+
+struct LoaderHints {
+    /// QKV projections have bias vectors (Qwen 2.5, GPT-OSS).
+    has_qkv_bias: bool,
+    /// QK-norm: per-head RMSNorm on Q and K before RoPE (Qwen3-MoE, Qwen3.5, Gemma3).
+    has_qk_norm: bool,
+    /// Fused qkv_proj and gate_up_proj tensors, split on load (Phi).
+    has_fused_qkv: bool,
+    /// O-projection has bias (GPT-OSS only).
+    has_o_proj_bias: bool,
+    /// MoE router has bias (GPT-OSS only).
+    has_router_bias: bool,
+    /// MoE experts have per-expert bias vectors (GPT-OSS only).
+    _has_expert_bias: bool,
+    /// RMSNorm weights stored as residual offsets: effective = 1 + stored (Qwen3.5, Gemma3).
+    residual_norm: bool,
+    /// Gemma 3: sandwich norms (extra pre/post norms around FFN).
+    is_gemma3: bool,
+    /// GPT-OSS: attention sinks, O-proj bias, MXFP4 expert format.
+    is_gpt_oss: bool,
+    /// Mixtral: different expert weight naming convention (w1/w2/w3).
+    is_mixtral: bool,
+    /// Hybrid DeltaNet + GQA model (Qwen 3.5).
+    is_hybrid: bool,
+}
+
+impl LoaderHints {
+    fn new(arch: ModelArch, config: &ModelConfig) -> Self {
+        Self {
+            has_qkv_bias: arch.has_qkv_bias(),
+            has_qk_norm: arch.has_qk_norm(),
+            has_fused_qkv: arch.has_fused_qkv(),
+            has_o_proj_bias: arch.has_o_proj_bias(),
+            has_router_bias: arch.has_router_bias(),
+            _has_expert_bias: arch.has_expert_bias(),
+            residual_norm: matches!(arch, ModelArch::Qwen3_5 | ModelArch::Gemma3),
+            is_gemma3: matches!(arch, ModelArch::Gemma3),
+            is_gpt_oss: matches!(arch, ModelArch::GptOss),
+            is_mixtral: matches!(arch, ModelArch::Mixtral),
+            is_hybrid: config.is_hybrid_deltanet(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-layer helper return types.
+//
+// Each helper returns a small struct whose fields map 1:1 to a subset of
+// LayerWeights.  This keeps the main loop body readable: allocate three
+// structs, then spread their fields into the final LayerWeights.
+// ---------------------------------------------------------------------------
+
+/// Attention projection weights loaded for one layer.
+struct AttentionLoaded<B: GpuCore> {
+    q_proj: B::Tensor,
+    k_proj: B::Tensor,
+    v_proj: B::Tensor,
+    o_proj: B::Tensor,
+    q_bias: Option<B::Tensor>,
+    k_bias: Option<B::Tensor>,
+    v_bias: Option<B::Tensor>,
+    o_proj_bias: Option<B::Tensor>,
+    sinks: Option<B::Tensor>,
+    q_norm: Option<B::Tensor>,
+    k_norm: Option<B::Tensor>,
+    attn_z_proj: Option<B::Tensor>,
+    // DeltaNet fields (all None for standard GQA layers).
+    in_proj_qkv: Option<B::Tensor>,
+    in_proj_a: Option<B::Tensor>,
+    in_proj_b: Option<B::Tensor>,
+    in_proj_z: Option<B::Tensor>,
+    conv1d_weight: Option<B::Tensor>,
+    linear_out_proj: Option<B::Tensor>,
+    a_log: Option<B::Tensor>,
+    dt_bias: Option<B::Tensor>,
+    linear_norm: Option<B::Tensor>,
+}
+
+/// FFN / MoE weights loaded for one layer.
+struct FfnLoaded<B: GpuCore> {
+    gate_proj: B::Tensor,
+    up_proj: B::Tensor,
+    down_proj: B::Tensor,
+    router_gate: Option<B::Tensor>,
+    router_bias: Option<B::Tensor>,
+    experts: Option<Vec<ExpertWeights<B>>>,
+    shared_expert_gate_proj: Option<B::Tensor>,
+    shared_expert_up_proj: Option<B::Tensor>,
+    shared_expert_down_proj: Option<B::Tensor>,
+    shared_expert_gate: Option<B::Tensor>,
+}
+
+/// Norm weights loaded for one layer.
+struct NormLoaded<B: GpuCore> {
+    input_layernorm: B::Tensor,
+    post_attention_layernorm: B::Tensor,
+    pre_feedforward_layernorm: Option<B::Tensor>,
+    post_feedforward_layernorm: Option<B::Tensor>,
+}
+
+// ---------------------------------------------------------------------------
+// load_weights — main entry point.
+// ---------------------------------------------------------------------------
+
 /// Load all model weights from safetensors file(s) into GPU memory.
 ///
 /// When `quantize` is true, linear projection weights (Q/K/V/O/gate/up/down)
@@ -446,11 +575,6 @@ pub(crate) fn load_weights<B: GpuCore>(
     let store = TensorStore { shards, weight_map };
 
     let hidden = config.hidden_size;
-    // Q dimension = num_attention_heads × head_dim.  For most models this equals
-    // hidden_size, but Qwen3 MoE has hidden=2048 with 32 heads × 128 head_dim = 4096.
-    let q_dim = config.num_attention_heads * config.head_dim;
-    let kv_dim = config.num_key_value_heads * config.head_dim;
-    let inter = config.intermediate_size;
     let wp = &config.weight_prefix; // "model." or "model.language_model."
 
     // Load the embedding table.
@@ -475,792 +599,65 @@ pub(crate) fn load_weights<B: GpuCore>(
         None
     };
 
-    // Load per-layer weights.  Projection weights are optionally quantised to Q4.
+    // Compute architecture-specific loading hints once up front.
     let arch = config.arch()?;
-    let has_qkv_bias = arch.has_qkv_bias();
-    let has_qk_norm = arch.has_qk_norm();
-    let is_moe = config.is_moe();
-    let moe_inter = config.moe_intermediate_size;
-    let num_experts = config.num_experts;
-    let head_dim = config.head_dim;
-    let is_hybrid = config.is_hybrid_deltanet();
-    let has_fused_qkv = arch.has_fused_qkv();
-    // Qwen 3.5 and Gemma 3 store RMSNorm weights as residual offsets
-    // (effective = 1 + stored_weight).  Both initialise norm weights to zero,
-    // so the effective scale starts at 1.0 and learns from there.
-    let residual_norm = matches!(arch, ModelArch::Qwen3_5 | ModelArch::Gemma3);
-    let is_gemma3 = matches!(arch, ModelArch::Gemma3);
-    let is_gpt_oss = matches!(arch, ModelArch::GptOss);
-    let has_o_proj_bias = arch.has_o_proj_bias();
-    let has_router_bias = arch.has_router_bias();
-    let _has_expert_bias = arch.has_expert_bias();
+    let hints = LoaderHints::new(arch, config);
+
+    // Load per-layer weights via focused helpers.
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for i in 0..config.num_hidden_layers {
         let prefix = format!("{wp}layers.{i}");
-        let is_deltanet_layer = is_hybrid && config.is_linear_attention_layer(i);
+        let is_deltanet_layer = hints.is_hybrid && config.is_linear_attention_layer(i);
 
-        // Load QKV bias vectors if the architecture has them (Qwen 2.5).
-        // Bias tensors are always bf16, never quantised — they're 1D and tiny.
-        let (q_bias, k_bias, v_bias) = if has_qkv_bias {
-            (
-                Some(upload_tensor(
-                    &store,
-                    backend,
-                    &format!("{prefix}.self_attn.q_proj.bias"),
-                    &[q_dim],
-                )?),
-                Some(upload_tensor(
-                    &store,
-                    backend,
-                    &format!("{prefix}.self_attn.k_proj.bias"),
-                    &[kv_dim],
-                )?),
-                Some(upload_tensor(
-                    &store,
-                    backend,
-                    &format!("{prefix}.self_attn.v_proj.bias"),
-                    &[kv_dim],
-                )?),
-            )
-        } else {
-            (None, None, None)
-        };
-
-        // Load QK-norm weights if the architecture has them (Qwen 3 MoE, Qwen 3.5 GQA).
-        // These are per-head RMSNorm weights [head_dim], applied to Q and K
-        // after projection but before RoPE.
-        // For hybrid models, only GQA (full_attention) layers have QK-norm —
-        // DeltaNet layers use L2 normalization instead (no learned weights).
-        let layer_has_qk_norm = has_qk_norm && !is_deltanet_layer;
-        let (q_norm, k_norm) = if layer_has_qk_norm {
-            // Qwen 3.5 uses Qwen3_5RMSNorm for QK-norm, which has residual weights:
-            // effective_weight = 1.0 + stored_weight (stored ≈ 0, effective ≈ 1).
-            // Other models (Qwen3-MoE) use standard RMSNorm (weight used directly).
-            let upload_qk_norm = if residual_norm { upload_norm_residual } else { upload_tensor };
-            (
-                Some(upload_qk_norm(
-                    &store,
-                    backend,
-                    &format!("{prefix}.self_attn.q_norm.weight"),
-                    &[head_dim],
-                )?),
-                Some(upload_qk_norm(
-                    &store,
-                    backend,
-                    &format!("{prefix}.self_attn.k_norm.weight"),
-                    &[head_dim],
-                )?),
-            )
-        } else {
-            (None, None)
-        };
-
-        // Load FFN weights: either dense (gate/up/down) or MoE (router + experts).
-        //
-        // For MoE models, the dense FFN fields get dummy zero-element tensors
-        // (never used — the forward pass dispatches to MoE routing instead).
-        // This avoids making the fields Optional and cascading changes everywhere.
-        //
-        // Two MoE weight formats exist:
-        //   1. Per-expert (Qwen3-MoE): mlp.experts.{j}.gate_proj.weight [moe_inter, hidden]
-        //   2. Fused (Qwen3.5): mlp.experts.gate_up_proj [num_experts, 2*moe_inter, hidden]
-        //      and mlp.experts.down_proj [num_experts, hidden, moe_inter]
-        //   Format 2 is detected by the presence of the fused tensor name.
-        let has_shared_expert = config.has_shared_expert();
-        let shared_inter = config.shared_expert_intermediate_size;
-        let (gate_proj, up_proj, down_proj, router_gate, router_bias_weight, experts,
-         shared_expert_gate_proj, shared_expert_up_proj, shared_expert_down_proj,
-         shared_expert_gate) = if is_moe {
-            // Dummy tensors for the dense FFN fields (never accessed by MoE forward pass).
-            let dummy = backend.alloc_tensor(&[1], TensorDtype::BF16);
-            let dummy2 = backend.alloc_tensor(&[1], TensorDtype::BF16);
-            let dummy3 = backend.alloc_tensor(&[1], TensorDtype::BF16);
-
-            // Router gate: [num_experts, hidden_size].  Stays bf16 — routing
-            // accuracy matters more than speed here (it's a single small matmul).
-            //
-            // Router naming varies by architecture:
-            //   Mixtral:  block_sparse_moe.gate.weight
-            //   GPT-OSS: mlp.router.weight (+ mlp.router.bias)
-            //   Others:   mlp.gate.weight
-            let is_mixtral = matches!(arch, ModelArch::Mixtral);
-            let router_name = if is_mixtral {
-                format!("{prefix}.block_sparse_moe.gate.weight")
-            } else if is_gpt_oss {
-                format!("{prefix}.mlp.router.weight")
-            } else {
-                format!("{prefix}.mlp.gate.weight")
-            };
-            let router = upload_tensor(
-                &store,
-                backend,
-                &router_name,
-                &[num_experts, hidden],
-            )?;
-
-            // Router bias (GPT-OSS only).
-            let router_bias_tensor = if has_router_bias {
-                Some(upload_tensor(
-                    &store,
-                    backend,
-                    &format!("{prefix}.mlp.router.bias"),
-                    &[num_experts],
-                )?)
-            } else {
-                None
-            };
-
-            // Detect MXFP4 format (GPT-OSS) by looking for packed blocks tensor.
-            let mxfp4_name = format!("{prefix}.mlp.experts.gate_up_proj_blocks");
-            let is_mxfp4 = store.tensor(&mxfp4_name).is_ok();
-
-            // Detect fused vs per-expert format.
-            let fused_name = format!("{prefix}.mlp.experts.gate_up_proj");
-            let is_fused = !is_mxfp4 && store.tensor(&fused_name).is_ok();
-
-            let expert_vec = if is_mxfp4 {
-                // -----------------------------------------------------------
-                // MXFP4 format (GPT-OSS): weights stored as packed fp4 blocks
-                // with per-block bf16 scales and optional per-expert biases.
-                //
-                // Tensors:
-                //   gate_up_proj_blocks: [num_experts, 2*moe_inter, hidden/2]  (packed nibbles)
-                //   gate_up_proj_scales: [num_experts, 2*moe_inter, num_blocks] (bf16)
-                //   gate_up_proj_bias:   [num_experts, 2*moe_inter]  (bf16, optional)
-                //   down_proj_blocks:    [num_experts, hidden, moe_inter/2]
-                //   down_proj_scales:    [num_experts, hidden, num_blocks]
-                //   down_proj_bias:      [num_experts, hidden]  (bf16, optional)
-                //
-                // We dequant each expert's slice to bf16, then optionally Q4.
-                // -----------------------------------------------------------
-                let block_size = 32usize; // MXFP4 standard block size
-
-                let gu_blocks_view = store.tensor(&mxfp4_name)?;
-                let gu_scales_view = store.tensor(
-                    &format!("{prefix}.mlp.experts.gate_up_proj_scales"),
-                )?;
-                let gu_blocks_data = gu_blocks_view.data();
-                let gu_scales_data = gu_scales_view.data();
-
-                let down_blocks_view = store.tensor(
-                    &format!("{prefix}.mlp.experts.down_proj_blocks"),
-                )?;
-                let down_scales_view = store.tensor(
-                    &format!("{prefix}.mlp.experts.down_proj_scales"),
-                )?;
-                let down_blocks_data = down_blocks_view.data();
-                let down_scales_data = down_scales_view.data();
-
-                // Optional biases.
-                let gu_bias_name = format!("{prefix}.mlp.experts.gate_up_proj_bias");
-                let gu_bias_data = store.tensor(&gu_bias_name).ok().map(|v| v.data().to_vec());
-                let down_bias_name = format!("{prefix}.mlp.experts.down_proj_bias");
-                let down_bias_data = store.tensor(&down_bias_name).ok().map(|v| v.data().to_vec());
-
-                // Per-expert byte sizes for slicing fused tensors.
-                let gu_rows = 2 * moe_inter;
-                let gu_blocks_per_expert = gu_rows * (hidden / 2);
-                let gu_num_scale_blocks = (hidden + block_size - 1) / block_size;
-                let gu_scales_per_expert = gu_rows * gu_num_scale_blocks; // E8M0: 1 byte each
-
-                let down_rows = hidden;
-                let down_blocks_per_expert = down_rows * (moe_inter / 2);
-                let down_num_scale_blocks = (moe_inter + block_size - 1) / block_size;
-                let down_scales_per_expert = down_rows * down_num_scale_blocks; // E8M0: 1 byte each
-
-                let gu_bias_per_expert = gu_rows * 2; // bf16
-                let down_bias_per_expert = down_rows * 2; // bf16
-
-                let mut experts = Vec::with_capacity(num_experts);
-                for j in 0..num_experts {
-                    // Dequant gate_up: on-disk [2*moe_inter, hidden] after unpacking MXFP4.
-                    //
-                    // MXFP4 stores weights transposed relative to HuggingFace convention:
-                    //   On-disk blocks shape: [experts, 2*moe_inter, blocks, bytes] → dequant → [2*moe_inter, hidden]
-                    //   HF model sees: [experts, hidden, 2*moe_inter] (via x @ W, not W @ x)
-                    //
-                    // Our matmul convention: y = W @ x with W = [out, in].
-                    // So we need gate = [moe_inter, hidden] and up = [moe_inter, hidden].
-                    //
-                    // The on-disk [2*moe_inter, hidden] is exactly [out, in] for our convention.
-                    // (HF transposes it to [in, out] for torch's x @ W.T convention.)
-                    // Split first half = gate [moe_inter, hidden], second half = up [moe_inter, hidden].
-                    let gu_b_off = j * gu_blocks_per_expert;
-                    let gu_s_off = j * gu_scales_per_expert;
-                    let gu_bf16 = dequantize_mxfp4(
-                        &gu_blocks_data[gu_b_off..gu_b_off + gu_blocks_per_expert],
-                        &gu_scales_data[gu_s_off..gu_s_off + gu_scales_per_expert],
-                        gu_rows, hidden, block_size,
-                    );
-
-                    // De-interleave gate and up from fused gate_up_proj.
-                    //
-                    // GPT-OSS gate_up_proj is [2*moe_inter, hidden] with interleaved rows:
-                    //   row 0 = gate[0], row 1 = up[0], row 2 = gate[1], row 3 = up[1], ...
-                    // We need to extract even rows → gate [moe_inter, hidden]
-                    //                  odd rows  → up   [moe_inter, hidden]
-                    let row_bytes = hidden * 2; // bf16
-                    let mut gate_raw = vec![0u8; moe_inter * row_bytes];
-                    let mut up_raw = vec![0u8; moe_inter * row_bytes];
-                    for r in 0..moe_inter {
-                        let even_start = (2 * r) * row_bytes;
-                        let odd_start = (2 * r + 1) * row_bytes;
-                        gate_raw[r * row_bytes..(r + 1) * row_bytes]
-                            .copy_from_slice(&gu_bf16[even_start..even_start + row_bytes]);
-                        up_raw[r * row_bytes..(r + 1) * row_bytes]
-                            .copy_from_slice(&gu_bf16[odd_start..odd_start + row_bytes]);
-                    }
-                    let gate_t = upload_raw_maybe_quantized(backend, &gate_raw, &[moe_inter, hidden], quantize);
-                    let up_t = upload_raw_maybe_quantized(backend, &up_raw, &[moe_inter, hidden], quantize);
-
-                    // Dequant down: on-disk [hidden, moe_inter] → our convention [hidden, moe_inter] = [out, in].
-                    let d_b_off = j * down_blocks_per_expert;
-                    let d_s_off = j * down_scales_per_expert;
-                    let down_bf16 = dequantize_mxfp4(
-                        &down_blocks_data[d_b_off..d_b_off + down_blocks_per_expert],
-                        &down_scales_data[d_s_off..d_s_off + down_scales_per_expert],
-                        down_rows, moe_inter, block_size,
-                    );
-                    let down_t = upload_raw_maybe_quantized(backend, &down_bf16, &[hidden, moe_inter], quantize);
-
-                    // Expert biases — de-interleave fused gate_up_bias into separate gate and up.
-                    //
-                    // The bias is [2*moe_inter] with interleaved elements:
-                    //   [gate[0], up[0], gate[1], up[1], ...]
-                    // Extract even indices → gate bias, odd indices → up bias.
-                    let (gate_bias, up_bias) = if let Some(ref bias) = gu_bias_data {
-                        let off = j * gu_bias_per_expert;
-                        let bias_slice = &bias[off..off + gu_bias_per_expert];
-                        let bias_bf16: &[u16] = bytemuck::cast_slice(bias_slice);
-                        let gate_vals: Vec<u16> = (0..moe_inter).map(|i| bias_bf16[2 * i]).collect();
-                        let up_vals: Vec<u16> = (0..moe_inter).map(|i| bias_bf16[2 * i + 1]).collect();
-                        let gate_bytes: &[u8] = bytemuck::cast_slice(&gate_vals);
-                        let up_bytes: &[u8] = bytemuck::cast_slice(&up_vals);
-                        (
-                            Some(backend.upload_tensor(gate_bytes, &[moe_inter], TensorDtype::BF16)),
-                            Some(backend.upload_tensor(up_bytes, &[moe_inter], TensorDtype::BF16)),
-                        )
-                    } else {
-                        (None, None)
-                    };
-                    let down_bias = if let Some(ref bias) = down_bias_data {
-                        let off = j * down_bias_per_expert;
-                        let bias_slice = &bias[off..off + down_bias_per_expert];
-                        Some(backend.upload_tensor(bias_slice, &[down_rows], TensorDtype::BF16))
-                    } else {
-                        None
-                    };
-
-                    experts.push(ExpertWeights {
-                        gate_proj: gate_t,
-                        up_proj: up_t,
-                        down_proj: down_t,
-                        gate_bias,
-                        up_bias,
-                        down_bias,
-                    });
-                }
-                experts
-            } else if is_fused {
-                // Fused format (Qwen3.5): gate_up_proj [num_experts, 2*moe_inter, hidden]
-                // and down_proj [num_experts, hidden, moe_inter].
-                // Split into per-expert tensors during loading.
-                let gate_up_view = store.tensor(&fused_name)?;
-                anyhow::ensure!(
-                    gate_up_view.shape() == [num_experts, moe_inter * 2, hidden],
-                    "fused gate_up_proj shape mismatch: expected [{}, {}, {}], got {:?}",
-                    num_experts, moe_inter * 2, hidden, gate_up_view.shape()
-                );
-                let down_view = store.tensor(
-                    &format!("{prefix}.mlp.experts.down_proj"),
-                )?;
-                anyhow::ensure!(
-                    down_view.shape() == [num_experts, hidden, moe_inter],
-                    "fused down_proj shape mismatch: expected [{}, {}, {}], got {:?}",
-                    num_experts, hidden, moe_inter, down_view.shape()
-                );
-
-                let gate_up_data = gate_up_view.data();
-                let down_data = down_view.data();
-                let gate_up_expert_bytes = moe_inter * 2 * hidden * 2; // bf16
-                let gate_bytes = moe_inter * hidden * 2;
-                let down_expert_bytes = hidden * moe_inter * 2;
-
-                let mut experts = Vec::with_capacity(num_experts);
-                for j in 0..num_experts {
-                    let gu_offset = j * gate_up_expert_bytes;
-                    let gate_raw = &gate_up_data[gu_offset..gu_offset + gate_bytes];
-                    let up_raw = &gate_up_data[gu_offset + gate_bytes..gu_offset + gate_up_expert_bytes];
-                    let d_offset = j * down_expert_bytes;
-                    let down_raw = &down_data[d_offset..d_offset + down_expert_bytes];
-
-                    let gate_t = upload_raw_maybe_quantized(backend, gate_raw, &[moe_inter, hidden], quantize);
-                    let up_t = upload_raw_maybe_quantized(backend, up_raw, &[moe_inter, hidden], quantize);
-                    let down_t = upload_raw_maybe_quantized(backend, down_raw, &[hidden, moe_inter], quantize);
-
-                    experts.push(ExpertWeights {
-                        gate_proj: gate_t,
-                        up_proj: up_t,
-                        down_proj: down_t,
-                        gate_bias: None,
-                        up_bias: None,
-                        down_bias: None,
-                    });
-                }
-                experts
-            } else {
-                // Per-expert format: separate tensors per expert.
-                //
-                // Two naming conventions exist:
-                //   Qwen3-MoE:  mlp.experts.{j}.gate_proj / up_proj / down_proj
-                //   Mixtral:    block_sparse_moe.experts.{j}.w1 / w3 / w2
-                //               (w1=gate, w3=up, w2=down — Mixtral convention)
-                let mut experts = Vec::with_capacity(num_experts);
-                for j in 0..num_experts {
-                    let (gate_name, up_name, down_name) = if is_mixtral {
-                        let ep = format!("{prefix}.block_sparse_moe.experts.{j}");
-                        (
-                            format!("{ep}.w1.weight"),
-                            format!("{ep}.w3.weight"),
-                            format!("{ep}.w2.weight"),
-                        )
-                    } else {
-                        let ep = format!("{prefix}.mlp.experts.{j}");
-                        (
-                            format!("{ep}.gate_proj.weight"),
-                            format!("{ep}.up_proj.weight"),
-                            format!("{ep}.down_proj.weight"),
-                        )
-                    };
-                    experts.push(ExpertWeights {
-                        gate_proj: upload_maybe_quantized(
-                            &store, backend,
-                            &gate_name,
-                            &[moe_inter, hidden], quantize,
-                        )?,
-                        up_proj: upload_maybe_quantized(
-                            &store, backend,
-                            &up_name,
-                            &[moe_inter, hidden], quantize,
-                        )?,
-                        down_proj: upload_maybe_quantized(
-                            &store, backend,
-                            &down_name,
-                            &[hidden, moe_inter], quantize,
-                        )?,
-                        gate_bias: None,
-                        up_bias: None,
-                        down_bias: None,
-                    });
-                }
-                experts
-            };
-            if i == 0 {
-                eprintln!(
-                    "  loading {} experts per layer (moe_inter={}){}",
-                    num_experts, moe_inter,
-                    if is_mxfp4 { " [MXFP4 format]" } else if is_fused { " [fused format]" } else { "" },
-                );
-            }
-
-            // Load shared expert weights if present.
-            let (se_gate_proj, se_up_proj, se_down_proj, se_gate) = if has_shared_expert {
-                let gp = upload_maybe_quantized(
-                    &store, backend,
-                    &format!("{prefix}.mlp.shared_expert.gate_proj.weight"),
-                    &[shared_inter, hidden], quantize,
-                )?;
-                let up = upload_maybe_quantized(
-                    &store, backend,
-                    &format!("{prefix}.mlp.shared_expert.up_proj.weight"),
-                    &[shared_inter, hidden], quantize,
-                )?;
-                let dp = upload_maybe_quantized(
-                    &store, backend,
-                    &format!("{prefix}.mlp.shared_expert.down_proj.weight"),
-                    &[hidden, shared_inter], quantize,
-                )?;
-                let sg = upload_tensor(
-                    &store, backend,
-                    &format!("{prefix}.mlp.shared_expert_gate.weight"),
-                    &[1, hidden],
-                )?;
-                if i == 0 {
-                    eprintln!("  shared expert: inter={}", shared_inter);
-                }
-                (Some(gp), Some(up), Some(dp), Some(sg))
-            } else {
-                (None, None, None, None)
-            };
-
-            (dummy, dummy2, dummy3, Some(router), router_bias_tensor, Some(expert_vec),
-             se_gate_proj, se_up_proj, se_down_proj, se_gate)
-        } else if has_fused_qkv {
-            // -----------------------------------------------------------------
-            // Phi FFN: fused gate_up_proj → split into separate gate and up.
-            //
-            // Phi stores gate and up projections as a single tensor:
-            //   gate_up_proj shape = [2 * inter_size, hidden_size]
-            //
-            // Layout (row-major): first inter_size rows are gate, next inter_size
-            // rows are up.  We slice the raw bytes and upload separately so the
-            // forward pass can call gate and up as individual matvecs.
-            //
-            // Why fused in the first place?  Microsoft's original implementation
-            // does `gate_up = gate_up_proj(x)` then splits the output, saving one
-            // kernel launch vs two separate matmuls.  We split on load instead so
-            // our forward pass stays architecture-generic.
-            // -----------------------------------------------------------------
-            let view = store.tensor(&format!("{prefix}.mlp.gate_up_proj.weight"))?;
-            let raw = view.data();
-            anyhow::ensure!(
-                view.shape() == [2 * inter, hidden],
-                "gate_up_proj shape mismatch: expected [{}, {}], got {:?}",
-                2 * inter, hidden, view.shape()
-            );
-            let row_bytes = hidden * 2; // bf16
-            let half = inter * row_bytes;
-            let gate_raw = &raw[..half];
-            let up_raw = &raw[half..2 * half];
-
-            let gate = upload_raw_maybe_quantized(backend, gate_raw, &[inter, hidden], quantize);
-            let up = upload_raw_maybe_quantized(backend, up_raw, &[inter, hidden], quantize);
-            let down = upload_maybe_quantized(
-                &store,
-                backend,
-                &format!("{prefix}.mlp.down_proj.weight"),
-                &[hidden, inter],
-                quantize,
-            )?;
-            (gate, up, down, None, None, None, None, None, None, None)
-        } else {
-            // Dense FFN: standard gate/up/down projections.
-            let gate = upload_maybe_quantized(
-                &store,
-                backend,
-                &format!("{prefix}.mlp.gate_proj.weight"),
-                &[inter, hidden],
-                quantize,
-            )?;
-            let up = upload_maybe_quantized(
-                &store,
-                backend,
-                &format!("{prefix}.mlp.up_proj.weight"),
-                &[inter, hidden],
-                quantize,
-            )?;
-            let down = upload_maybe_quantized(
-                &store,
-                backend,
-                &format!("{prefix}.mlp.down_proj.weight"),
-                &[hidden, inter],
-                quantize,
-            )?;
-            (gate, up, down, None, None, None, None, None, None, None)
-        };
-
-        // Load attention weights: DeltaNet layers use linear_attn namespace,
-        // GQA layers use self_attn namespace.
-        let (q_proj, k_proj, v_proj, o_proj, in_proj_qkv, in_proj_a, in_proj_b, in_proj_z, conv1d_weight, linear_out_proj, a_log, dt_bias, linear_norm, attn_z_proj) =
-            if is_deltanet_layer {
-                let dummy = backend.alloc_tensor(&[1], TensorDtype::BF16);
-                let dummy2 = backend.alloc_tensor(&[1], TensorDtype::BF16);
-                let dummy3 = backend.alloc_tensor(&[1], TensorDtype::BF16);
-                let dummy4 = backend.alloc_tensor(&[1], TensorDtype::BF16);
-
-                let qk_dim = config.linear_num_key_heads * config.linear_key_head_dim;
-                let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
-                let fused_dim = qk_dim * 2 + v_dim; // Q + K + V fused
-                let conv_dim = fused_dim; // Conv1D applied to concatenated QKV
-                let kernel_size = config.linear_conv_kernel_dim;
-
-                let qkv = upload_maybe_quantized(
-                    &store, backend,
-                    &format!("{prefix}.linear_attn.in_proj_qkv.weight"),
-                    &[fused_dim, hidden], quantize,
-                )?;
-                let a = upload_maybe_quantized(
-                    &store, backend,
-                    &format!("{prefix}.linear_attn.in_proj_a.weight"),
-                    &[config.linear_num_value_heads, hidden], quantize,
-                )?;
-                let b = upload_maybe_quantized(
-                    &store, backend,
-                    &format!("{prefix}.linear_attn.in_proj_b.weight"),
-                    &[config.linear_num_value_heads, hidden], quantize,
-                )?;
-                let z = upload_maybe_quantized(
-                    &store, backend,
-                    &format!("{prefix}.linear_attn.in_proj_z.weight"),
-                    &[v_dim, hidden], quantize,
-                )?;
-                // Conv1D: depthwise, shape [channels, 1, kernel_size] in safetensors.
-                let conv = upload_tensor(
-                    &store, backend,
-                    &format!("{prefix}.linear_attn.conv1d.weight"),
-                    &[conv_dim, 1, kernel_size],
-                )?;
-                let out = upload_maybe_quantized(
-                    &store, backend,
-                    &format!("{prefix}.linear_attn.out_proj.weight"),
-                    &[hidden, v_dim], quantize,
-                )?;
-
-                // DeltaNet-specific non-projection weights:
-                //   A_log [num_v_heads] — log decay rates (stored f32, kept f32)
-                //   dt_bias [num_v_heads] — timestep bias (stored bf16, converted to f32)
-                //   norm.weight [value_head_dim] — output norm weight (stored f32, converted to bf16)
-                let a_log_tensor = upload_tensor(
-                    &store, backend,
-                    &format!("{prefix}.linear_attn.A_log"),
-                    &[config.linear_num_value_heads],
-                )?;
-                // dt_bias: convert bf16 → f32 for precision in decay gate computation.
-                let dt_bias_view = store.tensor(
-                    &format!("{prefix}.linear_attn.dt_bias"),
-                )?;
-                let dt_bias_f32: Vec<f32> = bytemuck::cast_slice::<u8, half::bf16>(dt_bias_view.data())
-                    .iter()
-                    .map(|v| v.to_f32())
-                    .collect();
-                let dt_bias_tensor = backend.upload_tensor(
-                    bytemuck::cast_slice(&dt_bias_f32),
-                    &[config.linear_num_value_heads],
-                    TensorDtype::F32,
-                );
-                // norm.weight: convert f32 → bf16 for compatibility with rms_norm_batch.
-                // Note: linear_attn.norm uses Qwen3_5MoeRMSNormGated which does NOT
-                // use residual form — weights are initialized to ones, not zeros.
-                // Only the layer norms use (1 + weight) residual form.
-                let norm_view = store.tensor(
-                    &format!("{prefix}.linear_attn.norm.weight"),
-                )?;
-                let norm_bf16: Vec<half::bf16> = bytemuck::cast_slice::<u8, f32>(norm_view.data())
-                    .iter()
-                    .map(|v| half::bf16::from_f32(*v))
-                    .collect();
-                let norm_weight = backend.upload_tensor(
-                    bytemuck::cast_slice(&norm_bf16),
-                    &[config.linear_value_head_dim],
-                    TensorDtype::BF16,
-                );
-
-                if i == 0 {
-                    eprintln!(
-                        "  DeltaNet layers: qk_dim={}, v_dim={}, kernel_size={}",
-                        qk_dim, v_dim, kernel_size
-                    );
-                }
-
-                (dummy, dummy2, dummy3, dummy4,
-                 Some(qkv), Some(a), Some(b), Some(z), Some(conv), Some(out),
-                 Some(a_log_tensor), Some(dt_bias_tensor), Some(norm_weight), None)
-            } else if has_fused_qkv {
-                // -----------------------------------------------------------------
-                // Phi attention: fused qkv_proj → split into separate Q, K, V.
-                //
-                // Phi stores all three projections as a single tensor:
-                //   qkv_proj shape = [q_dim + 2*kv_dim, hidden_size]
-                //
-                // For Phi-4 (40Q/10KV heads, head_dim=128):
-                //   q_dim  = 40 * 128 = 5120
-                //   kv_dim = 10 * 128 = 1280
-                //   fused  = 5120 + 1280 + 1280 = 7680 rows
-                //
-                // Layout (row-major): first q_dim rows = Q, next kv_dim = K,
-                // next kv_dim = V.  We slice the raw bytes at the correct
-                // offsets and upload as three separate GPU tensors.
-                // -----------------------------------------------------------------
-                let fused_dim = q_dim + 2 * kv_dim;
-                let view = store.tensor(&format!("{prefix}.self_attn.qkv_proj.weight"))?;
-                let raw = view.data();
-                anyhow::ensure!(
-                    view.shape() == [fused_dim, hidden],
-                    "qkv_proj shape mismatch: expected [{}, {}], got {:?}",
-                    fused_dim, hidden, view.shape()
-                );
-                let row_bytes = hidden * 2; // bf16
-                let q_bytes = q_dim * row_bytes;
-                let kv_bytes = kv_dim * row_bytes;
-                let q_raw = &raw[..q_bytes];
-                let k_raw = &raw[q_bytes..q_bytes + kv_bytes];
-                let v_raw = &raw[q_bytes + kv_bytes..q_bytes + 2 * kv_bytes];
-
-                let qp = upload_raw_maybe_quantized(backend, q_raw, &[q_dim, hidden], quantize);
-                let kp = upload_raw_maybe_quantized(backend, k_raw, &[kv_dim, hidden], quantize);
-                let vp = upload_raw_maybe_quantized(backend, v_raw, &[kv_dim, hidden], quantize);
-                let op = upload_maybe_quantized(
-                    &store, backend,
-                    &format!("{prefix}.self_attn.o_proj.weight"),
-                    &[hidden, q_dim], quantize,
-                )?;
-                (qp, kp, vp, op, None, None, None, None, None, None,
-                 None, None, None, None)
-            } else {
-                // Standard GQA attention.
-                //
-                // When attn_output_gate is true (Qwen 3.5), q_proj is fused with an
-                // output gate projection: [2*q_dim, hidden].
-                //
-                // HF does: view(bsz, q_len, num_heads, head_dim*2).chunk(2, dim=-1)
-                // This means the weight rows are interleaved per head:
-                //   [head0_Q(head_dim rows), head0_gate(head_dim rows),
-                //    head1_Q(head_dim rows), head1_gate(head_dim rows), ...]
-                // We deinterleave into separate Q [q_dim, hidden] and Z [q_dim, hidden].
-                let attn_output_gate = config.attn_output_gate;
-                let (qp, z_proj) = if attn_output_gate {
-                    let view = store.tensor(
-                        &format!("{prefix}.self_attn.q_proj.weight"),
-                    )?;
-                    let raw = view.data();
-                    let fused_q_dim = q_dim * 2;
-                    anyhow::ensure!(
-                        view.shape() == [fused_q_dim, hidden],
-                        "q_proj fused shape mismatch: expected [{}, {}], got {:?}",
-                        fused_q_dim, hidden, view.shape()
-                    );
-                    let row_bytes = hidden * 2; // bf16
-                    let hd_bytes = head_dim * row_bytes;
-                    let num_heads = config.num_attention_heads;
-
-                    // Deinterleave: for each head, first head_dim rows are Q,
-                    // next head_dim rows are gate.
-                    let mut q_raw = Vec::with_capacity(q_dim * row_bytes);
-                    let mut z_raw = Vec::with_capacity(q_dim * row_bytes);
-                    for h in 0..num_heads {
-                        let base = h * 2 * hd_bytes;
-                        q_raw.extend_from_slice(&raw[base..base + hd_bytes]);
-                        z_raw.extend_from_slice(&raw[base + hd_bytes..base + 2 * hd_bytes]);
-                    }
-
-                    let q_tensor = upload_raw_maybe_quantized(backend, &q_raw, &[q_dim, hidden], quantize);
-                    let z_tensor = upload_raw_maybe_quantized(backend, &z_raw, &[q_dim, hidden], quantize);
-                    (q_tensor, Some(z_tensor))
-                } else {
-                    let qp = upload_maybe_quantized(
-                        &store, backend,
-                        &format!("{prefix}.self_attn.q_proj.weight"),
-                        &[q_dim, hidden], quantize,
-                    )?;
-                    (qp, None)
-                };
-                let kp = upload_maybe_quantized(
-                    &store, backend,
-                    &format!("{prefix}.self_attn.k_proj.weight"),
-                    &[kv_dim, hidden], quantize,
-                )?;
-                let vp = upload_maybe_quantized(
-                    &store, backend,
-                    &format!("{prefix}.self_attn.v_proj.weight"),
-                    &[kv_dim, hidden], quantize,
-                )?;
-                let op = upload_maybe_quantized(
-                    &store, backend,
-                    &format!("{prefix}.self_attn.o_proj.weight"),
-                    &[hidden, q_dim], quantize,
-                )?;
-                (qp, kp, vp, op, None, None, None, None, None, None,
-                 None, None, None, z_proj)
-            };
-
-        // Upload norm weight, adding 1.0 for Qwen 3.5 residual normalization.
-        let upload_norm = |name: &str, shape: &[usize]| -> anyhow::Result<B::Tensor> {
-            if residual_norm {
-                upload_norm_residual(&store, backend, name, shape)
-            } else {
-                upload_tensor(&store, backend, name, shape)
-            }
-        };
-
-        // Gemma 3 sandwich norms: extra pre/post norms around the FFN sub-block.
-        // These are loaded with residual form (1 + stored) just like the other norms.
-        let (pre_ffn_norm, post_ffn_norm) = if is_gemma3 {
-            (
-                Some(upload_norm(
-                    &format!("{prefix}.pre_feedforward_layernorm.weight"),
-                    &[hidden],
-                )?),
-                Some(upload_norm(
-                    &format!("{prefix}.post_feedforward_layernorm.weight"),
-                    &[hidden],
-                )?),
-            )
-        } else {
-            (None, None)
-        };
-
-        // O-proj bias (GPT-OSS only).
-        let o_proj_bias = if has_o_proj_bias {
-            Some(upload_tensor(
-                &store,
-                backend,
-                &format!("{prefix}.self_attn.o_proj.bias"),
-                &[hidden],
-            )?)
-        } else {
-            None
-        };
-
-        // Attention sinks (GPT-OSS only): per-head scalar logits [num_attention_heads].
-        let sinks = if is_gpt_oss {
-            let num_q_heads = config.num_attention_heads;
-            Some(upload_tensor(
-                &store,
-                backend,
-                &format!("{prefix}.self_attn.sinks"),
-                &[num_q_heads],
-            )?)
-        } else {
-            None
-        };
+        let norms = load_layer_norms(&store, backend, &prefix, config, &hints)?;
+        let attn = load_attention_weights(
+            &store, backend, &prefix, config, &hints, i, is_deltanet_layer, quantize,
+        )?;
+        let ffn = load_ffn_weights(
+            &store, backend, &prefix, config, &hints, arch, i, quantize,
+        )?;
 
         layers.push(LayerWeights {
-            input_layernorm: upload_norm(
-                &format!("{prefix}.input_layernorm.weight"),
-                &[hidden],
-            )?,
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
-            o_proj_bias,
-            sinks,
-            q_bias,
-            k_bias,
-            v_bias,
-            q_norm,
-            k_norm,
-            post_attention_layernorm: upload_norm(
-                &format!("{prefix}.post_attention_layernorm.weight"),
-                &[hidden],
-            )?,
-            gate_proj,
-            up_proj,
-            down_proj,
-            router_gate,
-            router_bias: router_bias_weight,
-            experts,
-            pre_feedforward_layernorm: pre_ffn_norm,
-            post_feedforward_layernorm: post_ffn_norm,
-            in_proj_qkv,
-            in_proj_a,
-            in_proj_b,
-            in_proj_z,
-            conv1d_weight,
-            linear_out_proj,
-            a_log,
-            dt_bias,
-            linear_norm,
-            attn_z_proj,
-            shared_expert_gate_proj,
-            shared_expert_up_proj,
-            shared_expert_down_proj,
-            shared_expert_gate,
+            input_layernorm: norms.input_layernorm,
+            post_attention_layernorm: norms.post_attention_layernorm,
+            pre_feedforward_layernorm: norms.pre_feedforward_layernorm,
+            post_feedforward_layernorm: norms.post_feedforward_layernorm,
+            q_proj: attn.q_proj,
+            k_proj: attn.k_proj,
+            v_proj: attn.v_proj,
+            o_proj: attn.o_proj,
+            q_bias: attn.q_bias,
+            k_bias: attn.k_bias,
+            v_bias: attn.v_bias,
+            o_proj_bias: attn.o_proj_bias,
+            sinks: attn.sinks,
+            q_norm: attn.q_norm,
+            k_norm: attn.k_norm,
+            attn_z_proj: attn.attn_z_proj,
+            in_proj_qkv: attn.in_proj_qkv,
+            in_proj_a: attn.in_proj_a,
+            in_proj_b: attn.in_proj_b,
+            in_proj_z: attn.in_proj_z,
+            conv1d_weight: attn.conv1d_weight,
+            linear_out_proj: attn.linear_out_proj,
+            a_log: attn.a_log,
+            dt_bias: attn.dt_bias,
+            linear_norm: attn.linear_norm,
+            gate_proj: ffn.gate_proj,
+            up_proj: ffn.up_proj,
+            down_proj: ffn.down_proj,
+            router_gate: ffn.router_gate,
+            router_bias: ffn.router_bias,
+            experts: ffn.experts,
+            shared_expert_gate_proj: ffn.shared_expert_gate_proj,
+            shared_expert_up_proj: ffn.shared_expert_up_proj,
+            shared_expert_down_proj: ffn.shared_expert_down_proj,
+            shared_expert_gate: ffn.shared_expert_gate,
         });
     }
 
     // Final RMSNorm weight (applied after all layers, before lm_head).
-    let norm_weight = if residual_norm {
+    let norm_weight = if hints.residual_norm {
         upload_norm_residual(&store, backend, &format!("{wp}norm.weight"), &[hidden])?
     } else {
         upload_tensor(&store, backend, &format!("{wp}norm.weight"), &[hidden])?
@@ -1273,6 +670,921 @@ pub(crate) fn load_weights<B: GpuCore>(
         norm_weight,
         lm_head,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Per-layer loading helpers.
+//
+// Each function handles one concern (attention, FFN, norms) and reads from
+// LoaderHints to handle architecture-specific differences.  The main loop
+// in load_weights calls all three per layer, then assembles LayerWeights.
+// ---------------------------------------------------------------------------
+
+/// Load RMSNorm weights for one layer.
+///
+/// Standard models have two norms per layer (input_layernorm, post_attention_layernorm).
+/// Gemma 3 adds two more for sandwich norms (pre/post_feedforward_layernorm).
+/// Qwen 3.5 and Gemma 3 use residual form (effective = 1 + stored weight).
+fn load_layer_norms<B: GpuCore>(
+    store: &TensorStore,
+    backend: &B,
+    prefix: &str,
+    config: &ModelConfig,
+    hints: &LoaderHints,
+) -> anyhow::Result<NormLoaded<B>> {
+    let hidden = config.hidden_size;
+    let upload_norm = |name: &str, shape: &[usize]| -> anyhow::Result<B::Tensor> {
+        if hints.residual_norm {
+            upload_norm_residual(store, backend, name, shape)
+        } else {
+            upload_tensor(store, backend, name, shape)
+        }
+    };
+
+    let input_layernorm = upload_norm(
+        &format!("{prefix}.input_layernorm.weight"),
+        &[hidden],
+    )?;
+    let post_attention_layernorm = upload_norm(
+        &format!("{prefix}.post_attention_layernorm.weight"),
+        &[hidden],
+    )?;
+
+    // Gemma 3 sandwich norms: extra pre/post norms around the FFN sub-block.
+    // These are loaded with residual form (1 + stored) just like the other norms.
+    let (pre_ffn_norm, post_ffn_norm) = if hints.is_gemma3 {
+        (
+            Some(upload_norm(
+                &format!("{prefix}.pre_feedforward_layernorm.weight"),
+                &[hidden],
+            )?),
+            Some(upload_norm(
+                &format!("{prefix}.post_feedforward_layernorm.weight"),
+                &[hidden],
+            )?),
+        )
+    } else {
+        (None, None)
+    };
+
+    Ok(NormLoaded {
+        input_layernorm,
+        post_attention_layernorm,
+        pre_feedforward_layernorm: pre_ffn_norm,
+        post_feedforward_layernorm: post_ffn_norm,
+    })
+}
+
+/// Load attention projection weights for one layer.
+///
+/// Handles three cases:
+///   1. DeltaNet layers (Qwen 3.5 hybrid): fused QKV + gate projections,
+///      Conv1D, decay/update gates, output norm.
+///   2. Fused QKV (Phi): single qkv_proj tensor split into Q, K, V on load.
+///   3. Standard GQA: separate Q, K, V, O projection weights.
+///
+/// Also loads QKV bias (Qwen 2.5), QK-norm (Qwen3-MoE), O-proj bias and
+/// attention sinks (GPT-OSS), and the attn_output_gate (Qwen 3.5 GQA).
+fn load_attention_weights<B: GpuCore>(
+    store: &TensorStore,
+    backend: &B,
+    prefix: &str,
+    config: &ModelConfig,
+    hints: &LoaderHints,
+    layer_idx: usize,
+    is_deltanet_layer: bool,
+    quantize: bool,
+) -> anyhow::Result<AttentionLoaded<B>> {
+    let hidden = config.hidden_size;
+    let q_dim = config.num_attention_heads * config.head_dim;
+    let kv_dim = config.num_key_value_heads * config.head_dim;
+    let head_dim = config.head_dim;
+
+    // Load QKV bias vectors if the architecture has them (Qwen 2.5).
+    // Bias tensors are always bf16, never quantised — they're 1D and tiny.
+    let (q_bias, k_bias, v_bias) = if hints.has_qkv_bias {
+        (
+            Some(upload_tensor(
+                store, backend,
+                &format!("{prefix}.self_attn.q_proj.bias"),
+                &[q_dim],
+            )?),
+            Some(upload_tensor(
+                store, backend,
+                &format!("{prefix}.self_attn.k_proj.bias"),
+                &[kv_dim],
+            )?),
+            Some(upload_tensor(
+                store, backend,
+                &format!("{prefix}.self_attn.v_proj.bias"),
+                &[kv_dim],
+            )?),
+        )
+    } else {
+        (None, None, None)
+    };
+
+    // Load QK-norm weights if the architecture has them (Qwen 3 MoE, Qwen 3.5 GQA).
+    // These are per-head RMSNorm weights [head_dim], applied to Q and K
+    // after projection but before RoPE.
+    // For hybrid models, only GQA (full_attention) layers have QK-norm —
+    // DeltaNet layers use L2 normalization instead (no learned weights).
+    let layer_has_qk_norm = hints.has_qk_norm && !is_deltanet_layer;
+    let (q_norm, k_norm) = if layer_has_qk_norm {
+        // Qwen 3.5 uses Qwen3_5RMSNorm for QK-norm, which has residual weights:
+        // effective_weight = 1.0 + stored_weight (stored ≈ 0, effective ≈ 1).
+        // Other models (Qwen3-MoE) use standard RMSNorm (weight used directly).
+        let upload_qk_norm = if hints.residual_norm { upload_norm_residual } else { upload_tensor };
+        (
+            Some(upload_qk_norm(
+                store, backend,
+                &format!("{prefix}.self_attn.q_norm.weight"),
+                &[head_dim],
+            )?),
+            Some(upload_qk_norm(
+                store, backend,
+                &format!("{prefix}.self_attn.k_norm.weight"),
+                &[head_dim],
+            )?),
+        )
+    } else {
+        (None, None)
+    };
+
+    // Load attention projection weights — three cases.
+    let (q_proj, k_proj, v_proj, o_proj, in_proj_qkv, in_proj_a, in_proj_b,
+         in_proj_z, conv1d_weight, linear_out_proj, a_log, dt_bias, linear_norm,
+         attn_z_proj) =
+        if is_deltanet_layer {
+            load_deltanet_attention(store, backend, prefix, config, layer_idx, quantize)?
+        } else if hints.has_fused_qkv {
+            load_fused_qkv_attention(store, backend, prefix, hidden, q_dim, kv_dim, quantize)?
+        } else {
+            load_standard_attention(store, backend, prefix, config, hidden, q_dim, kv_dim, quantize)?
+        };
+
+    // O-proj bias (GPT-OSS only).
+    let o_proj_bias = if hints.has_o_proj_bias {
+        Some(upload_tensor(
+            store, backend,
+            &format!("{prefix}.self_attn.o_proj.bias"),
+            &[hidden],
+        )?)
+    } else {
+        None
+    };
+
+    // Attention sinks (GPT-OSS only): per-head scalar logits [num_attention_heads].
+    let sinks = if hints.is_gpt_oss {
+        let num_q_heads = config.num_attention_heads;
+        Some(upload_tensor(
+            store, backend,
+            &format!("{prefix}.self_attn.sinks"),
+            &[num_q_heads],
+        )?)
+    } else {
+        None
+    };
+
+    Ok(AttentionLoaded {
+        q_proj, k_proj, v_proj, o_proj,
+        q_bias, k_bias, v_bias,
+        o_proj_bias, sinks,
+        q_norm, k_norm,
+        attn_z_proj,
+        in_proj_qkv, in_proj_a, in_proj_b, in_proj_z,
+        conv1d_weight, linear_out_proj,
+        a_log, dt_bias, linear_norm,
+    })
+}
+
+/// Load DeltaNet attention weights (Qwen 3.5 linear attention layers).
+///
+/// DeltaNet layers use a fused QKV projection and separate gate projections
+/// instead of standard q/k/v_proj.  Returns dummy tensors for q/k/v/o_proj
+/// (unused by the forward pass) and populates the DeltaNet-specific fields.
+#[allow(clippy::type_complexity)]
+fn load_deltanet_attention<B: GpuCore>(
+    store: &TensorStore,
+    backend: &B,
+    prefix: &str,
+    config: &ModelConfig,
+    layer_idx: usize,
+    quantize: bool,
+) -> anyhow::Result<(
+    B::Tensor, B::Tensor, B::Tensor, B::Tensor,         // q, k, v, o (dummies)
+    Option<B::Tensor>, Option<B::Tensor>,                 // in_proj_qkv, in_proj_a
+    Option<B::Tensor>, Option<B::Tensor>,                 // in_proj_b, in_proj_z
+    Option<B::Tensor>, Option<B::Tensor>,                 // conv1d_weight, linear_out_proj
+    Option<B::Tensor>, Option<B::Tensor>,                 // a_log, dt_bias
+    Option<B::Tensor>, Option<B::Tensor>,                 // linear_norm, attn_z_proj
+)> {
+    let hidden = config.hidden_size;
+    let dummy = backend.alloc_tensor(&[1], TensorDtype::BF16);
+    let dummy2 = backend.alloc_tensor(&[1], TensorDtype::BF16);
+    let dummy3 = backend.alloc_tensor(&[1], TensorDtype::BF16);
+    let dummy4 = backend.alloc_tensor(&[1], TensorDtype::BF16);
+
+    let qk_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+    let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+    let fused_dim = qk_dim * 2 + v_dim; // Q + K + V fused
+    let conv_dim = fused_dim; // Conv1D applied to concatenated QKV
+    let kernel_size = config.linear_conv_kernel_dim;
+
+    let qkv = upload_maybe_quantized(
+        store, backend,
+        &format!("{prefix}.linear_attn.in_proj_qkv.weight"),
+        &[fused_dim, hidden], quantize,
+    )?;
+    let a = upload_maybe_quantized(
+        store, backend,
+        &format!("{prefix}.linear_attn.in_proj_a.weight"),
+        &[config.linear_num_value_heads, hidden], quantize,
+    )?;
+    let b = upload_maybe_quantized(
+        store, backend,
+        &format!("{prefix}.linear_attn.in_proj_b.weight"),
+        &[config.linear_num_value_heads, hidden], quantize,
+    )?;
+    let z = upload_maybe_quantized(
+        store, backend,
+        &format!("{prefix}.linear_attn.in_proj_z.weight"),
+        &[v_dim, hidden], quantize,
+    )?;
+    // Conv1D: depthwise, shape [channels, 1, kernel_size] in safetensors.
+    let conv = upload_tensor(
+        store, backend,
+        &format!("{prefix}.linear_attn.conv1d.weight"),
+        &[conv_dim, 1, kernel_size],
+    )?;
+    let out = upload_maybe_quantized(
+        store, backend,
+        &format!("{prefix}.linear_attn.out_proj.weight"),
+        &[hidden, v_dim], quantize,
+    )?;
+
+    // DeltaNet-specific non-projection weights:
+    //   A_log [num_v_heads] — log decay rates (stored f32, kept f32)
+    //   dt_bias [num_v_heads] — timestep bias (stored bf16, converted to f32)
+    //   norm.weight [value_head_dim] — output norm weight (stored f32, converted to bf16)
+    let a_log_tensor = upload_tensor(
+        store, backend,
+        &format!("{prefix}.linear_attn.A_log"),
+        &[config.linear_num_value_heads],
+    )?;
+    // dt_bias: convert bf16 → f32 for precision in decay gate computation.
+    let dt_bias_view = store.tensor(
+        &format!("{prefix}.linear_attn.dt_bias"),
+    )?;
+    let dt_bias_f32: Vec<f32> = bytemuck::cast_slice::<u8, half::bf16>(dt_bias_view.data())
+        .iter()
+        .map(|v| v.to_f32())
+        .collect();
+    let dt_bias_tensor = backend.upload_tensor(
+        bytemuck::cast_slice(&dt_bias_f32),
+        &[config.linear_num_value_heads],
+        TensorDtype::F32,
+    );
+    // norm.weight: convert f32 → bf16 for compatibility with rms_norm_batch.
+    // Note: linear_attn.norm uses Qwen3_5MoeRMSNormGated which does NOT
+    // use residual form — weights are initialized to ones, not zeros.
+    // Only the layer norms use (1 + weight) residual form.
+    let norm_view = store.tensor(
+        &format!("{prefix}.linear_attn.norm.weight"),
+    )?;
+    let norm_bf16: Vec<half::bf16> = bytemuck::cast_slice::<u8, f32>(norm_view.data())
+        .iter()
+        .map(|v| half::bf16::from_f32(*v))
+        .collect();
+    let norm_weight = backend.upload_tensor(
+        bytemuck::cast_slice(&norm_bf16),
+        &[config.linear_value_head_dim],
+        TensorDtype::BF16,
+    );
+
+    if layer_idx == 0 {
+        eprintln!(
+            "  DeltaNet layers: qk_dim={}, v_dim={}, kernel_size={}",
+            qk_dim, v_dim, kernel_size
+        );
+    }
+
+    Ok((dummy, dummy2, dummy3, dummy4,
+        Some(qkv), Some(a), Some(b), Some(z), Some(conv), Some(out),
+        Some(a_log_tensor), Some(dt_bias_tensor), Some(norm_weight), None))
+}
+
+/// Load fused QKV attention weights (Phi).
+///
+/// Phi stores all three projections as a single tensor:
+///   qkv_proj shape = [q_dim + 2*kv_dim, hidden_size]
+///
+/// For Phi-4 (40Q/10KV heads, head_dim=128):
+///   q_dim  = 40 * 128 = 5120
+///   kv_dim = 10 * 128 = 1280
+///   fused  = 5120 + 1280 + 1280 = 7680 rows
+///
+/// Layout (row-major): first q_dim rows = Q, next kv_dim = K,
+/// next kv_dim = V.  We slice the raw bytes at the correct
+/// offsets and upload as three separate GPU tensors.
+#[allow(clippy::type_complexity)]
+fn load_fused_qkv_attention<B: GpuCore>(
+    store: &TensorStore,
+    backend: &B,
+    prefix: &str,
+    hidden: usize,
+    q_dim: usize,
+    kv_dim: usize,
+    quantize: bool,
+) -> anyhow::Result<(
+    B::Tensor, B::Tensor, B::Tensor, B::Tensor,         // q, k, v, o
+    Option<B::Tensor>, Option<B::Tensor>,                 // in_proj_qkv, in_proj_a
+    Option<B::Tensor>, Option<B::Tensor>,                 // in_proj_b, in_proj_z
+    Option<B::Tensor>, Option<B::Tensor>,                 // conv1d_weight, linear_out_proj
+    Option<B::Tensor>, Option<B::Tensor>,                 // a_log, dt_bias
+    Option<B::Tensor>, Option<B::Tensor>,                 // linear_norm, attn_z_proj
+)> {
+    let fused_dim = q_dim + 2 * kv_dim;
+    let view = store.tensor(&format!("{prefix}.self_attn.qkv_proj.weight"))?;
+    let raw = view.data();
+    anyhow::ensure!(
+        view.shape() == [fused_dim, hidden],
+        "qkv_proj shape mismatch: expected [{}, {}], got {:?}",
+        fused_dim, hidden, view.shape()
+    );
+    let row_bytes = hidden * 2; // bf16
+    let q_bytes = q_dim * row_bytes;
+    let kv_bytes = kv_dim * row_bytes;
+    let q_raw = &raw[..q_bytes];
+    let k_raw = &raw[q_bytes..q_bytes + kv_bytes];
+    let v_raw = &raw[q_bytes + kv_bytes..q_bytes + 2 * kv_bytes];
+
+    let qp = upload_raw_maybe_quantized(backend, q_raw, &[q_dim, hidden], quantize);
+    let kp = upload_raw_maybe_quantized(backend, k_raw, &[kv_dim, hidden], quantize);
+    let vp = upload_raw_maybe_quantized(backend, v_raw, &[kv_dim, hidden], quantize);
+    let op = upload_maybe_quantized(
+        store, backend,
+        &format!("{prefix}.self_attn.o_proj.weight"),
+        &[hidden, q_dim], quantize,
+    )?;
+    Ok((qp, kp, vp, op, None, None, None, None, None, None,
+        None, None, None, None))
+}
+
+/// Load standard GQA attention weights (most architectures).
+///
+/// When attn_output_gate is true (Qwen 3.5), q_proj is fused with an
+/// output gate projection: [2*q_dim, hidden].  The weight rows are
+/// interleaved per head — we deinterleave into separate Q and Z tensors.
+#[allow(clippy::type_complexity)]
+fn load_standard_attention<B: GpuCore>(
+    store: &TensorStore,
+    backend: &B,
+    prefix: &str,
+    config: &ModelConfig,
+    hidden: usize,
+    q_dim: usize,
+    kv_dim: usize,
+    quantize: bool,
+) -> anyhow::Result<(
+    B::Tensor, B::Tensor, B::Tensor, B::Tensor,         // q, k, v, o
+    Option<B::Tensor>, Option<B::Tensor>,                 // in_proj_qkv, in_proj_a
+    Option<B::Tensor>, Option<B::Tensor>,                 // in_proj_b, in_proj_z
+    Option<B::Tensor>, Option<B::Tensor>,                 // conv1d_weight, linear_out_proj
+    Option<B::Tensor>, Option<B::Tensor>,                 // a_log, dt_bias
+    Option<B::Tensor>, Option<B::Tensor>,                 // linear_norm, attn_z_proj
+)> {
+    // When attn_output_gate is true (Qwen 3.5), q_proj is fused with an
+    // output gate projection: [2*q_dim, hidden].
+    //
+    // HF does: view(bsz, q_len, num_heads, head_dim*2).chunk(2, dim=-1)
+    // This means the weight rows are interleaved per head:
+    //   [head0_Q(head_dim rows), head0_gate(head_dim rows),
+    //    head1_Q(head_dim rows), head1_gate(head_dim rows), ...]
+    // We deinterleave into separate Q [q_dim, hidden] and Z [q_dim, hidden].
+    let attn_output_gate = config.attn_output_gate;
+    let head_dim = config.head_dim;
+    let (qp, z_proj) = if attn_output_gate {
+        let view = store.tensor(
+            &format!("{prefix}.self_attn.q_proj.weight"),
+        )?;
+        let raw = view.data();
+        let fused_q_dim = q_dim * 2;
+        anyhow::ensure!(
+            view.shape() == [fused_q_dim, hidden],
+            "q_proj fused shape mismatch: expected [{}, {}], got {:?}",
+            fused_q_dim, hidden, view.shape()
+        );
+        let row_bytes = hidden * 2; // bf16
+        let hd_bytes = head_dim * row_bytes;
+        let num_heads = config.num_attention_heads;
+
+        // Deinterleave: for each head, first head_dim rows are Q,
+        // next head_dim rows are gate.
+        let mut q_raw = Vec::with_capacity(q_dim * row_bytes);
+        let mut z_raw = Vec::with_capacity(q_dim * row_bytes);
+        for h in 0..num_heads {
+            let base = h * 2 * hd_bytes;
+            q_raw.extend_from_slice(&raw[base..base + hd_bytes]);
+            z_raw.extend_from_slice(&raw[base + hd_bytes..base + 2 * hd_bytes]);
+        }
+
+        let q_tensor = upload_raw_maybe_quantized(backend, &q_raw, &[q_dim, hidden], quantize);
+        let z_tensor = upload_raw_maybe_quantized(backend, &z_raw, &[q_dim, hidden], quantize);
+        (q_tensor, Some(z_tensor))
+    } else {
+        let qp = upload_maybe_quantized(
+            store, backend,
+            &format!("{prefix}.self_attn.q_proj.weight"),
+            &[q_dim, hidden], quantize,
+        )?;
+        (qp, None)
+    };
+    let kp = upload_maybe_quantized(
+        store, backend,
+        &format!("{prefix}.self_attn.k_proj.weight"),
+        &[kv_dim, hidden], quantize,
+    )?;
+    let vp = upload_maybe_quantized(
+        store, backend,
+        &format!("{prefix}.self_attn.v_proj.weight"),
+        &[kv_dim, hidden], quantize,
+    )?;
+    let op = upload_maybe_quantized(
+        store, backend,
+        &format!("{prefix}.self_attn.o_proj.weight"),
+        &[hidden, q_dim], quantize,
+    )?;
+    Ok((qp, kp, vp, op, None, None, None, None, None, None,
+        None, None, None, z_proj))
+}
+
+/// Load FFN weights for one layer.
+///
+/// Handles three cases:
+///   1. MoE: router gate + per-expert weights (+ optional shared expert).
+///      Three MoE formats: per-expert (Qwen3-MoE), fused (Qwen3.5), MXFP4 (GPT-OSS).
+///   2. Fused gate_up_proj (Phi): single tensor split into gate and up on load.
+///   3. Dense FFN: standard gate/up/down projections.
+fn load_ffn_weights<B: GpuCore>(
+    store: &TensorStore,
+    backend: &B,
+    prefix: &str,
+    config: &ModelConfig,
+    hints: &LoaderHints,
+    arch: ModelArch,
+    layer_idx: usize,
+    quantize: bool,
+) -> anyhow::Result<FfnLoaded<B>> {
+    let hidden = config.hidden_size;
+    let inter = config.intermediate_size;
+
+    if config.is_moe() {
+        load_moe_ffn_weights(store, backend, prefix, config, hints, arch, layer_idx, quantize)
+    } else if hints.has_fused_qkv {
+        // -----------------------------------------------------------------
+        // Phi FFN: fused gate_up_proj → split into separate gate and up.
+        //
+        // Phi stores gate and up projections as a single tensor:
+        //   gate_up_proj shape = [2 * inter_size, hidden_size]
+        //
+        // Layout (row-major): first inter_size rows are gate, next inter_size
+        // rows are up.  We slice the raw bytes and upload separately so the
+        // forward pass can call gate and up as individual matvecs.
+        //
+        // Why fused in the first place?  Microsoft's original implementation
+        // does `gate_up = gate_up_proj(x)` then splits the output, saving one
+        // kernel launch vs two separate matmuls.  We split on load instead so
+        // our forward pass stays architecture-generic.
+        // -----------------------------------------------------------------
+        let view = store.tensor(&format!("{prefix}.mlp.gate_up_proj.weight"))?;
+        let raw = view.data();
+        anyhow::ensure!(
+            view.shape() == [2 * inter, hidden],
+            "gate_up_proj shape mismatch: expected [{}, {}], got {:?}",
+            2 * inter, hidden, view.shape()
+        );
+        let row_bytes = hidden * 2; // bf16
+        let half = inter * row_bytes;
+        let gate_raw = &raw[..half];
+        let up_raw = &raw[half..2 * half];
+
+        let gate = upload_raw_maybe_quantized(backend, gate_raw, &[inter, hidden], quantize);
+        let up = upload_raw_maybe_quantized(backend, up_raw, &[inter, hidden], quantize);
+        let down = upload_maybe_quantized(
+            store, backend,
+            &format!("{prefix}.mlp.down_proj.weight"),
+            &[hidden, inter], quantize,
+        )?;
+        Ok(FfnLoaded {
+            gate_proj: gate, up_proj: up, down_proj: down,
+            router_gate: None, router_bias: None, experts: None,
+            shared_expert_gate_proj: None, shared_expert_up_proj: None,
+            shared_expert_down_proj: None, shared_expert_gate: None,
+        })
+    } else {
+        // Dense FFN: standard gate/up/down projections.
+        let gate = upload_maybe_quantized(
+            store, backend,
+            &format!("{prefix}.mlp.gate_proj.weight"),
+            &[inter, hidden], quantize,
+        )?;
+        let up = upload_maybe_quantized(
+            store, backend,
+            &format!("{prefix}.mlp.up_proj.weight"),
+            &[inter, hidden], quantize,
+        )?;
+        let down = upload_maybe_quantized(
+            store, backend,
+            &format!("{prefix}.mlp.down_proj.weight"),
+            &[hidden, inter], quantize,
+        )?;
+        Ok(FfnLoaded {
+            gate_proj: gate, up_proj: up, down_proj: down,
+            router_gate: None, router_bias: None, experts: None,
+            shared_expert_gate_proj: None, shared_expert_up_proj: None,
+            shared_expert_down_proj: None, shared_expert_gate: None,
+        })
+    }
+}
+
+/// Load MoE FFN weights: router + per-expert gate/up/down + optional shared expert.
+///
+/// Three expert weight formats exist:
+///   1. MXFP4 (GPT-OSS): packed fp4 blocks with E8M0 scales, de-interleaved gate/up.
+///   2. Fused (Qwen3.5): gate_up_proj [num_experts, 2*moe_inter, hidden], split on load.
+///   3. Per-expert (Qwen3-MoE, Mixtral): separate tensors per expert.
+fn load_moe_ffn_weights<B: GpuCore>(
+    store: &TensorStore,
+    backend: &B,
+    prefix: &str,
+    config: &ModelConfig,
+    hints: &LoaderHints,
+    arch: ModelArch,
+    layer_idx: usize,
+    quantize: bool,
+) -> anyhow::Result<FfnLoaded<B>> {
+    let hidden = config.hidden_size;
+    let moe_inter = config.moe_intermediate_size;
+    let num_experts = config.num_experts;
+
+    // Dummy tensors for the dense FFN fields (never accessed by MoE forward pass).
+    let dummy = backend.alloc_tensor(&[1], TensorDtype::BF16);
+    let dummy2 = backend.alloc_tensor(&[1], TensorDtype::BF16);
+    let dummy3 = backend.alloc_tensor(&[1], TensorDtype::BF16);
+
+    // Router gate: [num_experts, hidden_size].  Stays bf16 — routing
+    // accuracy matters more than speed here (it's a single small matmul).
+    //
+    // Router naming varies by architecture:
+    //   Mixtral:  block_sparse_moe.gate.weight
+    //   GPT-OSS: mlp.router.weight (+ mlp.router.bias)
+    //   Others:   mlp.gate.weight
+    let router_name = if hints.is_mixtral {
+        format!("{prefix}.block_sparse_moe.gate.weight")
+    } else if hints.is_gpt_oss {
+        format!("{prefix}.mlp.router.weight")
+    } else {
+        format!("{prefix}.mlp.gate.weight")
+    };
+    let router = upload_tensor(
+        store, backend, &router_name, &[num_experts, hidden],
+    )?;
+
+    // Router bias (GPT-OSS only).
+    let router_bias_tensor = if hints.has_router_bias {
+        Some(upload_tensor(
+            store, backend,
+            &format!("{prefix}.mlp.router.bias"),
+            &[num_experts],
+        )?)
+    } else {
+        None
+    };
+
+    // Detect MXFP4 format (GPT-OSS) by looking for packed blocks tensor.
+    let mxfp4_name = format!("{prefix}.mlp.experts.gate_up_proj_blocks");
+    let is_mxfp4 = store.tensor(&mxfp4_name).is_ok();
+
+    // Detect fused vs per-expert format.
+    let fused_name = format!("{prefix}.mlp.experts.gate_up_proj");
+    let is_fused = !is_mxfp4 && store.tensor(&fused_name).is_ok();
+
+    let expert_vec = if is_mxfp4 {
+        load_mxfp4_experts(store, backend, prefix, hidden, moe_inter, num_experts, quantize)?
+    } else if is_fused {
+        load_fused_experts(store, backend, prefix, hidden, moe_inter, num_experts, quantize)?
+    } else {
+        // Per-expert format: separate tensors per expert.
+        //
+        // Two naming conventions exist:
+        //   Qwen3-MoE:  mlp.experts.{j}.gate_proj / up_proj / down_proj
+        //   Mixtral:    block_sparse_moe.experts.{j}.w1 / w3 / w2
+        //               (w1=gate, w3=up, w2=down — Mixtral convention)
+        let mut experts = Vec::with_capacity(num_experts);
+        for j in 0..num_experts {
+            let (gate_name, up_name, down_name) = if hints.is_mixtral {
+                let ep = format!("{prefix}.block_sparse_moe.experts.{j}");
+                (
+                    format!("{ep}.w1.weight"),
+                    format!("{ep}.w3.weight"),
+                    format!("{ep}.w2.weight"),
+                )
+            } else {
+                let ep = format!("{prefix}.mlp.experts.{j}");
+                (
+                    format!("{ep}.gate_proj.weight"),
+                    format!("{ep}.up_proj.weight"),
+                    format!("{ep}.down_proj.weight"),
+                )
+            };
+            experts.push(ExpertWeights {
+                gate_proj: upload_maybe_quantized(
+                    store, backend, &gate_name,
+                    &[moe_inter, hidden], quantize,
+                )?,
+                up_proj: upload_maybe_quantized(
+                    store, backend, &up_name,
+                    &[moe_inter, hidden], quantize,
+                )?,
+                down_proj: upload_maybe_quantized(
+                    store, backend, &down_name,
+                    &[hidden, moe_inter], quantize,
+                )?,
+                gate_bias: None,
+                up_bias: None,
+                down_bias: None,
+            });
+        }
+        experts
+    };
+
+    if layer_idx == 0 {
+        eprintln!(
+            "  loading {} experts per layer (moe_inter={}){}",
+            num_experts, moe_inter,
+            if is_mxfp4 { " [MXFP4 format]" } else if is_fused { " [fused format]" } else { "" },
+        );
+    }
+
+    // Load shared expert weights if present.
+    let shared_inter = config.shared_expert_intermediate_size;
+    let (se_gate_proj, se_up_proj, se_down_proj, se_gate) = if config.has_shared_expert() {
+        let gp = upload_maybe_quantized(
+            store, backend,
+            &format!("{prefix}.mlp.shared_expert.gate_proj.weight"),
+            &[shared_inter, hidden], quantize,
+        )?;
+        let up = upload_maybe_quantized(
+            store, backend,
+            &format!("{prefix}.mlp.shared_expert.up_proj.weight"),
+            &[shared_inter, hidden], quantize,
+        )?;
+        let dp = upload_maybe_quantized(
+            store, backend,
+            &format!("{prefix}.mlp.shared_expert.down_proj.weight"),
+            &[hidden, shared_inter], quantize,
+        )?;
+        let sg = upload_tensor(
+            store, backend,
+            &format!("{prefix}.mlp.shared_expert_gate.weight"),
+            &[1, hidden],
+        )?;
+        if layer_idx == 0 {
+            eprintln!("  shared expert: inter={}", shared_inter);
+        }
+        (Some(gp), Some(up), Some(dp), Some(sg))
+    } else {
+        (None, None, None, None)
+    };
+
+    // Suppress unused variable warning — arch is used only for hints which
+    // are already computed.  Kept in signature for future per-arch extensions.
+    let _ = arch;
+
+    Ok(FfnLoaded {
+        gate_proj: dummy, up_proj: dummy2, down_proj: dummy3,
+        router_gate: Some(router),
+        router_bias: router_bias_tensor,
+        experts: Some(expert_vec),
+        shared_expert_gate_proj: se_gate_proj,
+        shared_expert_up_proj: se_up_proj,
+        shared_expert_down_proj: se_down_proj,
+        shared_expert_gate: se_gate,
+    })
+}
+
+/// Load MXFP4-format expert weights (GPT-OSS).
+///
+/// MXFP4 stores weights as packed fp4 blocks with per-block E8M0 scales
+/// and optional per-expert biases.  We dequant to bf16, then optionally Q4.
+///
+/// Tensors:
+///   gate_up_proj_blocks: [num_experts, 2*moe_inter, hidden/2]  (packed nibbles)
+///   gate_up_proj_scales: [num_experts, 2*moe_inter, num_blocks] (E8M0, 1 byte each)
+///   gate_up_proj_bias:   [num_experts, 2*moe_inter]  (bf16, optional)
+///   down_proj_blocks:    [num_experts, hidden, moe_inter/2]
+///   down_proj_scales:    [num_experts, hidden, num_blocks]
+///   down_proj_bias:      [num_experts, hidden]  (bf16, optional)
+fn load_mxfp4_experts<B: GpuCore>(
+    store: &TensorStore,
+    backend: &B,
+    prefix: &str,
+    hidden: usize,
+    moe_inter: usize,
+    num_experts: usize,
+    quantize: bool,
+) -> anyhow::Result<Vec<ExpertWeights<B>>> {
+    let block_size = 32usize; // MXFP4 standard block size
+
+    let gu_blocks_view = store.tensor(
+        &format!("{prefix}.mlp.experts.gate_up_proj_blocks"),
+    )?;
+    let gu_scales_view = store.tensor(
+        &format!("{prefix}.mlp.experts.gate_up_proj_scales"),
+    )?;
+    let gu_blocks_data = gu_blocks_view.data();
+    let gu_scales_data = gu_scales_view.data();
+
+    let down_blocks_view = store.tensor(
+        &format!("{prefix}.mlp.experts.down_proj_blocks"),
+    )?;
+    let down_scales_view = store.tensor(
+        &format!("{prefix}.mlp.experts.down_proj_scales"),
+    )?;
+    let down_blocks_data = down_blocks_view.data();
+    let down_scales_data = down_scales_view.data();
+
+    // Optional biases.
+    let gu_bias_name = format!("{prefix}.mlp.experts.gate_up_proj_bias");
+    let gu_bias_data = store.tensor(&gu_bias_name).ok().map(|v| v.data().to_vec());
+    let down_bias_name = format!("{prefix}.mlp.experts.down_proj_bias");
+    let down_bias_data = store.tensor(&down_bias_name).ok().map(|v| v.data().to_vec());
+
+    // Per-expert byte sizes for slicing fused tensors.
+    let gu_rows = 2 * moe_inter;
+    let gu_blocks_per_expert = gu_rows * (hidden / 2);
+    let gu_num_scale_blocks = (hidden + block_size - 1) / block_size;
+    let gu_scales_per_expert = gu_rows * gu_num_scale_blocks; // E8M0: 1 byte each
+
+    let down_rows = hidden;
+    let down_blocks_per_expert = down_rows * (moe_inter / 2);
+    let down_num_scale_blocks = (moe_inter + block_size - 1) / block_size;
+    let down_scales_per_expert = down_rows * down_num_scale_blocks; // E8M0: 1 byte each
+
+    let gu_bias_per_expert = gu_rows * 2; // bf16
+    let down_bias_per_expert = down_rows * 2; // bf16
+
+    let mut experts = Vec::with_capacity(num_experts);
+    for j in 0..num_experts {
+        // Dequant gate_up: on-disk [2*moe_inter, hidden] after unpacking MXFP4.
+        //
+        // MXFP4 stores weights transposed relative to HuggingFace convention:
+        //   On-disk blocks shape: [experts, 2*moe_inter, blocks, bytes] → dequant → [2*moe_inter, hidden]
+        //   HF model sees: [experts, hidden, 2*moe_inter] (via x @ W, not W @ x)
+        //
+        // Our matmul convention: y = W @ x with W = [out, in].
+        // So we need gate = [moe_inter, hidden] and up = [moe_inter, hidden].
+        //
+        // The on-disk [2*moe_inter, hidden] is exactly [out, in] for our convention.
+        // (HF transposes it to [in, out] for torch's x @ W.T convention.)
+        // Split first half = gate [moe_inter, hidden], second half = up [moe_inter, hidden].
+        let gu_b_off = j * gu_blocks_per_expert;
+        let gu_s_off = j * gu_scales_per_expert;
+        let gu_bf16 = dequantize_mxfp4(
+            &gu_blocks_data[gu_b_off..gu_b_off + gu_blocks_per_expert],
+            &gu_scales_data[gu_s_off..gu_s_off + gu_scales_per_expert],
+            gu_rows, hidden, block_size,
+        );
+
+        // De-interleave gate and up from fused gate_up_proj.
+        //
+        // GPT-OSS gate_up_proj is [2*moe_inter, hidden] with interleaved rows:
+        //   row 0 = gate[0], row 1 = up[0], row 2 = gate[1], row 3 = up[1], ...
+        // We need to extract even rows → gate [moe_inter, hidden]
+        //                  odd rows  → up   [moe_inter, hidden]
+        let row_bytes = hidden * 2; // bf16
+        let mut gate_raw = vec![0u8; moe_inter * row_bytes];
+        let mut up_raw = vec![0u8; moe_inter * row_bytes];
+        for r in 0..moe_inter {
+            let even_start = (2 * r) * row_bytes;
+            let odd_start = (2 * r + 1) * row_bytes;
+            gate_raw[r * row_bytes..(r + 1) * row_bytes]
+                .copy_from_slice(&gu_bf16[even_start..even_start + row_bytes]);
+            up_raw[r * row_bytes..(r + 1) * row_bytes]
+                .copy_from_slice(&gu_bf16[odd_start..odd_start + row_bytes]);
+        }
+        let gate_t = upload_raw_maybe_quantized(backend, &gate_raw, &[moe_inter, hidden], quantize);
+        let up_t = upload_raw_maybe_quantized(backend, &up_raw, &[moe_inter, hidden], quantize);
+
+        // Dequant down: on-disk [hidden, moe_inter] → our convention [hidden, moe_inter] = [out, in].
+        let d_b_off = j * down_blocks_per_expert;
+        let d_s_off = j * down_scales_per_expert;
+        let down_bf16 = dequantize_mxfp4(
+            &down_blocks_data[d_b_off..d_b_off + down_blocks_per_expert],
+            &down_scales_data[d_s_off..d_s_off + down_scales_per_expert],
+            down_rows, moe_inter, block_size,
+        );
+        let down_t = upload_raw_maybe_quantized(backend, &down_bf16, &[hidden, moe_inter], quantize);
+
+        // Expert biases — de-interleave fused gate_up_bias into separate gate and up.
+        //
+        // The bias is [2*moe_inter] with interleaved elements:
+        //   [gate[0], up[0], gate[1], up[1], ...]
+        // Extract even indices → gate bias, odd indices → up bias.
+        let (gate_bias, up_bias) = if let Some(ref bias) = gu_bias_data {
+            let off = j * gu_bias_per_expert;
+            let bias_slice = &bias[off..off + gu_bias_per_expert];
+            let bias_bf16: &[u16] = bytemuck::cast_slice(bias_slice);
+            let gate_vals: Vec<u16> = (0..moe_inter).map(|i| bias_bf16[2 * i]).collect();
+            let up_vals: Vec<u16> = (0..moe_inter).map(|i| bias_bf16[2 * i + 1]).collect();
+            let gate_bytes: &[u8] = bytemuck::cast_slice(&gate_vals);
+            let up_bytes: &[u8] = bytemuck::cast_slice(&up_vals);
+            (
+                Some(backend.upload_tensor(gate_bytes, &[moe_inter], TensorDtype::BF16)),
+                Some(backend.upload_tensor(up_bytes, &[moe_inter], TensorDtype::BF16)),
+            )
+        } else {
+            (None, None)
+        };
+        let down_bias = if let Some(ref bias) = down_bias_data {
+            let off = j * down_bias_per_expert;
+            let bias_slice = &bias[off..off + down_bias_per_expert];
+            Some(backend.upload_tensor(bias_slice, &[down_rows], TensorDtype::BF16))
+        } else {
+            None
+        };
+
+        experts.push(ExpertWeights {
+            gate_proj: gate_t,
+            up_proj: up_t,
+            down_proj: down_t,
+            gate_bias,
+            up_bias,
+            down_bias,
+        });
+    }
+    Ok(experts)
+}
+
+/// Load fused-format expert weights (Qwen 3.5).
+///
+/// Fused format: gate_up_proj [num_experts, 2*moe_inter, hidden]
+/// and down_proj [num_experts, hidden, moe_inter].
+/// Split into per-expert tensors during loading.
+fn load_fused_experts<B: GpuCore>(
+    store: &TensorStore,
+    backend: &B,
+    prefix: &str,
+    hidden: usize,
+    moe_inter: usize,
+    num_experts: usize,
+    quantize: bool,
+) -> anyhow::Result<Vec<ExpertWeights<B>>> {
+    let fused_name = format!("{prefix}.mlp.experts.gate_up_proj");
+    let gate_up_view = store.tensor(&fused_name)?;
+    anyhow::ensure!(
+        gate_up_view.shape() == [num_experts, moe_inter * 2, hidden],
+        "fused gate_up_proj shape mismatch: expected [{}, {}, {}], got {:?}",
+        num_experts, moe_inter * 2, hidden, gate_up_view.shape()
+    );
+    let down_view = store.tensor(
+        &format!("{prefix}.mlp.experts.down_proj"),
+    )?;
+    anyhow::ensure!(
+        down_view.shape() == [num_experts, hidden, moe_inter],
+        "fused down_proj shape mismatch: expected [{}, {}, {}], got {:?}",
+        num_experts, hidden, moe_inter, down_view.shape()
+    );
+
+    let gate_up_data = gate_up_view.data();
+    let down_data = down_view.data();
+    let gate_up_expert_bytes = moe_inter * 2 * hidden * 2; // bf16
+    let gate_bytes = moe_inter * hidden * 2;
+    let down_expert_bytes = hidden * moe_inter * 2;
+
+    let mut experts = Vec::with_capacity(num_experts);
+    for j in 0..num_experts {
+        let gu_offset = j * gate_up_expert_bytes;
+        let gate_raw = &gate_up_data[gu_offset..gu_offset + gate_bytes];
+        let up_raw = &gate_up_data[gu_offset + gate_bytes..gu_offset + gate_up_expert_bytes];
+        let d_offset = j * down_expert_bytes;
+        let down_raw = &down_data[d_offset..d_offset + down_expert_bytes];
+
+        let gate_t = upload_raw_maybe_quantized(backend, gate_raw, &[moe_inter, hidden], quantize);
+        let up_t = upload_raw_maybe_quantized(backend, up_raw, &[moe_inter, hidden], quantize);
+        let down_t = upload_raw_maybe_quantized(backend, down_raw, &[hidden, moe_inter], quantize);
+
+        experts.push(ExpertWeights {
+            gate_proj: gate_t,
+            up_proj: up_t,
+            down_proj: down_t,
+            gate_bias: None,
+            up_bias: None,
+            down_bias: None,
+        });
+    }
+    Ok(experts)
 }
 
 // ---------------------------------------------------------------------------
@@ -1565,5 +1877,140 @@ mod tests {
                 rows, cols, block_size,
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // LoaderHints tests — verify each architecture gets the correct flags.
+    //
+    // These are pure-logic tests (no GPU, no files).  They catch regressions
+    // when adding a new architecture: if you add a ModelArch variant without
+    // setting its LoaderHints flags, the exhaustive match in config.rs won't
+    // compile, but these tests verify the flag *values* are correct.
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal ModelConfig for testing LoaderHints.
+    /// Uses serde_json to construct since ModelConfig has private fields.
+    fn minimal_config(model_type: &str) -> ModelConfig {
+        serde_json::from_value(serde_json::json!({
+            "model_type": model_type,
+            "hidden_size": 256,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 64,
+            "intermediate_size": 512,
+            "vocab_size": 1000,
+            "max_position_embeddings": 2048,
+            "rope_theta": 10000.0,
+            "rms_norm_eps": 1e-5,
+            "tie_word_embeddings": true,
+        })).unwrap()
+    }
+
+    #[test]
+    fn test_loader_hints_llama() {
+        let config = minimal_config("llama");
+        let hints = LoaderHints::new(ModelArch::Llama, &config);
+        assert!(!hints.has_qkv_bias);
+        assert!(!hints.has_qk_norm);
+        assert!(!hints.has_fused_qkv);
+        assert!(!hints.has_o_proj_bias);
+        assert!(!hints.residual_norm);
+        assert!(!hints.is_gemma3);
+        assert!(!hints.is_gpt_oss);
+        assert!(!hints.is_mixtral);
+        assert!(!hints.is_hybrid);
+    }
+
+    #[test]
+    fn test_loader_hints_qwen2() {
+        let config = minimal_config("qwen2");
+        let hints = LoaderHints::new(ModelArch::Qwen2, &config);
+        assert!(hints.has_qkv_bias, "Qwen2 has QKV bias");
+        assert!(!hints.has_qk_norm);
+        assert!(!hints.has_fused_qkv);
+        assert!(!hints.residual_norm);
+    }
+
+    #[test]
+    fn test_loader_hints_phi() {
+        let config = minimal_config("phi3");
+        let hints = LoaderHints::new(ModelArch::Phi, &config);
+        assert!(hints.has_fused_qkv, "Phi has fused QKV");
+        assert!(!hints.has_qkv_bias);
+        assert!(!hints.has_qk_norm);
+    }
+
+    #[test]
+    fn test_loader_hints_gemma3() {
+        let config = minimal_config("gemma3");
+        let hints = LoaderHints::new(ModelArch::Gemma3, &config);
+        assert!(hints.is_gemma3);
+        assert!(hints.residual_norm, "Gemma3 uses residual norms");
+        assert!(hints.has_qk_norm, "Gemma3 has QK-norm");
+        assert!(!hints.has_qkv_bias);
+    }
+
+    #[test]
+    fn test_loader_hints_gpt_oss() {
+        let config = minimal_config("gpt_oss");
+        let hints = LoaderHints::new(ModelArch::GptOss, &config);
+        assert!(hints.is_gpt_oss);
+        assert!(hints.has_qkv_bias, "GPT-OSS has QKV bias");
+        assert!(hints.has_o_proj_bias, "GPT-OSS has O-proj bias");
+        assert!(hints.has_router_bias, "GPT-OSS has router bias");
+        assert!(!hints.residual_norm);
+    }
+
+    #[test]
+    fn test_loader_hints_mixtral() {
+        let config = minimal_config("mixtral");
+        let hints = LoaderHints::new(ModelArch::Mixtral, &config);
+        assert!(hints.is_mixtral);
+        assert!(!hints.has_qkv_bias);
+        assert!(!hints.has_fused_qkv);
+    }
+
+    #[test]
+    fn test_loader_hints_qwen3_moe() {
+        let config = minimal_config("qwen3_moe");
+        let hints = LoaderHints::new(ModelArch::Qwen3Moe, &config);
+        assert!(hints.has_qk_norm, "Qwen3-MoE has QK-norm");
+        assert!(!hints.has_qkv_bias);
+        assert!(!hints.residual_norm);
+    }
+
+    #[test]
+    fn test_loader_hints_qwen3_5_hybrid() {
+        let mut config = minimal_config("qwen3_5");
+        // Qwen 3.5 hybrid has layer_types with linear_attention entries.
+        config.layer_types = vec![
+            "full_attention".to_string(),
+            "linear_attention".to_string(),
+        ];
+        let hints = LoaderHints::new(ModelArch::Qwen3_5, &config);
+        assert!(hints.is_hybrid, "Qwen3.5 with layer_types is hybrid");
+        assert!(hints.residual_norm, "Qwen3.5 uses residual norms");
+        assert!(hints.has_qk_norm, "Qwen3.5 has QK-norm");
+        assert!(!hints.has_fused_qkv);
+    }
+
+    #[test]
+    fn test_loader_hints_qwen3_5_non_hybrid() {
+        // Qwen 3.5 without layer_types (pure MoE, no DeltaNet).
+        let config = minimal_config("qwen3_5");
+        let hints = LoaderHints::new(ModelArch::Qwen3_5, &config);
+        assert!(!hints.is_hybrid, "Qwen3.5 without layer_types is not hybrid");
+        assert!(hints.residual_norm);
+    }
+
+    #[test]
+    fn test_loader_hints_mistral() {
+        let config = minimal_config("mistral");
+        let hints = LoaderHints::new(ModelArch::Mistral, &config);
+        assert!(!hints.has_qkv_bias);
+        assert!(!hints.has_fused_qkv);
+        assert!(!hints.is_mixtral, "Mistral != Mixtral");
+        assert!(!hints.is_gpt_oss);
     }
 }
