@@ -57,6 +57,25 @@ Q4 is ~17% faster than bf16 for decode on the RTX PRO 6000 — a middle ground b
 </details>
 
 <details>
+<summary><b>NVIDIA A100-SXM4-80GB</b> — 2.0 TB/s bandwidth</summary>
+
+Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Measured via `rllm run`, single run, 128 max tokens.
+
+| Model | Params | bf16 | Q4 |
+|---|---|---|---|
+| Llama 3.2 1B Instruct | 1.2B | 231.2 tok/s | 199.5 tok/s |
+| Llama 3.2 3B Instruct | 3.2B | 115.2 tok/s | 98.6 tok/s |
+| Qwen 2.5 3B Instruct | 3.1B | 103.0 tok/s | 83.1 tok/s |
+| Gemma 3 4B Instruct | 4.3B | 83.2 tok/s | 71.5 tok/s |
+| Qwen 2.5 7B Instruct | 7.6B | 82.9 tok/s | 69.1 tok/s |
+| Mistral 7B Instruct | 7.2B | 80.2 tok/s | 64.2 tok/s |
+| Llama 3.1 8B Instruct | 8.0B | 74.0 tok/s | 61.2 tok/s |
+| Phi-4 | 14.7B | 50.6 tok/s | 42.0 tok/s |
+| Gemma 3 27B Instruct | 27.4B | 29.0 tok/s | 23.0 tok/s |
+
+</details>
+
+<details>
 <summary><b>NVIDIA H100 NVL 94 GB HBM3</b> — 3.35 TB/s bandwidth</summary>
 
 Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Measured via `rllm run`, single run, 128 max tokens.

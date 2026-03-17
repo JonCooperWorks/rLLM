@@ -466,53 +466,53 @@ impl ShardingPlan {
 
                 // in_proj_qkv: [qkv_dim, hidden] → Column (split by heads)
                 add(
-                    format!("{layer}.deltanet.in_proj_qkv.weight"),
+                    format!("{layer}.linear_attn.in_proj_qkv.weight"),
                     SplitDimension::Column,
                     [lqkv_dim, hidden],
                 );
                 // in_proj_a, in_proj_b: per-head gates → Column
                 add(
-                    format!("{layer}.deltanet.in_proj_a.weight"),
+                    format!("{layer}.linear_attn.in_proj_a.weight"),
                     SplitDimension::Column,
                     [config.linear_num_key_heads, hidden],
                 );
                 add(
-                    format!("{layer}.deltanet.in_proj_b.weight"),
+                    format!("{layer}.linear_attn.in_proj_b.weight"),
                     SplitDimension::Column,
                     [config.linear_num_key_heads, hidden],
                 );
                 // in_proj_z: output gate, split by v_dim
                 add(
-                    format!("{layer}.deltanet.in_proj_z.weight"),
+                    format!("{layer}.linear_attn.in_proj_z.weight"),
                     SplitDimension::Column,
                     [lv_dim, hidden],
                 );
                 // linear_out_proj: [hidden, v_dim] → Row (requires AllReduce)
                 add(
-                    format!("{layer}.deltanet.linear_out_proj.weight"),
+                    format!("{layer}.linear_attn.linear_out_proj.weight"),
                     SplitDimension::Row,
                     [hidden, lv_dim],
                 );
                 // conv1d_weight: depthwise, channels = heads → Column
                 add(
-                    format!("{layer}.deltanet.conv1d.weight"),
+                    format!("{layer}.linear_attn.conv1d.weight"),
                     SplitDimension::Column,
                     [lk_dim, config.linear_conv_kernel_dim],
                 );
                 // a_log, dt_bias: per-head parameters → Column
                 add(
-                    format!("{layer}.deltanet.a_log"),
+                    format!("{layer}.linear_attn.a_log"),
                     SplitDimension::Column,
                     [config.linear_num_key_heads, 1],
                 );
                 add(
-                    format!("{layer}.deltanet.dt_bias"),
+                    format!("{layer}.linear_attn.dt_bias"),
                     SplitDimension::Column,
                     [config.linear_num_key_heads, 1],
                 );
                 // linear_norm: per-head-dim, shared → Replicated
                 add(
-                    format!("{layer}.deltanet.linear_norm.weight"),
+                    format!("{layer}.linear_attn.linear_norm.weight"),
                     SplitDimension::Replicated,
                     [config.linear_value_head_dim, 1],
                 );
@@ -896,5 +896,83 @@ mod tests {
         let plan = ShardingPlan::derive(&config, device, true).unwrap();
         assert_eq!(plan.embed_split, SplitDimension::VocabParallel);
         assert_eq!(plan.lm_head_split, SplitDimension::VocabParallel);
+    }
+
+    /// Helper: create a Qwen 3.5-style hybrid DeltaNet config for testing.
+    fn test_qwen35_config() -> ModelConfig {
+        let mut config: ModelConfig = serde_json::from_value(serde_json::json!({
+            "model_type": "qwen3_5",
+            "hidden_size": 2048,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 128,
+            "intermediate_size": 8192,
+            "vocab_size": 152064,
+            "linear_num_key_heads": 4,
+            "linear_num_value_heads": 4,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+        }))
+        .unwrap();
+        config.weight_prefix = "model.".to_string();
+        config.layer_types = vec![
+            "linear_attention".into(),
+            "full_attention".into(),
+        ];
+        config
+    }
+
+    #[test]
+    fn test_tp2_qwen35_deltanet_plan() {
+        let config = test_qwen35_config();
+        assert!(config.is_hybrid_deltanet());
+
+        let device = DeviceConfig {
+            world_size: 2,
+            rank: 0,
+            strategy: ParallelStrategy::TensorParallel,
+        };
+        let plan = ShardingPlan::derive(&config, device, false).unwrap();
+
+        // DeltaNet weight names must use `linear_attn` prefix (matching safetensors).
+        let qkv = plan.get("model.layers.0.linear_attn.in_proj_qkv.weight").unwrap();
+        assert_eq!(qkv.split, SplitDimension::Column);
+        // Q(4*128) + K(4*128) + V(4*128) = 1536 → shard = 768
+        assert_eq!(qkv.original_shape, [1536, 2048]);
+        assert_eq!(qkv.shard_shape, [768, 2048]);
+
+        // in_proj_a: [num_key_heads=4, hidden=2048] → Column → shard [2, 2048]
+        let a = plan.get("model.layers.0.linear_attn.in_proj_a.weight").unwrap();
+        assert_eq!(a.split, SplitDimension::Column);
+        assert_eq!(a.original_shape, [4, 2048]);
+        assert_eq!(a.shard_shape, [2, 2048]);
+
+        // in_proj_b: same as in_proj_a
+        let b = plan.get("model.layers.0.linear_attn.in_proj_b.weight").unwrap();
+        assert_eq!(b.split, SplitDimension::Column);
+        assert_eq!(b.shard_shape, [2, 2048]);
+
+        // in_proj_z: [v_dim=512, hidden=2048] → Column → shard [256, 2048]
+        let z = plan.get("model.layers.0.linear_attn.in_proj_z.weight").unwrap();
+        assert_eq!(z.split, SplitDimension::Column);
+        assert_eq!(z.original_shape, [512, 2048]);
+        assert_eq!(z.shard_shape, [256, 2048]);
+
+        // linear_out_proj: [hidden=2048, v_dim=512] → Row → shard [2048, 256]
+        let out = plan.get("model.layers.0.linear_attn.linear_out_proj.weight").unwrap();
+        assert_eq!(out.split, SplitDimension::Row);
+        assert_eq!(out.original_shape, [2048, 512]);
+        assert_eq!(out.shard_shape, [2048, 256]);
+
+        // Verify `deltanet` prefix does NOT appear in plan weight names.
+        for ws in &plan.weights {
+            assert!(!ws.name.contains(".deltanet."),
+                "plan key '{}' uses wrong prefix — should be 'linear_attn'", ws.name);
+        }
+
+        // Both layers should have standard attention entries.
+        assert!(plan.get("model.layers.1.self_attn.q_proj.weight").is_some());
     }
 }

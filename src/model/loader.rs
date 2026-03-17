@@ -819,7 +819,7 @@ fn load_attention_weights<B: GpuCore>(
          in_proj_z, conv1d_weight, linear_out_proj, a_log, dt_bias, linear_norm,
          attn_z_proj) =
         if is_deltanet_layer {
-            load_deltanet_attention(store, backend, prefix, config, layer_idx, quantize)?
+            load_deltanet_attention(store, backend, prefix, config, layer_idx, quantize, sharding)?
         } else if hints.has_fused_qkv {
             load_fused_qkv_attention(store, backend, prefix, hidden, q_dim, kv_dim, quantize)?
         } else {
@@ -874,6 +874,7 @@ fn load_deltanet_attention<B: GpuCore>(
     config: &ModelConfig,
     layer_idx: usize,
     quantize: bool,
+    sharding: Option<&crate::gpu::parallel::ShardingPlan>,
 ) -> anyhow::Result<(
     B::Tensor, B::Tensor, B::Tensor, B::Tensor,         // q, k, v, o (dummies)
     Option<B::Tensor>, Option<B::Tensor>,                 // in_proj_qkv, in_proj_a
@@ -894,25 +895,25 @@ fn load_deltanet_attention<B: GpuCore>(
     let conv_dim = fused_dim; // Conv1D applied to concatenated QKV
     let kernel_size = config.linear_conv_kernel_dim;
 
-    let qkv = upload_maybe_quantized(
+    let qkv = upload_sharded(
         store, backend,
         &format!("{prefix}.linear_attn.in_proj_qkv.weight"),
-        &[fused_dim, hidden], quantize,
+        &[fused_dim, hidden], quantize, sharding,
     )?;
-    let a = upload_maybe_quantized(
+    let a = upload_sharded(
         store, backend,
         &format!("{prefix}.linear_attn.in_proj_a.weight"),
-        &[config.linear_num_value_heads, hidden], quantize,
+        &[config.linear_num_value_heads, hidden], quantize, sharding,
     )?;
-    let b = upload_maybe_quantized(
+    let b = upload_sharded(
         store, backend,
         &format!("{prefix}.linear_attn.in_proj_b.weight"),
-        &[config.linear_num_value_heads, hidden], quantize,
+        &[config.linear_num_value_heads, hidden], quantize, sharding,
     )?;
-    let z = upload_maybe_quantized(
+    let z = upload_sharded(
         store, backend,
         &format!("{prefix}.linear_attn.in_proj_z.weight"),
-        &[v_dim, hidden], quantize,
+        &[v_dim, hidden], quantize, sharding,
     )?;
     // Conv1D: depthwise, shape [channels, 1, kernel_size] in safetensors.
     let conv = upload_tensor(
@@ -920,10 +921,10 @@ fn load_deltanet_attention<B: GpuCore>(
         &format!("{prefix}.linear_attn.conv1d.weight"),
         &[conv_dim, 1, kernel_size],
     )?;
-    let out = upload_maybe_quantized(
+    let out = upload_sharded(
         store, backend,
         &format!("{prefix}.linear_attn.out_proj.weight"),
-        &[hidden, v_dim], quantize,
+        &[hidden, v_dim], quantize, sharding,
     )?;
 
     // DeltaNet-specific non-projection weights:
