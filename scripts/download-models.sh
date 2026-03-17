@@ -130,9 +130,6 @@ if [[ "$TIER" == "big" ]]; then
     # Qwen 72B — largest dense Qwen 2.5
     "Qwen/Qwen2.5-72B-Instruct"
 
-    # Qwen 3.5 73B MoE
-    "Qwen/Qwen3.5-73B"
-
     # Mixtral 8x22B — 176B total MoE
     "mistralai/Mixtral-8x22B-Instruct-v0.1"
 

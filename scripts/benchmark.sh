@@ -10,6 +10,7 @@
 #   --small    only benchmark 1B–8B models
 #   --medium   add medium-tier models (default)
 #   --big      add 70B+ models
+#   --quantize only run Q4 for each model (compact Q4-only table)
 #   --q4-only  skip bf16 runs (useful for models that don't fit in VRAM)
 #   --bf16-only skip Q4 runs
 #   --runs N   number of runs per config (default: 1)
@@ -26,6 +27,7 @@ DEST="models"
 RUNS=1
 SKIP_BF16=false
 SKIP_Q4=false
+QUANTIZE_ONLY=false
 MAX_TOKENS="${RLLM_BENCH_TOKENS:-128}"
 PROMPT="${RLLM_BENCH_PROMPT:-The meaning of life is}"
 
@@ -34,6 +36,7 @@ for arg in "$@"; do
     --small)     TIER="small" ;;
     --medium)    TIER="medium" ;;
     --big)       TIER="big" ;;
+    --quantize)  SKIP_BF16=true; QUANTIZE_ONLY=true ;;
     --q4-only)   SKIP_BF16=true ;;
     --bf16-only) SKIP_Q4=true ;;
     --runs)      shift_next=runs ;;
@@ -256,8 +259,26 @@ done
 echo ""
 echo "## Results — $GPU_NAME"
 echo ""
-echo "| Model | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |"
-echo "|---|---|---|---|---|"
+
+# Helper: format TTFT value for table display.
+fmt_ttft() {
+  local val="$1"
+  if [[ "$val" == "—" ]]; then
+    echo "—"
+  elif (( $(echo "$val >= 1000" | bc -l) )); then
+    echo "$(echo "scale=0; $val / 1000" | bc),$(printf '%03.0f' "$(echo "$val % 1000" | bc)") ms"
+  else
+    echo "${val} ms"
+  fi
+}
+
+if [[ "$QUANTIZE_ONLY" == "true" ]]; then
+  echo "| Model | Q4 tok/s | TTFT |"
+  echo "|---|---|---|"
+else
+  echo "| Model | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |"
+  echo "|---|---|---|---|---|"
+fi
 
 for i in "${!MODELS[@]}"; do
   model="${MODELS[$i]}"
@@ -272,22 +293,14 @@ for i in "${!MODELS[@]}"; do
   [[ "$q4" != "—" ]] && q4="${q4} tok/s"
 
   # Format TTFT
-  if [[ "$bf16_ttft" != "—" ]]; then
-    if (( $(echo "$bf16_ttft >= 1000" | bc -l) )); then
-      bf16_ttft="$(echo "scale=0; $bf16_ttft / 1000" | bc),$(printf '%03.0f' "$(echo "$bf16_ttft % 1000" | bc)") ms"
-    else
-      bf16_ttft="${bf16_ttft} ms"
-    fi
-  fi
-  if [[ "$q4_ttft" != "—" ]]; then
-    if (( $(echo "$q4_ttft >= 1000" | bc -l) )); then
-      q4_ttft="$(echo "scale=0; $q4_ttft / 1000" | bc),$(printf '%03.0f' "$(echo "$q4_ttft % 1000" | bc)") ms"
-    else
-      q4_ttft="${q4_ttft} ms"
-    fi
-  fi
+  bf16_ttft=$(fmt_ttft "$bf16_ttft")
+  q4_ttft=$(fmt_ttft "$q4_ttft")
 
-  echo "| $model | $bf16 | $q4 | $bf16_ttft | $q4_ttft |"
+  if [[ "$QUANTIZE_ONLY" == "true" ]]; then
+    echo "| $model | $q4 | $q4_ttft |"
+  else
+    echo "| $model | $bf16 | $q4 | $bf16_ttft | $q4_ttft |"
+  fi
 done
 
 echo ""

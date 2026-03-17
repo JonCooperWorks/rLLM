@@ -83,6 +83,14 @@ extern "C" __global__ void matvec_bf16(
 //   bytes  0-3:  f32 scale
 //   bytes  4-19: 16 packed nibble bytes (2 weights per byte)
 //   Dequant: weight = (nibble - 8) * scale
+//
+// Coalesced access pattern: all 32 lanes cooperate on the SAME block.
+// Lane l handles weight l: reads nibble byte l/2, extracts low (l even) or
+// high (l odd) nibble, and reads x[block*32 + l].  This gives:
+//   1. Coalesced x reads — adjacent lanes read adjacent bf16 values.
+//   2. Local weight reads — all lanes read from the same 20-byte block.
+//   3. Broadcast scale — loaded once by lane 0, distributed via __shfl_sync.
+// 4x unrolled over blocks for ILP, matching the bf16 kernel's throughput.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void matvec_q4(
     const MatvecParams params,
@@ -102,28 +110,58 @@ extern "C" __global__ void matvec_q4(
     const unsigned int bytes_per_block = 20;
     const unsigned char* row_data = W_q4 + row * blocks_per_row * bytes_per_block;
 
+    // Which nibble byte this lane reads within any block (0..15), and whether
+    // it extracts the high nibble (odd lane) or low nibble (even lane).
+    const unsigned int byte_in_block = lane / 2;
+    const unsigned int nibble_hi = lane & 1;
+
     float acc = 0.0f;
-    for (unsigned int block_idx = lane; block_idx < blocks_per_row; block_idx += 32) {
-        const unsigned char* block_ptr = row_data + block_idx * bytes_per_block;
-        float scale = *((const float*)block_ptr);
-        const unsigned char* data = block_ptr + 4;
-        unsigned int x_base = block_idx * 32;
 
-        for (unsigned int i = 0; i < 16; i += 4) {
-            unsigned char b0 = data[i];
-            unsigned char b1 = data[i + 1];
-            unsigned char b2 = data[i + 2];
-            unsigned char b3 = data[i + 3];
-
-            acc += (float)((int)(b0 & 0xF) - 8) * scale * __bfloat162float(x[x_base + i * 2]);
-            acc += (float)((int)(b0 >> 4)  - 8) * scale * __bfloat162float(x[x_base + i * 2 + 1]);
-            acc += (float)((int)(b1 & 0xF) - 8) * scale * __bfloat162float(x[x_base + i * 2 + 2]);
-            acc += (float)((int)(b1 >> 4)  - 8) * scale * __bfloat162float(x[x_base + i * 2 + 3]);
-            acc += (float)((int)(b2 & 0xF) - 8) * scale * __bfloat162float(x[x_base + i * 2 + 4]);
-            acc += (float)((int)(b2 >> 4)  - 8) * scale * __bfloat162float(x[x_base + i * 2 + 5]);
-            acc += (float)((int)(b3 & 0xF) - 8) * scale * __bfloat162float(x[x_base + i * 2 + 6]);
-            acc += (float)((int)(b3 >> 4)  - 8) * scale * __bfloat162float(x[x_base + i * 2 + 7]);
+    // Main loop: process 4 blocks (128 weights) per iteration.
+    unsigned int base = 0;
+    for (; base + 3 < blocks_per_row; base += 4) {
+        // Lanes 0-3 cooperatively load 4 scales, then broadcast to all lanes.
+        float my_scale = 0.0f;
+        if (lane < 4) {
+            my_scale = *((const float*)(row_data + (base + lane) * bytes_per_block));
         }
+
+        {
+            float scale = __shfl_sync(0xffffffff, my_scale, 0);
+            unsigned char packed = row_data[(base + 0) * bytes_per_block + 4 + byte_in_block];
+            int nib = nibble_hi ? (packed >> 4) : (packed & 0xF);
+            acc += (float)(nib - 8) * scale * __bfloat162float(x[(base + 0) * 32 + lane]);
+        }
+        {
+            float scale = __shfl_sync(0xffffffff, my_scale, 1);
+            unsigned char packed = row_data[(base + 1) * bytes_per_block + 4 + byte_in_block];
+            int nib = nibble_hi ? (packed >> 4) : (packed & 0xF);
+            acc += (float)(nib - 8) * scale * __bfloat162float(x[(base + 1) * 32 + lane]);
+        }
+        {
+            float scale = __shfl_sync(0xffffffff, my_scale, 2);
+            unsigned char packed = row_data[(base + 2) * bytes_per_block + 4 + byte_in_block];
+            int nib = nibble_hi ? (packed >> 4) : (packed & 0xF);
+            acc += (float)(nib - 8) * scale * __bfloat162float(x[(base + 2) * 32 + lane]);
+        }
+        {
+            float scale = __shfl_sync(0xffffffff, my_scale, 3);
+            unsigned char packed = row_data[(base + 3) * bytes_per_block + 4 + byte_in_block];
+            int nib = nibble_hi ? (packed >> 4) : (packed & 0xF);
+            acc += (float)(nib - 8) * scale * __bfloat162float(x[(base + 3) * 32 + lane]);
+        }
+    }
+
+    // Tail: remaining blocks when blocks_per_row is not a multiple of 4.
+    for (; base < blocks_per_row; base++) {
+        float scale_val = 0.0f;
+        if (lane == 0) {
+            scale_val = *((const float*)(row_data + base * bytes_per_block));
+        }
+        float scale = __shfl_sync(0xffffffff, scale_val, 0);
+        unsigned char packed = row_data[base * bytes_per_block + 4 + byte_in_block];
+        int nib = nibble_hi ? (packed >> 4) : (packed & 0xF);
+        acc += (float)(nib - 8) * scale * __bfloat162float(x[base * 32 + lane]);
     }
 
     acc = warp_sum(acc);
@@ -183,6 +221,7 @@ extern "C" __global__ void gemm_bf16(
 // Same as gemm_bf16 but with inline Q4 dequantisation.
 // ===========================================================================
 
+// Same coalesced access pattern as matvec_q4 — see comments there.
 extern "C" __global__ void gemm_q4(
     const GemmParams params,
     const unsigned char* __restrict__ W_q4,
@@ -205,28 +244,53 @@ extern "C" __global__ void gemm_q4(
     const unsigned char* row_data = W_q4 + row * blocks_per_row * bytes_per_block;
     const __nv_bfloat16* x_vec = X + batch * K;
 
+    const unsigned int byte_in_block = lane / 2;
+    const unsigned int nibble_hi = lane & 1;
+
     float acc = 0.0f;
-    for (unsigned int block_idx = lane; block_idx < blocks_per_row; block_idx += 32) {
-        const unsigned char* block_ptr = row_data + block_idx * bytes_per_block;
-        float scale = *((const float*)block_ptr);
-        const unsigned char* data = block_ptr + 4;
-        unsigned int x_base = block_idx * 32;
 
-        for (unsigned int i = 0; i < 16; i += 4) {
-            unsigned char b0 = data[i];
-            unsigned char b1 = data[i + 1];
-            unsigned char b2 = data[i + 2];
-            unsigned char b3 = data[i + 3];
-
-            acc += (float)((int)(b0 & 0xF) - 8) * scale * __bfloat162float(x_vec[x_base + i * 2]);
-            acc += (float)((int)(b0 >> 4)  - 8) * scale * __bfloat162float(x_vec[x_base + i * 2 + 1]);
-            acc += (float)((int)(b1 & 0xF) - 8) * scale * __bfloat162float(x_vec[x_base + i * 2 + 2]);
-            acc += (float)((int)(b1 >> 4)  - 8) * scale * __bfloat162float(x_vec[x_base + i * 2 + 3]);
-            acc += (float)((int)(b2 & 0xF) - 8) * scale * __bfloat162float(x_vec[x_base + i * 2 + 4]);
-            acc += (float)((int)(b2 >> 4)  - 8) * scale * __bfloat162float(x_vec[x_base + i * 2 + 5]);
-            acc += (float)((int)(b3 & 0xF) - 8) * scale * __bfloat162float(x_vec[x_base + i * 2 + 6]);
-            acc += (float)((int)(b3 >> 4)  - 8) * scale * __bfloat162float(x_vec[x_base + i * 2 + 7]);
+    unsigned int base = 0;
+    for (; base + 3 < blocks_per_row; base += 4) {
+        float my_scale = 0.0f;
+        if (lane < 4) {
+            my_scale = *((const float*)(row_data + (base + lane) * bytes_per_block));
         }
+
+        {
+            float scale = __shfl_sync(0xffffffff, my_scale, 0);
+            unsigned char packed = row_data[(base + 0) * bytes_per_block + 4 + byte_in_block];
+            int nib = nibble_hi ? (packed >> 4) : (packed & 0xF);
+            acc += (float)(nib - 8) * scale * __bfloat162float(x_vec[(base + 0) * 32 + lane]);
+        }
+        {
+            float scale = __shfl_sync(0xffffffff, my_scale, 1);
+            unsigned char packed = row_data[(base + 1) * bytes_per_block + 4 + byte_in_block];
+            int nib = nibble_hi ? (packed >> 4) : (packed & 0xF);
+            acc += (float)(nib - 8) * scale * __bfloat162float(x_vec[(base + 1) * 32 + lane]);
+        }
+        {
+            float scale = __shfl_sync(0xffffffff, my_scale, 2);
+            unsigned char packed = row_data[(base + 2) * bytes_per_block + 4 + byte_in_block];
+            int nib = nibble_hi ? (packed >> 4) : (packed & 0xF);
+            acc += (float)(nib - 8) * scale * __bfloat162float(x_vec[(base + 2) * 32 + lane]);
+        }
+        {
+            float scale = __shfl_sync(0xffffffff, my_scale, 3);
+            unsigned char packed = row_data[(base + 3) * bytes_per_block + 4 + byte_in_block];
+            int nib = nibble_hi ? (packed >> 4) : (packed & 0xF);
+            acc += (float)(nib - 8) * scale * __bfloat162float(x_vec[(base + 3) * 32 + lane]);
+        }
+    }
+
+    for (; base < blocks_per_row; base++) {
+        float scale_val = 0.0f;
+        if (lane == 0) {
+            scale_val = *((const float*)(row_data + base * bytes_per_block));
+        }
+        float scale = __shfl_sync(0xffffffff, scale_val, 0);
+        unsigned char packed = row_data[base * bytes_per_block + 4 + byte_in_block];
+        int nib = nibble_hi ? (packed >> 4) : (packed & 0xF);
+        acc += (float)(nib - 8) * scale * __bfloat162float(x_vec[base * 32 + lane]);
     }
 
     acc = warp_sum(acc);
