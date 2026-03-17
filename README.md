@@ -44,6 +44,19 @@ Q4 quantization (`--quantize`) gives ~1.3-3.5x faster decode by reducing memory 
 </details>
 
 <details>
+<summary><b>NVIDIA RTX PRO 6000 Blackwell</b> — 96 GB GDDR7, 1.53 TB/s bandwidth</summary>
+
+Measured via `rllm run`, 3 runs averaged, 128 max tokens.
+
+| Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
+|---|---|---|---|---|---|
+| GPT-OSS 20B | 20.0B (3.6B active) | 103 tok/s | 121 tok/s | 153 ms | 144 ms |
+
+Q4 is ~17% faster than bf16 for decode on the RTX PRO 6000 — a middle ground between Apple Silicon (where Q4 is always much faster) and H100 (where Q4 is slower). The 1.53 TB/s GDDR7 bandwidth is high enough that dequantisation overhead is noticeable but not dominant. GPT-OSS 120B Q4 benchmarks pending.
+
+</details>
+
+<details>
 <summary><b>NVIDIA H100 NVL 94 GB HBM3</b> — 3.35 TB/s bandwidth</summary>
 
 Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Measured via `rllm run`, single run, 128 max tokens.

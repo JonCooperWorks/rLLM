@@ -135,6 +135,7 @@ pub(crate) struct CudaBackend {
     pub(crate) fn_silu_mul_clamp: CudaFunction,
     pub(crate) fn_rope_yarn: CudaFunction,
     pub(crate) fn_rope_yarn_batch: CudaFunction,
+    pub(crate) fn_gpt_oss_gated_act: CudaFunction,
 }
 
 impl CudaBackend {
@@ -260,6 +261,7 @@ impl CudaBackend {
             fn_silu_mul_clamp: func(&mod_elementwise, "silu_mul_clamp")?,
             fn_rope_yarn: func(&mod_rope, "rotary_embedding_yarn")?,
             fn_rope_yarn_batch: func(&mod_rope, "rotary_embedding_yarn_batch")?,
+            fn_gpt_oss_gated_act: func(&mod_elementwise, "gpt_oss_gated_act")?,
         })
     }
 

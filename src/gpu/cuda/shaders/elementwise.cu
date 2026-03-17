@@ -212,3 +212,33 @@ extern "C" __global__ void top_k_softmax(
         output[2 * j + 1] = top_logits[j] / exp_sum;
     }
 }
+
+// GPT-OSS gated activation: (clamp(up,-lim,lim) + 1) * clamp(gate,max=lim) * sigmoid(gate*alpha)
+//
+// NOT standard SwiGLU — uses scaled sigmoid, gate-only upper clamp, and (up + 1) offset.
+struct GptOssGatedActParams {
+    unsigned int size;
+    float alpha;
+    float limit;
+};
+
+extern "C" __global__ void gpt_oss_gated_act(
+    const GptOssGatedActParams params,
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ up,
+    __nv_bfloat16* __restrict__ output
+) {
+    const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= params.size) return;
+    float g = __bfloat162float(gate[gid]);
+    float u = __bfloat162float(up[gid]);
+
+    // Separate clamping: gate has upper-only clamp, up has both bounds.
+    float g_c = fminf(g, params.limit);
+    float u_c = fminf(fmaxf(u, -params.limit), params.limit);
+
+    // Gated activation: gate * sigmoid(gate * alpha).
+    float glu = g_c / (1.0f + expf(-g_c * params.alpha));
+
+    output[gid] = __float2bfloat16((u_c + 1.0f) * glu);
+}

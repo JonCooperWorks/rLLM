@@ -1385,6 +1385,123 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // GPT-OSS gated activation tests
+    // -----------------------------------------------------------------------
+
+    /// CPU reference for gpt_oss_gated_act.
+    fn gpt_oss_gated_act_cpu(gate: &[f32], up: &[f32], alpha: f32, limit: f32) -> Vec<f32> {
+        gate.iter().zip(up).map(|(&g, &u)| {
+            let g_c = g.min(limit);
+            let u_c = u.clamp(-limit, limit);
+            let glu = g_c / (1.0 + (-g_c * alpha).exp());
+            (u_c + 1.0) * glu
+        }).collect()
+    }
+
+    #[test]
+    fn test_gpt_oss_gated_act_basic() {
+        let b = CpuBackend;
+        let gate_vals = [1.0f32, -2.0, 0.0, 5.0, -8.0, 3.5];
+        let up_vals = [0.5f32, 1.0, -1.0, 0.0, 10.0, -3.0];
+        let alpha = 1.702;
+        let limit = 7.0;
+
+        let gate = b.upload_tensor(&bf16_bytes(&gate_vals), &[6], TensorDtype::BF16);
+        let up = b.upload_tensor(&bf16_bytes(&up_vals), &[6], TensorDtype::BF16);
+        let out = b.alloc_tensor(&[6], TensorDtype::BF16);
+        b.gpt_oss_gated_act(&gate, &up, &out, 6, alpha, limit);
+
+        let result = read_bf16(&out, 6);
+        let expected = gpt_oss_gated_act_cpu(&gate_vals, &up_vals, alpha, limit);
+        for i in 0..6 {
+            let tol = expected[i].abs() * 0.01 + 0.01;
+            assert!((result[i] - expected[i]).abs() < tol,
+                "gpt_oss_gated_act[{}]: got {} expected {}", i, result[i], expected[i]);
+        }
+    }
+
+    #[test]
+    fn test_gpt_oss_gated_act_clamping() {
+        let b = CpuBackend;
+        // gate=10 should be upper-clamped to 7, gate=-10 should NOT be clamped (no lower clamp).
+        // up=10 should be clamped to 7, up=-10 should be clamped to -7.
+        let gate_vals = [10.0f32, -10.0, 0.0, 0.0];
+        let up_vals = [0.0f32, 0.0, 10.0, -10.0];
+        let alpha = 1.702;
+        let limit = 7.0;
+
+        let gate = b.upload_tensor(&bf16_bytes(&gate_vals), &[4], TensorDtype::BF16);
+        let up = b.upload_tensor(&bf16_bytes(&up_vals), &[4], TensorDtype::BF16);
+        let out = b.alloc_tensor(&[4], TensorDtype::BF16);
+        b.gpt_oss_gated_act(&gate, &up, &out, 4, alpha, limit);
+        let result = read_bf16(&out, 4);
+
+        // gate=10 → g_c=7, glu=7*sigmoid(7*1.702) ≈ 7.0 (sigmoid ≈ 1)
+        // up=0 → u_c=0, out=(0+1)*glu = glu ≈ 7.0
+        assert!((result[0] - 7.0).abs() < 0.1, "gate clamped: got {}", result[0]);
+
+        // gate=-10 → g_c=-10 (no lower clamp), sigmoid(-10*1.702) ≈ 0, glu ≈ 0
+        assert!(result[1].abs() < 0.01, "negative gate: got {}", result[1]);
+
+        // gate=0 → glu=0, out=0 regardless of up
+        assert!(result[2].abs() < 0.01, "zero gate, large up: got {}", result[2]);
+        assert!(result[3].abs() < 0.01, "zero gate, negative up: got {}", result[3]);
+    }
+
+    #[test]
+    fn test_gpt_oss_gated_act_edge_cases() {
+        let b = CpuBackend;
+
+        // gate=0, up=0 → out=0
+        let gate = b.upload_tensor(&bf16_bytes(&[0.0]), &[1], TensorDtype::BF16);
+        let up = b.upload_tensor(&bf16_bytes(&[0.0]), &[1], TensorDtype::BF16);
+        let out = b.alloc_tensor(&[1], TensorDtype::BF16);
+        b.gpt_oss_gated_act(&gate, &up, &out, 1, 1.702, 7.0);
+        let result = read_bf16(&out, 1);
+        assert!(result[0].abs() < 0.001, "zero/zero: got {}", result[0]);
+
+        // up=0 → out = (0+1)*glu = glu (non-zero if gate != 0)
+        let gate2 = b.upload_tensor(&bf16_bytes(&[2.0]), &[1], TensorDtype::BF16);
+        let up2 = b.upload_tensor(&bf16_bytes(&[0.0]), &[1], TensorDtype::BF16);
+        let out2 = b.alloc_tensor(&[1], TensorDtype::BF16);
+        b.gpt_oss_gated_act(&gate2, &up2, &out2, 1, 1.702, 7.0);
+        let result2 = read_bf16(&out2, 1);
+        // glu = 2 / (1 + exp(-2*1.702)) ≈ 2 * 0.967 ≈ 1.934
+        assert!(result2[0] > 1.5, "up=0 with gate=2 should give non-zero: got {}", result2[0]);
+
+        // Very negative gate (-100): sigmoid(-100*1.702) ≈ 0, so glu ≈ 0
+        let gate3 = b.upload_tensor(&bf16_bytes(&[-100.0]), &[1], TensorDtype::BF16);
+        let up3 = b.upload_tensor(&bf16_bytes(&[5.0]), &[1], TensorDtype::BF16);
+        let out3 = b.alloc_tensor(&[1], TensorDtype::BF16);
+        b.gpt_oss_gated_act(&gate3, &up3, &out3, 1, 1.702, 7.0);
+        let result3 = read_bf16(&out3, 1);
+        assert!(result3[0].abs() < 0.01, "very negative gate: got {}", result3[0]);
+    }
+
+    #[test]
+    fn test_gpt_oss_gated_act_large_size() {
+        let b = CpuBackend;
+        let n = 4096;
+        let gate_vals: Vec<f32> = (0..n).map(|i| (i as f32 - 2048.0) * 0.01).collect();
+        let up_vals: Vec<f32> = (0..n).map(|i| (i as f32 - 2048.0) * 0.005).collect();
+        let alpha = 1.702;
+        let limit = 7.0;
+
+        let gate = b.upload_tensor(&bf16_bytes(&gate_vals), &[n], TensorDtype::BF16);
+        let up = b.upload_tensor(&bf16_bytes(&up_vals), &[n], TensorDtype::BF16);
+        let out = b.alloc_tensor(&[n], TensorDtype::BF16);
+        b.gpt_oss_gated_act(&gate, &up, &out, n as u32, alpha, limit);
+
+        let result = read_bf16(&out, n);
+        let expected = gpt_oss_gated_act_cpu(&gate_vals, &up_vals, alpha, limit);
+        for i in 0..n {
+            let tol = expected[i].abs() * 0.02 + 0.01;
+            assert!((result[i] - expected[i]).abs() < tol,
+                "large size [{}]: got {} expected {}", i, result[i], expected[i]);
+        }
+    }
+
     #[test]
     fn test_rope_yarn_position_zero() {
         let b = CpuBackend;

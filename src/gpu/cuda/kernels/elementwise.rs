@@ -76,6 +76,15 @@ struct SiluMulClampParams {
 }
 unsafe impl DeviceRepr for SiluMulClampParams {}
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GptOssGatedActParams {
+    size: u32,
+    alpha: f32,
+    limit: f32,
+}
+unsafe impl DeviceRepr for GptOssGatedActParams {}
+
 impl GpuElementwise for CudaBackend {
     fn silu_mul(&self, gate: &CudaTensor, up: &CudaTensor, out: &CudaTensor, size: u32) {
         let params = ElemParams { size };
@@ -255,14 +264,24 @@ impl GpuElementwise for CudaBackend {
 
     fn gpt_oss_gated_act(
         &self,
-        _gate: &CudaTensor,
-        _up: &CudaTensor,
-        _out: &CudaTensor,
-        _size: u32,
-        _alpha: f32,
-        _limit: f32,
+        gate: &CudaTensor,
+        up: &CudaTensor,
+        out: &CudaTensor,
+        size: u32,
+        alpha: f32,
+        limit: f32,
     ) {
-        unreachable!("CUDA gpt_oss_gated_act not yet implemented");
+        let params = GptOssGatedActParams { size, alpha, limit };
+        let block = 256.min(size);
+        let cfg = CudaBackend::cfg_1d(size, block);
+        unsafe {
+            self.stream.launch_builder(&self.fn_gpt_oss_gated_act)
+                .arg(&params)
+                .arg(&gate.buf)
+                .arg(&up.buf)
+                .arg(&out.buf)
+                .launch(cfg)
+        }.expect("gpt_oss_gated_act launch failed");
     }
 
     fn top_k_softmax(
