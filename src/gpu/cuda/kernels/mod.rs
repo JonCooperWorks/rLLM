@@ -16,6 +16,7 @@
 //   Backend struct:     cuda/backend.rs
 // ---------------------------------------------------------------------------
 
+mod allreduce;
 mod attention;
 mod core;
 mod deltanet;

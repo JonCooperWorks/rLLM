@@ -52,7 +52,7 @@
 // ===========================================================================
 
 use crate::gpu::{
-    GpuAttention, GpuCore, GpuDeltaNet, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
+    GpuAllReduce, GpuAttention, GpuCore, GpuDeltaNet, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
 };
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives::{self, Dims};
@@ -253,7 +253,7 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
 // gate_proj/up_proj/down_proj per layer.
 // ---------------------------------------------------------------------------
 
-fn ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(m: &Model<'_, B>, layer_idx: usize, d: &Dims) {
+fn ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce>(m: &Model<'_, B>, layer_idx: usize, d: &Dims) {
     if m.config.is_moe() {
         moe_ffn_block(m, layer_idx, d);
     } else {
@@ -270,7 +270,7 @@ fn ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(m: &Model<'_, B>
 // ===========================================================================
 
 /// Single-token forward pass using an external paged KV cache.
-pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed + GpuDeltaNet>(
+pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed + GpuDeltaNet + GpuAllReduce>(
     m: &Model<'_, B>,
     token_id: u32,
     pool: &KvPool<B>,
@@ -367,7 +367,7 @@ pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
 // ===========================================================================
 
 /// Batched prefill for Qwen 3.5 hybrid model.
-pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed + GpuDeltaNet>(
+pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed + GpuDeltaNet + GpuAllReduce>(
     m: &Model<'_, B>,
     tokens: &[u32],
     pool: &KvPool<B>,

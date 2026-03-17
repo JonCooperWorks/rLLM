@@ -18,6 +18,7 @@
 //   6. Add the trait to the GpuBackend supertrait bound in gpu/mod.rs
 // ---------------------------------------------------------------------------
 
+mod allreduce;
 mod attention;
 mod core;
 mod deltanet;

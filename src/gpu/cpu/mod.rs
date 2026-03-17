@@ -694,6 +694,20 @@ impl GpuDeltaNet for CpuBackend {
 }
 
 // ===========================================================================
+// GpuAllReduce — no-op (single process, no communication needed)
+// ===========================================================================
+
+impl GpuAllReduce for CpuBackend {
+    fn all_reduce_sum(&self, _tensor: &CpuTensor, _size: u32) {
+        // No-op: single process, nothing to reduce.
+    }
+
+    fn all_gather(&self, _tensor: &CpuTensor, _output: &CpuTensor, _local_size: u32, _full_size: u32) {
+        // No-op: single process, tensor is already the full result.
+    }
+}
+
+// ===========================================================================
 // Tests — GPU kernel correctness via CpuBackend
 // ===========================================================================
 

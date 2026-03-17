@@ -316,7 +316,15 @@ pub(crate) fn load_weights<B: GpuCore>(
     model_dir: &Path,
     config: &ModelConfig,
     quantize: bool,
+    sharding: Option<&crate::gpu::parallel::ShardingPlan>,
 ) -> anyhow::Result<ModelWeights<B>> {
+    // Sharding support: when provided, each weight is sliced to this rank's
+    // portion before uploading to GPU.  For world_size=1 the plan has no
+    // entries, so all weights pass through unmodified.  The actual byte-level
+    // slicing is performed inside upload_tensor / upload_maybe_quantized
+    // when sharding is fully wired up in a future change.  For now, the
+    // parameter is threaded through so call sites can start passing plans.
+    let _ = sharding;
     // Load safetensors file(s) — handles both single-file and sharded models.
     let (mmaps, weight_map) = load_safetensors_files(model_dir)?;
 
@@ -1103,7 +1111,7 @@ pub(crate) fn load_model<B: GpuCore>(
     let tokenizer = Tokenizer::from_file(&model_dir.join("tokenizer.json"), arch)?;
     eprintln!("tokenizer loaded");
 
-    let weights = load_weights(backend, model_dir, &config, quantize)?;
+    let weights = load_weights(backend, model_dir, &config, quantize, None)?;
     eprintln!(
         "weights loaded{}",
         if quantize { " (Q4 quantised)" } else { "" }

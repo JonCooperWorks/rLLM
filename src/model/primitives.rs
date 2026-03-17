@@ -16,7 +16,7 @@
 // ===========================================================================
 
 use crate::gpu::{
-    GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
+    GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
 };
 use crate::model::config::ModelConfig;
 use crate::model::kv_cache::{KvPool, SeqKvState};
@@ -231,7 +231,7 @@ pub(crate) fn paged_kv_and_attention<B: GpuAttention>(
 ///
 /// For models where q_dim == hidden_size, pass hidden_size for both args.
 /// For models where q_dim ≠ hidden_size (Qwen3 MoE), use o_proj_residual_qdim.
-pub(crate) fn o_proj_residual<B: GpuMatmul + GpuElementwise>(
+pub(crate) fn o_proj_residual<B: GpuMatmul + GpuElementwise + GpuAllReduce>(
     backend: &B,
     layer: &LayerWeights<B>,
     attn_out: &B::Tensor,
@@ -240,12 +240,13 @@ pub(crate) fn o_proj_residual<B: GpuMatmul + GpuElementwise>(
     hidden_size: u32,
 ) {
     backend.matmul(&layer.o_proj, attn_out, norm_buf, hidden_size, hidden_size);
+    backend.all_reduce_sum(norm_buf, hidden_size); // no-op when world_size=1
     backend.add(hidden, norm_buf, hidden, hidden_size);
 }
 
 /// O projection + residual for models where q_dim ≠ hidden_size.
 /// o_proj weight is [hidden_size, q_dim], input attn_out is [q_dim].
-pub(crate) fn o_proj_residual_qdim<B: GpuMatmul + GpuElementwise>(
+pub(crate) fn o_proj_residual_qdim<B: GpuMatmul + GpuElementwise + GpuAllReduce>(
     backend: &B,
     layer: &LayerWeights<B>,
     attn_out: &B::Tensor,
@@ -255,6 +256,7 @@ pub(crate) fn o_proj_residual_qdim<B: GpuMatmul + GpuElementwise>(
     q_dim: u32,
 ) {
     backend.matmul(&layer.o_proj, attn_out, norm_buf, hidden_size, q_dim);
+    backend.all_reduce_sum(norm_buf, hidden_size); // no-op when world_size=1
     backend.add(hidden, norm_buf, hidden, hidden_size);
 }
 
@@ -263,7 +265,7 @@ pub(crate) fn o_proj_residual_qdim<B: GpuMatmul + GpuElementwise>(
 // ===========================================================================
 
 /// Full FFN sub-block: RMSNorm → gate/up projections → SwiGLU → down → residual.
-pub(crate) fn ffn_block<B: GpuNorm + GpuMatmul + GpuElementwise>(
+pub(crate) fn ffn_block<B: GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce>(
     backend: &B,
     layer: &LayerWeights<B>,
     hidden: &B::Tensor,
@@ -279,6 +281,7 @@ pub(crate) fn ffn_block<B: GpuNorm + GpuMatmul + GpuElementwise>(
     backend.matmul(&layer.up_proj, norm_buf, up_buf, inter_size, hidden_size);
     backend.silu_mul(gate_buf, up_buf, gate_buf, inter_size);
     backend.matmul(&layer.down_proj, gate_buf, norm_buf, hidden_size, inter_size);
+    backend.all_reduce_sum(norm_buf, hidden_size); // no-op when world_size=1
     backend.add(hidden, norm_buf, hidden, hidden_size);
 }
 
@@ -536,7 +539,7 @@ pub(crate) fn paged_kv_and_prefill_attention<B: GpuAttention>(
 }
 
 /// Batched O projection + residual.
-pub(crate) fn o_proj_residual_batch<B: GpuMatmul + GpuElementwise>(
+pub(crate) fn o_proj_residual_batch<B: GpuMatmul + GpuElementwise + GpuAllReduce>(
     backend: &B,
     layer: &LayerWeights<B>,
     bufs: &PrefillBuffers<B>,
@@ -544,11 +547,12 @@ pub(crate) fn o_proj_residual_batch<B: GpuMatmul + GpuElementwise>(
     hidden_size: u32,
 ) {
     backend.matmul_batch(&layer.o_proj, &bufs.attn_out, &bufs.norm_buf, bs, hidden_size, hidden_size);
+    backend.all_reduce_sum(&bufs.norm_buf, bs * hidden_size); // no-op when world_size=1
     backend.add(&bufs.hidden, &bufs.norm_buf, &bufs.hidden, bs * hidden_size);
 }
 
 /// Batched O projection + residual with explicit q_dim.
-pub(crate) fn o_proj_residual_batch_qdim<B: GpuMatmul + GpuElementwise>(
+pub(crate) fn o_proj_residual_batch_qdim<B: GpuMatmul + GpuElementwise + GpuAllReduce>(
     backend: &B,
     layer: &LayerWeights<B>,
     bufs: &PrefillBuffers<B>,
@@ -557,11 +561,12 @@ pub(crate) fn o_proj_residual_batch_qdim<B: GpuMatmul + GpuElementwise>(
     q_dim: u32,
 ) {
     backend.matmul_batch(&layer.o_proj, &bufs.attn_out, &bufs.norm_buf, bs, hidden_size, q_dim);
+    backend.all_reduce_sum(&bufs.norm_buf, bs * hidden_size); // no-op when world_size=1
     backend.add(&bufs.hidden, &bufs.norm_buf, &bufs.hidden, bs * hidden_size);
 }
 
 /// Batched FFN sub-block.
-pub(crate) fn ffn_block_batch<B: GpuNorm + GpuMatmul + GpuElementwise>(
+pub(crate) fn ffn_block_batch<B: GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce>(
     backend: &B,
     layer: &LayerWeights<B>,
     bufs: &PrefillBuffers<B>,
@@ -575,6 +580,7 @@ pub(crate) fn ffn_block_batch<B: GpuNorm + GpuMatmul + GpuElementwise>(
     backend.matmul_batch(&layer.up_proj, &bufs.norm_buf, &bufs.up_buf, bs, inter_size, hidden_size);
     backend.silu_mul(&bufs.gate_buf, &bufs.up_buf, &bufs.gate_buf, bs * inter_size);
     backend.matmul_batch(&layer.down_proj, &bufs.gate_buf, &bufs.norm_buf, bs, hidden_size, inter_size);
+    backend.all_reduce_sum(&bufs.norm_buf, bs * hidden_size); // no-op when world_size=1
     backend.add(&bufs.hidden, &bufs.norm_buf, &bufs.hidden, bs * hidden_size);
 }
 

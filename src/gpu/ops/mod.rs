@@ -39,6 +39,7 @@
 //   4. Stub for CudaBackend in cuda/mod.rs
 // ===========================================================================
 
+mod allreduce;
 mod attention;
 mod core;
 mod deltanet;
@@ -48,6 +49,7 @@ mod matmul;
 mod norm;
 mod rope;
 
+pub(crate) use allreduce::GpuAllReduce;
 pub(crate) use attention::GpuAttention;
 pub(crate) use core::GpuCore;
 pub(crate) use deltanet::GpuDeltaNet;

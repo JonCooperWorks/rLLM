@@ -44,7 +44,7 @@
 // ===========================================================================
 
 use crate::gpu::{
-    GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
+    GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
 };
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives::{self, Dims};
@@ -76,7 +76,7 @@ const FEATURES: ArchFeatures = ArchFeatures {
 // Public entry points — called from model/mod.rs dispatch.
 // ===========================================================================
 
-pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed>(
+pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed + GpuAllReduce>(
     m: &Model<'_, B>,
     token_id: u32,
     pool: &KvPool<B>,
@@ -85,7 +85,7 @@ pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
     forward_single_impl(m, token_id, pool, seq_state, &FEATURES)
 }
 
-pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed>(
+pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed + GpuAllReduce>(
     m: &Model<'_, B>,
     tokens: &[u32],
     pool: &KvPool<B>,
@@ -107,7 +107,7 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
 ///   1. Embed token
 ///   2. For each layer: norm → QKV → [bias] → RoPE → attention → O proj → FFN
 ///   3. Final norm → LM head
-pub(crate) fn forward_single_impl<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed>(
+pub(crate) fn forward_single_impl<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed + GpuAllReduce>(
     m: &Model<'_, B>,
     token_id: u32,
     pool: &KvPool<B>,
@@ -175,7 +175,7 @@ pub(crate) fn forward_single_impl<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + G
 }
 
 /// Batched prefill: process entire prompt in one GEMM-based forward pass.
-pub(crate) fn forward_prefill_impl<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed>(
+pub(crate) fn forward_prefill_impl<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed + GpuAllReduce>(
     m: &Model<'_, B>,
     tokens: &[u32],
     pool: &KvPool<B>,

@@ -22,7 +22,7 @@
 // ===========================================================================
 
 use crate::gpu::{
-    GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
+    GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
 };
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::{Model, PrefillBuffers};
@@ -34,7 +34,7 @@ const FEATURES: ArchFeatures = ArchFeatures {
     has_qkv_bias: true,
 };
 
-pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed>(
+pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed + GpuAllReduce>(
     m: &Model<'_, B>,
     token_id: u32,
     pool: &KvPool<B>,
@@ -43,7 +43,7 @@ pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
     super::llama::forward_single_impl(m, token_id, pool, seq_state, &FEATURES)
 }
 
-pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed>(
+pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed + GpuAllReduce>(
     m: &Model<'_, B>,
     tokens: &[u32],
     pool: &KvPool<B>,
