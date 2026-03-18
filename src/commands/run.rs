@@ -59,7 +59,15 @@ pub(crate) struct RunArgs {
     tp: usize,
 }
 
-pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
+pub(crate) fn exec(mut args: RunArgs) -> anyhow::Result<()> {
+    // Multi-GPU tensor parallelism is CUDA-only (requires NCCL).
+    // On macOS (Metal), fall back to single GPU with a warning.
+    #[cfg(not(feature = "cuda"))]
+    if args.tp > 1 {
+        eprintln!("warning: --tp {} ignored (multi-GPU requires CUDA + NCCL), using single GPU", args.tp);
+        args.tp = 1;
+    }
+
     if args.tp > 1 {
         return exec_multi_gpu(args);
     }
