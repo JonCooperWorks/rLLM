@@ -183,7 +183,7 @@ Works as a drop-in backend for any tool that speaks the OpenAI or Anthropic API 
 | `--letsencrypt-email` | — | Contact email for Let's Encrypt |
 | `--cert-cache-dir` | `.rllm-certs` | Cache directory for Let's Encrypt certs |
 | `--dangerous-no-tls` | off | Allow serving over plain HTTP |
-| `--tp` | `1` | Tensor parallelism — number of GPUs (requires CUDA + NCCL) |
+| `--tp` | `0` (auto) | Tensor parallelism — number of GPUs (0 = auto-detect, requires CUDA + NCCL) |
 
 </details>
 

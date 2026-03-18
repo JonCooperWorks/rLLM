@@ -30,15 +30,6 @@ pub(crate) trait GpuCore: Send + Sync {
     /// Human-readable GPU device name (e.g. "Apple M4 Max").
     fn device_name(&self) -> &str;
 
-    /// Number of GPUs available on this system.
-    ///
-    /// Used to auto-detect tensor parallelism degree when `--tp auto`.
-    /// Metal always returns 1 (Apple Silicon is a single unified GPU).
-    /// CUDA queries `cudaGetDeviceCount`.  CPU returns 1.
-    fn device_count(&self) -> usize {
-        1
-    }
-
     /// Maximum recommended GPU working set size in bytes.
     fn recommended_max_memory(&self) -> u64;
 

@@ -27,10 +27,6 @@ impl GpuCore for CudaBackend {
         &self.name
     }
 
-    fn device_count(&self) -> usize {
-        cudarc::driver::CudaContext::device_count().unwrap_or(1) as usize
-    }
-
     fn recommended_max_memory(&self) -> u64 {
         // Use ~90% of total device memory (reserve some for CUDA runtime).
         (self.device_total_memory() as f64 * 0.9) as u64

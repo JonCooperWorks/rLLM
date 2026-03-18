@@ -54,9 +54,8 @@ pub(crate) struct RunArgs {
     )]
     system: String,
 
-    /// Tensor parallelism: number of GPUs to use.
-    /// 0 = auto-detect (use all available GPUs), 1 = single GPU (default).
-    #[arg(long, default_value = "1")]
+    /// Tensor parallelism: number of GPUs (0 = auto-detect all available).
+    #[arg(long, default_value = "0")]
     tp: usize,
 }
 
