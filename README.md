@@ -59,7 +59,7 @@ Q4 is ~17% faster than bf16 for decode on the RTX PRO 6000 — a middle ground b
 <details>
 <summary><b>NVIDIA A100-SXM4-80GB</b> — 2.0 TB/s bandwidth</summary>
 
-Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Measured via `rllm run`, single run, 128 max tokens.
+Benchmarked on [RunPod](https://runpod.io?ref=249k2lel). Measured via `rllm run`, single run, 128 max tokens.
 
 | Model | Params | bf16 | Q4 |
 |---|---|---|---|
@@ -78,12 +78,13 @@ Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Measured via `rl
 <details>
 <summary><b>2× NVIDIA A100-SXM4-80GB (TP=2)</b> — 2× 2.0 TB/s bandwidth</summary>
 
-Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Tensor parallelism across 2 GPUs via NCCL. Measured via `rllm run --tp 2`, single run, 128 max tokens.
+Benchmarked on [RunPod](https://runpod.io?ref=249k2lel). Tensor parallelism across 2 GPUs via NCCL. Measured via `rllm run --tp 2`, single run, 128 max tokens.
 
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
-| Qwen3.5 9B | ~9B | 62 tok/s | — | — | — |
+| Qwen3.5 27B | ~27B | 27.0 tok/s | — | 2,500 ms | — |
 | Llama 3.1 70B Instruct | 70.6B | 13.5 tok/s | 11.1 tok/s | 457 ms | 564 ms |
+| Qwen 2.5 72B Instruct | 72.7B | 12.9 tok/s | 11.0 tok/s | 408 ms | 516 ms |
 
 </details>
 
