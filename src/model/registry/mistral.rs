@@ -27,4 +27,6 @@
 // ===========================================================================
 
 // Mistral's forward pass is identical to Llama's — re-export directly.
-pub(crate) use super::llama::{forward_prefill_paged, forward_single_paged};
+pub(crate) use super::llama::{
+    forward_decode_batch_paged, forward_prefill_paged, forward_single_paged,
+};

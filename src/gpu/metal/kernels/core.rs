@@ -104,6 +104,38 @@ impl GpuCore for MetalBackend {
         tensor.byte_count()
     }
 
+    fn copy_tensor_region(
+        &self,
+        src: &MetalTensor,
+        src_byte_offset: usize,
+        dst: &MetalTensor,
+        dst_byte_offset: usize,
+        byte_count: usize,
+    ) {
+        // Use a blit command encoder to copy bytes between GPU buffers.
+        //
+        // Why not a CPU memcpy?  Even on Apple Silicon's unified memory, a CPU
+        // memcpy would race with prior async compute dispatches that wrote `src`.
+        // Metal's command buffer is serial — a blit encoder appended after compute
+        // encoders is guaranteed to see their completed writes.  This keeps the
+        // entire batched decode pipeline on the GPU timeline with zero CPU stalls.
+        //
+        // This is the key enabler for batched decode: after a batched matmul_batch
+        // writes Q/K/V into [batch_size, dim], we blit individual rows into the
+        // model's single-token scratch buffers for per-sequence paged attention.
+        let guard = self.get_or_create_cmd();
+        let cmd = guard.as_ref().unwrap();
+        let encoder = cmd.new_blit_command_encoder();
+        encoder.copy_from_buffer(
+            &src.buffer,
+            src_byte_offset as u64,
+            &dst.buffer,
+            dst_byte_offset as u64,
+            byte_count as u64,
+        );
+        encoder.end_encoding();
+    }
+
     fn copy_to_host(&self, tensor: &MetalTensor, dst: &mut [u8]) {
         self.flush();
 

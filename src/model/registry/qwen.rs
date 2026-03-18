@@ -68,3 +68,26 @@ pub(crate) fn forward_prefill_paged<
 ) -> anyhow::Result<()> {
     super::llama::forward_prefill_impl(m, tokens, pool, seq_state, bufs, &FEATURES)
 }
+
+pub(crate) fn forward_decode_batch_paged<
+    B: GpuCore
+        + GpuNorm
+        + GpuMatmul
+        + GpuRope
+        + GpuAttention
+        + GpuElementwise
+        + GpuEmbed
+        + GpuAllReduce,
+>(
+    m: &Model<'_, B>,
+    tokens: &[u32],
+    positions: &[u32],
+    pool: &KvPool<B>,
+    seq_states: &[&SeqKvState<B>],
+    bufs: &PrefillBuffers<B>,
+    logits_batch: &B::Tensor,
+) -> anyhow::Result<()> {
+    super::llama::forward_decode_batch_impl(
+        m, tokens, positions, pool, seq_states, bufs, logits_batch, &FEATURES,
+    )
+}

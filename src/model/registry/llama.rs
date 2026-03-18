@@ -94,6 +94,27 @@ pub(crate) fn forward_single_paged<
     forward_single_impl(m, token_id, pool, seq_state, &FEATURES)
 }
 
+pub(crate) fn forward_decode_batch_paged<
+    B: GpuCore
+        + GpuNorm
+        + GpuMatmul
+        + GpuRope
+        + GpuAttention
+        + GpuElementwise
+        + GpuEmbed
+        + GpuAllReduce,
+>(
+    m: &Model<'_, B>,
+    tokens: &[u32],
+    positions: &[u32],
+    pool: &KvPool<B>,
+    seq_states: &[&SeqKvState<B>],
+    bufs: &PrefillBuffers<B>,
+    logits_batch: &B::Tensor,
+) -> anyhow::Result<()> {
+    forward_decode_batch_impl(m, tokens, positions, pool, seq_states, bufs, logits_batch, &FEATURES)
+}
+
 pub(crate) fn forward_prefill_paged<
     B: GpuCore
         + GpuNorm
@@ -345,6 +366,143 @@ pub(crate) fn forward_prefill_impl<
         d.eps,
         bs,
         m.config.hidden_size,
+        m.config.vocab_size as u32,
+    );
+
+    Ok(())
+}
+
+/// Batched decode: process N tokens from N different sequences in one pass.
+///
+/// LEARNING OVERVIEW
+///
+/// This is the key throughput optimisation for serving concurrent requests.
+/// Instead of N separate forward passes (each doing mat-vec through all
+/// layers), we run ONE forward pass with GEMM on [N, dim] tensors.
+///
+/// The structure mirrors `forward_prefill_impl`, with two critical differences:
+///
+///   1. Positions are non-contiguous: each sequence is at a different point
+///      in its generation (e.g., seq A at position 50, seq B at position 203).
+///      Prefill has contiguous positions from one sequence.
+///
+///   2. Attention is per-sequence: each sequence has its own paged KV cache
+///      with a different block table.  We extract individual Q/K/V rows from
+///      the batched tensors, run paged_attention_fused per sequence, then
+///      write the attention output back.  Everything else (projections, FFN,
+///      AllReduce) is fully batched.
+///
+/// Performance: for N=8 sequences, projections become ~4-6x faster (GEMM
+/// vs 8 mat-vecs).  NCCL AllReduce calls drop from 8×2×num_layers to
+/// 2×num_layers.  Attention stays per-sequence (N kernel launches per layer)
+/// but it's already the cheapest part of decode.
+pub(crate) fn forward_decode_batch_impl<
+    B: GpuCore
+        + GpuNorm
+        + GpuMatmul
+        + GpuRope
+        + GpuAttention
+        + GpuElementwise
+        + GpuEmbed
+        + GpuAllReduce,
+>(
+    m: &Model<'_, B>,
+    tokens: &[u32],
+    positions: &[u32],
+    pool: &KvPool<B>,
+    seq_states: &[&SeqKvState<B>],
+    bufs: &PrefillBuffers<B>,
+    logits_batch: &B::Tensor,
+    features: &ArchFeatures,
+) -> anyhow::Result<()> {
+    let d = m.dims();
+    let bs = tokens.len() as u32;
+    assert_eq!(positions.len(), tokens.len());
+    assert_eq!(seq_states.len(), tokens.len());
+
+    // Upload N token IDs and N non-contiguous positions to GPU.
+    primitives::upload_decode_batch_inputs(m.backend, bufs, tokens, positions, bs);
+
+    // Batched embedding: [N] token IDs → [N, hidden_size].
+    primitives::embed_batch(m.backend, &m.weights, bufs, bs, d.hidden_size);
+
+    for layer_idx in 0..m.config.num_hidden_layers {
+        let layer = &m.weights.layers[layer_idx];
+        let kv_layer_idx = m.config.kv_layer_map()[layer_idx].unwrap();
+
+        // --- Attention sub-block (batched projections, per-seq attention) ---
+
+        // Batched RMSNorm: [N, hidden_size] → [N, hidden_size].
+        m.backend.rms_norm_batch(
+            &bufs.hidden,
+            &layer.input_layernorm,
+            d.eps,
+            &bufs.norm_buf,
+            bs,
+        );
+
+        // Batched QKV projection: 3 GEMMs instead of 3×N mat-vecs.
+        primitives::qkv_projection_batch_qdim(
+            m.backend, layer, bufs, bs, d.q_dim, d.hidden_size, d.kv_dim,
+        );
+
+        if features.has_qkv_bias {
+            primitives::apply_qkv_bias_batch_qdim(m.backend, layer, bufs, bs, d.q_dim, d.kv_dim);
+        }
+
+        // Batched RoPE: each token gets its own position from the positions tensor.
+        primitives::apply_rope_batch(
+            m.backend, bufs, d.rope_theta, bs, d.num_heads, d.num_kv_heads, d.head_dim,
+        );
+
+        // Per-sequence attention: extract row, run paged attention, write back.
+        // This is the one non-batched step — each sequence has a different block
+        // table and seq_len.  The row copies are ~2 KB each (trivial overhead).
+        for (i, &seq_state) in seq_states.iter().enumerate() {
+            primitives::batched_decode_per_seq_attention(
+                m.backend,
+                bufs,
+                &m.q_buf,
+                &m.k_buf,
+                &m.v_buf,
+                &m.attn_out,
+                pool,
+                seq_state,
+                kv_layer_idx,
+                i,
+                positions[i],
+                d.num_heads,
+                d.num_kv_heads,
+                d.head_dim,
+                0,    // window_size (0 = full context)
+                0.0,  // attn_scale (0.0 = default 1/sqrt(head_dim))
+                None, // sinks
+            );
+        }
+
+        // Batched O projection + residual: 1 GEMM + 1 AllReduce for all N seqs.
+        primitives::o_proj_residual_batch_qdim(
+            m.backend, layer, bufs, bs, d.hidden_size, d.q_dim,
+        );
+
+        // --- FFN sub-block (fully batched) ---
+        primitives::ffn_block_batch(
+            m.backend, layer, bufs, d.eps, bs, d.hidden_size, d.inter_size,
+        );
+
+        // Submit this layer's work so the GPU starts while we encode the next.
+        m.backend.submit();
+    }
+
+    // Final norm + LM head → [N, vocab_size] logits.
+    primitives::final_norm_and_lm_head_decode_batch(
+        m.backend,
+        &m.weights,
+        bufs,
+        logits_batch,
+        d.eps,
+        bs,
+        d.hidden_size as u32,
         m.config.vocab_size as u32,
     );
 

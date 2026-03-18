@@ -135,6 +135,24 @@ impl GpuCore for CpuBackend {
     fn tensor_byte_count(&self, tensor: &CpuTensor) -> usize {
         tensor.data.len()
     }
+
+    fn copy_tensor_region(
+        &self,
+        src: &CpuTensor,
+        src_byte_offset: usize,
+        dst: &CpuTensor,
+        dst_byte_offset: usize,
+        byte_count: usize,
+    ) {
+        // CPU backend: direct byte copy between Vec<u8> buffers.
+        // Uses raw pointers because GpuCore takes &Self::Tensor (not &mut),
+        // matching the GPU model where buffers have their own sync semantics.
+        unsafe {
+            let src_ptr = src.data.as_ptr().add(src_byte_offset);
+            let dst_ptr = (dst.data.as_ptr() as *mut u8).add(dst_byte_offset);
+            std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, byte_count);
+        }
+    }
 }
 
 // ===========================================================================
