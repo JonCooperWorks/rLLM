@@ -275,7 +275,7 @@ struct WorkerHandle {
 
 /// Spawn the inference worker thread.
 ///
-/// Delegates to engine::worker::load_and_run() for model loading and engine
+/// Delegates to engine::loader::load_and_run() for model loading and engine
 /// construction, providing callbacks for the ready signal and the worker loop.
 fn spawn_worker(
     model_dir: std::path::PathBuf,
@@ -290,7 +290,7 @@ fn spawn_worker(
     std::thread::spawn(move || {
         let max_active = 32;
 
-        let result = engine::worker::load_and_run(
+        let result = engine::loader::load_and_run(
             &model_dir,
             quantize,
             tp,

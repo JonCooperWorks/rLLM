@@ -52,7 +52,7 @@
 
 pub(crate) mod dispatch;
 pub(crate) mod multi_gpu;
-pub(crate) mod worker;
+pub(crate) mod loader;
 
 use std::collections::{HashMap, VecDeque};
 
@@ -309,28 +309,14 @@ pub(crate) fn run_step<D: Dispatch>(
 
     for id in prefilling_ids {
         let seq = scheduler.active.get_mut(&id).unwrap();
-
-        // Drain all pending prefill tokens — the full prompt in one shot.
         let tokens: Vec<u32> = seq.pending_prefill.drain(..).collect();
         let chunk_size = tokens.len();
-        let temperature = seq.temperature;
-        let top_p = seq.top_p;
 
-        // Pre-allocate all KV blocks and sync block table to GPU.
         dispatch.prepare_prefill(&mut seq.kv_state, chunk_size)?;
-
-        // Run batched GEMM forward pass — the entire prompt in one call.
         dispatch.forward_prefill(&tokens, &seq.kv_state)?;
         D::finish_prefill(&mut seq.kv_state, chunk_size);
 
-        // Sample the first generated token from the last token's logits.
-        let next_token = dispatch.sample(temperature, top_p, &mut rng)?;
-        seq.generated_tokens.push(next_token);
-        step_tokens.push((id, next_token));
-
-        if tokenizer.is_eos(next_token) || seq.generated_tokens.len() >= seq.max_gen_tokens {
-            seq.finished = true;
-        }
+        sample_and_finish(dispatch, seq, id, tokenizer, &mut step_tokens, &mut rng)?;
     }
 
     // 3. Decode: run one token per decoding sequence.
@@ -344,25 +330,13 @@ pub(crate) fn run_step<D: Dispatch>(
     for id in decoding_ids {
         let seq = scheduler.active.get_mut(&id).unwrap();
         let token = *seq.generated_tokens.last().unwrap();
-        let temperature = seq.temperature;
-        let top_p = seq.top_p;
 
-        // Allocate one KV slot and sync block table.
         dispatch.prepare_decode(&mut seq.kv_state)?;
-
-        // Run single-token forward pass.
         dispatch.forward_decode(token, &seq.kv_state)?;
         D::finish_decode(&mut seq.kv_state);
         model::profile::tick();
 
-        // Sample next token.
-        let next_token = dispatch.sample(temperature, top_p, &mut rng)?;
-        seq.generated_tokens.push(next_token);
-        step_tokens.push((id, next_token));
-
-        if tokenizer.is_eos(next_token) || seq.generated_tokens.len() >= seq.max_gen_tokens {
-            seq.finished = true;
-        }
+        sample_and_finish(dispatch, seq, id, tokenizer, &mut step_tokens, &mut rng)?;
     }
 
     // 4. Collect finished sequences.
@@ -388,6 +362,28 @@ pub(crate) fn run_step<D: Dispatch>(
         tokens: step_tokens,
         finished,
     })
+}
+
+/// Sample a token and check if the sequence should finish (EOS or max_tokens).
+///
+/// Shared by both the prefill and decode phases of run_step() — after each
+/// forward pass, we sample a token, record it, and check stopping conditions.
+fn sample_and_finish<D: Dispatch>(
+    dispatch: &D,
+    seq: &mut Sequence<D::SeqState>,
+    id: SeqId,
+    tokenizer: &Tokenizer,
+    step_tokens: &mut Vec<(SeqId, u32)>,
+    rng: &mut impl rand::Rng,
+) -> anyhow::Result<()> {
+    let next_token = dispatch.sample(seq.temperature, seq.top_p, rng)?;
+    seq.generated_tokens.push(next_token);
+    step_tokens.push((id, next_token));
+
+    if tokenizer.is_eos(next_token) || seq.generated_tokens.len() >= seq.max_gen_tokens {
+        seq.finished = true;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -492,9 +488,9 @@ impl<'a, B: GpuBackend> Dispatch for SingleGpuDispatch<'a, B> {
 
 /// The single-GPU inference engine.
 pub(crate) struct Engine<'a, B: GpuBackend> {
-    pub dispatch: SingleGpuDispatch<'a, B>,
-    pub scheduler: Scheduler<SeqKvState<B>>,
-    pub tokenizer: Tokenizer,
+    dispatch: SingleGpuDispatch<'a, B>,
+    scheduler: Scheduler<SeqKvState<B>>,
+    tokenizer: Tokenizer,
 }
 
 impl<'a, B: GpuBackend> Engine<'a, B> {
@@ -513,9 +509,10 @@ impl<'a, B: GpuBackend> Engine<'a, B> {
             tokenizer,
         }
     }
+}
 
-    /// Submit a new completion request.  Returns the sequence ID.
-    pub fn add_request(
+impl<'a, B: GpuBackend> InferenceEngine for Engine<'a, B> {
+    fn add_request(
         &mut self,
         prompt_tokens: Vec<u32>,
         max_gen_tokens: usize,
@@ -530,43 +527,16 @@ impl<'a, B: GpuBackend> Engine<'a, B> {
         })
     }
 
-    /// Abort a sequence, removing it from the waiting queue or active set.
-    pub fn abort_sequence(&mut self, id: SeqId) {
-        self.scheduler.abort_sequence(id, &mut self.dispatch);
-    }
-
-    /// Run one engine step.  Returns per-step tokens and newly finished sequences.
-    pub fn step(&mut self) -> anyhow::Result<StepOutput> {
+    fn step(&mut self) -> anyhow::Result<StepOutput> {
         run_step(&mut self.dispatch, &mut self.scheduler, &self.tokenizer)
     }
 
-    /// Whether the engine has any work remaining.
-    pub fn has_work(&self) -> bool {
-        self.scheduler.has_work()
-    }
-}
-
-impl<'a, B: GpuBackend> InferenceEngine for Engine<'a, B> {
-    fn add_request(
-        &mut self,
-        prompt_tokens: Vec<u32>,
-        max_gen_tokens: usize,
-        temperature: f32,
-        top_p: f32,
-    ) -> SeqId {
-        Engine::add_request(self, prompt_tokens, max_gen_tokens, temperature, top_p)
-    }
-
-    fn step(&mut self) -> anyhow::Result<StepOutput> {
-        Engine::step(self)
-    }
-
     fn abort_sequence(&mut self, id: SeqId) {
-        Engine::abort_sequence(self, id)
+        self.scheduler.abort_sequence(id, &mut self.dispatch);
     }
 
     fn has_work(&self) -> bool {
-        Engine::has_work(self)
+        self.scheduler.has_work()
     }
 
     fn tokenizer(&self) -> &Tokenizer {

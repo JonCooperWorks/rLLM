@@ -3,7 +3,7 @@
 //
 // Reads prompts (one per line), submits them all to the engine, and runs
 // the continuous batching loop until all sequences are complete.  Uses
-// engine::worker::load_and_run() for model loading and engine construction.
+// engine::loader::load_and_run() for model loading and engine construction.
 // ===========================================================================
 
 use std::path::PathBuf;
@@ -82,7 +82,7 @@ pub(crate) fn exec(args: BatchArgs) -> anyhow::Result<()> {
 
     let arch_cell: Cell<Option<ModelArch>> = Cell::new(None);
 
-    engine::worker::load_and_run(
+    engine::loader::load_and_run(
         &args.model,
         args.quantize,
         args.tp,
