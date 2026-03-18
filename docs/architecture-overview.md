@@ -167,3 +167,4 @@ on Linux uses CUDA, and plain `cargo build` on Linux uses the CPU backend
 - [Model Layer](model-layer.md) — config, loader, registry, primitives
 - [API Server](api-server.md) — HTTP endpoints, streaming, worker thread
 - [KV Cache](kv-cache.md) — paged cache, block allocation, memory management
+- [Tool Calling](tool-calling.md) — function calling, per-architecture formats, parsing
