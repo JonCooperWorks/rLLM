@@ -165,7 +165,16 @@ format produces unreliable results.
 | Qwen, Phi, Gemma, GPT-OSS | `# Tools` section with `<tool_call>` instructions | `<tool_call>...</tool_call>` XML markers | `parse_tool_calls_generic` (XML markers) |
 | Mistral, Mixtral | `[AVAILABLE_TOOLS]...[/AVAILABLE_TOOLS]` | `[TOOL_CALLS][{...}]` | `parse_tool_calls_mistral` |
 
-### Tool Result Formatting
+### API Response Formats
+
+After parsing, tool calls are returned to the client in the endpoint's native format:
+
+| Endpoint | Tool Call Field | Stop Reason | Tool Result Role |
+|----------|----------------|-------------|------------------|
+| OpenAI `/v1/chat/completions` | `message.tool_calls[]` (id, type, function.name, function.arguments) | `"tool_calls"` | `role: "tool"` with `tool_call_id` |
+| Anthropic `/v1/messages` | `content[]` block with `type: "tool_use"` (id, name, input) | `"tool_use"` | `type: "tool_result"` content block |
+
+### Internal Result Formatting
 
 Tool results sent back by the client are formatted per-architecture in the chat
 template (`chat.rs`), using helpers from `tools.rs`:
