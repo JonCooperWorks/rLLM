@@ -4,29 +4,33 @@
 // LEARNING OVERVIEW
 //
 // What this file does:
-//   Sets up an HTTP server (axum + tokio) and bridges async HTTP handlers
-//   to the synchronous GPU inference pipeline via a dedicated worker thread.
+//   Sets up an HTTP server (axum + tokio), defines the shared types that
+//   bridge HTTP handlers to the inference worker, and provides the shared
+//   worker loop (run_worker_loop) that drives any InferenceEngine.
+//
+// Module layout:
+//   mod.rs        — server setup, shared types, run_worker_loop
+//   worker.rs     — spawn_worker() factory (single-GPU or multi-GPU)
+//   openai.rs     — /v1/chat/completions, /v1/completions, /v1/models
+//   anthropic.rs  — /v1/messages
+//   tls.rs        — TLS support (manual certs, Let's Encrypt)
 //
 // Architecture:
 //
 //   HTTP clients ←→ [tokio async runtime / axum handlers]
 //                         ↕ channels
-//                    [inference worker thread (Engine + Scheduler)]
-//                         ↕ GPU
-//                    [Metal/CUDA backend]
+//                    [worker thread: run_worker_loop(&mut dyn InferenceEngine)]
+//                         ↕
+//                    [Engine<B> or MultiGpuEngine — server doesn't know which]
 //
-// Continuous batching:
-//   Multiple concurrent HTTP requests are batched together through the model.
-//   The worker thread runs an Engine step loop that processes all active
-//   sequences each step — prefilling new prompts via GEMM and decoding one
-//   token per active sequence.  The decode phase is memory-bandwidth-bound,
-//   so batching N sequences costs almost nothing extra per token.
+// The worker loop is GPU-topology-agnostic.  It calls add_request / step /
+// abort_sequence / has_work / tokenizer on the trait object.  The worker.rs
+// module handles single-GPU vs multi-GPU setup behind a single spawn_worker().
 //
 // Why a dedicated worker thread?
-//   The model (`Model<'a, B>`) borrows the GPU backend, has mutable scratch
-//   buffers, and GPU operations are single-threaded.  Rather than fighting
-//   Rust's borrow checker with Arc<Mutex<...>>, we keep ALL GPU state on
-//   one std::thread and communicate via channels:
+//   The model borrows the GPU backend and has mutable scratch buffers.
+//   Rather than fighting Arc<Mutex<...>>, we keep ALL GPU state on one
+//   std::thread and communicate via channels:
 //
 //   - Request channel (std::sync::mpsc):  HTTP handlers → worker
 //   - Response channel (tokio::sync::mpsc, one per request):  worker → handler
@@ -34,38 +38,20 @@
 //   The worker calls `blocking_send` on the tokio channel, which is safe
 //   from synchronous code.  The handler calls `recv().await` on the async
 //   side.  This cleanly bridges sync GPU code and async HTTP serving.
-//
-// Tokenization:
-//   Tokenization (text → token IDs) is CPU-only work.  It happens on the
-//   async handler threads using the shared Arc<Tokenizer>, so the worker
-//   thread's step loop is never blocked by tokenization.
-//
-// Streaming:
-//   For SSE (Server-Sent Events), the handler reads token events from the
-//   response channel and yields them as SSE frames.  The worker sends one
-//   event per generated token, so the client sees output in real-time.
-//
-//   If the client disconnects mid-stream, the handler drops its receiver.
-//   The worker detects this when `blocking_send` returns Err, and aborts
-//   the sequence via the Engine — KV cache blocks are freed immediately.
 // ===========================================================================
 
 pub(crate) mod anthropic;
-mod multi_gpu;
 pub(crate) mod openai;
 pub(crate) mod tls;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::ServeArgs;
 use crate::engine;
-use crate::engine::scheduler::{self, SeqId};
-use crate::gpu::{self, GpuCore};
-use crate::model;
-use crate::model::loader;
-use crate::model::{config, kv_cache, tokenizer};
+use crate::engine::SeqId;
+use crate::gpu;
+use crate::model::{config, tokenizer};
 
 // ---------------------------------------------------------------------------
 // Shared types: the bridge between HTTP handlers and the inference worker.
@@ -184,11 +170,7 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         request_tx,
         tokenizer,
         arch,
-    } = if tp > 1 {
-        multi_gpu::spawn_worker(args.model.clone(), args.quantize, tp)?
-    } else {
-        spawn_worker(args.model.clone(), args.quantize)?
-    };
+    } = spawn_worker(args.model.clone(), args.quantize, tp)?;
 
     eprintln!("model ready: {}", model_name);
 
@@ -291,6 +273,50 @@ struct WorkerHandle {
     arch: config::ModelArch,
 }
 
+/// Spawn the inference worker thread.
+///
+/// Delegates to engine::loader::load_and_run() for model loading and engine
+/// construction, providing callbacks for the ready signal and the worker loop.
+fn spawn_worker(
+    model_dir: std::path::PathBuf,
+    quantize: bool,
+    tp: usize,
+) -> anyhow::Result<WorkerHandle> {
+    let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<
+        Result<(Arc<tokenizer::Tokenizer>, config::ModelArch), String>,
+    >(1);
+
+    std::thread::spawn(move || {
+        let max_active = 32;
+
+        let result = engine::loader::load_and_run(
+            &model_dir,
+            quantize,
+            tp,
+            max_active,
+            |tok, arch| {
+                let _ = ready_tx.send(Ok((Arc::new(tok.clone()), arch)));
+            },
+            |eng| run_worker_loop(eng, request_rx),
+        );
+
+        if let Err(e) = result {
+            let _ = ready_tx.send(Err(format!("{e:#}")));
+        }
+    });
+
+    match ready_rx.recv() {
+        Ok(Ok((tokenizer, arch))) => Ok(WorkerHandle {
+            request_tx,
+            tokenizer,
+            arch,
+        }),
+        Ok(Err(e)) => anyhow::bail!("worker failed to start: {e}"),
+        Err(_) => anyhow::bail!("worker thread died during startup"),
+    }
+}
+
 /// Per-request context tracked by the worker's request registry.
 /// Maps an Engine SeqId to the HTTP response channel.
 struct RequestContext {
@@ -307,98 +333,57 @@ struct RequestContext {
     prev_text_len: usize,
 }
 
-/// Spawn the inference worker thread that owns all GPU state.
+// ---------------------------------------------------------------------------
+// Shared worker loop — drives any InferenceEngine (single- or multi-GPU).
+//
+// This is the continuous batching loop that bridges HTTP requests (via the
+// request channel) to the inference engine.  It drains requests, calls
+// engine.step(), streams tokens back to clients, and cleans up finished
+// or disconnected sequences.
+//
+// worker::spawn_worker() delegates to this function after constructing
+// the appropriate engine (single-GPU or multi-GPU).
+// ---------------------------------------------------------------------------
+
+/// Run the continuous batching loop for any InferenceEngine.
 ///
-/// Returns the request sender, shared tokenizer, and model architecture.
-/// The worker loads the model inside the thread (so all GPU resources have
-/// the thread's lifetime) and runs the Engine continuous batching loop.
-fn spawn_worker(model_dir: PathBuf, quantize: bool) -> anyhow::Result<WorkerHandle> {
-    // Channel for incoming requests.  Capacity 8 gives a small queue;
-    // if full, handlers get backpressure (try_send returns Err → 503).
-    let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
+/// Blocks the calling thread until the request channel closes (server shutdown).
+/// The engine must already be fully initialized (model loaded, KV cache allocated).
+fn run_worker_loop(
+    engine: &mut dyn engine::InferenceEngine,
+    request_rx: std::sync::mpsc::Receiver<WorkerRequest>,
+) -> anyhow::Result<()> {
+    let mut registry: HashMap<SeqId, RequestContext> = HashMap::new();
 
-    // Ready channel: worker sends back the tokenizer and arch (or an error).
-    let (ready_tx, ready_rx) =
-        std::sync::mpsc::sync_channel::<Result<(Arc<tokenizer::Tokenizer>, config::ModelArch), String>>(1);
-
-    std::thread::spawn(move || {
-        // All model state is created inside this thread so lifetimes work out.
-        // The backend is on the stack, model borrows it — both live until
-        // the thread exits (which is when the request channel closes).
-        let result = (|| -> anyhow::Result<()> {
-            let backend = gpu::create_backend()?;
-            eprintln!("gpu: {}", backend.device_name());
-
-            let loader::LoadedModel {
-                config,
-                arch,
-                tokenizer,
-                weights,
-            } = loader::load_model(&backend, &model_dir, quantize)?;
-
-            // Share the tokenizer with HTTP handlers for async tokenization.
-            let tokenizer = Arc::new(tokenizer);
-            let _ = ready_tx.send(Ok((Arc::clone(&tokenizer), arch)));
-
-            // Unwrap the Arc for the Engine — the worker thread keeps its own
-            // reference.  The Engine takes ownership of a Tokenizer, so we
-            // need to make a clone for it.
-            let engine_tokenizer = (*tokenizer).clone();
-
-            let model = model::Model::new(config.clone(), weights, &backend)?;
-
-            // Dynamic KV cache sizing: fit as many blocks as possible into
-            // the remaining GPU memory after weights.  Large models (e.g. 32B
-            // with 64 layers) need much more KV cache per block, so a fixed
-            // count can over-allocate and cause memory pressure / swap.
-            let gpu_budget = backend.recommended_max_memory();
-            let qpb = |m, k| backend.quantized_weight_bytes(m, k);
-            let num_blocks = config.recommended_kv_blocks(gpu_budget, quantize, &qpb);
-            let kv_dim = config.num_key_value_heads * config.head_dim;
-            let kv_pool =
-                kv_cache::KvPool::new(&backend, num_blocks, kv_dim, config.num_kv_layers());
-
-            let weight_mb = config.estimate_weight_bytes(quantize, &qpb) as f64 / (1024.0 * 1024.0);
-            let kv_mb = kv_pool.total_memory_bytes() as f64 / (1024.0 * 1024.0);
-            let max_tokens = kv_pool.max_tokens();
-            eprintln!(
-                "memory: {:.0} MB weights, {:.0} MB KV cache ({} blocks, {} max tokens), {:.0} MB GPU budget",
-                weight_mb,
-                kv_mb,
-                num_blocks,
-                max_tokens,
-                gpu_budget as f64 / (1024.0 * 1024.0),
+    loop {
+        // 1. Drain all pending requests (non-blocking).
+        while let Ok(req) = request_rx.try_recv() {
+            let prompt_token_count = req.prompt_tokens.len();
+            let seq_id =
+                engine.add_request(req.prompt_tokens, req.max_tokens, req.temperature, req.top_p);
+            registry.insert(
+                seq_id,
+                RequestContext {
+                    response_tx: req.response_tx,
+                    prompt_token_count,
+                    generated_count: 0,
+                    token_ids: Vec::new(),
+                    prev_text_len: 0,
+                },
             );
+        }
 
-            // Maximum 32 concurrent sequences (can tune based on memory).
-            let max_active = 32;
-            eprintln!("max {} concurrent sequences", max_active);
-            let sched = scheduler::Scheduler::new(kv_pool, max_active);
-
-            let mut eng = engine::Engine::new(
-                model,
-                sched,
-                engine_tokenizer,
-                &backend,
-            );
-
-            // Request registry: maps Engine sequence IDs to HTTP response channels.
-            let mut registry: HashMap<SeqId, RequestContext> = HashMap::new();
-
-            // ---------------------------------------------------------------------------
-            // Continuous batching loop.
-            //
-            // The loop has three phases:
-            //   1. Drain new requests from the channel (non-blocking).
-            //   2. If no work, block on recv() until a request arrives.
-            //   3. Run one Engine step, stream tokens, handle disconnects.
-            // ---------------------------------------------------------------------------
-            loop {
-                // 1. Drain all pending requests (non-blocking).
-                //    Batches up everything that arrived since the last step.
-                while let Ok(req) = request_rx.try_recv() {
+        // 2. If no work, block until a new request arrives.
+        if !engine.has_work() {
+            match request_rx.recv() {
+                Ok(req) => {
                     let prompt_token_count = req.prompt_tokens.len();
-                    let seq_id = eng.add_request(req.prompt_tokens, req.max_tokens, req.temperature, req.top_p);
+                    let seq_id = engine.add_request(
+                        req.prompt_tokens,
+                        req.max_tokens,
+                        req.temperature,
+                        req.top_p,
+                    );
                     registry.insert(
                         seq_id,
                         RequestContext {
@@ -410,117 +395,80 @@ fn spawn_worker(model_dir: PathBuf, quantize: bool) -> anyhow::Result<WorkerHand
                         },
                     );
                 }
+                Err(_) => break, // Channel closed — server shutting down.
+            }
+        }
 
-                // 2. If no work, block until a new request arrives.
-                if !eng.has_work() {
-                    match request_rx.recv() {
-                        Ok(req) => {
-                            let prompt_token_count = req.prompt_tokens.len();
-                            let seq_id = eng.add_request(req.prompt_tokens, req.max_tokens, req.temperature, req.top_p);
-                            registry.insert(
-                                seq_id,
-                                RequestContext {
-                                    response_tx: req.response_tx,
-                                    prompt_token_count,
-                                    generated_count: 0,
-                                    token_ids: Vec::new(),
-                                    prev_text_len: 0,
-                                },
-                            );
-                        }
-                        Err(_) => break, // Channel closed — server shutting down.
-                    }
+        // 3. Run one engine step (prefill + decode + sample).
+        let step_output = match engine.step() {
+            Ok(output) => output,
+            Err(e) => {
+                let error_msg = format!("{e:#}");
+                for (_, ctx) in registry.drain() {
+                    let _ = ctx
+                        .response_tx
+                        .blocking_send(InferenceEvent::Error(error_msg.clone()));
                 }
+                continue;
+            }
+        };
 
-                // 3. Run one Engine step (prefill + decode + sample).
-                let step_output = match eng.step() {
-                    Ok(output) => output,
-                    Err(e) => {
-                        // Engine error — notify all active requests and drain.
-                        let error_msg = format!("{e:#}");
-                        for (_, ctx) in registry.drain() {
-                            let _ = ctx
-                                .response_tx
-                                .blocking_send(InferenceEvent::Error(error_msg.clone()));
-                        }
-                        continue;
-                    }
-                };
+        // 4. Stream tokens to response channels.
+        let mut to_abort: Vec<SeqId> = Vec::new();
 
-                // 4. Stream tokens to response channels.
-                //    Collect aborts separately to avoid borrowing registry while iterating.
-                let mut to_abort: Vec<SeqId> = Vec::new();
-
-                for &(seq_id, token_id) in &step_output.tokens {
-                    if let Some(ctx) = registry.get_mut(&seq_id) {
-                        // Incremental decode: decode all tokens so far, emit the new
-                        // characters.  This ensures SentencePiece decoders (Mistral,
-                        // Mixtral) see the full token context for correct spacing.
-                        ctx.token_ids.push(token_id);
-                        let full_text = eng.tokenizer.decode(&ctx.token_ids).unwrap_or_default();
-                        let text = full_text[ctx.prev_text_len..].to_string();
-                        ctx.prev_text_len = full_text.len();
-                        ctx.generated_count += 1;
-                        if ctx
-                            .response_tx
-                            .blocking_send(InferenceEvent::Token { text })
-                            .is_err()
-                        {
-                            // Client disconnected — schedule abort.
-                            to_abort.push(seq_id);
-                        }
-                    }
-                }
-
-                // 5. Handle finished sequences.
-                for finished in &step_output.finished {
-                    if let Some(ctx) = registry.remove(&finished.id) {
-                        let stop_reason = match finished.reason {
-                            engine::FinishReason::Eos => StopReason::EndOfSequence,
-                            engine::FinishReason::MaxTokens => StopReason::MaxTokens,
-                        };
-                        let _ = ctx.response_tx.blocking_send(InferenceEvent::Done {
-                            stop_reason,
-                            prompt_tokens: ctx.prompt_token_count,
-                            completion_tokens: ctx.generated_count,
-                        });
-                    }
-                }
-
-                // 6. Abort disconnected sequences + proactive disconnect check.
-                for &id in &to_abort {
-                    eng.abort_sequence(id);
-                    registry.remove(&id);
-                }
-
-                let disconnected: Vec<SeqId> = registry
-                    .iter()
-                    .filter(|(_, ctx)| ctx.response_tx.is_closed())
-                    .map(|(&id, _)| id)
-                    .collect();
-                for id in disconnected {
-                    eng.abort_sequence(id);
-                    registry.remove(&id);
+        for &(seq_id, token_id) in &step_output.tokens {
+            if let Some(ctx) = registry.get_mut(&seq_id) {
+                ctx.token_ids.push(token_id);
+                let full_text = engine
+                    .tokenizer()
+                    .decode(&ctx.token_ids)
+                    .unwrap_or_default();
+                let text = full_text[ctx.prev_text_len..].to_string();
+                ctx.prev_text_len = full_text.len();
+                ctx.generated_count += 1;
+                if ctx
+                    .response_tx
+                    .blocking_send(InferenceEvent::Token { text })
+                    .is_err()
+                {
+                    to_abort.push(seq_id);
                 }
             }
-
-            Ok(())
-        })();
-
-        if let Err(e) = result {
-            let _ = ready_tx.send(Err(format!("{e:#}")));
         }
-    });
 
-    // Wait for the worker to finish loading (or fail).
-    match ready_rx.recv() {
-        Ok(Ok((tokenizer, arch))) => Ok(WorkerHandle {
-            request_tx,
-            tokenizer,
-            arch,
-        }),
-        Ok(Err(e)) => anyhow::bail!("worker failed to start: {e}"),
-        Err(_) => anyhow::bail!("worker thread died during startup"),
+        // 5. Handle finished sequences.
+        for finished in &step_output.finished {
+            if let Some(ctx) = registry.remove(&finished.id) {
+                let stop_reason = match finished.reason {
+                    engine::FinishReason::Eos => StopReason::EndOfSequence,
+                    engine::FinishReason::MaxTokens => StopReason::MaxTokens,
+                };
+                let _ = ctx.response_tx.blocking_send(InferenceEvent::Done {
+                    stop_reason,
+                    prompt_tokens: ctx.prompt_token_count,
+                    completion_tokens: ctx.generated_count,
+                });
+            }
+        }
+
+        // 6. Abort disconnected sequences + proactive disconnect check.
+        for &id in &to_abort {
+            engine.abort_sequence(id);
+            registry.remove(&id);
+        }
+
+        let disconnected: Vec<SeqId> = registry
+            .iter()
+            .filter(|(_, ctx)| ctx.response_tx.is_closed())
+            .map(|(&id, _)| id)
+            .collect();
+        for id in disconnected {
+            engine.abort_sequence(id);
+            registry.remove(&id);
+        }
     }
+
+    Ok(())
 }
+
 

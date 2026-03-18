@@ -1,0 +1,16 @@
+# rLLM Documentation
+
+Guide to the rLLM documentation suite.  Start with the architecture overview for the
+big picture, then drill into subsystem docs as needed.
+
+## Documents
+
+| Document | Description |
+|----------|-------------|
+| [Architecture Overview](architecture-overview.md) | End-to-end flow from user request to token generation — how CLI, HTTP API, inference engine, and GPU backend connect |
+| [GPU Backend](gpu-backend.md) | Hardware abstraction layer with composable operation traits and platform-specific implementations (Metal, CUDA, CPU) |
+| [Inference Engine](inference-engine.md) | Core scheduling and continuous batching across prefill/decode phases for all entry points (run, batch, serve) |
+| [KV Cache](kv-cache.md) | Paged key-value cache inspired by vLLM's PagedAttention — fixed-size block allocation instead of contiguous per-sequence buffers |
+| [Model Layer](model-layer.md) | Config parsing, weight loading, architecture dispatch, and forward pass implementations for nine model families |
+| [API Server](api-server.md) | HTTP server with OpenAI and Anthropic endpoint compatibility using a worker-thread architecture |
+| [Tool Calling](tool-calling.md) | Tool/function calling with per-architecture prompt formatting, output parsing, and both OpenAI and Anthropic API surfaces |

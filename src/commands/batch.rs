@@ -2,18 +2,16 @@
 // `rllm batch` — Batched inference from a file of prompts.
 //
 // Reads prompts (one per line), submits them all to the engine, and runs
-// the continuous batching loop until all sequences are complete.  Uses the
-// scheduler to manage concurrent sequences and the paged KV cache for
-// memory-efficient multi-sequence inference.
+// the continuous batching loop until all sequences are complete.  Uses
+// engine::loader::load_and_run() for model loading and engine construction.
 // ===========================================================================
 
 use std::path::PathBuf;
 
+use std::cell::Cell;
+
 use crate::engine;
-use crate::engine::scheduler;
-use crate::gpu::{self, GpuCore};
-use crate::model;
-use crate::model::{kv_cache, loader};
+use crate::model::config::ModelArch;
 
 #[derive(clap::Args)]
 pub(crate) struct BatchArgs {
@@ -62,22 +60,12 @@ pub(crate) struct BatchArgs {
 }
 
 pub(crate) fn exec(args: BatchArgs) -> anyhow::Result<()> {
-    // --- Load GPU backend + model ---
-    let backend = gpu::create_backend()?;
-    eprintln!("gpu: {}", backend.device_name());
-
-    let loader::LoadedModel {
-        config,
-        arch,
-        tokenizer,
-        weights,
-    } = loader::load_model(&backend, &args.model, args.quantize)?;
-
     // Read prompts from file.
     let prompts_text = std::fs::read_to_string(&args.batch_file)?;
-    let prompts: Vec<&str> = prompts_text
+    let prompts: Vec<String> = prompts_text
         .lines()
         .filter(|l| !l.trim().is_empty())
+        .map(|l| l.to_string())
         .collect();
     eprintln!(
         "batch: {} prompts from {}",
@@ -85,60 +73,54 @@ pub(crate) fn exec(args: BatchArgs) -> anyhow::Result<()> {
         args.batch_file.display()
     );
 
-    // Create paged KV pool: enough blocks for all prompts + generation.
-    // Each prompt needs blocks for prefill plus blocks for generation.
-    // Uses kv_cache::blocks_needed_for() to encapsulate block size arithmetic —
-    // callers shouldn't need to know the block size to estimate capacity.
-    let max_blocks_per_seq = kv_cache::blocks_needed_for(512 + args.max_tokens);
-    let num_blocks = prompts.len() * max_blocks_per_seq;
-    eprintln!(
-        "KV pool: {} blocks ({} per sequence)",
-        num_blocks, max_blocks_per_seq
-    );
+    let max_active = prompts.len();
+    let max_tokens = args.max_tokens;
+    let temperature = args.temperature;
+    let top_p = args.top_p;
+    let chat = args.chat;
+    let system = args.system.clone();
 
-    let kv_dim = config.num_key_value_heads * config.head_dim;
-    let kv_pool = kv_cache::KvPool::new(&backend, num_blocks, kv_dim, config.num_kv_layers());
+    let arch_cell: Cell<Option<ModelArch>> = Cell::new(None);
 
-    let model = model::Model::new(config, weights, &backend)?;
+    engine::loader::load_and_run(
+        &args.model,
+        args.quantize,
+        args.tp,
+        max_active,
+        |_tok, arch| { arch_cell.set(Some(arch)); },
+        |eng| {
+            let arch = arch_cell.get().unwrap();
+            // Submit all prompts.
+            let system_ref = chat.then(|| system.as_str());
+            for prompt_text in &prompts {
+                let tokens = eng.tokenizer().encode_prompt(prompt_text, arch, system_ref)?;
+                eng.add_request(tokens, max_tokens, temperature, top_p);
+            }
 
-    // Create scheduler and engine.
-    let sched = scheduler::Scheduler::new(kv_pool, prompts.len());
-    let mut eng = engine::Engine::new(
-        model,
-        sched,
-        tokenizer,
-        &backend,
-    );
+            // Run engine loop.
+            let start = std::time::Instant::now();
+            let mut total_generated = 0usize;
 
-    // Submit all prompts.
-    let system = args.chat.then(|| args.system.as_str());
-    for prompt_text in &prompts {
-        let tokens = eng.tokenizer.encode_prompt(prompt_text, arch, system)?;
-        eng.add_request(tokens, args.max_tokens, args.temperature, args.top_p);
-    }
+            while eng.has_work() {
+                let output = eng.step()?;
+                for seq in &output.finished {
+                    total_generated += seq.tokens.len();
+                    println!("--- sequence {} ({} tokens) ---", seq.id, seq.tokens.len());
+                    println!("{}", seq.text);
+                }
+            }
 
-    // Run engine loop.
-    let start = std::time::Instant::now();
-    let mut total_generated = 0usize;
+            let elapsed = start.elapsed();
+            let tps = total_generated as f64 / elapsed.as_secs_f64();
+            eprintln!(
+                "batch complete: {} tokens from {} sequences in {:.1?} ({:.1} tok/s total throughput)",
+                total_generated,
+                prompts.len(),
+                elapsed,
+                tps
+            );
 
-    while eng.has_work() {
-        let output = eng.step()?;
-        for seq in &output.finished {
-            total_generated += seq.tokens.len();
-            println!("--- sequence {} ({} tokens) ---", seq.id, seq.tokens.len());
-            println!("{}", seq.text);
-        }
-    }
-
-    let elapsed = start.elapsed();
-    let tps = total_generated as f64 / elapsed.as_secs_f64();
-    eprintln!(
-        "batch complete: {} tokens from {} sequences in {:.1?} ({:.1} tok/s total throughput)",
-        total_generated,
-        prompts.len(),
-        elapsed,
-        tps
-    );
-
-    Ok(())
+            Ok(())
+        },
+    )
 }
