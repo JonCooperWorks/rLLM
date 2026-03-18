@@ -223,5 +223,16 @@ pub(crate) mod tp {
                 rank.seq_state.advance_by(count);
             }
         }
+
+        /// Reset for a new sequence: free all KV blocks and create fresh state.
+        ///
+        /// Called between requests in the API server so we can reuse the same
+        /// MultiGpuInference instance without reallocating backends/models.
+        pub fn reset(&mut self) {
+            for rank in &mut self.ranks {
+                rank.kv_pool.free_sequence(&rank.seq_state);
+                rank.seq_state = rank.kv_pool.new_sequence(rank.model.backend);
+            }
+        }
     }
 }

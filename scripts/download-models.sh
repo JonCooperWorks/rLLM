@@ -125,7 +125,6 @@ fi
 if [[ "$TIER" == "big" ]]; then
   MODELS+=(
     # Llama 70B — the standard large-model benchmark
-    "meta-llama/Llama-3.1-70B"
     "meta-llama/Llama-3.1-70B-Instruct"
 
     # Qwen 72B — largest dense Qwen 2.5

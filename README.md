@@ -122,6 +122,7 @@ Q4 is slower than bf16 for decode on H100 — unlike Apple Silicon where Q4 is a
 
 - **Multi-architecture** — Llama 3, Qwen 2.5, Mistral, Mixtral 8x7B, Qwen3 MoE, Qwen3.5, Phi-4, Gemma 3, DeepSeek-R1-Distill, and GPT-OSS from the same codebase
 - **Metal + CUDA backends** — SIMD-cooperative matmul, async command buffer dispatch
+- **Multi-GPU tensor parallelism** — split models across GPUs via NCCL (`--tp 2`)
 - **Batched prefill** — GEMM-based prompt processing (3-10x faster than token-by-token)
 - **Paged KV cache** — on-demand block allocation, shared across sequences
 - **Continuous batching** — concurrent multi-sequence inference via engine/scheduler
@@ -147,6 +148,9 @@ cargo run --release -- run --model models/llama-3.2-1b --prompt "The meaning of 
 # Chat mode (auto-detects template per architecture)
 cargo run --release -- run --model models/llama-3.2-3b-instruct --prompt "Write a fibonacci function" --chat --temperature 0
 
+# Multi-GPU tensor parallelism (splits model across GPUs via NCCL)
+cargo run --release -- run --model models/llama-3.1-70b-instruct --prompt "Hello" --chat --tp 2
+
 # Continuous batching (multiple prompts from a file)
 cargo run --release -- batch --model models/llama-3.2-1b --batch-file test_prompts.txt --max-tokens 64
 ```
@@ -157,9 +161,12 @@ Start an OpenAI/Anthropic-compatible server:
 
 ```bash
 cargo run --release -- serve --model models/llama-3.2-1b-instruct --port 8080 --dangerous-no-tls
+
+# Multi-GPU: shard a 70B model across 2 GPUs
+cargo run --release -- serve --model models/llama-3.1-70b-instruct --quantize --tp 2 --port 8080 --dangerous-no-tls
 ```
 
-Works as a drop-in backend for any tool that speaks the OpenAI or Anthropic API — just point it at `http://localhost:8080`.
+Works as a drop-in backend for any tool that speaks the OpenAI or Anthropic API — just point it at `http://localhost:8080`. With `--tp 2`, the model is sharded across GPUs via NCCL and requests are served sequentially (no continuous batching in TP mode — single-request throughput is the priority for large models).
 
 <details>
 <summary>Server options</summary>
@@ -176,6 +183,7 @@ Works as a drop-in backend for any tool that speaks the OpenAI or Anthropic API 
 | `--letsencrypt-email` | — | Contact email for Let's Encrypt |
 | `--cert-cache-dir` | `.rllm-certs` | Cache directory for Let's Encrypt certs |
 | `--dangerous-no-tls` | off | Allow serving over plain HTTP |
+| `--tp` | `1` | Tensor parallelism — number of GPUs (requires CUDA + NCCL) |
 
 </details>
 
@@ -275,7 +283,8 @@ src/
 └── gpu/
     ├── mod.rs           — GpuBackend trait (platform-generic interface)
     ├── metal/           — Metal backend + .metal compute shaders
-    └── cuda/            — CUDA backend + .cu shader ports
+    ├── cuda/            — CUDA backend + .cu shader ports
+    └── multi_gpu/       — Tensor parallelism (NCCL all-reduce, weight sharding)
 ```
 
 ### Optimisation Stack
@@ -289,6 +298,7 @@ src/
 | KV cache | Paged allocation (on-demand blocks, no waste) | — |
 | Attention | Fused single-pass softmax+V, head_dim-specialised pipelines | 1.3-2.8x |
 | Batching | Continuous batching (N sequences share the GPU) | ~Nx |
+| Tensor parallelism | NCCL all-reduce across GPUs (`--tp N`) | ~Nx bandwidth |
 
 ## Scripts
 
@@ -333,6 +343,9 @@ scripts/benchmark.sh --q4-only
 
 # Multiple runs for more stable numbers
 scripts/benchmark.sh --runs 3
+
+# Multi-GPU tensor parallelism
+scripts/benchmark.sh --big --tp 2
 ```
 
 Auto-detects the GPU (Apple Silicon or NVIDIA), runs each model in bf16 and Q4, and prints a Markdown table with tok/s and TTFT.

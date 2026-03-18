@@ -168,7 +168,11 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         request_tx,
         tokenizer,
         arch,
-    } = spawn_worker(args.model.clone(), args.quantize)?;
+    } = if args.tp > 1 {
+        spawn_worker_multi_gpu(args.model.clone(), args.quantize, args.tp)?
+    } else {
+        spawn_worker(args.model.clone(), args.quantize)?
+    };
 
     eprintln!("model ready: {}", model_name);
 
@@ -502,4 +506,187 @@ fn spawn_worker(model_dir: PathBuf, quantize: bool) -> anyhow::Result<WorkerHand
         Ok(Err(e)) => anyhow::bail!("worker failed to start: {e}"),
         Err(_) => anyhow::bail!("worker thread died during startup"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-GPU inference worker (--tp > 1).
+//
+// Uses MultiGpuInference for tensor-parallel forward passes.  Processes one
+// request at a time (no continuous batching) — the Engine doesn't yet support
+// multi-GPU, so we drive the generation loop directly.  For large models where
+// TP is needed, single-request throughput is the main concern anyway.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cuda")]
+fn spawn_worker_multi_gpu(
+    model_dir: PathBuf,
+    quantize: bool,
+    tp: usize,
+) -> anyhow::Result<WorkerHandle> {
+    use crate::gpu::multi_gpu::tp::MultiGpuInference;
+    use crate::model::sampler;
+
+    let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
+    let (ready_tx, ready_rx) =
+        std::sync::mpsc::sync_channel::<Result<(Arc<tokenizer::Tokenizer>, config::ModelArch), String>>(1);
+
+    std::thread::spawn(move || {
+        let result = (|| -> anyhow::Result<()> {
+            eprintln!("tensor parallelism: {} GPUs", tp);
+
+            let config = config::ModelConfig::from_file(&model_dir.join("config.json"))?;
+            let arch = config.arch()?;
+            let tokenizer = tokenizer::Tokenizer::from_file(
+                &model_dir.join("tokenizer.json"),
+                arch,
+            )?;
+
+            let tokenizer = Arc::new(tokenizer);
+
+            // Use 256 KV blocks as reasonable default for TP.
+            let num_blocks = 256;
+            let mut multi = MultiGpuInference::new(
+                &model_dir, config.clone(), quantize, tp, num_blocks,
+            )?;
+            eprintln!("multi-GPU inference ready ({} ranks)", tp);
+
+            let _ = ready_tx.send(Ok((Arc::clone(&tokenizer), arch)));
+
+            // ---------------------------------------------------------------
+            // Serial request loop.
+            //
+            // Process one request at a time: prefill → generate → done.
+            // No continuous batching — MultiGpuInference manages a single
+            // sequence with its own KV cache state.
+            // ---------------------------------------------------------------
+            let mut rng = rand::rng();
+
+            loop {
+                // Block until a request arrives.
+                let req = match request_rx.recv() {
+                    Ok(r) => r,
+                    Err(_) => break, // Channel closed — server shutting down.
+                };
+
+                let prompt_len = req.prompt_tokens.len();
+
+                // Reset KV state for new sequence.
+                multi.reset();
+
+                // Prefill.
+                if let Err(e) = multi.ensure_slots(prompt_len) {
+                    let _ = req.response_tx.blocking_send(InferenceEvent::Error(format!("{e:#}")));
+                    continue;
+                }
+                if let Err(e) = multi.forward_prefill_paged(&req.prompt_tokens) {
+                    let _ = req.response_tx.blocking_send(InferenceEvent::Error(format!("{e:#}")));
+                    continue;
+                }
+                multi.advance_by(prompt_len);
+
+                // Sample first token from prefill logits.
+                let mut next_token = match sampler::sample(
+                    multi.backend(),
+                    multi.logits(),
+                    req.temperature,
+                    req.top_p,
+                    &mut rng,
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let _ = req.response_tx.blocking_send(InferenceEvent::Error(format!("{e:#}")));
+                        continue;
+                    }
+                };
+
+                // Generation loop.
+                let mut generated: usize = 0;
+                let mut token_ids: Vec<u32> = Vec::new();
+                let mut prev_text_len: usize = 0;
+                let mut stop_reason = StopReason::MaxTokens;
+
+                for _ in 0..req.max_tokens {
+                    if tokenizer.is_eos(next_token) {
+                        stop_reason = StopReason::EndOfSequence;
+                        break;
+                    }
+
+                    generated += 1;
+                    token_ids.push(next_token);
+
+                    // Incremental decode (same as single-GPU worker).
+                    let full_text = tokenizer.decode(&token_ids).unwrap_or_default();
+                    let text = full_text[prev_text_len..].to_string();
+                    prev_text_len = full_text.len();
+
+                    // Send token to client.  If the channel is closed, the
+                    // client disconnected — stop generating.
+                    if req
+                        .response_tx
+                        .blocking_send(InferenceEvent::Token { text })
+                        .is_err()
+                    {
+                        break;
+                    }
+
+                    // Forward next token.
+                    if let Err(e) = multi.ensure_slot() {
+                        let _ = req.response_tx.blocking_send(InferenceEvent::Error(format!("{e:#}")));
+                        break;
+                    }
+                    if let Err(e) = multi.forward_single_paged(next_token) {
+                        let _ = req.response_tx.blocking_send(InferenceEvent::Error(format!("{e:#}")));
+                        break;
+                    }
+                    multi.advance();
+
+                    next_token = match sampler::sample(
+                        multi.backend(),
+                        multi.logits(),
+                        req.temperature,
+                        req.top_p,
+                        &mut rng,
+                    ) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            let _ = req.response_tx.blocking_send(InferenceEvent::Error(format!("{e:#}")));
+                            break;
+                        }
+                    };
+                }
+
+                // Send Done event (client may already be disconnected — ignore error).
+                let _ = req.response_tx.blocking_send(InferenceEvent::Done {
+                    stop_reason,
+                    prompt_tokens: prompt_len,
+                    completion_tokens: generated,
+                });
+            }
+
+            Ok(())
+        })();
+
+        if let Err(e) = result {
+            let _ = ready_tx.send(Err(format!("{e:#}")));
+        }
+    });
+
+    match ready_rx.recv() {
+        Ok(Ok((tokenizer, arch))) => Ok(WorkerHandle {
+            request_tx,
+            tokenizer,
+            arch,
+        }),
+        Ok(Err(e)) => anyhow::bail!("worker failed to start: {e}"),
+        Err(_) => anyhow::bail!("worker thread died during startup"),
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn spawn_worker_multi_gpu(
+    _model_dir: PathBuf,
+    _quantize: bool,
+    _tp: usize,
+) -> anyhow::Result<WorkerHandle> {
+    anyhow::bail!("multi-GPU tensor parallelism requires the cuda feature")
 }
