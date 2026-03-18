@@ -1467,6 +1467,152 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_llama_3_1_8b_config() {
+        let Some(config) = load_config("llama-3.1-8b") else {
+            return;
+        };
+        assert_eq!(config.arch().unwrap(), ModelArch::Llama);
+        assert_eq!(config.hidden_size, 4096);
+        assert_eq!(config.num_hidden_layers, 32);
+        assert_eq!(config.num_attention_heads, 32);
+        assert_eq!(config.num_key_value_heads, 8);
+        assert_eq!(config.head_dim, 128); // computed: 4096 / 32
+        assert_eq!(config.intermediate_size, 14336);
+        assert_eq!(config.vocab_size, 128256);
+        assert!(!config.tie_word_embeddings);
+        assert!(!config.is_moe());
+        assert!(!config.arch().unwrap().has_qkv_bias());
+        let rs = config.rope_scaling.as_ref().expect("rope_scaling should be present");
+        assert_eq!(rs.rope_type, "llama3");
+        assert!((rs.factor - 8.0).abs() < 0.01);
+        assert_eq!(rs.original_max_position_embeddings, 8192);
+    }
+
+    #[test]
+    fn test_parse_llama_3_1_8b_instruct_config() {
+        let Some(config) = load_config("llama-3.1-8b-instruct") else {
+            return;
+        };
+        assert_eq!(config.arch().unwrap(), ModelArch::Llama);
+        assert_eq!(config.hidden_size, 4096);
+        assert_eq!(config.num_hidden_layers, 32);
+        assert_eq!(config.num_attention_heads, 32);
+        assert_eq!(config.num_key_value_heads, 8);
+        assert_eq!(config.head_dim, 128);
+        assert_eq!(config.intermediate_size, 14336);
+        assert_eq!(config.vocab_size, 128256);
+        assert!(!config.tie_word_embeddings);
+        assert!(!config.is_moe());
+    }
+
+    #[test]
+    fn test_parse_llama_3_2_1b_instruct_config() {
+        let Some(config) = load_config("llama-3.2-1b-instruct") else {
+            return;
+        };
+        assert_eq!(config.arch().unwrap(), ModelArch::Llama);
+        assert_eq!(config.hidden_size, 2048);
+        assert_eq!(config.num_hidden_layers, 16);
+        assert_eq!(config.num_attention_heads, 32);
+        assert_eq!(config.num_key_value_heads, 8);
+        assert_eq!(config.head_dim, 64);
+        assert_eq!(config.intermediate_size, 8192);
+        assert_eq!(config.vocab_size, 128256);
+        assert!(config.tie_word_embeddings);
+        assert!(!config.is_moe());
+    }
+
+    #[test]
+    fn test_parse_llama_3_2_3b_config() {
+        let Some(config) = load_config("llama-3.2-3b") else {
+            return;
+        };
+        assert_eq!(config.arch().unwrap(), ModelArch::Llama);
+        assert_eq!(config.hidden_size, 3072);
+        assert_eq!(config.num_hidden_layers, 28);
+        assert_eq!(config.num_attention_heads, 24);
+        assert_eq!(config.num_key_value_heads, 8);
+        assert_eq!(config.head_dim, 128);
+        assert_eq!(config.intermediate_size, 8192);
+        assert_eq!(config.vocab_size, 128256);
+        assert!(config.tie_word_embeddings);
+        assert!(!config.is_moe());
+    }
+
+    #[test]
+    fn test_parse_llama_3_2_3b_instruct_config() {
+        let Some(config) = load_config("llama-3.2-3b-instruct") else {
+            return;
+        };
+        assert_eq!(config.arch().unwrap(), ModelArch::Llama);
+        assert_eq!(config.hidden_size, 3072);
+        assert_eq!(config.num_hidden_layers, 28);
+        assert_eq!(config.num_attention_heads, 24);
+        assert_eq!(config.num_key_value_heads, 8);
+        assert_eq!(config.head_dim, 128);
+        assert_eq!(config.intermediate_size, 8192);
+        assert_eq!(config.vocab_size, 128256);
+        assert!(config.tie_word_embeddings);
+        assert!(!config.is_moe());
+    }
+
+    #[test]
+    fn test_parse_mistral_7b_config() {
+        let Some(config) = load_config("mistral-7b-instruct-v0.3") else {
+            return;
+        };
+        assert_eq!(config.arch().unwrap(), ModelArch::Mistral);
+        assert_eq!(config.hidden_size, 4096);
+        assert_eq!(config.num_hidden_layers, 32);
+        assert_eq!(config.num_attention_heads, 32);
+        assert_eq!(config.num_key_value_heads, 8);
+        assert_eq!(config.head_dim, 128); // computed: 4096 / 32
+        assert_eq!(config.intermediate_size, 14336);
+        assert_eq!(config.vocab_size, 32768);
+        assert!(!config.tie_word_embeddings);
+        assert!(!config.is_moe());
+        assert!(!config.arch().unwrap().has_qkv_bias());
+    }
+
+    #[test]
+    fn test_parse_mixtral_8x7b_config() {
+        let Some(config) = load_config("mixtral-8x7b-instruct-v0.1") else {
+            return;
+        };
+        assert_eq!(config.arch().unwrap(), ModelArch::Mixtral);
+        assert_eq!(config.hidden_size, 4096);
+        assert_eq!(config.num_hidden_layers, 32);
+        assert_eq!(config.num_attention_heads, 32);
+        assert_eq!(config.num_key_value_heads, 8);
+        assert_eq!(config.head_dim, 128); // computed: 4096 / 32
+        assert_eq!(config.intermediate_size, 14336);
+        assert_eq!(config.vocab_size, 32000);
+        assert!(!config.tie_word_embeddings);
+        assert!(config.is_moe());
+        assert_eq!(config.num_experts, 8); // from num_local_experts
+        assert_eq!(config.num_experts_per_tok, 2);
+        assert!(!config.arch().unwrap().has_qkv_bias());
+    }
+
+    #[test]
+    fn test_parse_qwen2_5_7b_config() {
+        let Some(config) = load_config("qwen2.5-7b-instruct") else {
+            return;
+        };
+        assert_eq!(config.arch().unwrap(), ModelArch::Qwen2);
+        assert_eq!(config.hidden_size, 3584);
+        assert_eq!(config.num_hidden_layers, 28);
+        assert_eq!(config.num_attention_heads, 28);
+        assert_eq!(config.num_key_value_heads, 4);
+        assert_eq!(config.head_dim, 128); // computed: 3584 / 28
+        assert_eq!(config.intermediate_size, 18944);
+        assert_eq!(config.vocab_size, 152064);
+        assert!(!config.tie_word_embeddings);
+        assert!(!config.is_moe());
+        assert!(config.arch().unwrap().has_qkv_bias());
+    }
+
+    #[test]
     fn test_num_heads_per_kv_group() {
         let mut config = minimal_config();
         config.num_attention_heads = 32;

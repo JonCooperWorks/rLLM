@@ -367,19 +367,52 @@ impl ShardingPlan {
             }
 
             // -- MoE experts --
+            //
+            // Weight naming varies by architecture:
+            //   Mixtral:  block_sparse_moe.gate / block_sparse_moe.experts.{j}.w1/w3/w2
+            //   Others:   mlp.gate / mlp.experts.{j}.gate_proj/up_proj/down_proj
+            //
+            // The plan must use the exact safetensors key so upload_sharded() can
+            // match the tensor name when slicing.  See loader.rs load_moe_ffn_weights()
+            // for the corresponding loading logic.
             if config.is_moe() {
                 let moe_inter = config.moe_intermediate_size;
+                let is_mixtral = config.model_type == "mixtral";
                 let use_ep = matches!(
                     device.strategy,
                     ParallelStrategy::ExpertParallel | ParallelStrategy::Hybrid
                 );
 
                 // Router gate: always replicated (all GPUs need full routing).
+                let router_name = if is_mixtral {
+                    format!("{layer}.block_sparse_moe.gate.weight")
+                } else {
+                    format!("{layer}.mlp.gate.weight")
+                };
                 add(
-                    format!("{layer}.mlp.gate.weight"),
+                    router_name,
                     SplitDimension::Replicated,
                     [config.num_experts, hidden],
                 );
+
+                // Helper: build (gate, up, down) tensor names for expert `ei`.
+                let expert_names = |ei: usize| -> (String, String, String) {
+                    if is_mixtral {
+                        let ep = format!("{layer}.block_sparse_moe.experts.{ei}");
+                        (
+                            format!("{ep}.w1.weight"),
+                            format!("{ep}.w3.weight"),
+                            format!("{ep}.w2.weight"),
+                        )
+                    } else {
+                        let ep = format!("{layer}.mlp.experts.{ei}");
+                        (
+                            format!("{ep}.gate_proj.weight"),
+                            format!("{ep}.up_proj.weight"),
+                            format!("{ep}.down_proj.weight"),
+                        )
+                    }
+                };
 
                 if use_ep {
                     // Expert parallelism: assign whole experts to ranks.
@@ -388,22 +421,23 @@ impl ShardingPlan {
                     let indices: Vec<usize> = (start..start + experts_per_rank).collect();
 
                     for &ei in &indices {
+                        let (gate, up, down) = expert_names(ei);
                         add(
-                            format!("{layer}.mlp.experts.{ei}.gate_proj.weight"),
+                            gate,
                             SplitDimension::ExpertParallel {
                                 expert_indices: indices.clone(),
                             },
                             [moe_inter, hidden],
                         );
                         add(
-                            format!("{layer}.mlp.experts.{ei}.up_proj.weight"),
+                            up,
                             SplitDimension::ExpertParallel {
                                 expert_indices: indices.clone(),
                             },
                             [moe_inter, hidden],
                         );
                         add(
-                            format!("{layer}.mlp.experts.{ei}.down_proj.weight"),
+                            down,
                             SplitDimension::ExpertParallel {
                                 expert_indices: indices.clone(),
                             },
@@ -413,21 +447,10 @@ impl ShardingPlan {
                 } else {
                     // Tensor parallelism for experts: split each expert's weights.
                     for ei in 0..config.num_experts {
-                        add(
-                            format!("{layer}.mlp.experts.{ei}.gate_proj.weight"),
-                            SplitDimension::Column,
-                            [moe_inter, hidden],
-                        );
-                        add(
-                            format!("{layer}.mlp.experts.{ei}.up_proj.weight"),
-                            SplitDimension::Column,
-                            [moe_inter, hidden],
-                        );
-                        add(
-                            format!("{layer}.mlp.experts.{ei}.down_proj.weight"),
-                            SplitDimension::Row,
-                            [hidden, moe_inter],
-                        );
+                        let (gate, up, down) = expert_names(ei);
+                        add(gate, SplitDimension::Column, [moe_inter, hidden]);
+                        add(up, SplitDimension::Column, [moe_inter, hidden]);
+                        add(down, SplitDimension::Row, [hidden, moe_inter]);
                     }
                 }
 
@@ -993,5 +1016,85 @@ mod tests {
 
         // Both layers should have standard attention entries.
         assert!(plan.get("model.layers.1.self_attn.q_proj.weight").is_some());
+    }
+
+    /// Helper: create a Mixtral-style MoE config for testing.
+    fn test_mixtral_moe_config() -> ModelConfig {
+        let mut config: ModelConfig = serde_json::from_value(serde_json::json!({
+            "model_type": "mixtral",
+            "hidden_size": 4096,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "intermediate_size": 0,
+            "vocab_size": 32000,
+            "num_experts": 8,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 14336,
+        }))
+        .unwrap();
+        config.weight_prefix = "model.".to_string();
+        config
+    }
+
+    #[test]
+    fn test_tp2_mixtral_moe_sharding() {
+        let config = test_mixtral_moe_config();
+        assert!(config.is_moe());
+
+        let device = DeviceConfig {
+            world_size: 2,
+            rank: 0,
+            strategy: ParallelStrategy::TensorParallel,
+        };
+        let plan = ShardingPlan::derive(&config, device, false).unwrap();
+
+        // Expert weights must use Mixtral naming (block_sparse_moe, w1/w3/w2).
+        let w1 = plan
+            .get("model.layers.0.block_sparse_moe.experts.0.w1.weight")
+            .unwrap();
+        assert_eq!(w1.split, SplitDimension::Column);
+        assert_eq!(w1.original_shape, [14336, 4096]);
+        assert_eq!(w1.shard_shape, [7168, 4096]);
+
+        let w3 = plan
+            .get("model.layers.0.block_sparse_moe.experts.0.w3.weight")
+            .unwrap();
+        assert_eq!(w3.split, SplitDimension::Column);
+
+        let w2 = plan
+            .get("model.layers.0.block_sparse_moe.experts.0.w2.weight")
+            .unwrap();
+        assert_eq!(w2.split, SplitDimension::Row);
+        assert_eq!(w2.original_shape, [4096, 14336]);
+        assert_eq!(w2.shard_shape, [4096, 7168]);
+
+        // All 8 experts should be in the plan.
+        for ei in 0..8 {
+            assert!(
+                plan.get(&format!(
+                    "model.layers.0.block_sparse_moe.experts.{ei}.w1.weight"
+                ))
+                .is_some(),
+                "missing expert {ei} w1 in plan"
+            );
+        }
+
+        // Generic mlp.experts naming must NOT appear.
+        assert!(
+            plan.get("model.layers.0.mlp.experts.0.gate_proj.weight")
+                .is_none(),
+            "Mixtral plan should not use generic mlp.experts naming"
+        );
+
+        // Router gate uses Mixtral naming.
+        let router = plan
+            .get("model.layers.0.block_sparse_moe.gate.weight")
+            .unwrap();
+        assert_eq!(router.split, SplitDimension::Replicated);
+
+        // Generic mlp.gate must NOT appear.
+        assert!(plan.get("model.layers.0.mlp.gate.weight").is_none());
     }
 }

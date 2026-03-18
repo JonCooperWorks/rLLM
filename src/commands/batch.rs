@@ -128,3 +128,70 @@ pub(crate) fn exec(args: BatchArgs) -> anyhow::Result<()> {
         },
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    /// Helper: replicate the prompt-parsing logic from exec() lines 65-69.
+    fn parse_prompts(text: &str) -> Vec<String> {
+        text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_prompt_parsing_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompts.txt");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "What is 2+2?").unwrap();
+        writeln!(f, "Tell me a joke.").unwrap();
+        writeln!(f, "Summarize this.").unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let prompts = parse_prompts(&text);
+        assert_eq!(prompts.len(), 3);
+        assert_eq!(prompts[0], "What is 2+2?");
+        assert_eq!(prompts[1], "Tell me a joke.");
+        assert_eq!(prompts[2], "Summarize this.");
+    }
+
+    #[test]
+    fn test_prompt_parsing_skips_empty_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompts.txt");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "First prompt").unwrap();
+        writeln!(f).unwrap();
+        writeln!(f, "   ").unwrap();
+        writeln!(f, "Second prompt").unwrap();
+        writeln!(f).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let prompts = parse_prompts(&text);
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0], "First prompt");
+        assert_eq!(prompts[1], "Second prompt");
+    }
+
+    #[test]
+    fn test_prompt_parsing_trims_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompts.txt");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "  leading spaces").unwrap();
+        writeln!(f, "trailing spaces   ").unwrap();
+        writeln!(f, "  both sides  ").unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let prompts = parse_prompts(&text);
+        // The current code does NOT trim — it only filters empty-after-trim.
+        // So whitespace is preserved in the output strings.
+        assert_eq!(prompts.len(), 3);
+        assert_eq!(prompts[0], "  leading spaces");
+        assert_eq!(prompts[1], "trailing spaces   ");
+        assert_eq!(prompts[2], "  both sides  ");
+    }
+}

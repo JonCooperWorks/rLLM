@@ -9,7 +9,7 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use crate::engine::{self, InferenceEngine};
+use crate::engine;
 use crate::gpu;
 
 #[derive(clap::Args)]
@@ -121,15 +121,28 @@ pub(crate) fn exec(mut args: RunArgs) -> anyhow::Result<()> {
             );
 
             // Submit request and run generation loop.
+            let prompt_len = prompt_tokens.len();
             eng.add_request(prompt_tokens, max_tokens, temperature, top_p);
 
             let start = std::time::Instant::now();
             let mut gen_count = 0usize;
             let mut prev_text_len = 0usize;
             let mut all_token_ids: Vec<u32> = Vec::new();
+            let mut prefill_reported = false;
 
             while eng.has_work() {
                 let output = eng.step()?;
+
+                // Report prefill (TTFT) after the first token arrives.
+                if !prefill_reported && !output.tokens.is_empty() {
+                    let ttft = start.elapsed();
+                    let prefill_tps = prompt_len as f64 / ttft.as_secs_f64();
+                    eprintln!(
+                        "prefill: {} tokens in {:.1?} ({:.1} tok/s)",
+                        prompt_len, ttft, prefill_tps
+                    );
+                    prefill_reported = true;
+                }
 
                 // Stream tokens to stdout as they're generated.
                 for &(_seq_id, token_id) in &output.tokens {

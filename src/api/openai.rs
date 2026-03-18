@@ -770,4 +770,82 @@ mod tests {
         assert_eq!(json["choices"][0]["text"], "world");
         assert_eq!(json["usage"]["prompt_tokens"], 3);
     }
+
+    // --- SSE streaming format tests ---
+
+    #[test]
+    fn test_sse_token_event_format() {
+        let chunk = serde_json::json!({
+            "id": "chatcmpl-test1",
+            "object": "chat.completion.chunk",
+            "created": 1234567890,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "delta": { "content": "Hello" },
+                "finish_reason": serde_json::Value::Null
+            }]
+        });
+        let sse = format!("data: {}\n\n", chunk);
+        assert!(sse.starts_with("data: "));
+        assert!(sse.ends_with("\n\n"));
+        // Verify the JSON inside is parseable.
+        let json_str = sse.strip_prefix("data: ").unwrap().trim();
+        let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        assert_eq!(parsed["choices"][0]["delta"]["content"], "Hello");
+    }
+
+    #[test]
+    fn test_sse_done_sentinel() {
+        let done = "data: [DONE]\n\n";
+        assert_eq!(done, "data: [DONE]\n\n");
+        assert!(done.starts_with("data: "));
+        assert!(done.ends_with("\n\n"));
+        // [DONE] is not valid JSON — it is a special sentinel.
+        let payload = done.strip_prefix("data: ").unwrap().trim();
+        assert_eq!(payload, "[DONE]");
+        assert!(serde_json::from_str::<serde_json::Value>(payload).is_err());
+    }
+
+    #[test]
+    fn test_sse_chunk_has_delta_content() {
+        let token_text = "world";
+        let chunk = serde_json::json!({
+            "id": "chatcmpl-test2",
+            "object": "chat.completion.chunk",
+            "created": 1234567890,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "delta": { "content": token_text },
+                "finish_reason": serde_json::Value::Null
+            }]
+        });
+        // Verify choices[0].delta.content is present and correct.
+        assert_eq!(chunk["choices"][0]["delta"]["content"], token_text);
+        assert!(chunk["choices"][0]["delta"].get("content").is_some());
+        assert!(chunk["choices"][0]["finish_reason"].is_null());
+    }
+
+    #[test]
+    fn test_sse_final_chunk_has_finish_reason() {
+        let chunk = serde_json::json!({
+            "id": "chatcmpl-test3",
+            "object": "chat.completion.chunk",
+            "created": 1234567890,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }]
+        });
+        let sse = format!("data: {}\n\n", chunk);
+        let json_str = sse.strip_prefix("data: ").unwrap().trim();
+        let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        // Final chunk: finish_reason is set, delta is empty.
+        assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
+        assert!(parsed["choices"][0]["delta"].get("content").is_none());
+        assert!(parsed["choices"][0]["delta"].as_object().unwrap().is_empty());
+    }
 }

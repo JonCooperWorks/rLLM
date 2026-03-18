@@ -169,4 +169,29 @@ mod imp {
             &self.tokenizer
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Compile-time verification that MultiGpuDispatch implements Dispatch
+        /// with the expected associated type.
+        fn _assert_dispatch_impl() {
+            fn assert_dispatch<T: Dispatch>() {}
+            assert_dispatch::<MultiGpuDispatch>();
+        }
+
+        /// Compile-time verification that the SeqState associated type is
+        /// Vec<SeqKvState<CudaBackend>>, matching the per-rank KV state design.
+        fn _assert_seq_state_is_vec() {
+            fn check<T: Dispatch<SeqState = Vec<SeqKvState<CudaBackend>>>>() {}
+            check::<MultiGpuDispatch>();
+        }
+
+        /// Compile-time verification that MultiGpuEngine implements InferenceEngine.
+        fn _assert_engine_impl() {
+            fn assert_engine<T: InferenceEngine>() {}
+            assert_engine::<MultiGpuEngine>();
+        }
+    }
 }

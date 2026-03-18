@@ -57,6 +57,27 @@ Q4 is ~17% faster than bf16 for decode on the RTX PRO 6000 — a middle ground b
 </details>
 
 <details>
+<summary><b>2× NVIDIA GeForce RTX 5090 (TP=2)</b> — 2× 1.79 TB/s GDDR7X bandwidth</summary>
+
+Tensor parallelism across 2 GPUs via NCCL. Measured via `rllm run --tp 2`, single run, 128 max tokens.
+
+| Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
+|---|---|---|---|---|---|
+| Llama 3.2 1B Instruct | 1.2B | 178 tok/s | 173 tok/s | 70 ms | 75 ms |
+| Llama 3.2 3B Instruct | 3.2B | 112 tok/s | 125 tok/s | 85 ms | 87 ms |
+| Qwen 2.5 3B Instruct | 3.1B | 99 tok/s | 101 tok/s | 77 ms | 84 ms |
+| Gemma 3 4B Instruct | 4.3B | 82 tok/s | 89 tok/s | 47 ms | 47 ms |
+| Qwen 2.5 7B Instruct | 7.6B | 85 tok/s | 98 tok/s | 97 ms | 113 ms |
+| Mistral 7B Instruct | 7.2B | 100 tok/s | 123 tok/s | 106 ms | 114 ms |
+| Llama 3.1 8B Instruct | 8.0B | 82 tok/s | 96 tok/s | 113 ms | 123 ms |
+| Phi-4 | 14.7B | 56 tok/s | 73 tok/s | 124 ms | 133 ms |
+| Gemma 3 27B Instruct | 27.4B | 35 tok/s | 45 tok/s | 140 ms | 126 ms |
+
+Small models (1B-4B) are bottlenecked by NCCL all-reduce latency — single GPU is faster. TP=2 shines for larger models: Gemma 27B gets 45 tok/s Q4 vs ~24 tok/s on a single A100. Q4 is 10-30% faster than bf16, consistent with GDDR7X bandwidth characteristics. Mixtral 8x7B and Qwen3 MoE bf16 do not fit in 2×32 GB; Mixtral Q4 TP=2 is supported (expert weights are sharded per rank via the sharding plan).
+
+</details>
+
+<details>
 <summary><b>NVIDIA A100-SXM4-80GB</b> — 2.0 TB/s bandwidth</summary>
 
 Benchmarked on [RunPod](https://runpod.io?ref=249k2lel). Measured via `rllm run`, single run, 128 max tokens.

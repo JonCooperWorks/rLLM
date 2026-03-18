@@ -1494,7 +1494,7 @@ fn load_moe_ffn_weights<B: GpuCore>(
     hints: &LoaderHints,
     layer_idx: usize,
     quantize: bool,
-    _sharding: Option<&crate::gpu::parallel::ShardingPlan>,
+    sharding: Option<&crate::gpu::parallel::ShardingPlan>,
 ) -> anyhow::Result<FfnLoaded<B>> {
     let hidden = config.hidden_size;
     let moe_inter = config.moe_intermediate_size;
@@ -1568,6 +1568,12 @@ fn load_moe_ffn_weights<B: GpuCore>(
         //   Qwen3-MoE:  mlp.experts.{j}.gate_proj / up_proj / down_proj
         //   Mixtral:    block_sparse_moe.experts.{j}.w1 / w3 / w2
         //               (w1=gate, w3=up, w2=down — Mixtral convention)
+        //
+        // We use upload_sharded (not upload_maybe_quantized) so that tensor
+        // parallelism slices each expert's weights per the sharding plan.
+        // upload_sharded falls back to upload_maybe_quantized when sharding
+        // is None or the tensor is Replicated, so single-GPU is unaffected.
+        // See parallel.rs ShardingPlan::derive() for the plan derivation.
         let mut experts = Vec::with_capacity(num_experts);
         for j in 0..num_experts {
             let (gate_name, up_name, down_name) = if hints.is_mixtral {
@@ -1586,26 +1592,29 @@ fn load_moe_ffn_weights<B: GpuCore>(
                 )
             };
             experts.push(ExpertWeights {
-                gate_proj: upload_maybe_quantized(
+                gate_proj: upload_sharded(
                     store,
                     backend,
                     &gate_name,
                     &[moe_inter, hidden],
                     quantize,
+                    sharding,
                 )?,
-                up_proj: upload_maybe_quantized(
+                up_proj: upload_sharded(
                     store,
                     backend,
                     &up_name,
                     &[moe_inter, hidden],
                     quantize,
+                    sharding,
                 )?,
-                down_proj: upload_maybe_quantized(
+                down_proj: upload_sharded(
                     store,
                     backend,
                     &down_name,
                     &[hidden, moe_inter],
                     quantize,
+                    sharding,
                 )?,
                 gate_bias: None,
                 up_bias: None,
@@ -2410,5 +2419,72 @@ mod tests {
         assert!(!hints.has_fused_qkv);
         assert!(!hints.is_mixtral, "Mistral != Mixtral");
         assert!(!hints.is_gpt_oss);
+    }
+
+    // --- Shard detection tests ---
+
+    /// Create a minimal valid safetensors file containing one f32 tensor.
+    fn make_safetensors_bytes(tensor_name: &str) -> Vec<u8> {
+        use safetensors::tensor::TensorView;
+        let data: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+        let data_bytes: &[u8] = bytemuck::cast_slice(&data);
+        let tv = TensorView::new(safetensors::Dtype::F32, vec![4], data_bytes).unwrap();
+        safetensors::serialize([(tensor_name, tv)], &None).unwrap()
+    }
+
+    #[test]
+    fn test_load_safetensors_single_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        std::fs::write(&path, make_safetensors_bytes("weight")).unwrap();
+
+        let (mmaps, weight_map) = load_safetensors_files(dir.path()).unwrap();
+        assert_eq!(mmaps.len(), 1);
+        assert!(weight_map.is_empty(), "single file has no weight_map");
+    }
+
+    #[test]
+    fn test_load_safetensors_sharded() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write two shard files.
+        let shard1 = "model-00001-of-00002.safetensors";
+        let shard2 = "model-00002-of-00002.safetensors";
+        std::fs::write(dir.path().join(shard1), make_safetensors_bytes("layer.0.weight")).unwrap();
+        std::fs::write(dir.path().join(shard2), make_safetensors_bytes("layer.1.weight")).unwrap();
+
+        // Write the index file.
+        let index = serde_json::json!({
+            "weight_map": {
+                "layer.0.weight": shard1,
+                "layer.1.weight": shard2
+            }
+        });
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            serde_json::to_string(&index).unwrap(),
+        )
+        .unwrap();
+
+        let (mmaps, weight_map) = load_safetensors_files(dir.path()).unwrap();
+        assert_eq!(mmaps.len(), 2);
+        assert_eq!(weight_map.len(), 2);
+        assert!(weight_map.contains_key("layer.0.weight"));
+        assert!(weight_map.contains_key("layer.1.weight"));
+        // The two tensors should map to different shard indices.
+        assert_ne!(weight_map["layer.0.weight"], weight_map["layer.1.weight"]);
+    }
+
+    #[test]
+    fn test_load_safetensors_missing_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        // Empty directory — no safetensors files at all.
+        let result = load_safetensors_files(dir.path());
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("no safetensors file found"),
+            "unexpected error: {msg}"
+        );
     }
 }
