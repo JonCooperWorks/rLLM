@@ -54,12 +54,19 @@ pub(crate) struct RunArgs {
     )]
     system: String,
 
-    /// Tensor parallelism: number of GPUs to use (default 1).
+    /// Tensor parallelism: number of GPUs to use.
+    /// 0 = auto-detect (use all available GPUs), 1 = single GPU (default).
     #[arg(long, default_value = "1")]
     tp: usize,
 }
 
 pub(crate) fn exec(mut args: RunArgs) -> anyhow::Result<()> {
+    // Resolve --tp 0 → auto-detect available GPUs.
+    if args.tp == 0 {
+        args.tp = gpu::device_count();
+        eprintln!("auto-detected {} GPU(s)", args.tp);
+    }
+
     // Multi-GPU tensor parallelism is CUDA-only (requires NCCL).
     // On macOS (Metal), fall back to single GPU with a warning.
     #[cfg(not(feature = "cuda"))]

@@ -246,6 +246,21 @@ pub(crate) fn create_backend() -> anyhow::Result<cpu::CpuBackend> {
     Ok(cpu::CpuBackend)
 }
 
+/// Number of GPUs available on this system.
+///
+/// Returns the count without creating a full backend — used to resolve
+/// `--tp auto` before spawning worker threads.  CUDA queries the driver
+/// directly; Metal and CPU always return 1.
+#[cfg(feature = "cuda")]
+pub(crate) fn device_count() -> usize {
+    cudarc::driver::CudaContext::device_count().unwrap_or(1) as usize
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn device_count() -> usize {
+    1
+}
+
 #[cfg(not(any(target_os = "macos", feature = "cuda")))]
 pub(crate) type Backend = cpu::CpuBackend;
 

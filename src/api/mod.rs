@@ -164,9 +164,15 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // The worker loads backend/tokenizer/weights/model and runs the Engine
     // step loop.  We get back the request sender plus shared tokenizer/arch
     // for handler-side tokenization.
+    // Resolve --tp 0 → auto-detect available GPUs.
+    let mut tp = args.tp;
+    if tp == 0 {
+        tp = gpu::device_count();
+        eprintln!("auto-detected {} GPU(s)", tp);
+    }
+
     // Multi-GPU tensor parallelism is CUDA-only (requires NCCL).
     // On macOS (Metal), fall back to single GPU with a warning.
-    let mut tp = args.tp;
     #[cfg(not(feature = "cuda"))]
     if tp > 1 {
         eprintln!("warning: --tp {} ignored (multi-GPU requires CUDA + NCCL), using single GPU", tp);
