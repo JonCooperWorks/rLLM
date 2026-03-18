@@ -166,7 +166,7 @@ cargo run --release -- serve --model models/llama-3.2-1b-instruct --port 8080 --
 cargo run --release -- serve --model models/llama-3.1-70b-instruct --quantize --tp 2 --port 8080 --dangerous-no-tls
 ```
 
-Works as a drop-in backend for any tool that speaks the OpenAI or Anthropic API — just point it at `http://localhost:8080`. With `--tp 2`, the model is sharded across GPUs via NCCL and requests are served sequentially (no continuous batching in TP mode — single-request throughput is the priority for large models).
+Works as a drop-in backend for any tool that speaks the OpenAI or Anthropic API — just point it at `http://localhost:8080`. With `--tp 2`, the model is sharded across GPUs via NCCL with continuous batching — multiple concurrent requests are interleaved just like the single-GPU path.
 
 <details>
 <summary>Server options</summary>

@@ -234,5 +234,117 @@ pub(crate) mod tp {
                 rank.seq_state = rank.kv_pool.new_sequence(rank.model.backend);
             }
         }
+
+        // -------------------------------------------------------------------
+        // Multi-sequence methods for continuous batching.
+        //
+        // The methods above use a single internal seq_state per rank (for
+        // `rllm run` which processes one sequence).  The methods below accept
+        // external per-rank KV states, allowing the API server to manage
+        // multiple concurrent sequences with the same MultiGpuInference.
+        // -------------------------------------------------------------------
+
+        /// Create a new per-rank KV state set for a new sequence.
+        pub fn new_sequence(&self) -> Vec<SeqKvState<CudaBackend>> {
+            self.ranks.iter()
+                .map(|r| r.kv_pool.new_sequence(r.model.backend))
+                .collect()
+        }
+
+        /// Free all KV blocks for a sequence across all ranks.
+        pub fn free_sequence(&mut self, states: &[SeqKvState<CudaBackend>]) {
+            for (rank, state) in self.ranks.iter_mut().zip(states) {
+                rank.kv_pool.free_sequence(state);
+            }
+        }
+
+        /// Allocate one KV slot on all ranks for an external sequence.
+        pub fn ensure_slot_for(
+            &mut self,
+            states: &mut [SeqKvState<CudaBackend>],
+        ) -> anyhow::Result<()> {
+            for (rank, state) in self.ranks.iter_mut().zip(states.iter_mut()) {
+                state.ensure_slot(&mut rank.kv_pool)?;
+                state.sync_block_table(rank.model.backend);
+            }
+            Ok(())
+        }
+
+        /// Allocate KV slots for prefill on all ranks for an external sequence.
+        pub fn ensure_slots_for(
+            &mut self,
+            states: &mut [SeqKvState<CudaBackend>],
+            count: usize,
+        ) -> anyhow::Result<()> {
+            for (rank, state) in self.ranks.iter_mut().zip(states.iter_mut()) {
+                state.ensure_slots(&mut rank.kv_pool, count)?;
+                state.sync_block_table(rank.model.backend);
+            }
+            Ok(())
+        }
+
+        /// Advance KV state on all ranks for an external sequence.
+        pub fn advance_for(states: &mut [SeqKvState<CudaBackend>]) {
+            for state in states {
+                state.advance();
+            }
+        }
+
+        /// Advance KV state by count on all ranks for an external sequence.
+        pub fn advance_by_for(states: &mut [SeqKvState<CudaBackend>], count: usize) {
+            for state in states {
+                state.advance_by(count);
+            }
+        }
+
+        /// Run single-token forward pass with external per-rank KV states.
+        pub fn forward_single_paged_with(
+            &self,
+            token_id: u32,
+            states: &[SeqKvState<CudaBackend>],
+        ) -> anyhow::Result<()> {
+            if self.world_size == 1 {
+                let r = &self.ranks[0];
+                return r.model.forward_single_paged(token_id, &r.kv_pool, &states[0]);
+            }
+
+            std::thread::scope(|s| {
+                let handles: Vec<_> = self.ranks.iter().zip(states.iter()).map(|(rank, state)| {
+                    s.spawn(move || {
+                        rank.model.forward_single_paged(token_id, &rank.kv_pool, state)
+                    })
+                }).collect();
+
+                for h in handles {
+                    h.join().unwrap()?;
+                }
+                Ok(())
+            })
+        }
+
+        /// Run prefill forward pass with external per-rank KV states.
+        pub fn forward_prefill_paged_with(
+            &self,
+            tokens: &[u32],
+            states: &[SeqKvState<CudaBackend>],
+        ) -> anyhow::Result<()> {
+            if self.world_size == 1 {
+                let r = &self.ranks[0];
+                return r.model.forward_prefill_paged(tokens, &r.kv_pool, &states[0], &r.prefill_bufs);
+            }
+
+            std::thread::scope(|s| {
+                let handles: Vec<_> = self.ranks.iter().zip(states.iter()).map(|(rank, state)| {
+                    s.spawn(move || {
+                        rank.model.forward_prefill_paged(tokens, &rank.kv_pool, state, &rank.prefill_bufs)
+                    })
+                }).collect();
+
+                for h in handles {
+                    h.join().unwrap()?;
+                }
+                Ok(())
+            })
+        }
     }
 }
