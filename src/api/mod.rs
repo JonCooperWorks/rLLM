@@ -4,29 +4,34 @@
 // LEARNING OVERVIEW
 //
 // What this file does:
-//   Sets up an HTTP server (axum + tokio) and bridges async HTTP handlers
-//   to the synchronous GPU inference pipeline via a dedicated worker thread.
+//   Sets up an HTTP server (axum + tokio), defines the shared types that
+//   bridge HTTP handlers to the inference worker, and provides the shared
+//   worker loop (run_worker_loop) that drives any InferenceEngine.
+//
+// Module layout:
+//   mod.rs        — server setup, shared types, run_worker_loop
+//   single_gpu.rs — spawns worker thread with Engine<B> (1 GPU)
+//   multi_gpu.rs  — spawns worker thread with MultiGpuEngine (N GPUs)
+//   openai.rs     — /v1/chat/completions, /v1/completions, /v1/models
+//   anthropic.rs  — /v1/messages
+//   tls.rs        — TLS support (manual certs, Let's Encrypt)
 //
 // Architecture:
 //
 //   HTTP clients ←→ [tokio async runtime / axum handlers]
 //                         ↕ channels
-//                    [inference worker thread (Engine + Scheduler)]
-//                         ↕ GPU
-//                    [Metal/CUDA backend]
+//                    [worker thread: run_worker_loop(&mut dyn InferenceEngine)]
+//                         ↕
+//                    [Engine<B> or MultiGpuEngine — server doesn't know which]
 //
-// Continuous batching:
-//   Multiple concurrent HTTP requests are batched together through the model.
-//   The worker thread runs an Engine step loop that processes all active
-//   sequences each step — prefilling new prompts via GEMM and decoding one
-//   token per active sequence.  The decode phase is memory-bandwidth-bound,
-//   so batching N sequences costs almost nothing extra per token.
+// The worker loop is GPU-topology-agnostic.  It calls add_request / step /
+// abort_sequence / has_work / tokenizer on the trait object.  Single-GPU
+// and multi-GPU setup is isolated in their respective modules.
 //
 // Why a dedicated worker thread?
-//   The model (`Model<'a, B>`) borrows the GPU backend, has mutable scratch
-//   buffers, and GPU operations are single-threaded.  Rather than fighting
-//   Rust's borrow checker with Arc<Mutex<...>>, we keep ALL GPU state on
-//   one std::thread and communicate via channels:
+//   The model borrows the GPU backend and has mutable scratch buffers.
+//   Rather than fighting Arc<Mutex<...>>, we keep ALL GPU state on one
+//   std::thread and communicate via channels:
 //
 //   - Request channel (std::sync::mpsc):  HTTP handlers → worker
 //   - Response channel (tokio::sync::mpsc, one per request):  worker → handler
@@ -34,38 +39,22 @@
 //   The worker calls `blocking_send` on the tokio channel, which is safe
 //   from synchronous code.  The handler calls `recv().await` on the async
 //   side.  This cleanly bridges sync GPU code and async HTTP serving.
-//
-// Tokenization:
-//   Tokenization (text → token IDs) is CPU-only work.  It happens on the
-//   async handler threads using the shared Arc<Tokenizer>, so the worker
-//   thread's step loop is never blocked by tokenization.
-//
-// Streaming:
-//   For SSE (Server-Sent Events), the handler reads token events from the
-//   response channel and yields them as SSE frames.  The worker sends one
-//   event per generated token, so the client sees output in real-time.
-//
-//   If the client disconnects mid-stream, the handler drops its receiver.
-//   The worker detects this when `blocking_send` returns Err, and aborts
-//   the sequence via the Engine — KV cache blocks are freed immediately.
 // ===========================================================================
 
 pub(crate) mod anthropic;
 mod multi_gpu;
 pub(crate) mod openai;
+mod single_gpu;
 pub(crate) mod tls;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::ServeArgs;
 use crate::engine;
-use crate::engine::scheduler::{self, SeqId};
-use crate::gpu::{self, GpuCore};
-use crate::model;
-use crate::model::loader;
-use crate::model::{config, kv_cache, tokenizer};
+use crate::engine::scheduler::SeqId;
+use crate::gpu;
+use crate::model::{config, tokenizer};
 
 // ---------------------------------------------------------------------------
 // Shared types: the bridge between HTTP handlers and the inference worker.
@@ -187,7 +176,7 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     } = if tp > 1 {
         multi_gpu::spawn_worker(args.model.clone(), args.quantize, tp)?
     } else {
-        spawn_worker(args.model.clone(), args.quantize)?
+        single_gpu::spawn_worker(args.model.clone(), args.quantize)?
     };
 
     eprintln!("model ready: {}", model_name);
@@ -445,86 +434,4 @@ fn run_worker_loop(
     Ok(())
 }
 
-/// Spawn the single-GPU inference worker thread.
-///
-/// Returns the request sender, shared tokenizer, and model architecture.
-/// The worker loads the model inside the thread (so all GPU resources have
-/// the thread's lifetime) and runs the shared worker loop.
-fn spawn_worker(model_dir: PathBuf, quantize: bool) -> anyhow::Result<WorkerHandle> {
-    // Channel for incoming requests.  Capacity 8 gives a small queue;
-    // if full, handlers get backpressure (try_send returns Err → 503).
-    let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
-
-    // Ready channel: worker sends back the tokenizer and arch (or an error).
-    let (ready_tx, ready_rx) =
-        std::sync::mpsc::sync_channel::<Result<(Arc<tokenizer::Tokenizer>, config::ModelArch), String>>(1);
-
-    std::thread::spawn(move || {
-        let result = (|| -> anyhow::Result<()> {
-            let backend = gpu::create_backend()?;
-            eprintln!("gpu: {}", backend.device_name());
-
-            let loader::LoadedModel {
-                config,
-                arch,
-                tokenizer,
-                weights,
-            } = loader::load_model(&backend, &model_dir, quantize)?;
-
-            let tokenizer = Arc::new(tokenizer);
-            let _ = ready_tx.send(Ok((Arc::clone(&tokenizer), arch)));
-
-            let engine_tokenizer = (*tokenizer).clone();
-            let model = model::Model::new(config.clone(), weights, &backend)?;
-
-            // Dynamic KV cache sizing.
-            let gpu_budget = backend.recommended_max_memory();
-            let qpb = |m, k| backend.quantized_weight_bytes(m, k);
-            let num_blocks = config.recommended_kv_blocks(gpu_budget, quantize, &qpb);
-            let kv_dim = config.num_key_value_heads * config.head_dim;
-            let kv_pool =
-                kv_cache::KvPool::new(&backend, num_blocks, kv_dim, config.num_kv_layers());
-
-            let weight_mb = config.estimate_weight_bytes(quantize, &qpb) as f64 / (1024.0 * 1024.0);
-            let kv_mb = kv_pool.total_memory_bytes() as f64 / (1024.0 * 1024.0);
-            let max_tokens = kv_pool.max_tokens();
-            eprintln!(
-                "memory: {:.0} MB weights, {:.0} MB KV cache ({} blocks, {} max tokens), {:.0} MB GPU budget",
-                weight_mb,
-                kv_mb,
-                num_blocks,
-                max_tokens,
-                gpu_budget as f64 / (1024.0 * 1024.0),
-            );
-
-            let max_active = 32;
-            eprintln!("max {} concurrent sequences", max_active);
-            let sched = scheduler::Scheduler::new(kv_pool, max_active);
-
-            let mut eng = engine::Engine::new(
-                model,
-                sched,
-                engine_tokenizer,
-                &backend,
-            );
-
-            run_worker_loop(&mut eng, request_rx)
-        })();
-
-        if let Err(e) = result {
-            let _ = ready_tx.send(Err(format!("{e:#}")));
-        }
-    });
-
-    // Wait for the worker to finish loading (or fail).
-    match ready_rx.recv() {
-        Ok(Ok((tokenizer, arch))) => Ok(WorkerHandle {
-            request_tx,
-            tokenizer,
-            arch,
-        }),
-        Ok(Err(e)) => anyhow::bail!("worker failed to start: {e}"),
-        Err(_) => anyhow::bail!("worker thread died during startup"),
-    }
-}
 
