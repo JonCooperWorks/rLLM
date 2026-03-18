@@ -84,6 +84,7 @@ Benchmarked on [RunPod](https://runpod.io?ref=249k2lel). Tensor parallelism acro
 |---|---|---|---|---|---|
 | Llama 3.1 70B Instruct | 70.6B | 13.5 tok/s | 11.1 tok/s | 457 ms | 564 ms |
 | Qwen 2.5 72B Instruct | 72.7B | 12.9 tok/s | 11.0 tok/s | 408 ms | 516 ms |
+| Qwen3.5 122B-A10B | ~122B (~10B active) | — | 17.8 tok/s | — | 1,800 ms |
 
 </details>
 
