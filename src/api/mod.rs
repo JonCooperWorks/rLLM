@@ -10,8 +10,7 @@
 //
 // Module layout:
 //   mod.rs        — server setup, shared types, run_worker_loop
-//   single_gpu.rs — spawns worker thread with Engine<B> (1 GPU)
-//   multi_gpu.rs  — spawns worker thread with MultiGpuEngine (N GPUs)
+//   worker.rs     — spawn_worker() factory (single-GPU or multi-GPU)
 //   openai.rs     — /v1/chat/completions, /v1/completions, /v1/models
 //   anthropic.rs  — /v1/messages
 //   tls.rs        — TLS support (manual certs, Let's Encrypt)
@@ -25,8 +24,8 @@
 //                    [Engine<B> or MultiGpuEngine — server doesn't know which]
 //
 // The worker loop is GPU-topology-agnostic.  It calls add_request / step /
-// abort_sequence / has_work / tokenizer on the trait object.  Single-GPU
-// and multi-GPU setup is isolated in their respective modules.
+// abort_sequence / has_work / tokenizer on the trait object.  The worker.rs
+// module handles single-GPU vs multi-GPU setup behind a single spawn_worker().
 //
 // Why a dedicated worker thread?
 //   The model borrows the GPU backend and has mutable scratch buffers.
@@ -42,10 +41,9 @@
 // ===========================================================================
 
 pub(crate) mod anthropic;
-mod multi_gpu;
 pub(crate) mod openai;
-mod single_gpu;
 pub(crate) mod tls;
+mod worker;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -173,11 +171,7 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         request_tx,
         tokenizer,
         arch,
-    } = if tp > 1 {
-        multi_gpu::spawn_worker(args.model.clone(), args.quantize, tp)?
-    } else {
-        single_gpu::spawn_worker(args.model.clone(), args.quantize)?
-    };
+    } = worker::spawn_worker(args.model.clone(), args.quantize, tp)?;
 
     eprintln!("model ready: {}", model_name);
 
@@ -304,8 +298,8 @@ struct RequestContext {
 // engine.step(), streams tokens back to clients, and cleans up finished
 // or disconnected sequences.
 //
-// Both spawn_worker (single-GPU) and multi_gpu::spawn_worker (multi-GPU)
-// delegate to this function after constructing their respective engine.
+// worker::spawn_worker() delegates to this function after constructing
+// the appropriate engine (single-GPU or multi-GPU).
 // ---------------------------------------------------------------------------
 
 /// Run the continuous batching loop for any InferenceEngine.
