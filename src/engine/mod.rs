@@ -52,6 +52,7 @@
 
 pub(crate) mod dispatch;
 pub(crate) mod multi_gpu;
+pub(crate) mod worker;
 
 use std::collections::{HashMap, VecDeque};
 
