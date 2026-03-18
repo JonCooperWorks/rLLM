@@ -52,7 +52,7 @@ use std::sync::Arc;
 
 use crate::ServeArgs;
 use crate::engine;
-use crate::engine::scheduler::SeqId;
+use crate::engine::SeqId;
 use crate::gpu;
 use crate::model::{config, tokenizer};
 

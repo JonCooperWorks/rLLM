@@ -4,8 +4,8 @@
 // LEARNING OVERVIEW
 //
 // What this file does:
-//   The engine owns the model, scheduler, and tokenizer, and drives the
-//   generation loop for MULTIPLE concurrent sequences.  Each step:
+//   The engine owns the dispatch, sequence state, and tokenizer, and drives
+//   the generation loop for MULTIPLE concurrent sequences.  Each step:
 //     1. Admit new requests from the waiting queue.
 //     2. Prefill: for sequences still processing their prompt, run the
 //        ENTIRE prompt through the model in one batched forward pass (GEMM).
@@ -28,25 +28,36 @@
 //
 // Continuous batching:
 //   Multiple sequences can be in flight simultaneously: some prefilling,
-//   some decoding, some finishing.  The scheduler manages the sequence
-//   lifecycle, and finished sequences' KV blocks are returned to the
-//   free list for reuse.
+//   some decoding, some finishing.  Finished sequences' KV blocks are
+//   returned to the free list for reuse.
 //
 // Dispatch trait:
 //   The step loop is generic over the Dispatch trait (dispatch.rs), which
 //   abstracts over single-GPU and multi-GPU backends.  run_step() contains
 //   the loop logic once; SingleGpuDispatch and MultiGpuDispatch provide
 //   the GPU-specific operations.
+//
+// Sequence lifecycle:
+//   add_request() → waiting queue (pre-assigned SeqId)
+//   schedule()    → admitted to active set (FCFS, checked against KV capacity)
+//   run_step()    → prefill → decode → sample → finish check
+//   collect_finished() → removed from active, KV blocks freed
+//
+// Related files:
+//   - engine/dispatch.rs  — Dispatch trait (GPU-specific operations)
+//   - engine/multi_gpu.rs — MultiGpuDispatch + MultiGpuEngine (CUDA N-GPU)
+//   - model/kv_cache.rs   — KvPool, SeqKvState, block allocation
+//   - api/mod.rs          — worker loop calls InferenceEngine trait
 // ===========================================================================
 
 pub(crate) mod dispatch;
 pub(crate) mod multi_gpu;
-pub(crate) mod scheduler;
+
+use std::collections::{HashMap, VecDeque};
 
 use self::dispatch::Dispatch;
-use self::scheduler::{Scheduler, SeqId, SequenceRequest};
 use crate::gpu::GpuBackend;
-use crate::model::kv_cache::{KvPool, SeqKvState};
+use crate::model::kv_cache::{self, KvPool, SeqKvState};
 use crate::model::tokenizer::Tokenizer;
 use crate::model::{self, Model, PrefillBuffers};
 
@@ -111,11 +122,162 @@ pub(crate) struct StepOutput {
 }
 
 // ---------------------------------------------------------------------------
+// Sequence management — waiting queue, active set, FCFS admission.
+//
+// These types manage the lifecycle of concurrent sequences.  The Scheduler
+// is a thin data container: it stores the waiting queue and active set,
+// delegates GPU operations (block allocation, sequence creation) to the
+// Dispatch trait, and provides admission (schedule) and cleanup
+// (collect_finished, abort_sequence) helpers.
+// ---------------------------------------------------------------------------
+
+/// Unique identifier for a sequence request.
+pub(crate) type SeqId = u64;
+
+/// A new sequence request submitted to the engine.
+pub(crate) struct SequenceRequest {
+    pub prompt_tokens: Vec<u32>,
+    pub max_gen_tokens: usize,
+    pub temperature: f32,
+    pub top_p: f32,
+}
+
+/// State of a single active sequence.
+///
+/// Generic over `S` — the per-sequence KV cache state provided by the
+/// Dispatch implementation.  Single-GPU uses `SeqKvState<B>`, multi-GPU
+/// uses `Vec<SeqKvState<CudaBackend>>`.
+pub(crate) struct Sequence<S> {
+    /// Tokens remaining to prefill (drained as prefill progresses).
+    pub pending_prefill: VecDeque<u32>,
+    /// KV cache state for this sequence (opaque to the scheduler).
+    pub kv_state: S,
+    /// Generated tokens so far (includes the first sampled token from prefill).
+    pub generated_tokens: Vec<u32>,
+    /// Maximum tokens to generate after prefill.
+    pub max_gen_tokens: usize,
+    /// Sampling temperature for this sequence.
+    pub temperature: f32,
+    /// Top-p (nucleus) sampling threshold for this sequence.
+    pub top_p: f32,
+    /// Whether this sequence has finished (EOS or max_tokens reached).
+    pub finished: bool,
+}
+
+/// Manages the waiting queue and active set for continuous batching.
+///
+/// Generic over `S` — the per-sequence KV cache state.  Delegates GPU-specific
+/// operations to the Dispatch trait.
+pub(crate) struct Scheduler<S> {
+    /// Waiting queue of new requests (ID pre-assigned at submission time).
+    waiting: VecDeque<(SeqId, SequenceRequest)>,
+    /// Active sequences currently being processed.
+    pub active: HashMap<SeqId, Sequence<S>>,
+    /// Next sequence ID.
+    next_id: SeqId,
+    /// Maximum concurrent sequences.
+    max_active: usize,
+}
+
+impl<S> Scheduler<S> {
+    pub fn new(max_active: usize) -> Self {
+        Self {
+            waiting: VecDeque::new(),
+            active: HashMap::new(),
+            next_id: 0,
+            max_active,
+        }
+    }
+
+    /// Submit a new sequence request.  Returns the pre-assigned sequence ID
+    /// so the caller can track this request before it's admitted to the active set.
+    pub fn add_request(&mut self, req: SequenceRequest) -> SeqId {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.waiting.push_back((id, req));
+        id
+    }
+
+    /// Try to admit waiting requests into the active set (FCFS).
+    ///
+    /// Uses the Dispatch to check free block count (admission heuristic) and
+    /// to create new per-sequence KV state.  Blocks are not actually allocated
+    /// here — that happens later in prepare_prefill/prepare_decode.
+    pub fn schedule(&mut self, dispatch: &impl Dispatch<SeqState = S>) -> Vec<SeqId> {
+        let mut admitted = Vec::new();
+
+        while !self.waiting.is_empty() && self.active.len() < self.max_active {
+            let (_, req) = self.waiting.front().unwrap();
+            let prompt_blocks = kv_cache::blocks_needed_for(req.prompt_tokens.len());
+            if dispatch.free_block_count() < prompt_blocks {
+                break;
+            }
+
+            let (id, req) = self.waiting.pop_front().unwrap();
+            let seq = Sequence {
+                pending_prefill: req.prompt_tokens.into(),
+                kv_state: dispatch.new_seq_state(),
+                generated_tokens: Vec::new(),
+                max_gen_tokens: req.max_gen_tokens,
+                temperature: req.temperature,
+                top_p: req.top_p,
+                finished: false,
+            };
+            self.active.insert(id, seq);
+            admitted.push(id);
+        }
+
+        admitted
+    }
+
+    /// Abort a sequence, removing it from the waiting queue or active set.
+    /// Frees KV blocks if the sequence was active.
+    pub fn abort_sequence(&mut self, id: SeqId, dispatch: &mut impl Dispatch<SeqState = S>) {
+        self.waiting.retain(|(wid, _)| *wid != id);
+        if let Some(seq) = self.active.remove(&id) {
+            dispatch.free_seq_state(&seq.kv_state);
+        }
+    }
+
+    /// Collect and remove finished sequences, freeing their KV blocks.
+    pub fn collect_finished(
+        &mut self,
+        dispatch: &mut impl Dispatch<SeqState = S>,
+    ) -> Vec<(SeqId, Sequence<S>)> {
+        let finished_ids: Vec<SeqId> = self
+            .active
+            .iter()
+            .filter(|(_, seq)| seq.finished)
+            .map(|(&id, _)| id)
+            .collect();
+
+        let mut results = Vec::new();
+        for id in finished_ids {
+            if let Some(seq) = self.active.remove(&id) {
+                dispatch.free_seq_state(&seq.kv_state);
+                results.push((id, seq));
+            }
+        }
+        results
+    }
+
+    /// Whether there's any work to do.
+    pub fn has_work(&self) -> bool {
+        !self.waiting.is_empty() || !self.active.is_empty()
+    }
+
+    /// Number of waiting requests.
+    #[cfg(test)]
+    pub fn waiting_count(&self) -> usize {
+        self.waiting.len()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // run_step — the shared engine step loop, generic over Dispatch.
 //
 // This is the single implementation of admit → prefill → decode → sample →
-// collect that both single-GPU and multi-GPU engines use.  The Dispatch
-// trait provides the GPU-specific operations.
+// collect that both single-GPU and multi-GPU engines use.
 // ---------------------------------------------------------------------------
 
 /// Run one engine step: admit → prefill → decode → sample → collect.
@@ -383,19 +545,127 @@ impl<'a, B: GpuBackend> Engine<'a, B> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests — verify the shared run_step() loop using a mock Dispatch.
-//
-// MockDispatch tracks sequence state as a simple counter (no real GPU ops).
-// It returns deterministic tokens: incrementing from 100, with a configurable
-// EOS token.  This tests the engine loop logic (admission, prefill, decode,
-// EOS detection, max_tokens) without needing any GPU backend.
-// ---------------------------------------------------------------------------
+impl<'a, B: GpuBackend> InferenceEngine for Engine<'a, B> {
+    fn add_request(
+        &mut self,
+        prompt_tokens: Vec<u32>,
+        max_gen_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+    ) -> SeqId {
+        Engine::add_request(self, prompt_tokens, max_gen_tokens, temperature, top_p)
+    }
+
+    fn step(&mut self) -> anyhow::Result<StepOutput> {
+        Engine::step(self)
+    }
+
+    fn abort_sequence(&mut self, id: SeqId) {
+        Engine::abort_sequence(self, id)
+    }
+
+    fn has_work(&self) -> bool {
+        Engine::has_work(self)
+    }
+
+    fn tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    use crate::gpu::cpu::CpuBackend;
+    use crate::model::kv_cache::{KvPool, SeqKvState};
+
+    // -----------------------------------------------------------------------
+    // TestDispatch — real CpuBackend KvPool for scheduler admission tests.
+    // -----------------------------------------------------------------------
+
+    /// Dispatch backed by a real CpuBackend KvPool.
+    ///
+    /// Forward passes are no-ops, but KV block allocation is real — so tests
+    /// can verify admission heuristics and block freeing.
+    struct TestDispatch {
+        pool: KvPool<CpuBackend>,
+        backend: CpuBackend,
+    }
+
+    impl TestDispatch {
+        fn new(num_blocks: usize) -> Self {
+            let backend = CpuBackend;
+            let pool = KvPool::new(&backend, num_blocks, 4, 1);
+            Self { pool, backend }
+        }
+    }
+
+    impl Dispatch for TestDispatch {
+        type SeqState = SeqKvState<CpuBackend>;
+
+        fn new_seq_state(&self) -> Self::SeqState {
+            self.pool.new_sequence(&self.backend)
+        }
+
+        fn free_seq_state(&mut self, state: &Self::SeqState) {
+            self.pool.free_sequence(state);
+        }
+
+        fn free_block_count(&self) -> usize {
+            self.pool.free_block_count()
+        }
+
+        fn prepare_prefill(
+            &mut self,
+            state: &mut Self::SeqState,
+            token_count: usize,
+        ) -> anyhow::Result<()> {
+            state.ensure_slots(&mut self.pool, token_count)?;
+            state.sync_block_table(&self.backend);
+            Ok(())
+        }
+
+        fn forward_prefill(&self, _tokens: &[u32], _state: &Self::SeqState) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn finish_prefill(state: &mut Self::SeqState, token_count: usize) {
+            state.advance_by(token_count);
+        }
+
+        fn prepare_decode(&mut self, state: &mut Self::SeqState) -> anyhow::Result<()> {
+            state.ensure_slot(&mut self.pool)?;
+            state.sync_block_table(&self.backend);
+            Ok(())
+        }
+
+        fn forward_decode(&self, _token: u32, _state: &Self::SeqState) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn finish_decode(state: &mut Self::SeqState) {
+            state.advance();
+        }
+
+        fn sample(
+            &self,
+            _temperature: f32,
+            _top_p: f32,
+            _rng: &mut impl rand::Rng,
+        ) -> anyhow::Result<u32> {
+            Ok(0)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // MockDispatch — deterministic tokens for engine step loop tests.
+    // -----------------------------------------------------------------------
 
     /// Minimal sequence state for testing — just a position counter.
     struct MockSeqState {
@@ -405,9 +675,8 @@ mod tests {
     /// Mock dispatch that returns deterministic tokens.
     ///
     /// Each call to `sample()` returns the next value from a counter starting
-    /// at `next_token`.  The `eos_token` value is never returned by sample
-    /// itself — tests that want EOS-triggered finishes set it to a value
-    /// that the counter will hit.
+    /// at `next_token`.  Tests that want EOS-triggered finishes set the EOS
+    /// token to a value that the counter will hit.
     struct MockDispatch {
         free_blocks: usize,
         next_token: Cell<u32>,
@@ -434,8 +703,6 @@ mod tests {
         }
 
         fn free_seq_state(&mut self, _state: &MockSeqState) {
-            // Return blocks to the free list (one block per 16 positions).
-            // Simplified: just add back some blocks.
             self.free_blocks += 1;
         }
 
@@ -493,9 +760,206 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    fn make_request(prompt_len: usize, max_gen: usize) -> SequenceRequest {
+        SequenceRequest {
+            prompt_tokens: vec![1; prompt_len],
+            max_gen_tokens: max_gen,
+            temperature: 1.0,
+            top_p: 0.9,
+        }
+    }
+
     fn make_tokenizer(eos_ids: Vec<u32>) -> Tokenizer {
         Tokenizer::for_test(eos_ids)
     }
+
+    fn setup_scheduler(
+        num_blocks: usize,
+        max_active: usize,
+    ) -> (TestDispatch, Scheduler<SeqKvState<CpuBackend>>) {
+        let dispatch = TestDispatch::new(num_blocks);
+        let scheduler = Scheduler::new(max_active);
+        (dispatch, scheduler)
+    }
+
+    // -----------------------------------------------------------------------
+    // Scheduler tests — admission, abort, collect, block freeing.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_add_request_returns_incrementing_ids() {
+        let (_d, mut s) = setup_scheduler(10, 4);
+        let id0 = s.add_request(make_request(4, 10));
+        let id1 = s.add_request(make_request(4, 10));
+        let id2 = s.add_request(make_request(4, 10));
+        assert_eq!(id0, 0);
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+        assert_eq!(s.waiting_count(), 3);
+        assert!(s.active.is_empty());
+    }
+
+    #[test]
+    fn test_schedule_admits_to_active() {
+        let (d, mut s) = setup_scheduler(10, 4);
+        s.add_request(make_request(4, 10));
+        s.add_request(make_request(4, 10));
+
+        let admitted = s.schedule(&d);
+        assert_eq!(admitted.len(), 2);
+        assert_eq!(s.active.len(), 2);
+        assert_eq!(s.waiting_count(), 0);
+    }
+
+    #[test]
+    fn test_schedule_respects_max_active() {
+        let (d, mut s) = setup_scheduler(10, 2);
+        s.add_request(make_request(4, 10));
+        s.add_request(make_request(4, 10));
+        s.add_request(make_request(4, 10));
+
+        let admitted = s.schedule(&d);
+        assert_eq!(admitted.len(), 2);
+        assert_eq!(s.active.len(), 2);
+        assert_eq!(s.waiting_count(), 1);
+    }
+
+    #[test]
+    fn test_schedule_blocks_on_kv_memory() {
+        let (d, mut s) = setup_scheduler(2, 4);
+        s.add_request(make_request(48, 10)); // needs ceil(48/16) = 3 blocks > 2 available
+
+        let admitted = s.schedule(&d);
+        assert_eq!(admitted.len(), 0);
+        assert_eq!(s.waiting_count(), 1);
+
+        // FCFS: blocked first request prevents the second from being tried
+        s.add_request(make_request(16, 10));
+        let admitted = s.schedule(&d);
+        assert_eq!(admitted.len(), 0);
+    }
+
+    #[test]
+    fn test_abort_waiting_sequence() {
+        let (mut d, mut s) = setup_scheduler(10, 4);
+        let id0 = s.add_request(make_request(4, 10));
+        let _id1 = s.add_request(make_request(4, 10));
+
+        s.abort_sequence(id0, &mut d);
+        assert_eq!(s.waiting_count(), 1);
+    }
+
+    #[test]
+    fn test_abort_active_sequence_frees_blocks() {
+        let (mut d, mut s) = setup_scheduler(4, 4);
+        s.add_request(make_request(16, 10));
+        let admitted = s.schedule(&d);
+        let id = admitted[0];
+
+        d.prepare_prefill(&mut s.active.get_mut(&id).unwrap().kv_state, 16)
+            .unwrap();
+
+        let free_before = d.free_block_count();
+        s.abort_sequence(id, &mut d);
+        let free_after = d.free_block_count();
+
+        assert!(s.active.is_empty());
+        assert_eq!(free_after, free_before + 1);
+    }
+
+    #[test]
+    fn test_collect_finished() {
+        let (mut d, mut s) = setup_scheduler(10, 4);
+        let id0 = s.add_request(make_request(4, 10));
+        let id1 = s.add_request(make_request(4, 10));
+        s.schedule(&d);
+
+        s.active.get_mut(&id0).unwrap().finished = true;
+
+        let finished = s.collect_finished(&mut d);
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].0, id0);
+        assert_eq!(s.active.len(), 1);
+        assert!(s.active.contains_key(&id1));
+    }
+
+    #[test]
+    fn test_collect_finished_frees_blocks() {
+        let (mut d, mut s) = setup_scheduler(10, 4);
+        s.add_request(make_request(16, 10));
+        s.schedule(&d);
+
+        for seq in s.active.values_mut() {
+            d.prepare_prefill(&mut seq.kv_state, 16).unwrap();
+        }
+
+        let free_before = d.free_block_count();
+        for seq in s.active.values_mut() {
+            seq.finished = true;
+        }
+        s.collect_finished(&mut d);
+        let free_after = d.free_block_count();
+
+        assert!(s.active.is_empty());
+        assert_eq!(free_after, free_before + 1);
+    }
+
+    #[test]
+    fn test_has_work() {
+        let (mut d, mut s) = setup_scheduler(10, 4);
+        assert!(!s.has_work());
+
+        s.add_request(make_request(4, 10));
+        assert!(s.has_work());
+
+        s.schedule(&d);
+        assert!(s.has_work());
+
+        for seq in s.active.values_mut() {
+            seq.finished = true;
+        }
+        s.collect_finished(&mut d);
+        assert!(!s.has_work());
+    }
+
+    #[test]
+    fn test_schedule_admits_after_finish_frees_blocks() {
+        let (mut d, mut s) = setup_scheduler(3, 4);
+        s.add_request(make_request(20, 10));
+        s.schedule(&d);
+        assert_eq!(s.active.len(), 1);
+
+        for seq in s.active.values_mut() {
+            d.prepare_prefill(&mut seq.kv_state, 20).unwrap();
+        }
+        assert_eq!(d.free_block_count(), 1);
+
+        // Second request needs 2 blocks but only 1 free
+        s.add_request(make_request(20, 10));
+        let admitted = s.schedule(&d);
+        assert_eq!(admitted.len(), 0);
+        assert_eq!(s.waiting_count(), 1);
+
+        // Finish first → frees 2 blocks → second can be admitted
+        for seq in s.active.values_mut() {
+            seq.finished = true;
+        }
+        s.collect_finished(&mut d);
+        assert_eq!(d.free_block_count(), 3);
+
+        let admitted = s.schedule(&d);
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(s.active.len(), 1);
+        assert_eq!(s.waiting_count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Engine step tests — verify the shared run_step() loop.
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_step_prefill_then_decode() {
@@ -509,7 +973,7 @@ mod tests {
         // Step 2: decode (samples 102, hits max_tokens=3) → finishes
         let mut dispatch = MockDispatch::new(10, 100);
         let mut scheduler: Scheduler<MockSeqState> = Scheduler::new(4);
-        let tokenizer = make_tokenizer(vec![999]); // EOS token that won't be hit
+        let tokenizer = make_tokenizer(vec![999]);
 
         scheduler.add_request(SequenceRequest {
             prompt_tokens: vec![1, 2, 3, 4],
@@ -521,8 +985,8 @@ mod tests {
         // Step 1: admit + prefill + decode (2 tokens in one step)
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
         assert_eq!(out.tokens.len(), 2);
-        assert_eq!(out.tokens[0].1, 100); // from prefill
-        assert_eq!(out.tokens[1].1, 101); // from decode (same step)
+        assert_eq!(out.tokens[0].1, 100);
+        assert_eq!(out.tokens[1].1, 101);
         assert!(out.finished.is_empty());
         assert_eq!(dispatch.prefill_count.get(), 1);
         assert_eq!(dispatch.decode_count.get(), 1);
@@ -551,7 +1015,6 @@ mod tests {
             top_p: 1.0,
         });
 
-        // Step 1: prefill → 100 (not EOS), decode → 101 (EOS) → finishes
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
         assert_eq!(out.tokens.len(), 2);
         assert_eq!(out.tokens[0].1, 100);
@@ -563,8 +1026,8 @@ mod tests {
     #[test]
     fn test_step_eos_during_prefill() {
         // If the first sampled token (from prefill) is EOS, the sequence
-        // should finish immediately.
-        let mut dispatch = MockDispatch::new(10, 999); // 999 = first sampled token
+        // should finish immediately (no decode phase).
+        let mut dispatch = MockDispatch::new(10, 999);
         let mut scheduler: Scheduler<MockSeqState> = Scheduler::new(4);
         let tokenizer = make_tokenizer(vec![999]);
 
@@ -585,8 +1048,7 @@ mod tests {
     #[test]
     fn test_step_multiple_concurrent_sequences() {
         // Two sequences, both with short prompts and max 2 tokens.
-        // Step 1: both prefill + decode (prefill samples token, decode samples another).
-        //         Each sequence gets 2 tokens → both hit max_gen_tokens=2 → both finish.
+        // Step 1: both prefill + decode → each gets 2 tokens → both finish.
         let mut dispatch = MockDispatch::new(10, 100);
         let mut scheduler: Scheduler<MockSeqState> = Scheduler::new(4);
         let tokenizer = make_tokenizer(vec![999]);
@@ -604,17 +1066,14 @@ mod tests {
             top_p: 1.0,
         });
 
-        // Step 1: both admitted, prefilled, decoded, and finished (all in one step)
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
         assert_eq!(dispatch.prefill_count.get(), 2);
-        // 2 prefill tokens + 2 decode tokens = 4 total
-        assert_eq!(out.tokens.len(), 4);
+        assert_eq!(out.tokens.len(), 4); // 2 prefill + 2 decode
         assert_eq!(out.finished.len(), 2);
     }
 
     #[test]
     fn test_step_admission_blocked_by_kv_memory() {
-        // Only 0 free blocks → request can't be admitted.
         let mut dispatch = MockDispatch::new(0, 100);
         let mut scheduler: Scheduler<MockSeqState> = Scheduler::new(4);
         let tokenizer = make_tokenizer(vec![999]);
@@ -626,11 +1085,10 @@ mod tests {
             top_p: 1.0,
         });
 
-        // Step: nothing admitted, no tokens generated
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
         assert!(out.tokens.is_empty());
         assert!(out.finished.is_empty());
-        assert!(scheduler.has_work()); // still waiting
+        assert!(scheduler.has_work());
     }
 
     #[test]
@@ -646,15 +1104,12 @@ mod tests {
             top_p: 1.0,
         });
 
-        // Step 1: admit + prefill
         run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
         assert!(scheduler.has_work());
 
-        // Abort the sequence
         scheduler.abort_sequence(id, &mut dispatch);
         assert!(!scheduler.has_work());
 
-        // Step 2: nothing to do
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
         assert!(out.tokens.is_empty());
         assert!(out.finished.is_empty());
@@ -698,10 +1153,9 @@ mod tests {
         // Sequence A finishes, freeing its slot.  Sequence B (waiting) should
         // then be admitted in the next step.
         let mut dispatch = MockDispatch::new(10, 100);
-        let mut scheduler: Scheduler<MockSeqState> = Scheduler::new(1); // max 1 active
+        let mut scheduler: Scheduler<MockSeqState> = Scheduler::new(1);
         let tokenizer = make_tokenizer(vec![999]);
 
-        // Submit two requests — only 1 can be active at a time.
         scheduler.add_request(SequenceRequest {
             prompt_tokens: vec![1],
             max_gen_tokens: 1,
@@ -719,40 +1173,12 @@ mod tests {
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
         assert_eq!(out.finished.len(), 1);
         assert_eq!(out.finished[0].tokens, vec![100]);
-        assert!(scheduler.has_work()); // B still waiting
+        assert!(scheduler.has_work());
 
         // Step 2: B admitted + prefilled + finished
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
         assert_eq!(out.finished.len(), 1);
         assert_eq!(out.finished[0].tokens, vec![101]);
-        assert!(!scheduler.has_work()); // done
-    }
-}
-
-impl<'a, B: GpuBackend> InferenceEngine for Engine<'a, B> {
-    fn add_request(
-        &mut self,
-        prompt_tokens: Vec<u32>,
-        max_gen_tokens: usize,
-        temperature: f32,
-        top_p: f32,
-    ) -> SeqId {
-        Engine::add_request(self, prompt_tokens, max_gen_tokens, temperature, top_p)
-    }
-
-    fn step(&mut self) -> anyhow::Result<StepOutput> {
-        Engine::step(self)
-    }
-
-    fn abort_sequence(&mut self, id: SeqId) {
-        Engine::abort_sequence(self, id)
-    }
-
-    fn has_work(&self) -> bool {
-        Engine::has_work(self)
-    }
-
-    fn tokenizer(&self) -> &Tokenizer {
-        &self.tokenizer
+        assert!(!scheduler.has_work());
     }
 }

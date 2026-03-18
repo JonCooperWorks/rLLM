@@ -33,8 +33,7 @@ pub(crate) use imp::MultiGpuEngine;
 #[cfg(feature = "cuda")]
 mod imp {
     use crate::engine::dispatch::Dispatch;
-    use crate::engine::scheduler::{Scheduler, SeqId, SequenceRequest};
-    use crate::engine::{run_step, FinishReason, FinishedSequence, InferenceEngine, StepOutput};
+    use crate::engine::{run_step, Scheduler, SeqId, SequenceRequest, InferenceEngine, StepOutput};
     use crate::gpu::cuda::CudaBackend;
     use crate::gpu::multi_gpu::tp::MultiGpuInference;
     use crate::model::kv_cache::SeqKvState;
