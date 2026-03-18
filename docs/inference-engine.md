@@ -79,6 +79,16 @@ Separating them allows using different kernel paths optimized for each
 workload.  Prefill uses batched GEMM (`matmul_batch`); decode uses mat-vec
 (`matmul`).
 
+### Known Improvement Areas
+
+- **Single-sequence decode loop** (high priority): Decode currently processes
+  one sequence at a time.  Batching decode across concurrent sequences into a
+  single padded mat-mul call would significantly improve GPU utilization at
+  high concurrency.
+- **Serial prefill** (low priority): Multiple concurrent prefills are processed
+  sequentially.  While each individual prefill is already GEMM-batched, merging
+  multiple prefills could amortize kernel launch overhead.
+
 ---
 
 ## Dispatch Trait

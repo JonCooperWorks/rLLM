@@ -51,6 +51,9 @@ runtime would block other requests.  The worker thread:
 2. **Batches naturally** — `try_recv()` drains all pending requests before each step
 3. **Avoids async/sync conflicts** — Metal/CUDA APIs are not async-safe
 
+**Note:** The `SyncSender` channel capacity should be tuned to avoid stalling
+HTTP handlers under burst load.
+
 ### Key Types
 
 | Type | Purpose |

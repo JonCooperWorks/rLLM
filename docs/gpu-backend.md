@@ -103,6 +103,15 @@ The Metal backend compiles specialized pipelines at startup:
 Runtime dispatch selects the correct pipeline based on the model's head
 dimension and weight dtype.
 
+### Known Improvement Areas
+
+- `dispatch_async()` allocates a new param buffer per kernel dispatch.  A ring
+  buffer or pool of param buffers would reduce allocation pressure, especially
+  on MoE models with ~2,500 dispatches per token.
+- The `Mutex` on `current_cmd` is uncontested (single worker thread) but still
+  has lock/unlock overhead.  An `UnsafeCell` with a single-thread assertion
+  could eliminate it.
+
 ### Param Structs
 
 Each kernel has a corresponding `#[repr(C)]` Rust struct that matches the
