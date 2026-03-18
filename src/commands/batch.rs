@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use crate::engine;
+use crate::engine::{self, InferenceEngine};
 use crate::engine::scheduler;
 use crate::gpu::{self, GpuCore};
 use crate::model;
@@ -103,17 +103,17 @@ pub(crate) fn exec(args: BatchArgs) -> anyhow::Result<()> {
 
     // Create scheduler and engine.
     let sched = scheduler::Scheduler::new(kv_pool, prompts.len());
-    let mut eng = engine::Engine::new(
+    let mut eng: Box<dyn InferenceEngine> = Box::new(engine::Engine::new(
         model,
         sched,
         tokenizer,
         &backend,
-    );
+    ));
 
     // Submit all prompts.
     let system = args.chat.then(|| args.system.as_str());
     for prompt_text in &prompts {
-        let tokens = eng.tokenizer.encode_prompt(prompt_text, arch, system)?;
+        let tokens = eng.tokenizer().encode_prompt(prompt_text, arch, system)?;
         eng.add_request(tokens, args.max_tokens, args.temperature, args.top_p);
     }
 
