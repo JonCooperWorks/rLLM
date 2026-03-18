@@ -43,7 +43,6 @@
 pub(crate) mod anthropic;
 pub(crate) mod openai;
 pub(crate) mod tls;
-mod worker;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -171,7 +170,7 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         request_tx,
         tokenizer,
         arch,
-    } = worker::spawn_worker(args.model.clone(), args.quantize, tp)?;
+    } = spawn_worker(args.model.clone(), args.quantize, tp)?;
 
     eprintln!("model ready: {}", model_name);
 
@@ -272,6 +271,50 @@ struct WorkerHandle {
     request_tx: std::sync::mpsc::SyncSender<WorkerRequest>,
     tokenizer: Arc<tokenizer::Tokenizer>,
     arch: config::ModelArch,
+}
+
+/// Spawn the inference worker thread.
+///
+/// Delegates to engine::worker::load_and_run() for model loading and engine
+/// construction, providing callbacks for the ready signal and the worker loop.
+fn spawn_worker(
+    model_dir: std::path::PathBuf,
+    quantize: bool,
+    tp: usize,
+) -> anyhow::Result<WorkerHandle> {
+    let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<
+        Result<(Arc<tokenizer::Tokenizer>, config::ModelArch), String>,
+    >(1);
+
+    std::thread::spawn(move || {
+        let max_active = 32;
+
+        let result = engine::worker::load_and_run(
+            &model_dir,
+            quantize,
+            tp,
+            max_active,
+            |tok, arch| {
+                let _ = ready_tx.send(Ok((Arc::new(tok.clone()), arch)));
+            },
+            |eng| run_worker_loop(eng, request_rx),
+        );
+
+        if let Err(e) = result {
+            let _ = ready_tx.send(Err(format!("{e:#}")));
+        }
+    });
+
+    match ready_rx.recv() {
+        Ok(Ok((tokenizer, arch))) => Ok(WorkerHandle {
+            request_tx,
+            tokenizer,
+            arch,
+        }),
+        Ok(Err(e)) => anyhow::bail!("worker failed to start: {e}"),
+        Err(_) => anyhow::bail!("worker thread died during startup"),
+    }
 }
 
 /// Per-request context tracked by the worker's request registry.
