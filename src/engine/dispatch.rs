@@ -51,6 +51,14 @@ pub(crate) trait Dispatch {
     /// Number of free KV cache blocks (used for admission heuristic).
     fn free_block_count(&self) -> usize;
 
+    /// Maximum number of tokens that can be prefilled in a single forward pass.
+    ///
+    /// Prompts longer than this are chunked into multiple prefill passes.
+    /// Returns usize::MAX by default (no chunking).
+    fn max_prefill_chunk(&self) -> usize {
+        usize::MAX
+    }
+
     /// Prepare for prefill: allocate KV blocks for `token_count` tokens
     /// and sync the block table to the GPU.
     fn prepare_prefill(

@@ -298,8 +298,8 @@ pub(crate) fn run_step<D: Dispatch>(
     scheduler.schedule(dispatch);
 
     // 2. Batched prefill: drain all pending tokens for each prefilling sequence.
-    //    Each sequence's entire prompt is processed in one forward pass using
-    //    GEMM (mat-mat) instead of individual mat-vec calls per token.
+    //    Each sequence's prompt is processed via GEMM (mat-mat).  Long prompts
+    //    are chunked to fit within the prefill buffer allocation (max_chunk).
     let prefilling_ids: Vec<SeqId> = scheduler
         .active
         .iter()
@@ -307,14 +307,21 @@ pub(crate) fn run_step<D: Dispatch>(
         .map(|(&id, _)| id)
         .collect();
 
+    let max_chunk = dispatch.max_prefill_chunk();
+
     for id in prefilling_ids {
         let seq = scheduler.active.get_mut(&id).unwrap();
         let tokens: Vec<u32> = seq.pending_prefill.drain(..).collect();
-        let chunk_size = tokens.len();
 
-        dispatch.prepare_prefill(&mut seq.kv_state, chunk_size)?;
-        dispatch.forward_prefill(&tokens, &seq.kv_state)?;
-        D::finish_prefill(&mut seq.kv_state, chunk_size);
+        // Chunk the prompt if it exceeds the prefill buffer size.
+        // Each chunk gets its own prepare → forward → finish cycle so that
+        // seq_state.seq_len advances between chunks (positions stay correct).
+        for chunk in tokens.chunks(max_chunk) {
+            let chunk_size = chunk.len();
+            dispatch.prepare_prefill(&mut seq.kv_state, chunk_size)?;
+            dispatch.forward_prefill(chunk, &seq.kv_state)?;
+            D::finish_prefill(&mut seq.kv_state, chunk_size);
+        }
 
         sample_and_finish(dispatch, seq, id, tokenizer, &mut step_tokens, &mut rng)?;
     }
@@ -499,6 +506,10 @@ impl<'a, B: GpuBackend> Dispatch for SingleGpuDispatch<'a, B> {
 
     fn free_seq_state(&mut self, state: &SeqKvState<B>) {
         self.kv_pool.free_sequence(state);
+    }
+
+    fn max_prefill_chunk(&self) -> usize {
+        self.prefill_bufs.max_chunk
     }
 
     fn free_block_count(&self) -> usize {
