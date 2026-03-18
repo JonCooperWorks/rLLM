@@ -495,21 +495,57 @@ impl GpuMatmul for CpuBackend {
         let bs = batch_size as usize;
 
         // Weight is [m, k], input is [batch_size, k], out is [batch_size, m]
-        for b in 0..bs {
-            let inp_offset = b * kk * 2;
-            let inp = read_bf16_bytes(&input.data[inp_offset..], kk);
+        match weight.dtype {
+            TensorDtype::BF16 => {
+                for b in 0..bs {
+                    let inp_offset = b * kk * 2;
+                    let inp = read_bf16_bytes(&input.data[inp_offset..], kk);
 
-            let mut row_result = vec![0.0f32; mm];
-            for row in 0..mm {
-                let w_offset = row * kk * 2;
-                let w_row = read_bf16_bytes(&weight.data[w_offset..], kk);
-                let mut acc = 0.0f32;
-                for j in 0..kk {
-                    acc += w_row[j] * inp[j];
+                    let mut row_result = vec![0.0f32; mm];
+                    for row in 0..mm {
+                        let w_offset = row * kk * 2;
+                        let w_row = read_bf16_bytes(&weight.data[w_offset..], kk);
+                        let mut acc = 0.0f32;
+                        for j in 0..kk {
+                            acc += w_row[j] * inp[j];
+                        }
+                        row_result[row] = acc;
+                    }
+                    write_bf16_at(out, b * mm * 2, &row_result);
                 }
-                row_result[row] = acc;
             }
-            write_bf16_at(out, b * mm * 2, &row_result);
+            TensorDtype::Q4 => {
+                let blocks_per_row = kk / 32;
+                for b in 0..bs {
+                    let inp_offset = b * kk * 2;
+                    let inp = read_bf16_bytes(&input.data[inp_offset..], kk);
+
+                    let mut row_result = vec![0.0f32; mm];
+                    for row in 0..mm {
+                        let row_offset = row * blocks_per_row * 20;
+                        let mut acc = 0.0f32;
+                        for block in 0..blocks_per_row {
+                            let block_offset = row_offset + block * 20;
+                            let scale: f32 = bytemuck::cast_slice::<u8, f32>(
+                                &weight.data[block_offset..block_offset + 4],
+                            )[0];
+                            let nibbles =
+                                &weight.data[block_offset + 4..block_offset + 20];
+                            for i in 0..16 {
+                                let byte = nibbles[i];
+                                let lo = (byte & 0x0F) as i8 - 8;
+                                let hi = ((byte >> 4) & 0x0F) as i8 - 8;
+                                let j = block * 32 + i * 2;
+                                acc += (lo as f32 * scale) * inp[j];
+                                acc += (hi as f32 * scale) * inp[j + 1];
+                            }
+                        }
+                        row_result[row] = acc;
+                    }
+                    write_bf16_at(out, b * mm * 2, &row_result);
+                }
+            }
+            _ => unimplemented!("CpuBackend::matmul_batch for {:?}", weight.dtype),
         }
     }
 }
@@ -543,16 +579,63 @@ impl GpuRope for CpuBackend {
 
     fn rope_batch(
         &self,
-        _q: &CpuTensor,
-        _k: &CpuTensor,
-        _positions: &CpuTensor,
-        _rope_theta: f32,
-        _batch_size: u32,
-        _num_heads: u32,
-        _num_kv_heads: u32,
-        _head_dim: u32,
+        q: &CpuTensor,
+        k: &CpuTensor,
+        positions: &CpuTensor,
+        rope_theta: f32,
+        batch_size: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
     ) {
-        unimplemented!("CpuBackend::rope_batch")
+        let bs = batch_size as usize;
+        let nh = num_heads as usize;
+        let nkv = num_kv_heads as usize;
+        let hd = head_dim as usize;
+        let half_dim = hd / 2;
+        let q_stride = nh * hd;
+        let k_stride = nkv * hd;
+
+        let pos_data: &[u32] = bytemuck::cast_slice(&positions.data[..bs * 4]);
+        let mut q_data = read_bf16(q, bs * q_stride);
+        let mut k_data = read_bf16(k, bs * k_stride);
+
+        for b in 0..bs {
+            let pos = pos_data[b] as f32;
+
+            // Apply RoPE to Q heads
+            for h in 0..nh {
+                let base = b * q_stride + h * hd;
+                for pair in 0..half_dim {
+                    let freq_exp = 2.0 * pair as f32 / head_dim as f32;
+                    let inv_freq = 1.0 / rope_theta.powf(freq_exp);
+                    let angle = pos * inv_freq;
+                    let (sin_a, cos_a) = angle.sin_cos();
+                    let a = q_data[base + pair];
+                    let b_val = q_data[base + pair + half_dim];
+                    q_data[base + pair] = a * cos_a - b_val * sin_a;
+                    q_data[base + pair + half_dim] = a * sin_a + b_val * cos_a;
+                }
+            }
+
+            // Apply RoPE to K heads
+            for h in 0..nkv {
+                let base = b * k_stride + h * hd;
+                for pair in 0..half_dim {
+                    let freq_exp = 2.0 * pair as f32 / head_dim as f32;
+                    let inv_freq = 1.0 / rope_theta.powf(freq_exp);
+                    let angle = pos * inv_freq;
+                    let (sin_a, cos_a) = angle.sin_cos();
+                    let a = k_data[base + pair];
+                    let b_val = k_data[base + pair + half_dim];
+                    k_data[base + pair] = a * cos_a - b_val * sin_a;
+                    k_data[base + pair + half_dim] = a * sin_a + b_val * cos_a;
+                }
+            }
+        }
+
+        write_bf16(q, &q_data);
+        write_bf16(k, &k_data);
     }
 
     fn rope_partial(
@@ -913,15 +996,36 @@ impl GpuAttention for CpuBackend {
 
     fn copy_to_paged_kv_cache_batch(
         &self,
-        _src: &CpuTensor,
-        _pool: &CpuTensor,
-        _block_table: &CpuTensor,
-        _positions: &CpuTensor,
-        _batch_size: u32,
-        _num_kv_heads: u32,
-        _head_dim: u32,
+        src: &CpuTensor,
+        pool: &CpuTensor,
+        block_table: &CpuTensor,
+        positions: &CpuTensor,
+        batch_size: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
     ) {
-        unimplemented!("CpuBackend::copy_to_paged_kv_cache_batch")
+        let bs = batch_size as usize;
+        let kv_dim = num_kv_heads as usize * head_dim as usize;
+        let block_size = 16usize;
+        let token_bytes = kv_dim * 2; // bf16
+
+        let pos_data: &[u32] = bytemuck::cast_slice(&positions.data[..bs * 4]);
+        let table: &[u32] = bytemuck::cast_slice(&block_table.data);
+
+        for b in 0..bs {
+            let pos = pos_data[b] as usize;
+            let block_idx = pos / block_size;
+            let block_offset = pos % block_size;
+            let physical_block = table[block_idx] as usize;
+
+            let src_offset = b * token_bytes;
+            let dst_offset = (physical_block * block_size + block_offset) * kv_dim * 2;
+            write_bytes_at(
+                pool,
+                dst_offset,
+                &src.data[src_offset..src_offset + token_bytes],
+            );
+        }
     }
 
     fn prefill_attention(
