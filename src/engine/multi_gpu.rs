@@ -84,6 +84,11 @@ mod imp {
             MultiGpuInference::advance_by_for(state, token_count);
         }
 
+        fn seq_len(state: &Self::SeqState) -> usize {
+            // All ranks have the same seq_len — use rank 0.
+            state[0].seq_len
+        }
+
         fn prepare_decode(&mut self, state: &mut Self::SeqState) -> anyhow::Result<()> {
             self.multi.ensure_slot_for(state)
         }

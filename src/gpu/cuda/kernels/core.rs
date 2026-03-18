@@ -116,6 +116,47 @@ impl GpuCore for CudaBackend {
         tensor.byte_count()
     }
 
+    fn copy_tensor_region(
+        &self,
+        src: &CudaTensor,
+        src_byte_offset: usize,
+        dst: &CudaTensor,
+        dst_byte_offset: usize,
+        byte_count: usize,
+    ) {
+        // Device-to-device async copy on the backend's CUDA stream.
+        //
+        // CUDA streams provide ordering guarantees: all prior kernel launches
+        // on this stream will complete before this copy starts, and the copy
+        // will complete before any subsequent kernels.  This makes it safe to
+        // extract rows from a batched tensor right after a GEMM wrote to it.
+        //
+        // Unlike Metal's unified memory, CUDA device memory is NOT CPU-visible,
+        // so we must use the driver's DtoD memcpy (no CPU roundtrip).
+        //
+        // We use raw device pointers (u64) with arithmetic because cudarc's
+        // DevicePtr doesn't expose offset methods — same pattern as allreduce.rs.
+        self.ctx
+            .bind_to_thread()
+            .expect("CUDA bind_to_thread failed");
+
+        let (src_dptr, _s) =
+            cudarc::driver::DevicePtr::<u8>::device_ptr(&src.buf, &self.stream);
+        let (dst_dptr, _d) =
+            cudarc::driver::DevicePtr::<u8>::device_ptr(&dst.buf, &self.stream);
+        let src_addr = src_dptr as u64 + src_byte_offset as u64;
+        let dst_addr = dst_dptr as u64 + dst_byte_offset as u64;
+        unsafe {
+            cudarc::driver::result::memcpy_dtod_async(
+                dst_addr,
+                src_addr,
+                byte_count,
+                self.stream.cu_stream(),
+            )
+        }
+        .expect("CUDA memcpy_dtod_async failed");
+    }
+
     fn copy_to_host(&self, tensor: &CudaTensor, dst: &mut [u8]) {
         // Bind context for multi-GPU support.
         self.ctx

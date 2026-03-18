@@ -1128,3 +1128,166 @@ pub(crate) fn apply_qkv_bias_batch_qdim<B: GpuElementwise>(
         backend.bias_add_batch(&bufs.v_buf, v_bias, &bufs.v_buf, bs, kv_dim);
     }
 }
+
+// ===========================================================================
+// Batched decode primitives.
+//
+// LEARNING OVERVIEW
+//
+// What this section does:
+//   Enables batched decode — processing N decoding sequences in a single
+//   forward pass instead of N separate passes.  This turns N mat-vec ops
+//   (bandwidth-bound, low GPU utilisation) into 1 GEMM (compute-bound,
+//   high GPU utilisation).
+//
+// Why not just reuse the prefill primitives?
+//   Most of them ARE reused directly (embed_batch, qkv_projection_batch,
+//   apply_rope_batch, o_proj_residual_batch, ffn_block_batch).  The new
+//   functions here handle the parts that DIFFER between prefill and
+//   batched decode:
+//
+//   1. Position upload: prefill has contiguous positions [start..start+N],
+//      but batched decode has non-contiguous positions (each sequence is
+//      at a different point in its generation).
+//
+//   2. Attention: prefill uses dense causal attention on the batch (all
+//      tokens are from the same sequence).  Batched decode has N tokens
+//      from N DIFFERENT sequences, each needing its own block table and
+//      seq_len for paged attention.  This requires per-sequence calls.
+//
+//   3. LM head: prefill only needs the last token's logits.  Batched
+//      decode needs ALL N tokens' logits (each is a different sequence's
+//      next-token prediction).
+//
+// The per-sequence attention inner loop is the one non-batched part.  It
+// uses copy_tensor_region to extract/insert individual rows from the
+// batched Q/K/V tensors into the model's single-token scratch buffers,
+// then calls the existing paged_attention_fused.  This is bandwidth-bound
+// and fast — the GEMM savings from batching projections far outweigh the
+// row-copy overhead.
+// ===========================================================================
+
+/// Upload token IDs and non-contiguous positions for batched decode.
+///
+/// Unlike `upload_prefill_inputs` where positions are contiguous
+/// (start..start+N), batched decode positions come from each sequence's
+/// current seq_len — they can be any values (e.g., [15, 203, 42, 891]).
+pub(crate) fn upload_decode_batch_inputs<B: GpuCore>(
+    backend: &B,
+    bufs: &PrefillBuffers<B>,
+    tokens: &[u32],
+    positions: &[u32],
+    bs: u32,
+) {
+    assert_eq!(tokens.len(), bs as usize);
+    assert_eq!(positions.len(), bs as usize);
+    let token_bytes: &[u8] = bytemuck::cast_slice(tokens);
+    backend.copy_to_tensor(&bufs.token_ids, token_bytes);
+    let pos_bytes: &[u8] = bytemuck::cast_slice(positions);
+    backend.copy_to_tensor(&bufs.positions, pos_bytes);
+}
+
+/// Per-sequence attention within a batched decode forward pass.
+///
+/// Extracts row `seq_idx` from the batched Q/K/V tensors (written by
+/// the preceding batched matmul), runs paged_attention_fused using that
+/// sequence's block table, and writes the attention output back into
+/// row `seq_idx` of the batched attention output tensor.
+///
+/// Why copy rows instead of a batched attention kernel?
+///   Each sequence has a DIFFERENT block table (different physical KV block
+///   allocations from the shared pool) and a different seq_len.  A batched
+///   kernel would need per-sequence block table indirection — complex to
+///   implement correctly.  Row copies are ~2 KB each (one [q_dim] vector),
+///   taking microseconds on GPU, while attention itself is the cheap part
+///   of decode (bandwidth-bound, short sequences).  Phase 2 can add a
+///   batched paged attention kernel for further gains.
+pub(crate) fn batched_decode_per_seq_attention<B: GpuAttention + GpuCore>(
+    backend: &B,
+    bufs: &PrefillBuffers<B>,
+    // Model's single-token scratch buffers (used as temporaries)
+    scratch_q: &B::Tensor,
+    scratch_k: &B::Tensor,
+    scratch_v: &B::Tensor,
+    scratch_attn_out: &B::Tensor,
+    pool: &KvPool<B>,
+    seq_state: &SeqKvState<B>,
+    layer_idx: usize,
+    seq_idx: usize,
+    pos: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    window_size: u32,
+    attn_scale: f32,
+    sinks: Option<&B::Tensor>,
+) {
+    let q_dim = (num_heads * head_dim) as usize;
+    let kv_dim = (num_kv_heads * head_dim) as usize;
+    let bf16_size = 2; // bytes per bf16
+
+    // Extract row seq_idx from batched buffers → model's single-token scratch.
+    backend.copy_tensor_region(
+        &bufs.q_buf, seq_idx * q_dim * bf16_size,
+        scratch_q, 0,
+        q_dim * bf16_size,
+    );
+    backend.copy_tensor_region(
+        &bufs.k_buf, seq_idx * kv_dim * bf16_size,
+        scratch_k, 0,
+        kv_dim * bf16_size,
+    );
+    backend.copy_tensor_region(
+        &bufs.v_buf, seq_idx * kv_dim * bf16_size,
+        scratch_v, 0,
+        kv_dim * bf16_size,
+    );
+
+    // Run fused KV cache write + paged attention for this one sequence.
+    backend.paged_attention_fused(
+        scratch_q,
+        scratch_k,
+        scratch_v,
+        &pool.k_pool[layer_idx],
+        &pool.v_pool[layer_idx],
+        &seq_state.block_table_gpu,
+        scratch_attn_out,
+        pos,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        window_size,
+        attn_scale,
+        sinks,
+    );
+
+    // Write attention output back into row seq_idx of the batched tensor.
+    backend.copy_tensor_region(
+        scratch_attn_out, 0,
+        &bufs.attn_out, seq_idx * q_dim * bf16_size,
+        q_dim * bf16_size,
+    );
+}
+
+/// Final norm + batched LM head for batched decode.
+///
+/// Unlike the prefill version which extracts only the last token's logits,
+/// batched decode produces logits for ALL N tokens — each row is a different
+/// sequence's next-token prediction.  The output is [N, vocab_size] in
+/// `logits_batch`, ready for `sample_batch()`.
+pub(crate) fn final_norm_and_lm_head_decode_batch<B: GpuCore + GpuNorm + GpuMatmul>(
+    backend: &B,
+    weights: &ModelWeights<B>,
+    bufs: &PrefillBuffers<B>,
+    logits_batch: &B::Tensor,
+    eps: f32,
+    bs: u32,
+    hidden_size: u32,
+    vocab_size: u32,
+) {
+    // RMSNorm each row of [N, hidden_size].
+    backend.rms_norm_batch(&bufs.hidden, &weights.norm_weight, eps, &bufs.norm_buf, bs);
+    // GEMM: [N, hidden_size] × [vocab_size, hidden_size]^T → [N, vocab_size].
+    let lm_head_weight = weights.lm_head.as_ref().unwrap_or(&weights.embed_tokens);
+    backend.matmul_batch(lm_head_weight, &bufs.norm_buf, logits_batch, bs, vocab_size, hidden_size);
+}

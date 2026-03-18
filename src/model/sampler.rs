@@ -193,6 +193,120 @@ pub(crate) fn sample<B: GpuBackend>(
     Ok((logits_f32.len() - 1) as u32)
 }
 
+/// Sample N tokens from a batched logits tensor [batch_size, vocab_size].
+///
+/// This is the batched-decode counterpart to `sample()`.  Instead of N
+/// separate GPU→CPU copies (one per sequence), we do ONE copy of the full
+/// [N, vocab_size] tensor, then iterate rows on the CPU.  Each sequence
+/// gets its own temperature and top_p — different concurrent requests can
+/// have different sampling parameters.
+///
+/// Why batch the copy but not the sampling math?
+///   The GPU→CPU transfer is the expensive part (~250 KB per sequence at
+///   vocab_size=128256).  The CPU sampling (softmax + sort + random walk)
+///   takes microseconds per sequence — parallelizing it on the GPU would
+///   add kernel complexity without meaningful speedup.
+pub(crate) fn sample_batch<B: GpuBackend>(
+    backend: &B,
+    logits_batch: &B::Tensor,
+    batch_size: usize,
+    vocab_size: usize,
+    temperatures: &[f32],
+    top_ps: &[f32],
+    rng: &mut impl Rng,
+) -> anyhow::Result<Vec<u32>> {
+    assert_eq!(temperatures.len(), batch_size);
+    assert_eq!(top_ps.len(), batch_size);
+
+    // One GPU→CPU copy for all N sequences' logits.
+    let total_bytes = batch_size * vocab_size * 2; // bf16 = 2 bytes
+    let mut buf = vec![0u8; total_bytes];
+    backend.copy_to_host(logits_batch, &mut buf);
+
+    let row_bytes = vocab_size * 2;
+    let mut results = Vec::with_capacity(batch_size);
+
+    for i in 0..batch_size {
+        let row_data = &buf[i * row_bytes..(i + 1) * row_bytes];
+        let token = if temperatures[i] == 0.0 {
+            // Greedy: argmax on this row.
+            argmax_bf16(row_data)
+        } else {
+            // Temperature + top-p sampling on this row.
+            sample_row(row_data, temperatures[i], top_ps[i], rng)
+        };
+        results.push(token);
+    }
+
+    Ok(results)
+}
+
+/// Sample one token from a single row of bf16 logits (CPU-side).
+///
+/// Extracted from `sample()` so it can be reused by `sample_batch()` without
+/// needing a GPU tensor — it operates directly on a byte slice already on the CPU.
+fn sample_row(logits_bytes: &[u8], temperature: f32, top_p: f32, rng: &mut impl Rng) -> u32 {
+    let bf16_values: &[bf16] = bytemuck::cast_slice(logits_bytes);
+    let mut logits_f32: Vec<f32> = bf16_values.iter().map(|v| v.to_f32()).collect();
+
+    // Temperature scaling.
+    let inv_temp = 1.0 / temperature;
+    for logit in logits_f32.iter_mut() {
+        *logit *= inv_temp;
+    }
+
+    // Softmax.
+    let max_logit = logits_f32.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for logit in logits_f32.iter_mut() {
+        *logit = (*logit - max_logit).exp();
+        sum += *logit;
+    }
+    let inv_sum = 1.0 / sum;
+    for prob in logits_f32.iter_mut() {
+        *prob *= inv_sum;
+    }
+
+    // Top-p filtering.
+    if top_p < 1.0 {
+        let mut indices: Vec<u32> = (0..logits_f32.len() as u32).collect();
+        indices.sort_unstable_by(|&a, &b| {
+            logits_f32[b as usize]
+                .partial_cmp(&logits_f32[a as usize])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut cumulative = 0.0f32;
+        let mut cutoff_idx = indices.len();
+        for (i, &token_idx) in indices.iter().enumerate() {
+            cumulative += logits_f32[token_idx as usize];
+            if cumulative >= top_p {
+                cutoff_idx = i + 1;
+                break;
+            }
+        }
+        for &token_idx in &indices[cutoff_idx..] {
+            logits_f32[token_idx as usize] = 0.0;
+        }
+        let new_sum: f32 = logits_f32.iter().sum();
+        let inv_new_sum = 1.0 / new_sum;
+        for prob in logits_f32.iter_mut() {
+            *prob *= inv_new_sum;
+        }
+    }
+
+    // Weighted random sample.
+    let r: f32 = rng.random();
+    let mut cumulative = 0.0f32;
+    for (i, &prob) in logits_f32.iter().enumerate() {
+        cumulative += prob;
+        if cumulative > r {
+            return i as u32;
+        }
+    }
+    (logits_f32.len() - 1) as u32
+}
+
 /// Greedy sampling: copy logits to host, return the argmax token ID.
 ///
 /// This is the only place where data moves from GPU → CPU during generation.

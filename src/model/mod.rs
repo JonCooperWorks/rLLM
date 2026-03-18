@@ -719,6 +719,59 @@ impl<'a, B: GpuBackend> Model<'a, B> {
             }
         }
     }
+
+    /// Whether this architecture supports batched decode.
+    ///
+    /// Only standard dense transformers (Llama-like) support batched decode
+    /// today.  MoE models (Mixtral, Qwen3-MoE, GPT-OSS), Gemma (sandwich
+    /// norms), and Qwen 3.5 (DeltaNet layers) fall back to the serial
+    /// per-sequence decode path.
+    pub fn arch_supports_batched_decode(&self) -> bool {
+        matches!(
+            self.arch,
+            ModelArch::Llama | ModelArch::Mistral | ModelArch::Phi | ModelArch::Qwen2
+        )
+    }
+
+    /// Batched decode: process N tokens from N different sequences in one pass.
+    ///
+    /// Turns N mat-vec operations into 1 GEMM for projections and FFN, with
+    /// per-sequence paged attention in between.  Produces [N, vocab_size]
+    /// logits in `logits_batch` (NOT in the model's single-token logits_buf).
+    ///
+    /// The caller must:
+    ///   - Pre-allocate one KV slot per sequence via `prepare_decode`
+    ///   - Sync block tables for all sequences
+    ///   - Call `finish_decode` for each sequence after this returns
+    pub fn forward_decode_batch_paged(
+        &self,
+        tokens: &[u32],
+        positions: &[u32],
+        pool: &KvPool<B>,
+        seq_states: &[&SeqKvState<B>],
+        bufs: &PrefillBuffers<B>,
+        logits_batch: &B::Tensor,
+    ) -> anyhow::Result<()> {
+        match self.arch {
+            ModelArch::Llama => registry::llama::forward_decode_batch_paged(
+                self, tokens, positions, pool, seq_states, bufs, logits_batch,
+            ),
+            ModelArch::Mistral => registry::mistral::forward_decode_batch_paged(
+                self, tokens, positions, pool, seq_states, bufs, logits_batch,
+            ),
+            ModelArch::Phi => registry::phi::forward_decode_batch_paged(
+                self, tokens, positions, pool, seq_states, bufs, logits_batch,
+            ),
+            ModelArch::Qwen2 => registry::qwen::forward_decode_batch_paged(
+                self, tokens, positions, pool, seq_states, bufs, logits_batch,
+            ),
+            _ => anyhow::bail!(
+                "batched decode not supported for {:?} (should not be called — \
+                 check arch_supports_batched_decode() first)",
+                self.arch
+            ),
+        }
+    }
 }
 
 // ===========================================================================

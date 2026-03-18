@@ -65,6 +65,11 @@ pub(crate) trait Dispatch {
     /// Advance KV state after prefill (marks positions as filled).
     fn finish_prefill(state: &mut Self::SeqState, token_count: usize);
 
+    /// Current sequence length (number of tokens in KV cache).
+    ///
+    /// Needed by the batched decode loop to collect per-sequence positions.
+    fn seq_len(state: &Self::SeqState) -> usize;
+
     /// Prepare for decode: allocate one KV slot and sync block table.
     fn prepare_decode(&mut self, state: &mut Self::SeqState) -> anyhow::Result<()>;
 
@@ -77,4 +82,51 @@ pub(crate) trait Dispatch {
     /// Sample a token from the current logits.
     fn sample(&self, temperature: f32, top_p: f32, rng: &mut impl rand::Rng)
     -> anyhow::Result<u32>;
+
+    // -----------------------------------------------------------------------
+    // Batched decode — processing N decoding sequences in one forward pass.
+    //
+    // These methods turn N separate mat-vec decode passes into one GEMM pass.
+    // The default implementations fall back to serial per-sequence decode
+    // (no batching), so existing Dispatch impls work without changes.
+    // -----------------------------------------------------------------------
+
+    /// Whether this dispatch supports batched decode.
+    ///
+    /// Returns false by default.  Implementations return true when the
+    /// model architecture supports batched decode AND the necessary
+    /// buffers (logits_batch) are allocated.
+    fn supports_batched_decode(&self) -> bool {
+        false
+    }
+
+    /// Run a batched forward pass for N decoding sequences.
+    ///
+    /// `tokens[i]` is the last generated token for sequence i.
+    /// `positions[i]` is the KV cache position for sequence i.
+    /// `states[i]` is the KV state for sequence i (block table already synced).
+    ///
+    /// Produces [N, vocab_size] logits in an internal buffer, ready for
+    /// `sample_batch()`.
+    fn forward_decode_batch(
+        &self,
+        _tokens: &[u32],
+        _positions: &[u32],
+        _states: &[&Self::SeqState],
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("batched decode not supported by this Dispatch implementation")
+    }
+
+    /// Sample N tokens from the batched logits produced by `forward_decode_batch`.
+    ///
+    /// Each sequence gets its own temperature and top_p — different concurrent
+    /// requests can have different sampling parameters.
+    fn sample_batch(
+        &self,
+        _temperatures: &[f32],
+        _top_ps: &[f32],
+        _rng: &mut impl rand::Rng,
+    ) -> anyhow::Result<Vec<u32>> {
+        anyhow::bail!("batched sampling not supported by this Dispatch implementation")
+    }
 }

@@ -478,7 +478,7 @@ impl MetalBackend {
     /// `new_command_buffer()` returns a borrowed `&CommandBufferRef` with
     /// autorelease semantics.  We retain it via `to_owned()` so it lives
     /// in the Mutex until flush() commits it.
-    fn get_or_create_cmd(&self) -> std::sync::MutexGuard<'_, Option<metal::CommandBuffer>> {
+    pub(crate) fn get_or_create_cmd(&self) -> std::sync::MutexGuard<'_, Option<metal::CommandBuffer>> {
         let mut guard = self.current_cmd.lock().unwrap();
         if guard.is_none() {
             let cmd_ref = self.queue.new_command_buffer();

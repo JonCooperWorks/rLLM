@@ -74,6 +74,30 @@ pub(crate) trait GpuCore: Send + Sync {
         self.upload_tensor(&q4_data, shape, TensorDtype::Q4)
     }
 
+    /// Copy a contiguous region of bytes between two GPU tensors.
+    ///
+    /// This is the primitive that enables batched decode: when we have a
+    /// [batch_size, dim] tensor holding multiple sequences' data, we need to
+    /// extract individual rows into single-token scratch buffers for per-sequence
+    /// attention, then write the attention output back into the batched tensor.
+    ///
+    /// Example: extracting row 3 of a [8, 4096] bf16 Q buffer:
+    ///   src_byte_offset = 3 * 4096 * 2 = 24576
+    ///   dst_byte_offset = 0
+    ///   byte_count = 4096 * 2 = 8192
+    ///
+    /// Metal: MTLBlitCommandEncoder copy (GPU-side, async, zero CPU involvement).
+    /// CUDA:  cuMemcpyDtoDAsync on the backend's stream.
+    /// CPU:   simple slice copy.
+    fn copy_tensor_region(
+        &self,
+        src: &Self::Tensor,
+        src_byte_offset: usize,
+        dst: &Self::Tensor,
+        dst_byte_offset: usize,
+        byte_count: usize,
+    );
+
     /// Estimate the byte count of a 2D weight [m, k] after quantisation.
     ///
     /// Used by config.rs to predict GPU memory usage before loading weights.
