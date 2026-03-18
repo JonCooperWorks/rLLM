@@ -34,12 +34,52 @@
 //   the free list for reuse.
 // ===========================================================================
 
+pub(crate) mod multi_gpu;
 pub(crate) mod scheduler;
 
 use self::scheduler::{Scheduler, SeqId, SequenceRequest};
 use crate::gpu::GpuBackend;
 use crate::model::tokenizer::Tokenizer;
 use crate::model::{Model, PrefillBuffers};
+
+// ---------------------------------------------------------------------------
+// InferenceEngine trait — unified interface for single- and multi-GPU.
+//
+// Both the single-GPU Engine and multi-GPU MultiGpuEngine implement this
+// trait.  The API worker loop operates on `&mut dyn InferenceEngine`, so
+// it never needs to know how many GPUs are involved.
+//
+// The trait is object-safe (no generics, no Self by value) so it can be
+// used as a trait object.  The lifetime and backend type parameters of
+// the concrete impls are erased behind the `dyn` pointer.
+// ---------------------------------------------------------------------------
+
+/// Unified interface for inference engines.
+///
+/// Abstracts over single-GPU (`Engine<B>`) and multi-GPU (`MultiGpuEngine`)
+/// so the API server's worker loop doesn't need to know the GPU topology.
+pub(crate) trait InferenceEngine {
+    /// Submit a new completion request.  Returns a sequence ID for tracking.
+    fn add_request(
+        &mut self,
+        prompt_tokens: Vec<u32>,
+        max_gen_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+    ) -> SeqId;
+
+    /// Run one engine step: admit → prefill → decode → sample → collect.
+    fn step(&mut self) -> anyhow::Result<StepOutput>;
+
+    /// Abort a sequence, freeing its KV cache blocks.
+    fn abort_sequence(&mut self, id: SeqId);
+
+    /// Whether the engine has pending or active work.
+    fn has_work(&self) -> bool;
+
+    /// Access the tokenizer (for incremental text decoding in the worker loop).
+    fn tokenizer(&self) -> &Tokenizer;
+}
 
 /// Why a sequence stopped generating.
 #[derive(Clone, Copy)]
@@ -253,5 +293,33 @@ impl<'a, B: GpuBackend> Engine<'a, B> {
     /// Whether the engine has any work remaining.
     pub fn has_work(&self) -> bool {
         self.scheduler.has_work()
+    }
+}
+
+impl<'a, B: GpuBackend> InferenceEngine for Engine<'a, B> {
+    fn add_request(
+        &mut self,
+        prompt_tokens: Vec<u32>,
+        max_gen_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+    ) -> SeqId {
+        Engine::add_request(self, prompt_tokens, max_gen_tokens, temperature, top_p)
+    }
+
+    fn step(&mut self) -> anyhow::Result<StepOutput> {
+        Engine::step(self)
+    }
+
+    fn abort_sequence(&mut self, id: SeqId) {
+        Engine::abort_sequence(self, id)
+    }
+
+    fn has_work(&self) -> bool {
+        Engine::has_work(self)
+    }
+
+    fn tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
     }
 }
