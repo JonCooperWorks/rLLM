@@ -76,7 +76,16 @@ const FEATURES: ArchFeatures = ArchFeatures {
 // Public entry points — called from model/mod.rs dispatch.
 // ===========================================================================
 
-pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed + GpuAllReduce>(
+pub(crate) fn forward_single_paged<
+    B: GpuCore
+        + GpuNorm
+        + GpuMatmul
+        + GpuRope
+        + GpuAttention
+        + GpuElementwise
+        + GpuEmbed
+        + GpuAllReduce,
+>(
     m: &Model<'_, B>,
     token_id: u32,
     pool: &KvPool<B>,
@@ -85,7 +94,16 @@ pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
     forward_single_impl(m, token_id, pool, seq_state, &FEATURES)
 }
 
-pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed + GpuAllReduce>(
+pub(crate) fn forward_prefill_paged<
+    B: GpuCore
+        + GpuNorm
+        + GpuMatmul
+        + GpuRope
+        + GpuAttention
+        + GpuElementwise
+        + GpuEmbed
+        + GpuAllReduce,
+>(
     m: &Model<'_, B>,
     tokens: &[u32],
     pool: &KvPool<B>,
@@ -107,7 +125,16 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
 ///   1. Embed token
 ///   2. For each layer: norm → QKV → [bias] → RoPE → attention → O proj → FFN
 ///   3. Final norm → LM head
-pub(crate) fn forward_single_impl<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed + GpuAllReduce>(
+pub(crate) fn forward_single_impl<
+    B: GpuCore
+        + GpuNorm
+        + GpuMatmul
+        + GpuRope
+        + GpuAttention
+        + GpuElementwise
+        + GpuEmbed
+        + GpuAllReduce,
+>(
     m: &Model<'_, B>,
     token_id: u32,
     pool: &KvPool<B>,
@@ -126,49 +153,91 @@ pub(crate) fn forward_single_impl<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + G
 
         // --- Attention sub-block ---
         let t = profile::begin(m.backend);
-        m.backend.rms_norm(&m.hidden, &layer.input_layernorm, d.eps, &m.norm_buf);
+        m.backend
+            .rms_norm(&m.hidden, &layer.input_layernorm, d.eps, &m.norm_buf);
         primitives::qkv_projection_qdim(
-            m.backend, layer, &m.norm_buf, &m.q_buf, &m.k_buf, &m.v_buf,
-            d.q_dim, d.hidden_size, d.kv_dim,
+            m.backend,
+            layer,
+            &m.norm_buf,
+            &m.q_buf,
+            &m.k_buf,
+            &m.v_buf,
+            d.q_dim,
+            d.hidden_size,
+            d.kv_dim,
         );
 
         // QKV bias: the one line that separates Qwen from Llama/Phi.
         if features.has_qkv_bias {
             primitives::apply_qkv_bias_qdim(
-                m.backend, layer, &m.q_buf, &m.k_buf, &m.v_buf,
-                d.q_dim, d.kv_dim,
+                m.backend, layer, &m.q_buf, &m.k_buf, &m.v_buf, d.q_dim, d.kv_dim,
             );
         }
 
         primitives::apply_rope(
-            m.backend, &m.q_buf, &m.k_buf, pos, d.rope_theta,
-            d.num_heads, d.num_kv_heads, d.head_dim,
+            m.backend,
+            &m.q_buf,
+            &m.k_buf,
+            pos,
+            d.rope_theta,
+            d.num_heads,
+            d.num_kv_heads,
+            d.head_dim,
         );
         primitives::paged_kv_and_attention(
-            m.backend, &m.k_buf, &m.v_buf, &m.q_buf, &m.attn_out,
-            pool, seq_state, layer_idx, pos,
-            d.num_heads, d.num_kv_heads, d.head_dim,
-            0, 0.0, None, // No sliding window, default attention scale, no sinks.
+            m.backend,
+            &m.k_buf,
+            &m.v_buf,
+            &m.q_buf,
+            &m.attn_out,
+            pool,
+            seq_state,
+            layer_idx,
+            pos,
+            d.num_heads,
+            d.num_kv_heads,
+            d.head_dim,
+            0,
+            0.0,
+            None, // No sliding window, default attention scale, no sinks.
         );
         primitives::o_proj_residual_qdim(
-            m.backend, layer, &m.attn_out, &m.norm_buf, &m.hidden,
-            d.hidden_size, d.q_dim,
+            m.backend,
+            layer,
+            &m.attn_out,
+            &m.norm_buf,
+            &m.hidden,
+            d.hidden_size,
+            d.q_dim,
         );
         profile::record(m.backend, t, Component::Attention);
 
         // --- FFN sub-block ---
         let t = profile::begin(m.backend);
         primitives::ffn_block(
-            m.backend, layer, &m.hidden, &m.norm_buf, &m.gate_buf, &m.up_buf,
-            d.eps, d.hidden_size, d.inter_size,
+            m.backend,
+            layer,
+            &m.hidden,
+            &m.norm_buf,
+            &m.gate_buf,
+            &m.up_buf,
+            d.eps,
+            d.hidden_size,
+            d.inter_size,
         );
         profile::record(m.backend, t, Component::Ffn);
     }
 
     let t = profile::begin(m.backend);
     primitives::final_norm_and_lm_head(
-        m.backend, &m.weights, &m.hidden, &m.norm_buf, &m.logits_buf,
-        d.eps, d.hidden_size, m.config.vocab_size as u32,
+        m.backend,
+        &m.weights,
+        &m.hidden,
+        &m.norm_buf,
+        &m.logits_buf,
+        d.eps,
+        d.hidden_size,
+        m.config.vocab_size as u32,
     );
     profile::record(m.backend, t, Component::Other);
 
@@ -176,7 +245,16 @@ pub(crate) fn forward_single_impl<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + G
 }
 
 /// Batched prefill: process entire prompt in one GEMM-based forward pass.
-pub(crate) fn forward_prefill_impl<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed + GpuAllReduce>(
+pub(crate) fn forward_prefill_impl<
+    B: GpuCore
+        + GpuNorm
+        + GpuMatmul
+        + GpuRope
+        + GpuAttention
+        + GpuElementwise
+        + GpuEmbed
+        + GpuAllReduce,
+>(
     m: &Model<'_, B>,
     tokens: &[u32],
     pool: &KvPool<B>,
@@ -195,33 +273,62 @@ pub(crate) fn forward_prefill_impl<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
         let layer = &m.weights.layers[layer_idx];
 
         m.backend.rms_norm_batch(
-            &bufs.hidden, &layer.input_layernorm, d.eps, &bufs.norm_buf, bs,
+            &bufs.hidden,
+            &layer.input_layernorm,
+            d.eps,
+            &bufs.norm_buf,
+            bs,
         );
         primitives::qkv_projection_batch_qdim(
-            m.backend, layer, bufs, bs, d.q_dim, d.hidden_size, d.kv_dim,
+            m.backend,
+            layer,
+            bufs,
+            bs,
+            d.q_dim,
+            d.hidden_size,
+            d.kv_dim,
         );
 
         // QKV bias (batched): broadcast-add [dim] bias across [batch_size, dim].
         if features.has_qkv_bias {
-            primitives::apply_qkv_bias_batch_qdim(
-                m.backend, layer, bufs, bs, d.q_dim, d.kv_dim,
-            );
+            primitives::apply_qkv_bias_batch_qdim(m.backend, layer, bufs, bs, d.q_dim, d.kv_dim);
         }
 
         primitives::apply_rope_batch(
-            m.backend, bufs, d.rope_theta, bs,
-            d.num_heads, d.num_kv_heads, d.head_dim,
+            m.backend,
+            bufs,
+            d.rope_theta,
+            bs,
+            d.num_heads,
+            d.num_kv_heads,
+            d.head_dim,
         );
         primitives::paged_kv_and_prefill_attention(
-            m.backend, bufs, pool, seq_state, layer_idx,
-            bs, start_pos, d.num_heads, d.num_kv_heads, d.head_dim,
-            0, 0.0, None,
+            m.backend,
+            bufs,
+            pool,
+            seq_state,
+            layer_idx,
+            bs,
+            start_pos,
+            d.num_heads,
+            d.num_kv_heads,
+            d.head_dim,
+            0,
+            0.0,
+            None,
         );
         primitives::o_proj_residual_batch_qdim(m.backend, layer, bufs, bs, d.hidden_size, d.q_dim);
 
         // FFN sub-block.
         primitives::ffn_block_batch(
-            m.backend, layer, bufs, d.eps, bs, d.hidden_size, d.inter_size,
+            m.backend,
+            layer,
+            bufs,
+            d.eps,
+            bs,
+            d.hidden_size,
+            d.inter_size,
         );
 
         // Submit this layer's work so the GPU starts executing while we
@@ -230,8 +337,15 @@ pub(crate) fn forward_prefill_impl<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
     }
 
     primitives::final_norm_and_lm_head_prefill(
-        m.backend, &m.weights, bufs, &m.norm_buf, &m.logits_buf,
-        d.eps, bs, m.config.hidden_size, m.config.vocab_size as u32,
+        m.backend,
+        &m.weights,
+        bufs,
+        &m.norm_buf,
+        &m.logits_buf,
+        d.eps,
+        bs,
+        m.config.hidden_size,
+        m.config.vocab_size as u32,
     );
 
     Ok(())

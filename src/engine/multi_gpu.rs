@@ -24,7 +24,7 @@
 //   - engine/dispatch.rs  — Dispatch trait
 //   - engine/mod.rs       — run_step(), InferenceEngine trait, Engine
 //   - gpu/multi_gpu.rs    — MultiGpuInference: fan-out, NCCL, per-rank state
-//   - api/multi_gpu.rs    — spawns MultiGpuEngine for the API server
+//   - engine/loader.rs    — load_and_run_multi_gpu() constructs MultiGpuEngine
 // ===========================================================================
 
 #[cfg(feature = "cuda")]
@@ -33,7 +33,7 @@ pub(crate) use imp::MultiGpuEngine;
 #[cfg(feature = "cuda")]
 mod imp {
     use crate::engine::dispatch::Dispatch;
-    use crate::engine::{run_step, Scheduler, SeqId, SequenceRequest, InferenceEngine, StepOutput};
+    use crate::engine::{InferenceEngine, Scheduler, SeqId, SequenceRequest, StepOutput, run_step};
     use crate::gpu::cuda::CudaBackend;
     use crate::gpu::multi_gpu::tp::MultiGpuInference;
     use crate::model::kv_cache::SeqKvState;
@@ -76,11 +76,7 @@ mod imp {
             self.multi.ensure_slots_for(state, token_count)
         }
 
-        fn forward_prefill(
-            &self,
-            tokens: &[u32],
-            state: &Self::SeqState,
-        ) -> anyhow::Result<()> {
+        fn forward_prefill(&self, tokens: &[u32], state: &Self::SeqState) -> anyhow::Result<()> {
             self.multi.forward_prefill_paged_with(tokens, state)
         }
 
@@ -92,11 +88,7 @@ mod imp {
             self.multi.ensure_slot_for(state)
         }
 
-        fn forward_decode(
-            &self,
-            token: u32,
-            state: &Self::SeqState,
-        ) -> anyhow::Result<()> {
+        fn forward_decode(&self, token: u32, state: &Self::SeqState) -> anyhow::Result<()> {
             self.multi.forward_single_paged_with(token, state)
         }
 
@@ -136,11 +128,7 @@ mod imp {
     }
 
     impl MultiGpuEngine {
-        pub fn new(
-            multi: MultiGpuInference,
-            tokenizer: Tokenizer,
-            max_active: usize,
-        ) -> Self {
+        pub fn new(multi: MultiGpuInference, tokenizer: Tokenizer, max_active: usize) -> Self {
             Self {
                 dispatch: MultiGpuDispatch { multi },
                 scheduler: Scheduler::new(max_active),

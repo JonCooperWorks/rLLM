@@ -6,7 +6,7 @@
 // What this file does:
 //   Implements the Metal device management, pipeline compilation, and
 //   async dispatch infrastructure.  The actual kernel dispatch methods
-//   (trait implementation) live in kernels.rs.
+//   (trait implementations) live in the kernels/ directory.
 //
 // Key concepts for understanding this backend:
 //
@@ -197,8 +197,12 @@ impl MetalBackend {
             Self::make_pipeline(&device, METAL_SOURCE_ELEMENTWISE, "silu_mul", &compile_opts)?;
         let pipeline_gelu_mul =
             Self::make_pipeline(&device, METAL_SOURCE_ELEMENTWISE, "gelu_mul", &compile_opts)?;
-        let pipeline_scalar_mul =
-            Self::make_pipeline(&device, METAL_SOURCE_ELEMENTWISE, "scalar_mul", &compile_opts)?;
+        let pipeline_scalar_mul = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_ELEMENTWISE,
+            "scalar_mul",
+            &compile_opts,
+        )?;
         let pipeline_add = Self::make_pipeline(
             &device,
             METAL_SOURCE_ELEMENTWISE,
@@ -207,36 +211,32 @@ impl MetalBackend {
         )?;
         let pipeline_bias_add =
             Self::make_pipeline(&device, METAL_SOURCE_ELEMENTWISE, "bias_add", &compile_opts)?;
-        let pipeline_scale_add =
-            Self::make_pipeline(&device, METAL_SOURCE_ELEMENTWISE, "scale_add", &compile_opts)?;
-        let pipeline_fill_zero =
-            Self::make_pipeline(&device, METAL_SOURCE_ELEMENTWISE, "fill_zero", &compile_opts)?;
-        let pipeline_embed_lookup =
-            Self::make_pipeline(&device, METAL_SOURCE_EMBED, "embed_lookup", &compile_opts)?;
-        let pipeline_copy_kv = Self::make_pipeline(
+        let pipeline_scale_add = Self::make_pipeline(
             &device,
-            &attn_src_128,
-            "copy_to_kv_cache",
+            METAL_SOURCE_ELEMENTWISE,
+            "scale_add",
             &compile_opts,
         )?;
+        let pipeline_fill_zero = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_ELEMENTWISE,
+            "fill_zero",
+            &compile_opts,
+        )?;
+        let pipeline_embed_lookup =
+            Self::make_pipeline(&device, METAL_SOURCE_EMBED, "embed_lookup", &compile_opts)?;
+        let pipeline_copy_kv =
+            Self::make_pipeline(&device, &attn_src_128, "copy_to_kv_cache", &compile_opts)?;
         let pipeline_paged_copy_kv = Self::make_pipeline(
             &device,
             &attn_src_128,
             "copy_to_paged_kv_cache",
             &compile_opts,
         )?;
-        let pipeline_paged_attention = Self::make_pipeline(
-            &device,
-            &attn_src_128,
-            "paged_attention",
-            &compile_opts,
-        )?;
-        let pipeline_paged_attention_hd256 = Self::make_pipeline(
-            &device,
-            &attn_src_256,
-            "paged_attention",
-            &compile_opts,
-        )?;
+        let pipeline_paged_attention =
+            Self::make_pipeline(&device, &attn_src_128, "paged_attention", &compile_opts)?;
+        let pipeline_paged_attention_hd256 =
+            Self::make_pipeline(&device, &attn_src_256, "paged_attention", &compile_opts)?;
         let pipeline_paged_attention_fused = Self::make_pipeline(
             &device,
             &attn_src_128,
@@ -279,18 +279,10 @@ impl MetalBackend {
             "copy_to_paged_kv_cache_batch",
             &compile_opts,
         )?;
-        let pipeline_prefill_attention = Self::make_pipeline(
-            &device,
-            &attn_src_128,
-            "prefill_attention",
-            &compile_opts,
-        )?;
-        let pipeline_prefill_attention_hd256 = Self::make_pipeline(
-            &device,
-            &attn_src_256,
-            "prefill_attention",
-            &compile_opts,
-        )?;
+        let pipeline_prefill_attention =
+            Self::make_pipeline(&device, &attn_src_128, "prefill_attention", &compile_opts)?;
+        let pipeline_prefill_attention_hd256 =
+            Self::make_pipeline(&device, &attn_src_256, "prefill_attention", &compile_opts)?;
         let pipeline_top_k_softmax = Self::make_pipeline(
             &device,
             METAL_SOURCE_ELEMENTWISE,
@@ -317,12 +309,24 @@ impl MetalBackend {
             "l2_normalize_heads",
             &compile_opts,
         )?;
-        let pipeline_sigmoid =
-            Self::make_pipeline(&device, METAL_SOURCE_DELTANET, "sigmoid_kernel", &compile_opts)?;
-        let pipeline_sigmoid_bf16 =
-            Self::make_pipeline(&device, METAL_SOURCE_DELTANET, "sigmoid_bf16", &compile_opts)?;
-        let pipeline_decay_gate =
-            Self::make_pipeline(&device, METAL_SOURCE_DELTANET, "deltanet_decay_gate", &compile_opts)?;
+        let pipeline_sigmoid = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_DELTANET,
+            "sigmoid_kernel",
+            &compile_opts,
+        )?;
+        let pipeline_sigmoid_bf16 = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_DELTANET,
+            "sigmoid_bf16",
+            &compile_opts,
+        )?;
+        let pipeline_decay_gate = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_DELTANET,
+            "deltanet_decay_gate",
+            &compile_opts,
+        )?;
         let pipeline_silu_elem = Self::make_pipeline(
             &device,
             METAL_SOURCE_DELTANET,

@@ -91,13 +91,15 @@ impl GpuElementwise for CudaBackend {
         let block = 256.min(size);
         let cfg = CudaBackend::cfg_1d(size, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_silu_mul)
+            self.stream
+                .launch_builder(&self.fn_silu_mul)
                 .arg(&params)
                 .arg(&gate.buf)
                 .arg(&up.buf)
                 .arg(&out.buf)
                 .launch(cfg)
-        }.expect("silu_mul launch failed");
+        }
+        .expect("silu_mul launch failed");
     }
 
     fn gelu_mul(&self, gate: &CudaTensor, up: &CudaTensor, out: &CudaTensor, size: u32) {
@@ -105,13 +107,15 @@ impl GpuElementwise for CudaBackend {
         let block = 256.min(size);
         let cfg = CudaBackend::cfg_1d(size, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_gelu_mul)
+            self.stream
+                .launch_builder(&self.fn_gelu_mul)
                 .arg(&params)
                 .arg(&gate.buf)
                 .arg(&up.buf)
                 .arg(&out.buf)
                 .launch(cfg)
-        }.expect("gelu_mul launch failed");
+        }
+        .expect("gelu_mul launch failed");
     }
 
     fn scalar_mul(&self, input: &CudaTensor, out: &CudaTensor, scalar: f32, size: u32) {
@@ -119,12 +123,14 @@ impl GpuElementwise for CudaBackend {
         let block = 256.min(size);
         let cfg = CudaBackend::cfg_1d(size, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_scalar_mul)
+            self.stream
+                .launch_builder(&self.fn_scalar_mul)
                 .arg(&params)
                 .arg(&input.buf)
                 .arg(&out.buf)
                 .launch(cfg)
-        }.expect("scalar_mul launch failed");
+        }
+        .expect("scalar_mul launch failed");
     }
 
     fn add(&self, a: &CudaTensor, b: &CudaTensor, out: &CudaTensor, size: u32) {
@@ -132,13 +138,15 @@ impl GpuElementwise for CudaBackend {
         let block = 256.min(size);
         let cfg = CudaBackend::cfg_1d(size, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_add)
+            self.stream
+                .launch_builder(&self.fn_add)
                 .arg(&params)
                 .arg(&a.buf)
                 .arg(&b.buf)
                 .arg(&out.buf)
                 .launch(cfg)
-        }.expect("add launch failed");
+        }
+        .expect("add launch failed");
     }
 
     fn scale_add(&self, dst: &CudaTensor, src: &CudaTensor, scale: f32, size: u32) {
@@ -146,12 +154,14 @@ impl GpuElementwise for CudaBackend {
         let block = 256.min(size);
         let cfg = CudaBackend::cfg_1d(size, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_scale_add)
+            self.stream
+                .launch_builder(&self.fn_scale_add)
                 .arg(&params)
                 .arg(&dst.buf)
                 .arg(&src.buf)
                 .launch(cfg)
-        }.expect("scale_add launch failed");
+        }
+        .expect("scale_add launch failed");
     }
 
     fn fill_zero(&self, dst: &CudaTensor, size: u32) {
@@ -159,11 +169,13 @@ impl GpuElementwise for CudaBackend {
         let block = 256.min(size);
         let cfg = CudaBackend::cfg_1d(size, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_fill_zero)
+            self.stream
+                .launch_builder(&self.fn_fill_zero)
                 .arg(&params)
                 .arg(&dst.buf)
                 .launch(cfg)
-        }.expect("fill_zero launch failed");
+        }
+        .expect("fill_zero launch failed");
     }
 
     fn bias_add_batch(
@@ -179,13 +191,15 @@ impl GpuElementwise for CudaBackend {
         let block = 256.min(total);
         let cfg = CudaBackend::cfg_1d(total, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_bias_add)
+            self.stream
+                .launch_builder(&self.fn_bias_add)
                 .arg(&params)
                 .arg(&input.buf)
                 .arg(&bias.buf)
                 .arg(&out.buf)
                 .launch(cfg)
-        }.expect("bias_add launch failed");
+        }
+        .expect("bias_add launch failed");
     }
 
     fn sigmoid(&self, input: &CudaTensor, out: &CudaTensor, size: u32) {
@@ -193,12 +207,14 @@ impl GpuElementwise for CudaBackend {
         let block = 256.min(size);
         let cfg = CudaBackend::cfg_1d(size, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_sigmoid)
+            self.stream
+                .launch_builder(&self.fn_sigmoid)
                 .arg(&params)
                 .arg(&input.buf)
                 .arg(&out.buf)
                 .launch(cfg)
-        }.expect("sigmoid launch failed");
+        }
+        .expect("sigmoid launch failed");
     }
 
     fn sigmoid_bf16(&self, input: &CudaTensor, out: &CudaTensor, size: u32) {
@@ -206,12 +222,14 @@ impl GpuElementwise for CudaBackend {
         let block = 256.min(size);
         let cfg = CudaBackend::cfg_1d(size, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_sigmoid_bf16)
+            self.stream
+                .launch_builder(&self.fn_sigmoid_bf16)
                 .arg(&params)
                 .arg(&input.buf)
                 .arg(&out.buf)
                 .launch(cfg)
-        }.expect("sigmoid_bf16 launch failed");
+        }
+        .expect("sigmoid_bf16 launch failed");
     }
 
     fn silu(&self, input: &CudaTensor, out: &CudaTensor, size: u32) {
@@ -219,12 +237,14 @@ impl GpuElementwise for CudaBackend {
         let block = 256.min(size);
         let cfg = CudaBackend::cfg_1d(size, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_silu_elem)
+            self.stream
+                .launch_builder(&self.fn_silu_elem)
                 .arg(&params)
                 .arg(&input.buf)
                 .arg(&out.buf)
                 .launch(cfg)
-        }.expect("silu launch failed");
+        }
+        .expect("silu launch failed");
     }
 
     fn silu_mul_clamp(
@@ -239,13 +259,15 @@ impl GpuElementwise for CudaBackend {
         let block = 256.min(size);
         let cfg = CudaBackend::cfg_1d(size, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_silu_mul_clamp)
+            self.stream
+                .launch_builder(&self.fn_silu_mul_clamp)
                 .arg(&params)
                 .arg(&gate.buf)
                 .arg(&up.buf)
                 .arg(&out.buf)
                 .launch(cfg)
-        }.expect("silu_mul_clamp launch failed");
+        }
+        .expect("silu_mul_clamp launch failed");
     }
 
     fn mul(&self, a: &CudaTensor, b: &CudaTensor, out: &CudaTensor, size: u32) {
@@ -253,13 +275,15 @@ impl GpuElementwise for CudaBackend {
         let block = 256.min(size);
         let cfg = CudaBackend::cfg_1d(size, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_mul_elem)
+            self.stream
+                .launch_builder(&self.fn_mul_elem)
                 .arg(&params)
                 .arg(&a.buf)
                 .arg(&b.buf)
                 .arg(&out.buf)
                 .launch(cfg)
-        }.expect("mul launch failed");
+        }
+        .expect("mul launch failed");
     }
 
     fn gpt_oss_gated_act(
@@ -275,31 +299,29 @@ impl GpuElementwise for CudaBackend {
         let block = 256.min(size);
         let cfg = CudaBackend::cfg_1d(size, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_gpt_oss_gated_act)
+            self.stream
+                .launch_builder(&self.fn_gpt_oss_gated_act)
                 .arg(&params)
                 .arg(&gate.buf)
                 .arg(&up.buf)
                 .arg(&out.buf)
                 .launch(cfg)
-        }.expect("gpt_oss_gated_act launch failed");
+        }
+        .expect("gpt_oss_gated_act launch failed");
     }
 
-    fn top_k_softmax(
-        &self,
-        logits: &CudaTensor,
-        output: &CudaTensor,
-        num_experts: u32,
-        k: u32,
-    ) {
+    fn top_k_softmax(&self, logits: &CudaTensor, output: &CudaTensor, num_experts: u32, k: u32) {
         let params = TopKParams { num_experts, k };
         // Single thread — sequential top-k selection.
         let cfg = CudaBackend::cfg_blocks(1, 1);
         unsafe {
-            self.stream.launch_builder(&self.fn_top_k_softmax)
+            self.stream
+                .launch_builder(&self.fn_top_k_softmax)
                 .arg(&params)
                 .arg(&logits.buf)
                 .arg(&output.buf)
                 .launch(cfg)
-        }.expect("top_k_softmax launch failed");
+        }
+        .expect("top_k_softmax launch failed");
     }
 }

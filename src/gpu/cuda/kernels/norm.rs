@@ -42,13 +42,15 @@ impl GpuNorm for CudaBackend {
         // Single vector: 1 block × 256 threads.
         let cfg = CudaBackend::cfg_blocks(1, 256);
         unsafe {
-            self.stream.launch_builder(&self.fn_rms_norm)
+            self.stream
+                .launch_builder(&self.fn_rms_norm)
                 .arg(&params)
                 .arg(&input.buf)
                 .arg(&weight.buf)
                 .arg(&out.buf)
                 .launch(cfg)
-        }.expect("rms_norm launch failed");
+        }
+        .expect("rms_norm launch failed");
     }
 
     fn rms_norm_batch(
@@ -68,12 +70,14 @@ impl GpuNorm for CudaBackend {
         // One block per row, 256 threads per block.
         let cfg = CudaBackend::cfg_blocks(batch_size, 256);
         unsafe {
-            self.stream.launch_builder(&self.fn_rms_norm_batch)
+            self.stream
+                .launch_builder(&self.fn_rms_norm_batch)
                 .arg(&params)
                 .arg(&input.buf)
                 .arg(&weight.buf)
                 .arg(&out.buf)
                 .launch(cfg)
-        }.expect("rms_norm_batch launch failed");
+        }
+        .expect("rms_norm_batch launch failed");
     }
 }

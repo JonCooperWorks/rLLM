@@ -30,8 +30,9 @@
 //   tie_word_embeddings:     true   / false
 //   model_type:              llama  / qwen2
 //
-// All supported architectures (Llama, Qwen, Phi, Gemma, Mistral, Qwen3 MoE,
-// Qwen 3.5) share the same core building blocks (RMSNorm, GQA, SwiGLU, RoPE).
+// All supported architectures (Llama, Qwen, Phi, Gemma, Mistral, Mixtral,
+// Qwen3 MoE, Qwen 3.5, GPT-OSS) share the same core building blocks
+// (RMSNorm, GQA, SwiGLU, RoPE).
 // Differences are captured by ModelArch: QKV bias (Qwen), QK-norm (Qwen3 MoE),
 // fused QKV (Gemma), chat template format, and MoE vs dense FFN.
 //
@@ -195,7 +196,11 @@ impl ModelArch {
     /// this helps at smaller model sizes.
     pub fn has_qkv_bias(&self) -> bool {
         match self {
-            ModelArch::Llama | ModelArch::Mistral | ModelArch::Mixtral | ModelArch::Phi | ModelArch::Gemma3 => false,
+            ModelArch::Llama
+            | ModelArch::Mistral
+            | ModelArch::Mixtral
+            | ModelArch::Phi
+            | ModelArch::Gemma3 => false,
             ModelArch::Qwen2 | ModelArch::GptOss => true,
             ModelArch::Qwen3Moe | ModelArch::Qwen3_5 => false,
         }
@@ -235,9 +240,14 @@ impl ModelArch {
     /// rely on the implicit normalisation from RMSNorm on the hidden state.
     pub fn has_qk_norm(&self) -> bool {
         match self {
-            ModelArch::Llama | ModelArch::Mistral | ModelArch::Mixtral | ModelArch::Qwen2 | ModelArch::Phi | ModelArch::GptOss => false,
-            ModelArch::Gemma3 => true,  // Both 4B and 27B have q_norm/k_norm weights
-            ModelArch::Qwen3_5 => true,  // GQA layers have QK-norm
+            ModelArch::Llama
+            | ModelArch::Mistral
+            | ModelArch::Mixtral
+            | ModelArch::Qwen2
+            | ModelArch::Phi
+            | ModelArch::GptOss => false,
+            ModelArch::Gemma3 => true, // Both 4B and 27B have q_norm/k_norm weights
+            ModelArch::Qwen3_5 => true, // GQA layers have QK-norm
             ModelArch::Qwen3Moe => true,
         }
     }
@@ -261,7 +271,9 @@ impl ModelArch {
             "mixtral" => Ok(ModelArch::Mixtral),
             "qwen2" => Ok(ModelArch::Qwen2),
             "qwen3_moe" => Ok(ModelArch::Qwen3Moe),
-            "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => Ok(ModelArch::Qwen3_5),
+            "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => {
+                Ok(ModelArch::Qwen3_5)
+            }
             "phi3" | "phi4" => Ok(ModelArch::Phi),
             "gemma3_text" | "gemma3" => Ok(ModelArch::Gemma3),
             "gpt_oss" => Ok(ModelArch::GptOss),
@@ -340,7 +352,6 @@ pub struct ModelConfig {
     //
     // These fields are only present in MoE configs (e.g. qwen3_moe).
     // For dense models they default to 0.
-
     /// Total number of expert FFN sub-networks per layer.
     /// Qwen3-Coder-30B-A3B: 128 experts per layer.
     /// Mixtral uses `num_local_experts` in config.json (serde alias handles this).
@@ -378,7 +389,6 @@ pub struct ModelConfig {
     // regardless of sequence length — no growing KV cache.  The trade-off is
     // that the fixed-size state can't represent every detail of long contexts,
     // which is why some layers still use full attention.
-
     /// Number of key heads in DeltaNet (linear attention) layers.
     /// Qwen3.5-27B: 16 QK-heads with head_dim=128.
     #[serde(default)]
@@ -431,7 +441,6 @@ pub struct ModelConfig {
     // Gemma 3 also uses two different RoPE frequencies — a lower base for
     // local layers (where precise nearby-token positioning matters) and a
     // higher base for global layers (where long-range discrimination matters).
-
     /// Sliding window size for local attention layers (tokens).
     /// Gemma 3 1B: 512, larger models: up to 4096.
     /// Only used when layer_types contains "sliding_attention".
@@ -568,16 +577,17 @@ impl ModelConfig {
             // Promote top-level `tie_word_embeddings` into text_config if not already set.
             if let Some(tie) = raw.get("tie_word_embeddings") {
                 if merged.get("tie_word_embeddings").is_none() {
-                    merged.as_object_mut().unwrap().insert(
-                        "tie_word_embeddings".to_string(),
-                        tie.clone(),
-                    );
+                    merged
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("tie_word_embeddings".to_string(), tie.clone());
                 }
             }
             // Detect which VLM wrapper this is.  Gemma 3 text_config has
             // model_type="gemma3_text" and keeps it; Qwen 3.5 VLMs need
             // the type forced to "qwen3_5".
-            let text_model_type = merged.get("model_type")
+            let text_model_type = merged
+                .get("model_type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let weight_prefix = if text_model_type.starts_with("gemma3") {
@@ -593,20 +603,28 @@ impl ModelConfig {
             };
             // Extract rope_theta from nested rope_parameters if present.
             // Clone values first to avoid borrow conflicts.
-            let rope_theta_val = merged.get("rope_parameters")
+            let rope_theta_val = merged
+                .get("rope_parameters")
                 .and_then(|rp| rp.get("rope_theta"))
                 .cloned();
-            let prf_val = merged.get("rope_parameters")
+            let prf_val = merged
+                .get("rope_parameters")
                 .and_then(|rp| rp.get("partial_rotary_factor"))
                 .cloned();
             if let Some(theta) = rope_theta_val {
                 if merged.get("rope_theta").is_none() {
-                    merged.as_object_mut().unwrap().insert("rope_theta".to_string(), theta);
+                    merged
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("rope_theta".to_string(), theta);
                 }
             }
             if let Some(prf) = prf_val {
                 if merged.get("partial_rotary_factor").is_none() {
-                    merged.as_object_mut().unwrap().insert("partial_rotary_factor".to_string(), prf);
+                    merged
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("partial_rotary_factor".to_string(), prf);
                 }
             }
             (merged, weight_prefix)
@@ -638,22 +656,42 @@ impl ModelConfig {
         // (hidden_size, intermediate_size, num_hidden_layers, sliding_window).
         // The full defaults come from HF's Gemma3TextConfig class.
         if config.model_type == "gemma3_text" || config.model_type == "gemma3" {
-            if config.num_attention_heads == 0 { config.num_attention_heads = 8; }
-            if config.num_key_value_heads == 0 { config.num_key_value_heads = 4; }
-            if config.head_dim == 0 { config.head_dim = 256; }
-            if config.vocab_size == 0 { config.vocab_size = 262208; }
-            if config.max_position_embeddings == 0 { config.max_position_embeddings = 131072; }
-            if config.rope_theta == 0.0 { config.rope_theta = 1_000_000.0; }
-            if config.rms_norm_eps == 0.0 { config.rms_norm_eps = 1e-6; }
-            if config.sliding_window_pattern == 0 { config.sliding_window_pattern = 6; }
+            if config.num_attention_heads == 0 {
+                config.num_attention_heads = 8;
+            }
+            if config.num_key_value_heads == 0 {
+                config.num_key_value_heads = 4;
+            }
+            if config.head_dim == 0 {
+                config.head_dim = 256;
+            }
+            if config.vocab_size == 0 {
+                config.vocab_size = 262208;
+            }
+            if config.max_position_embeddings == 0 {
+                config.max_position_embeddings = 131072;
+            }
+            if config.rope_theta == 0.0 {
+                config.rope_theta = 1_000_000.0;
+            }
+            if config.rms_norm_eps == 0.0 {
+                config.rms_norm_eps = 1e-6;
+            }
+            if config.sliding_window_pattern == 0 {
+                config.sliding_window_pattern = 6;
+            }
             if config.hidden_activation.is_empty() {
                 config.hidden_activation = "gelu_pytorch_tanh".to_string();
             }
             if config.query_pre_attn_scalar == 0.0 {
                 config.query_pre_attn_scalar = config.head_dim as f64;
             }
-            if config.sliding_window == 0 { config.sliding_window = 1024; }
-            if config.rope_local_base_freq == 0.0 { config.rope_local_base_freq = 10_000.0; }
+            if config.sliding_window == 0 {
+                config.sliding_window = 1024;
+            }
+            if config.rope_local_base_freq == 0.0 {
+                config.rope_local_base_freq = 10_000.0;
+            }
             // Gemma 3 ties embeddings (no separate lm_head.weight).
             // The top-level config may not specify this, so default to true.
             if !config.tie_word_embeddings {
@@ -772,10 +810,10 @@ impl ModelConfig {
             let mut layer = 0usize;
 
             // Attention projections (Q4 or BF16).
-            layer += proj(q_dim, hidden);  // q_proj
+            layer += proj(q_dim, hidden); // q_proj
             layer += proj(kv_dim, hidden); // k_proj
             layer += proj(kv_dim, hidden); // v_proj
-            layer += proj(hidden, q_dim);  // o_proj
+            layer += proj(hidden, q_dim); // o_proj
 
             // Norm weights (always BF16, small).
             // Gemma 3 uses 4 norms per layer (sandwich norms); all others use 2.
@@ -812,7 +850,7 @@ impl ModelConfig {
                 let moe_inter = self.moe_intermediate_size;
                 let per_expert = proj(moe_inter, hidden) // gate_proj
                     + proj(moe_inter, hidden)             // up_proj
-                    + proj(hidden, moe_inter);            // down_proj
+                    + proj(hidden, moe_inter); // down_proj
                 layer += self.num_experts * per_expert;
                 // Expert biases (GPT-OSS: gate_bias + up_bias + down_bias per expert, bf16).
                 if self.arch().map_or(false, |a| a.has_expert_bias()) {
@@ -870,8 +908,7 @@ impl ModelConfig {
 
     /// Whether this model uses the hybrid DeltaNet + GQA architecture.
     pub fn is_hybrid_deltanet(&self) -> bool {
-        !self.layer_types.is_empty()
-            && self.layer_types.iter().any(|t| t == "linear_attention")
+        !self.layer_types.is_empty() && self.layer_types.iter().any(|t| t == "linear_attention")
     }
 
     /// Whether a given layer uses DeltaNet (linear) attention.
@@ -982,7 +1019,10 @@ mod tests {
             .join(subdir)
             .join("config.json");
         if path.exists() {
-            Some(ModelConfig::from_file(&path).expect(&format!("failed to parse {}", path.display())))
+            Some(
+                ModelConfig::from_file(&path)
+                    .expect(&format!("failed to parse {}", path.display())),
+            )
         } else {
             None
         }
@@ -990,18 +1030,48 @@ mod tests {
 
     #[test]
     fn test_model_arch_from_model_type() {
-        assert_eq!(ModelArch::from_model_type("llama").unwrap(), ModelArch::Llama);
-        assert_eq!(ModelArch::from_model_type("mistral").unwrap(), ModelArch::Mistral);
-        assert_eq!(ModelArch::from_model_type("qwen2").unwrap(), ModelArch::Qwen2);
-        assert_eq!(ModelArch::from_model_type("qwen3_moe").unwrap(), ModelArch::Qwen3Moe);
-        assert_eq!(ModelArch::from_model_type("qwen3_5").unwrap(), ModelArch::Qwen3_5);
-        assert_eq!(ModelArch::from_model_type("qwen3_5_text").unwrap(), ModelArch::Qwen3_5);
-        assert_eq!(ModelArch::from_model_type("qwen3_5_moe").unwrap(), ModelArch::Qwen3_5);
-        assert_eq!(ModelArch::from_model_type("qwen3_5_moe_text").unwrap(), ModelArch::Qwen3_5);
+        assert_eq!(
+            ModelArch::from_model_type("llama").unwrap(),
+            ModelArch::Llama
+        );
+        assert_eq!(
+            ModelArch::from_model_type("mistral").unwrap(),
+            ModelArch::Mistral
+        );
+        assert_eq!(
+            ModelArch::from_model_type("qwen2").unwrap(),
+            ModelArch::Qwen2
+        );
+        assert_eq!(
+            ModelArch::from_model_type("qwen3_moe").unwrap(),
+            ModelArch::Qwen3Moe
+        );
+        assert_eq!(
+            ModelArch::from_model_type("qwen3_5").unwrap(),
+            ModelArch::Qwen3_5
+        );
+        assert_eq!(
+            ModelArch::from_model_type("qwen3_5_text").unwrap(),
+            ModelArch::Qwen3_5
+        );
+        assert_eq!(
+            ModelArch::from_model_type("qwen3_5_moe").unwrap(),
+            ModelArch::Qwen3_5
+        );
+        assert_eq!(
+            ModelArch::from_model_type("qwen3_5_moe_text").unwrap(),
+            ModelArch::Qwen3_5
+        );
         assert_eq!(ModelArch::from_model_type("phi3").unwrap(), ModelArch::Phi);
         assert_eq!(ModelArch::from_model_type("phi4").unwrap(), ModelArch::Phi);
-        assert_eq!(ModelArch::from_model_type("gemma3_text").unwrap(), ModelArch::Gemma3);
-        assert_eq!(ModelArch::from_model_type("gemma3").unwrap(), ModelArch::Gemma3);
+        assert_eq!(
+            ModelArch::from_model_type("gemma3_text").unwrap(),
+            ModelArch::Gemma3
+        );
+        assert_eq!(
+            ModelArch::from_model_type("gemma3").unwrap(),
+            ModelArch::Gemma3
+        );
         assert!(ModelArch::from_model_type("gpt2").is_err());
         assert!(ModelArch::from_model_type("").is_err());
     }
@@ -1039,7 +1109,9 @@ mod tests {
 
     #[test]
     fn test_parse_llama_config() {
-        let Some(config) = load_config("llama-3.2-1b") else { return };
+        let Some(config) = load_config("llama-3.2-1b") else {
+            return;
+        };
         assert_eq!(config.model_type, "llama");
         assert_eq!(config.hidden_size, 2048);
         assert_eq!(config.num_hidden_layers, 16);
@@ -1058,7 +1130,9 @@ mod tests {
 
     #[test]
     fn test_parse_qwen2_config() {
-        let Some(config) = load_config("qwen-2.5-3b-instruct") else { return };
+        let Some(config) = load_config("qwen-2.5-3b-instruct") else {
+            return;
+        };
         assert_eq!(config.model_type, "qwen2");
         assert_eq!(config.arch().unwrap(), ModelArch::Qwen2);
         assert!(config.arch().unwrap().has_qkv_bias());
@@ -1066,12 +1140,17 @@ mod tests {
         assert!(!config.is_moe());
         // head_dim should be computed from hidden_size / num_attention_heads
         assert!(config.head_dim > 0);
-        assert_eq!(config.head_dim, config.hidden_size / config.num_attention_heads);
+        assert_eq!(
+            config.head_dim,
+            config.hidden_size / config.num_attention_heads
+        );
     }
 
     #[test]
     fn test_parse_phi_config() {
-        let Some(config) = load_config("phi-4") else { return };
+        let Some(config) = load_config("phi-4") else {
+            return;
+        };
         assert_eq!(config.arch().unwrap(), ModelArch::Phi);
         assert!(config.arch().unwrap().has_fused_qkv());
         assert!(!config.arch().unwrap().has_qkv_bias());
@@ -1080,7 +1159,9 @@ mod tests {
 
     #[test]
     fn test_parse_qwen3_moe_config() {
-        let Some(config) = load_config("qwen3-coder-30b-a3b-instruct") else { return };
+        let Some(config) = load_config("qwen3-coder-30b-a3b-instruct") else {
+            return;
+        };
         assert_eq!(config.arch().unwrap(), ModelArch::Qwen3Moe);
         assert!(config.is_moe());
         assert!(config.num_experts > 0);
@@ -1091,7 +1172,9 @@ mod tests {
 
     #[test]
     fn test_parse_gemma3_4b_config() {
-        let Some(config) = load_config("gemma-3-4b-it") else { return };
+        let Some(config) = load_config("gemma-3-4b-it") else {
+            return;
+        };
         assert_eq!(config.arch().unwrap(), ModelArch::Gemma3);
         // Verify defaults were applied for the sparse 4B config
         assert_eq!(config.num_attention_heads, 8);
@@ -1107,7 +1190,9 @@ mod tests {
 
     #[test]
     fn test_parse_gemma3_27b_config() {
-        let Some(config) = load_config("gemma-3-27b-it") else { return };
+        let Some(config) = load_config("gemma-3-27b-it") else {
+            return;
+        };
         assert_eq!(config.arch().unwrap(), ModelArch::Gemma3);
         assert_eq!(config.num_attention_heads, 32);
         assert_eq!(config.num_key_value_heads, 16);
@@ -1208,7 +1293,10 @@ mod tests {
     #[test]
     fn test_kv_layer_map_dense() {
         let config = minimal_config();
-        assert_eq!(config.kv_layer_map(), vec![Some(0), Some(1), Some(2), Some(3)]);
+        assert_eq!(
+            config.kv_layer_map(),
+            vec![Some(0), Some(1), Some(2), Some(3)]
+        );
     }
 
     #[test]
@@ -1236,10 +1324,7 @@ mod tests {
     #[test]
     fn test_is_linear_attention_layer() {
         let mut config = minimal_config();
-        config.layer_types = vec![
-            "linear_attention".into(),
-            "full_attention".into(),
-        ];
+        config.layer_types = vec!["linear_attention".into(), "full_attention".into()];
         assert!(config.is_linear_attention_layer(0));
         assert!(!config.is_linear_attention_layer(1));
         assert!(!config.is_linear_attention_layer(99)); // out of bounds
@@ -1248,10 +1333,7 @@ mod tests {
     #[test]
     fn test_is_sliding_attention_layer() {
         let mut config = minimal_config();
-        config.layer_types = vec![
-            "sliding_attention".into(),
-            "full_attention".into(),
-        ];
+        config.layer_types = vec!["sliding_attention".into(), "full_attention".into()];
         assert!(config.is_sliding_attention_layer(0));
         assert!(!config.is_sliding_attention_layer(1));
         assert!(!config.is_sliding_attention_layer(99));
@@ -1314,20 +1396,34 @@ mod tests {
 
     #[test]
     fn test_estimate_weight_bytes_sanity() {
-        let Some(config) = load_config("llama-3.2-1b") else { return };
+        let Some(config) = load_config("llama-3.2-1b") else {
+            return;
+        };
         let q4_proj = |m, k| crate::gpu::q4_byte_count(m, k);
         let bf16_bytes = config.estimate_weight_bytes(false, &q4_proj);
         let q4_bytes = config.estimate_weight_bytes(true, &q4_proj);
         // BF16 should be larger than Q4
-        assert!(bf16_bytes > q4_bytes, "bf16={bf16_bytes} should be > q4={q4_bytes}");
+        assert!(
+            bf16_bytes > q4_bytes,
+            "bf16={bf16_bytes} should be > q4={q4_bytes}"
+        );
         // Sanity: 1B model should be roughly 2GB bf16
-        assert!(bf16_bytes > 1_000_000_000, "bf16 bytes {bf16_bytes} too small for 1B model");
-        assert!(bf16_bytes < 5_000_000_000, "bf16 bytes {bf16_bytes} too large for 1B model");
+        assert!(
+            bf16_bytes > 1_000_000_000,
+            "bf16 bytes {bf16_bytes} too small for 1B model"
+        );
+        assert!(
+            bf16_bytes < 5_000_000_000,
+            "bf16 bytes {bf16_bytes} too large for 1B model"
+        );
     }
 
     #[test]
     fn test_model_arch_gpt_oss() {
-        assert_eq!(ModelArch::from_model_type("gpt_oss").unwrap(), ModelArch::GptOss);
+        assert_eq!(
+            ModelArch::from_model_type("gpt_oss").unwrap(),
+            ModelArch::GptOss
+        );
         assert!(ModelArch::GptOss.has_qkv_bias());
         assert!(ModelArch::GptOss.has_o_proj_bias());
         assert!(ModelArch::GptOss.has_router_bias());
@@ -1338,7 +1434,9 @@ mod tests {
 
     #[test]
     fn test_parse_gpt_oss_config() {
-        let Some(config) = load_config("gpt-oss-20b") else { return; };
+        let Some(config) = load_config("gpt-oss-20b") else {
+            return;
+        };
         assert_eq!(config.arch().unwrap(), ModelArch::GptOss);
         assert_eq!(config.hidden_size, 2880);
         assert_eq!(config.num_hidden_layers, 24);
@@ -1353,7 +1451,10 @@ mod tests {
         assert!((config.swiglu_limit - 7.0).abs() < 0.01);
         assert!(config.is_moe());
         // YaRN rope scaling.
-        let rs = config.rope_scaling.as_ref().expect("rope_scaling should be present");
+        let rs = config
+            .rope_scaling
+            .as_ref()
+            .expect("rope_scaling should be present");
         assert_eq!(rs.rope_type, "yarn");
         assert!((rs.factor - 32.0).abs() < 0.01);
         assert_eq!(rs.original_max_position_embeddings, 4096);

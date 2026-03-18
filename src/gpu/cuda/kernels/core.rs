@@ -17,8 +17,8 @@ use cudarc::driver::DevicePtr;
 
 use super::super::backend::CudaBackend;
 use super::super::tensor::CudaTensor;
-use crate::gpu::ops::GpuCore;
 use crate::gpu::TensorDtype;
+use crate::gpu::ops::GpuCore;
 
 impl GpuCore for CudaBackend {
     type Tensor = CudaTensor;
@@ -33,7 +33,9 @@ impl GpuCore for CudaBackend {
     }
 
     fn flush(&self) {
-        self.stream.synchronize().expect("CUDA stream synchronize failed");
+        self.stream
+            .synchronize()
+            .expect("CUDA stream synchronize failed");
     }
 
     fn submit(&self) {
@@ -49,7 +51,9 @@ impl GpuCore for CudaBackend {
             }
             _ => shape.iter().product::<usize>() * dtype.byte_size(),
         };
-        let buf = self.stream.alloc_zeros::<u8>(byte_count)
+        let buf = self
+            .stream
+            .alloc_zeros::<u8>(byte_count)
             .expect("CUDA alloc_zeros failed");
         CudaTensor {
             buf,
@@ -73,7 +77,9 @@ impl GpuCore for CudaBackend {
             data.len(),
             expected
         );
-        let buf = self.stream.clone_htod(data)
+        let buf = self
+            .stream
+            .clone_htod(data)
             .expect("CUDA clone_htod failed");
         CudaTensor {
             buf,
@@ -93,16 +99,17 @@ impl GpuCore for CudaBackend {
         // Bind this device's CUDA context to the calling thread.
         // Required for multi-GPU: the main thread may call this for any device,
         // and the raw memcpy needs the correct context to be active.
-        self.ctx.bind_to_thread().expect("CUDA bind_to_thread failed");
+        self.ctx
+            .bind_to_thread()
+            .expect("CUDA bind_to_thread failed");
 
         // Use raw driver API since we have &CudaTensor (immutable) but need
         // to write to the device buffer.  This is safe because:
         //   1. We're the only writer (single stream, serialised dispatch)
         //   2. The device pointer itself is unchanged (only data at that address)
         let (dptr, _sync) = tensor.buf.device_ptr(&self.stream);
-        unsafe {
-            cudarc::driver::result::memcpy_htod_async(dptr, src, self.stream.cu_stream())
-        }.expect("CUDA memcpy_htod failed");
+        unsafe { cudarc::driver::result::memcpy_htod_async(dptr, src, self.stream.cu_stream()) }
+            .expect("CUDA memcpy_htod failed");
     }
 
     fn tensor_byte_count(&self, tensor: &CudaTensor) -> usize {
@@ -111,7 +118,9 @@ impl GpuCore for CudaBackend {
 
     fn copy_to_host(&self, tensor: &CudaTensor, dst: &mut [u8]) {
         // Bind context for multi-GPU support.
-        self.ctx.bind_to_thread().expect("CUDA bind_to_thread failed");
+        self.ctx
+            .bind_to_thread()
+            .expect("CUDA bind_to_thread failed");
         // Synchronise to ensure all GPU work is complete before reading.
         self.flush();
 
@@ -122,7 +131,8 @@ impl GpuCore for CudaBackend {
             dst.len(),
             byte_count
         );
-        self.stream.memcpy_dtoh(&tensor.buf, &mut dst[..byte_count])
+        self.stream
+            .memcpy_dtoh(&tensor.buf, &mut dst[..byte_count])
             .expect("CUDA memcpy_dtoh failed");
     }
 

@@ -33,9 +33,7 @@
 //   Dispatch:    model/mod.rs (forward_single/prefill_paged arms)
 // ===========================================================================
 
-use crate::gpu::{
-    GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
-};
+use crate::gpu::{GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope};
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives::{self, Dims};
 use crate::model::profile::{self, Component};
@@ -82,7 +80,9 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
 // ===========================================================================
 
 /// Single-token forward pass for GPT-OSS-20B.
-pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed>(
+pub(crate) fn forward_single_paged<
+    B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed,
+>(
     m: &Model<'_, B>,
     token_id: u32,
     pool: &KvPool<B>,
@@ -115,30 +115,50 @@ pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
 
         // --- Attention sub-block ---
         let t = profile::begin(m.backend);
-        m.backend.rms_norm(&m.hidden, &layer.input_layernorm, d.eps, &m.norm_buf);
+        m.backend
+            .rms_norm(&m.hidden, &layer.input_layernorm, d.eps, &m.norm_buf);
 
         // QKV projection with explicit q_dim (4096 vs 2880 hidden).
         primitives::qkv_projection_qdim(
-            m.backend, layer, &m.norm_buf, &m.q_buf, &m.k_buf, &m.v_buf,
-            d.q_dim, d.hidden_size, d.kv_dim,
+            m.backend,
+            layer,
+            &m.norm_buf,
+            &m.q_buf,
+            &m.k_buf,
+            &m.v_buf,
+            d.q_dim,
+            d.hidden_size,
+            d.kv_dim,
         );
 
         // QKV bias (GPT-OSS has bias on all projections).
         primitives::apply_qkv_bias_qdim(
-            m.backend, layer, &m.q_buf, &m.k_buf, &m.v_buf,
-            d.q_dim, d.kv_dim,
+            m.backend, layer, &m.q_buf, &m.k_buf, &m.v_buf, d.q_dim, d.kv_dim,
         );
 
         // RoPE — use YaRN if rope_scaling is configured.
         if let Some(scaling) = rope_scaling {
             primitives::apply_rope_yarn(
-                m.backend, &m.q_buf, &m.k_buf, pos, d.rope_theta,
-                d.num_heads, d.num_kv_heads, d.head_dim, scaling,
+                m.backend,
+                &m.q_buf,
+                &m.k_buf,
+                pos,
+                d.rope_theta,
+                d.num_heads,
+                d.num_kv_heads,
+                d.head_dim,
+                scaling,
             );
         } else {
             primitives::apply_rope(
-                m.backend, &m.q_buf, &m.k_buf, pos, d.rope_theta,
-                d.num_heads, d.num_kv_heads, d.head_dim,
+                m.backend,
+                &m.q_buf,
+                &m.k_buf,
+                pos,
+                d.rope_theta,
+                d.num_heads,
+                d.num_kv_heads,
+                d.head_dim,
             );
         }
 
@@ -150,30 +170,59 @@ pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
         };
 
         primitives::paged_kv_and_attention(
-            m.backend, &m.k_buf, &m.v_buf, &m.q_buf, &m.attn_out,
-            pool, seq_state, layer_idx, pos,
-            d.num_heads, d.num_kv_heads, d.head_dim,
-            window_size, attn_scale,
+            m.backend,
+            &m.k_buf,
+            &m.v_buf,
+            &m.q_buf,
+            &m.attn_out,
+            pool,
+            seq_state,
+            layer_idx,
+            pos,
+            d.num_heads,
+            d.num_kv_heads,
+            d.head_dim,
+            window_size,
+            attn_scale,
             layer.sinks.as_ref(),
         );
 
         // O projection with bias + residual.
         primitives::o_proj_residual_qdim_biased(
-            m.backend, layer, &m.attn_out, &m.norm_buf, &m.hidden,
-            d.hidden_size, d.q_dim,
+            m.backend,
+            layer,
+            &m.attn_out,
+            &m.norm_buf,
+            &m.hidden,
+            d.hidden_size,
+            d.q_dim,
         );
         profile::record(m.backend, t, Component::Attention);
 
         // --- MoE FFN sub-block ---
         let t = profile::begin(m.backend);
-        moe_ffn_block(m, layer_idx, &d, moe_inter, num_experts, num_experts_per_tok, swiglu_limit);
+        moe_ffn_block(
+            m,
+            layer_idx,
+            &d,
+            moe_inter,
+            num_experts,
+            num_experts_per_tok,
+            swiglu_limit,
+        );
         profile::record(m.backend, t, Component::Ffn);
     }
 
     let t = profile::begin(m.backend);
     primitives::final_norm_and_lm_head(
-        m.backend, &m.weights, &m.hidden, &m.norm_buf, &m.logits_buf,
-        d.eps, d.hidden_size, m.config.vocab_size as u32,
+        m.backend,
+        &m.weights,
+        &m.hidden,
+        &m.norm_buf,
+        &m.logits_buf,
+        d.eps,
+        d.hidden_size,
+        m.config.vocab_size as u32,
     );
     profile::record(m.backend, t, Component::Other);
 
@@ -186,7 +235,9 @@ pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
 // Batched attention (GEMM) + per-token MoE FFN (same pattern as Qwen3 MoE).
 // ===========================================================================
 
-pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed>(
+pub(crate) fn forward_prefill_paged<
+    B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed,
+>(
     m: &Model<'_, B>,
     tokens: &[u32],
     pool: &KvPool<B>,
@@ -218,28 +269,47 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
 
         // --- Batched attention ---
         m.backend.rms_norm_batch(
-            &bufs.hidden, &layer.input_layernorm, d.eps, &bufs.norm_buf, bs,
+            &bufs.hidden,
+            &layer.input_layernorm,
+            d.eps,
+            &bufs.norm_buf,
+            bs,
         );
 
         primitives::qkv_projection_batch_qdim(
-            m.backend, layer, bufs, bs, d.q_dim, d.hidden_size, d.kv_dim,
+            m.backend,
+            layer,
+            bufs,
+            bs,
+            d.q_dim,
+            d.hidden_size,
+            d.kv_dim,
         );
 
         // QKV bias (batched broadcast-add).
-        primitives::apply_qkv_bias_batch_qdim(
-            m.backend, layer, bufs, bs, d.q_dim, d.kv_dim,
-        );
+        primitives::apply_qkv_bias_batch_qdim(m.backend, layer, bufs, bs, d.q_dim, d.kv_dim);
 
         // Batched RoPE — use YaRN if configured.
         if let Some(scaling) = rope_scaling {
             primitives::apply_rope_yarn_batch(
-                m.backend, bufs, d.rope_theta, bs,
-                d.num_heads, d.num_kv_heads, d.head_dim, scaling,
+                m.backend,
+                bufs,
+                d.rope_theta,
+                bs,
+                d.num_heads,
+                d.num_kv_heads,
+                d.head_dim,
+                scaling,
             );
         } else {
             primitives::apply_rope_batch(
-                m.backend, bufs, d.rope_theta, bs,
-                d.num_heads, d.num_kv_heads, d.head_dim,
+                m.backend,
+                bufs,
+                d.rope_theta,
+                bs,
+                d.num_heads,
+                d.num_kv_heads,
+                d.head_dim,
             );
         }
 
@@ -251,20 +321,40 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
         };
 
         primitives::paged_kv_and_prefill_attention(
-            m.backend, bufs, pool, seq_state, layer_idx,
-            bs, start_pos, d.num_heads, d.num_kv_heads, d.head_dim,
-            window_size, attn_scale,
+            m.backend,
+            bufs,
+            pool,
+            seq_state,
+            layer_idx,
+            bs,
+            start_pos,
+            d.num_heads,
+            d.num_kv_heads,
+            d.head_dim,
+            window_size,
+            attn_scale,
             layer.sinks.as_ref(),
         );
 
         // O projection with bias (batched) + residual.
         m.backend.matmul_batch(
-            &layer.o_proj, &bufs.attn_out, &bufs.norm_buf, bs, d.hidden_size, d.q_dim,
+            &layer.o_proj,
+            &bufs.attn_out,
+            &bufs.norm_buf,
+            bs,
+            d.hidden_size,
+            d.q_dim,
         );
         if let Some(ref o_bias) = layer.o_proj_bias {
-            m.backend.bias_add_batch(&bufs.norm_buf, o_bias, &bufs.norm_buf, bs, d.hidden_size);
+            m.backend
+                .bias_add_batch(&bufs.norm_buf, o_bias, &bufs.norm_buf, bs, d.hidden_size);
         }
-        m.backend.add(&bufs.hidden, &bufs.norm_buf, &bufs.hidden, bs * d.hidden_size);
+        m.backend.add(
+            &bufs.hidden,
+            &bufs.norm_buf,
+            &bufs.hidden,
+            bs * d.hidden_size,
+        );
 
         // --- MoE FFN: process each token independently ---
         let hidden_byte_size = m.config.hidden_size * crate::gpu::TensorDtype::BF16.byte_size();
@@ -274,25 +364,37 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
 
         for t in 0..tokens.len() {
             let offset = t * hidden_byte_size;
-            m.backend.copy_to_tensor(
-                &m.hidden,
-                &host_hidden[offset..offset + hidden_byte_size],
-            );
+            m.backend
+                .copy_to_tensor(&m.hidden, &host_hidden[offset..offset + hidden_byte_size]);
 
-            moe_ffn_block(m, layer_idx, &d, moe_inter, num_experts, num_experts_per_tok, swiglu_limit);
+            moe_ffn_block(
+                m,
+                layer_idx,
+                &d,
+                moe_inter,
+                num_experts,
+                num_experts_per_tok,
+                swiglu_limit,
+            );
 
             let mut token_hidden = vec![0u8; hidden_byte_size];
             m.backend.copy_to_host(&m.hidden, &mut token_hidden);
-            host_hidden[offset..offset + hidden_byte_size]
-                .copy_from_slice(&token_hidden);
+            host_hidden[offset..offset + hidden_byte_size].copy_from_slice(&token_hidden);
         }
 
         m.backend.copy_to_tensor(&bufs.hidden, &host_hidden);
     }
 
     primitives::final_norm_and_lm_head_prefill(
-        m.backend, &m.weights, bufs, &m.norm_buf, &m.logits_buf,
-        d.eps, bs, m.config.hidden_size, m.config.vocab_size as u32,
+        m.backend,
+        &m.weights,
+        bufs,
+        &m.norm_buf,
+        &m.logits_buf,
+        d.eps,
+        bs,
+        m.config.hidden_size,
+        m.config.vocab_size as u32,
     );
 
     Ok(())

@@ -23,6 +23,7 @@
 //   GpuElementwise  — point-wise activations, reductions, MoE routing
 //   GpuEmbed        — embedding table lookups
 //   GpuDeltaNet     — Gated DeltaNet linear attention (Qwen 3.5)
+//   GpuAllReduce    — collective communication for tensor parallelism
 //
 // This composability means a new backend can implement sub-traits
 // incrementally and model code can express fine-grained bounds.
@@ -41,13 +42,13 @@
 // Sub-trait definitions, organised by kernel family.
 // ---------------------------------------------------------------------------
 
+pub(crate) mod multi_gpu;
 pub(crate) mod ops;
 pub(crate) mod parallel;
-pub(crate) mod multi_gpu;
 
 pub(crate) use ops::{
-    GpuAllReduce, GpuAttention, GpuCore, GpuDeltaNet, GpuElementwise, GpuEmbed, GpuMatmul,
-    GpuNorm, GpuRope,
+    GpuAllReduce, GpuAttention, GpuCore, GpuDeltaNet, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm,
+    GpuRope,
 };
 
 // ---------------------------------------------------------------------------
@@ -234,9 +235,7 @@ pub(crate) fn create_backends(world_size: usize) -> anyhow::Result<Vec<Backend>>
     let comms = cuda::nccl::init_nccl_comms(world_size)?;
 
     (0..world_size)
-        .map(|rank| {
-            Backend::new_with_device(rank, rank, world_size, Some(comms[rank].clone()))
-        })
+        .map(|rank| Backend::new_with_device(rank, rank, world_size, Some(comms[rank].clone())))
         .collect()
 }
 
@@ -263,7 +262,6 @@ pub(crate) fn device_count() -> usize {
 
 #[cfg(not(any(target_os = "macos", feature = "cuda")))]
 pub(crate) type Backend = cpu::CpuBackend;
-
 
 // CPU backend: always available in tests for correctness validation,
 // and used as the runtime fallback when no GPU backend is compiled.

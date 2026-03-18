@@ -27,7 +27,7 @@
 // Related files:
 //   - engine/mod.rs       — run_step() uses this trait, Engine holds SingleGpuDispatch
 //   - engine/multi_gpu.rs — MultiGpuDispatch wraps MultiGpuInference
-//   - engine/scheduler.rs — Scheduler<S> is generic over the same SeqState
+//   - engine/mod.rs       — Scheduler<S> is generic over the same SeqState
 // ===========================================================================
 
 /// Abstracts over single-GPU and multi-GPU inference dispatch.
@@ -60,11 +60,7 @@ pub(crate) trait Dispatch {
     ) -> anyhow::Result<()>;
 
     /// Run the batched (GEMM) forward pass for prefill.
-    fn forward_prefill(
-        &self,
-        tokens: &[u32],
-        state: &Self::SeqState,
-    ) -> anyhow::Result<()>;
+    fn forward_prefill(&self, tokens: &[u32], state: &Self::SeqState) -> anyhow::Result<()>;
 
     /// Advance KV state after prefill (marks positions as filled).
     fn finish_prefill(state: &mut Self::SeqState, token_count: usize);
@@ -73,20 +69,12 @@ pub(crate) trait Dispatch {
     fn prepare_decode(&mut self, state: &mut Self::SeqState) -> anyhow::Result<()>;
 
     /// Run single-token forward pass for decode.
-    fn forward_decode(
-        &self,
-        token: u32,
-        state: &Self::SeqState,
-    ) -> anyhow::Result<()>;
+    fn forward_decode(&self, token: u32, state: &Self::SeqState) -> anyhow::Result<()>;
 
     /// Advance KV state by one position after decode.
     fn finish_decode(state: &mut Self::SeqState);
 
     /// Sample a token from the current logits.
-    fn sample(
-        &self,
-        temperature: f32,
-        top_p: f32,
-        rng: &mut impl rand::Rng,
-    ) -> anyhow::Result<u32>;
+    fn sample(&self, temperature: f32, top_p: f32, rng: &mut impl rand::Rng)
+    -> anyhow::Result<u32>;
 }

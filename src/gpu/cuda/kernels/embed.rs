@@ -40,12 +40,14 @@ impl GpuEmbed for CudaBackend {
         let block = 256.min(hidden_dim);
         let cfg = CudaBackend::cfg_1d(hidden_dim, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_embed_lookup)
+            self.stream
+                .launch_builder(&self.fn_embed_lookup)
                 .arg(&params)
                 .arg(&table.buf)
                 .arg(&out.buf)
                 .launch(cfg)
-        }.expect("embed_lookup launch failed");
+        }
+        .expect("embed_lookup launch failed");
     }
 
     fn embed_lookup_batch(
@@ -64,12 +66,14 @@ impl GpuEmbed for CudaBackend {
         let block = 256.min(total);
         let cfg = CudaBackend::cfg_1d(total, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_embed_lookup_batch)
+            self.stream
+                .launch_builder(&self.fn_embed_lookup_batch)
                 .arg(&params)
                 .arg(&table.buf)
                 .arg(&token_ids.buf)
                 .arg(&out.buf)
                 .launch(cfg)
-        }.expect("embed_lookup_batch launch failed");
+        }
+        .expect("embed_lookup_batch launch failed");
     }
 }

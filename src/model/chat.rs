@@ -101,7 +101,9 @@ pub(crate) fn format_chat(arch: ModelArch, messages: &[Message]) -> String {
         // Mistral and Mixtral use [INST]/[/INST] markers with system prepended to first user message.
         ModelArch::Mistral | ModelArch::Mixtral => format_mistral(messages),
         // Qwen 2.5, Qwen 3 MoE, Qwen 3.5, and GPT-OSS all use ChatML format.
-        ModelArch::Qwen2 | ModelArch::Qwen3Moe | ModelArch::Qwen3_5 | ModelArch::GptOss => format_chatml(messages),
+        ModelArch::Qwen2 | ModelArch::Qwen3Moe | ModelArch::Qwen3_5 | ModelArch::GptOss => {
+            format_chatml(messages)
+        }
         // Phi uses a ChatML-like format but with <|im_sep|> between role and content.
         ModelArch::Phi => format_phi(messages),
         // Gemma 3 uses <start_of_turn>/<end_of_turn> markers.
@@ -210,7 +212,11 @@ fn format_gemma3(messages: &[Message]) -> String {
 
         out.push_str("<start_of_turn>");
         // Gemma uses "model" for the assistant role.
-        let role = if msg.role == "assistant" { "model" } else { &msg.role };
+        let role = if msg.role == "assistant" {
+            "model"
+        } else {
+            &msg.role
+        };
         out.push_str(role);
         out.push('\n');
         out.push_str(&msg.content);
@@ -325,10 +331,7 @@ mod tests {
 
     #[test]
     fn test_llama3_system_and_user() {
-        let messages = vec![
-            msg("system", "You are helpful."),
-            msg("user", "Hello"),
-        ];
+        let messages = vec![msg("system", "You are helpful."), msg("user", "Hello")];
         let result = format_chat(ModelArch::Llama, &messages);
         assert_eq!(
             result,
@@ -347,16 +350,15 @@ mod tests {
             msg("user", "How are you?"),
         ];
         let result = format_chat(ModelArch::Llama, &messages);
-        assert!(result.contains("<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nHello!<|eot_id|>"));
+        assert!(result.contains(
+            "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nHello!<|eot_id|>"
+        ));
         assert!(result.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
     }
 
     #[test]
     fn test_chatml_format() {
-        let messages = vec![
-            msg("system", "You are helpful."),
-            msg("user", "Hello"),
-        ];
+        let messages = vec![msg("system", "You are helpful."), msg("user", "Hello")];
         let result = format_chat(ModelArch::Qwen2, &messages);
         assert_eq!(
             result,
@@ -379,10 +381,7 @@ mod tests {
 
     #[test]
     fn test_phi_format() {
-        let messages = vec![
-            msg("system", "You are helpful."),
-            msg("user", "Hello"),
-        ];
+        let messages = vec![msg("system", "You are helpful."), msg("user", "Hello")];
         let result = format_chat(ModelArch::Phi, &messages);
         assert_eq!(
             result,
@@ -394,9 +393,7 @@ mod tests {
 
     #[test]
     fn test_gemma3_format() {
-        let messages = vec![
-            msg("user", "Hello"),
-        ];
+        let messages = vec![msg("user", "Hello")];
         let result = format_chat(ModelArch::Gemma3, &messages);
         assert_eq!(
             result,
@@ -420,10 +417,7 @@ mod tests {
 
     #[test]
     fn test_mistral_system_and_user() {
-        let messages = vec![
-            msg("system", "You are helpful."),
-            msg("user", "Hello"),
-        ];
+        let messages = vec![msg("system", "You are helpful."), msg("user", "Hello")];
         let result = format_chat(ModelArch::Mistral, &messages);
         assert_eq!(result, " [INST] You are helpful.\n\nHello [/INST]");
     }
@@ -436,7 +430,10 @@ mod tests {
             msg("user", "How are you?"),
         ];
         let result = format_chat(ModelArch::Mistral, &messages);
-        assert_eq!(result, " [INST] Hi [/INST] Hello!</s> [INST] How are you? [/INST]");
+        assert_eq!(
+            result,
+            " [INST] Hi [/INST] Hello!</s> [INST] How are you? [/INST]"
+        );
     }
 
     #[test]

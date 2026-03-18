@@ -268,11 +268,17 @@ mod tests {
 
     #[test]
     fn test_eos_tokens_gemma3() {
-        let Some(tok) = load_if_exists("gemma-3-4b-it", ModelArch::Gemma3) else { return };
+        let Some(tok) = load_if_exists("gemma-3-4b-it", ModelArch::Gemma3) else {
+            return;
+        };
         // <end_of_turn> should be token 106, and it should be EOS.
         let ids = tok.inner.encode("<end_of_turn>", true).unwrap();
         let eot_id = ids.get_ids().iter().find(|&&id| id != 2); // skip BOS=2
-        assert_eq!(eot_id, Some(&106), "Gemma <end_of_turn> should be token 106");
+        assert_eq!(
+            eot_id,
+            Some(&106),
+            "Gemma <end_of_turn> should be token 106"
+        );
         assert!(tok.is_eos(106), "Gemma token 106 should be EOS");
         assert!(tok.is_eos(1), "Gemma token 1 (<eos>) should be EOS");
         assert!(!tok.is_eos(107), "Gemma token 107 should NOT be EOS");
@@ -280,34 +286,51 @@ mod tests {
 
     #[test]
     fn test_eos_tokens_llama() {
-        let Some(tok) = load_if_exists("llama-3.2-1b-instruct", ModelArch::Llama) else { return };
+        let Some(tok) = load_if_exists("llama-3.2-1b-instruct", ModelArch::Llama) else {
+            return;
+        };
         let ids = tok.inner.encode("<|eot_id|>", true).unwrap();
-        assert!(ids.get_ids().contains(&128009), "Llama <|eot_id|> should be 128009");
+        assert!(
+            ids.get_ids().contains(&128009),
+            "Llama <|eot_id|> should be 128009"
+        );
         assert!(tok.is_eos(128001), "Llama EOS token");
         assert!(tok.is_eos(128009), "Llama EOT token");
     }
 
     #[test]
     fn test_eos_tokens_mistral() {
-        let Some(tok) = load_if_exists("mistral-7b-instruct", ModelArch::Mistral) else { return };
+        let Some(tok) = load_if_exists("mistral-7b-instruct", ModelArch::Mistral) else {
+            return;
+        };
         assert!(tok.is_eos(2), "Mistral EOS=2");
         // Token 2 should decode to </s>.
         let text = tok.decode(&[2]).unwrap();
-        assert!(text.is_empty() || text == "</s>", "Mistral EOS decode: {text:?}");
+        assert!(
+            text.is_empty() || text == "</s>",
+            "Mistral EOS decode: {text:?}"
+        );
     }
 
     #[test]
     fn test_eos_tokens_qwen2() {
-        let Some(tok) = load_if_exists("qwen-2.5-3b-instruct", ModelArch::Qwen2) else { return };
+        let Some(tok) = load_if_exists("qwen-2.5-3b-instruct", ModelArch::Qwen2) else {
+            return;
+        };
         let ids = tok.inner.encode("<|im_end|>", true).unwrap();
-        assert!(ids.get_ids().contains(&151645), "Qwen <|im_end|> should be 151645");
+        assert!(
+            ids.get_ids().contains(&151645),
+            "Qwen <|im_end|> should be 151645"
+        );
         assert!(tok.is_eos(151643), "Qwen endoftext");
         assert!(tok.is_eos(151645), "Qwen im_end");
     }
 
     #[test]
     fn test_eos_tokens_phi() {
-        let Some(tok) = load_if_exists("phi-4", ModelArch::Phi) else { return };
+        let Some(tok) = load_if_exists("phi-4", ModelArch::Phi) else {
+            return;
+        };
         assert!(tok.is_eos(100257), "Phi endoftext");
         assert!(tok.is_eos(100265), "Phi im_end");
     }
@@ -350,7 +373,9 @@ mod tests {
 
     #[test]
     fn test_incremental_decode_mistral() {
-        let Some(tok) = load_if_exists("mistral-7b-instruct", ModelArch::Mistral) else { return };
+        let Some(tok) = load_if_exists("mistral-7b-instruct", ModelArch::Mistral) else {
+            return;
+        };
         // These strings have spaces that SentencePiece Strip would eat.
         check_incremental_decode(&tok, "for number in range(1, 21):");
         check_incremental_decode(&tok, "def hello_world():\n    print(\"Hello World\")");
@@ -359,28 +384,36 @@ mod tests {
 
     #[test]
     fn test_incremental_decode_llama() {
-        let Some(tok) = load_if_exists("llama-3.2-1b-instruct", ModelArch::Llama) else { return };
+        let Some(tok) = load_if_exists("llama-3.2-1b-instruct", ModelArch::Llama) else {
+            return;
+        };
         check_incremental_decode(&tok, "for i in range(1, 21):");
         check_incremental_decode(&tok, "The quick brown fox jumps over the lazy dog");
     }
 
     #[test]
     fn test_incremental_decode_gemma() {
-        let Some(tok) = load_if_exists("gemma-3-4b-it", ModelArch::Gemma3) else { return };
+        let Some(tok) = load_if_exists("gemma-3-4b-it", ModelArch::Gemma3) else {
+            return;
+        };
         check_incremental_decode(&tok, "for i in range(1, 21):");
         check_incremental_decode(&tok, "The quick brown fox jumps over the lazy dog");
     }
 
     #[test]
     fn test_incremental_decode_qwen() {
-        let Some(tok) = load_if_exists("qwen-2.5-3b-instruct", ModelArch::Qwen2) else { return };
+        let Some(tok) = load_if_exists("qwen-2.5-3b-instruct", ModelArch::Qwen2) else {
+            return;
+        };
         check_incremental_decode(&tok, "for i in range(1, 21):");
         check_incremental_decode(&tok, "The quick brown fox jumps over the lazy dog");
     }
 
     #[test]
     fn test_incremental_decode_phi() {
-        let Some(tok) = load_if_exists("phi-4", ModelArch::Phi) else { return };
+        let Some(tok) = load_if_exists("phi-4", ModelArch::Phi) else {
+            return;
+        };
         check_incremental_decode(&tok, "for i in range(1, 21):");
         check_incremental_decode(&tok, "The quick brown fox jumps over the lazy dog");
     }

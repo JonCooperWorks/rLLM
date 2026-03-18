@@ -8,7 +8,7 @@
 // Most are trivially bandwidth-bound — the kernel cost is dominated by
 // reading/writing the tensor, not by the arithmetic.
 //
-// Metal shaders: shaders/elementwise.metal, shaders/deltanet.metal
+// Metal shaders: shaders/elementwise.metal
 // Metal impl:    gpu/metal/kernels/elementwise.rs
 // ---------------------------------------------------------------------------
 
@@ -80,11 +80,5 @@ pub(crate) trait GpuElementwise: GpuCore {
     );
 
     /// GPU-side top-k selection with softmax for MoE expert routing.
-    fn top_k_softmax(
-        &self,
-        logits: &Self::Tensor,
-        output: &Self::Tensor,
-        num_experts: u32,
-        k: u32,
-    );
+    fn top_k_softmax(&self, logits: &Self::Tensor, output: &Self::Tensor, num_experts: u32, k: u32);
 }

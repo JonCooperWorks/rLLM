@@ -18,8 +18,8 @@ use cudarc::driver::{DeviceRepr, PushKernelArg};
 
 use super::super::backend::CudaBackend;
 use super::super::tensor::CudaTensor;
-use crate::gpu::ops::GpuMatmul;
 use crate::gpu::TensorDtype;
+use crate::gpu::ops::GpuMatmul;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -48,13 +48,15 @@ impl GpuMatmul for CudaBackend {
         // M rows × 32 threads per row = M*32 total threads.
         let cfg = CudaBackend::cfg_1d(m * 32, 256);
         unsafe {
-            self.stream.launch_builder(func)
+            self.stream
+                .launch_builder(func)
                 .arg(&params)
                 .arg(&weight.buf)
                 .arg(&input.buf)
                 .arg(&out.buf)
                 .launch(cfg)
-        }.expect("matmul launch failed");
+        }
+        .expect("matmul launch failed");
     }
 
     fn matmul_batch(
@@ -75,12 +77,14 @@ impl GpuMatmul for CudaBackend {
         let total = batch_size * m * 32;
         let cfg = CudaBackend::cfg_1d(total, 256);
         unsafe {
-            self.stream.launch_builder(func)
+            self.stream
+                .launch_builder(func)
                 .arg(&params)
                 .arg(&weight.buf)
                 .arg(&input.buf)
                 .arg(&out.buf)
                 .launch(cfg)
-        }.expect("matmul_batch launch failed");
+        }
+        .expect("matmul_batch launch failed");
     }
 }

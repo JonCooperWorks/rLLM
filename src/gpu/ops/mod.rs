@@ -19,13 +19,13 @@
 // HOW THE TRAITS COMPOSE
 //
 //   Every sub-trait extends GpuCore so it can reference `Self::Tensor`.
-//   GpuBackend is a blanket supertrait — any type implementing all eight
+//   GpuBackend is a blanket supertrait — any type implementing all nine
 //   sub-traits automatically implements GpuBackend (see gpu/mod.rs).
 //
 // WHERE THE IMPLEMENTATIONS LIVE
 //
 //   Metal:  gpu/metal/kernels/{core,norm,matmul,...}.rs
-//   CUDA:   gpu/cuda/mod.rs (stubs for now)
+//   CUDA:   gpu/cuda/kernels/{core,norm,matmul,...}.rs
 //
 //   Each kernel impl file mirrors the ops file it implements, plus the
 //   `#[repr(C)]` param structs that must match the corresponding .metal

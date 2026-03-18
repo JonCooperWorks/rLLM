@@ -13,7 +13,13 @@ use super::core::GpuCore;
 
 pub(crate) trait GpuEmbed: GpuCore {
     /// Embedding lookup: copy row `token_id` from the embedding table to `out`.
-    fn embed_lookup(&self, table: &Self::Tensor, token_id: u32, out: &Self::Tensor, hidden_dim: u32);
+    fn embed_lookup(
+        &self,
+        table: &Self::Tensor,
+        token_id: u32,
+        out: &Self::Tensor,
+        hidden_dim: u32,
+    );
 
     /// Batched embedding lookup: N token IDs → [batch_size, hidden_dim].
     fn embed_lookup_batch(

@@ -87,13 +87,17 @@ pub(crate) fn exec(args: BatchArgs) -> anyhow::Result<()> {
         args.quantize,
         args.tp,
         max_active,
-        |_tok, arch| { arch_cell.set(Some(arch)); },
+        |_tok, arch| {
+            arch_cell.set(Some(arch));
+        },
         |eng| {
             let arch = arch_cell.get().unwrap();
             // Submit all prompts.
             let system_ref = chat.then(|| system.as_str());
             for prompt_text in &prompts {
-                let tokens = eng.tokenizer().encode_prompt(prompt_text, arch, system_ref)?;
+                let tokens = eng
+                    .tokenizer()
+                    .encode_prompt(prompt_text, arch, system_ref)?;
                 eng.add_request(tokens, max_tokens, temperature, top_p);
             }
 

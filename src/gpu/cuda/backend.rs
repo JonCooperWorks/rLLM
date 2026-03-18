@@ -161,8 +161,7 @@ impl CudaBackend {
         let stream = ctx.default_stream();
 
         // Query device name via the CudaContext API.
-        let name = ctx.name()
-            .unwrap_or_else(|_| "NVIDIA GPU".to_string());
+        let name = ctx.name().unwrap_or_else(|_| "NVIDIA GPU".to_string());
 
         // Compile shader sources via NVRTC.
         // NVRTC needs the CUDA include path for headers like cuda_bf16.h.
@@ -209,7 +208,8 @@ impl CudaBackend {
         let mod_deltanet = load(ptx_deltanet)?;
 
         let func = |module: &Arc<CudaModule>, name: &str| -> anyhow::Result<CudaFunction> {
-            module.load_function(name)
+            module
+                .load_function(name)
                 .map_err(|e| anyhow!("function '{name}' not found: {e}"))
         };
 
@@ -316,8 +316,7 @@ impl CudaBackend {
 
     /// Query total device memory in bytes.
     pub(crate) fn device_total_memory(&self) -> u64 {
-        let (_, total) = cudarc::driver::result::mem_get_info()
-            .unwrap_or((0, 0));
+        let (_, total) = cudarc::driver::result::mem_get_info().unwrap_or((0, 0));
         total as u64
     }
 }

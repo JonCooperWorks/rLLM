@@ -2,7 +2,8 @@
 // CPU reference backend for testing.
 //
 // Implements all GPU traits with pure Rust math on Vec<u8> tensors.
-// Only compiled during tests (#[cfg(test)]) — zero impact on production.
+// Compiled during tests and as a runtime fallback when no GPU backend
+// (Metal or CUDA) is available.  Zero impact on production GPU builds.
 //
 // Purposes:
 //   1. Ground truth for validating Metal/CUDA kernel correctness
@@ -17,8 +18,8 @@
 
 use half::bf16;
 
-use super::ops::*;
 use super::TensorDtype;
+use super::ops::*;
 
 pub(crate) struct CpuBackend;
 
@@ -87,8 +88,12 @@ fn write_bytes_at(tensor: &CpuTensor, offset: usize, src: &[u8]) {
 impl GpuCore for CpuBackend {
     type Tensor = CpuTensor;
 
-    fn device_name(&self) -> &str { "cpu-reference" }
-    fn recommended_max_memory(&self) -> u64 { 16 * 1024 * 1024 * 1024 }
+    fn device_name(&self) -> &str {
+        "cpu-reference"
+    }
+    fn recommended_max_memory(&self) -> u64 {
+        16 * 1024 * 1024 * 1024
+    }
     fn flush(&self) {}
     fn submit(&self) {}
 
@@ -103,11 +108,19 @@ impl GpuCore for CpuBackend {
                 total_elements * other.byte_size()
             }
         };
-        CpuTensor { data: vec![0u8; byte_count], shape: shape.to_vec(), dtype }
+        CpuTensor {
+            data: vec![0u8; byte_count],
+            shape: shape.to_vec(),
+            dtype,
+        }
     }
 
     fn upload_tensor(&self, data: &[u8], shape: &[usize], dtype: TensorDtype) -> CpuTensor {
-        CpuTensor { data: data.to_vec(), shape: shape.to_vec(), dtype }
+        CpuTensor {
+            data: data.to_vec(),
+            shape: shape.to_vec(),
+            dtype,
+        }
     }
 
     fn copy_to_host(&self, tensor: &CpuTensor, dst: &mut [u8]) {
@@ -137,11 +150,22 @@ impl GpuNorm for CpuBackend {
         let mean_sq: f32 = x.iter().map(|v| v * v).sum::<f32>() / size as f32;
         let scale = 1.0 / (mean_sq + eps).sqrt();
 
-        let result: Vec<f32> = x.iter().zip(w.iter()).map(|(xi, wi)| xi * scale * wi).collect();
+        let result: Vec<f32> = x
+            .iter()
+            .zip(w.iter())
+            .map(|(xi, wi)| xi * scale * wi)
+            .collect();
         write_bf16(out, &result);
     }
 
-    fn rms_norm_batch(&self, input: &CpuTensor, weight: &CpuTensor, eps: f32, out: &CpuTensor, batch_size: u32) {
+    fn rms_norm_batch(
+        &self,
+        input: &CpuTensor,
+        weight: &CpuTensor,
+        eps: f32,
+        out: &CpuTensor,
+        batch_size: u32,
+    ) {
         let dim = weight.data.len() / 2; // bf16 weight size = hidden dim
         let w = read_bf16(weight, dim);
 
@@ -150,11 +174,14 @@ impl GpuNorm for CpuBackend {
             let x = read_bf16_bytes(&input.data[offset..], dim);
             let mean_sq: f32 = x.iter().map(|v| v * v).sum::<f32>() / dim as f32;
             let scale = 1.0 / (mean_sq + eps).sqrt();
-            let result: Vec<f32> = x.iter().zip(w.iter()).map(|(xi, wi)| xi * scale * wi).collect();
+            let result: Vec<f32> = x
+                .iter()
+                .zip(w.iter())
+                .map(|(xi, wi)| xi * scale * wi)
+                .collect();
             write_bf16_at(out, offset, &result);
         }
     }
-
 }
 
 // ===========================================================================
@@ -166,7 +193,9 @@ impl GpuElementwise for CpuBackend {
         let n = size as usize;
         let g = read_bf16(gate, n);
         let u = read_bf16(up, n);
-        let result: Vec<f32> = g.iter().zip(u.iter())
+        let result: Vec<f32> = g
+            .iter()
+            .zip(u.iter())
             .map(|(gi, ui)| {
                 let silu = gi / (1.0 + (-gi).exp()); // silu(x) = x * sigmoid(x)
                 silu * ui
@@ -179,7 +208,9 @@ impl GpuElementwise for CpuBackend {
         let n = size as usize;
         let g = read_bf16(gate, n);
         let u = read_bf16(up, n);
-        let result: Vec<f32> = g.iter().zip(u.iter())
+        let result: Vec<f32> = g
+            .iter()
+            .zip(u.iter())
             .map(|(gi, ui)| {
                 // GELU tanh approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
                 let c = (2.0f32 / std::f32::consts::PI).sqrt();
@@ -209,7 +240,11 @@ impl GpuElementwise for CpuBackend {
         let n = size as usize;
         let d = read_bf16(dst, n);
         let s = read_bf16(src, n);
-        let result: Vec<f32> = d.iter().zip(s.iter()).map(|(di, si)| di + si * scale).collect();
+        let result: Vec<f32> = d
+            .iter()
+            .zip(s.iter())
+            .map(|(di, si)| di + si * scale)
+            .collect();
         write_bf16(dst, &result);
     }
 
@@ -219,7 +254,14 @@ impl GpuElementwise for CpuBackend {
         unsafe { std::ptr::write_bytes(ptr, 0, byte_count) };
     }
 
-    fn bias_add_batch(&self, input: &CpuTensor, bias: &CpuTensor, out: &CpuTensor, batch_size: u32, dim: u32) {
+    fn bias_add_batch(
+        &self,
+        input: &CpuTensor,
+        bias: &CpuTensor,
+        out: &CpuTensor,
+        batch_size: u32,
+        dim: u32,
+    ) {
         let d = dim as usize;
         let b_vec = read_bf16(bias, d);
         for b in 0..batch_size as usize {
@@ -259,11 +301,20 @@ impl GpuElementwise for CpuBackend {
         write_bf16(out, &result);
     }
 
-    fn silu_mul_clamp(&self, gate: &CpuTensor, up: &CpuTensor, out: &CpuTensor, size: u32, limit: f32) {
+    fn silu_mul_clamp(
+        &self,
+        gate: &CpuTensor,
+        up: &CpuTensor,
+        out: &CpuTensor,
+        size: u32,
+        limit: f32,
+    ) {
         let n = size as usize;
         let g = read_bf16(gate, n);
         let u = read_bf16(up, n);
-        let result: Vec<f32> = g.iter().zip(u.iter())
+        let result: Vec<f32> = g
+            .iter()
+            .zip(u.iter())
             .map(|(gi, ui)| {
                 let silu = gi / (1.0 + (-gi).exp());
                 (silu * ui).clamp(-limit, limit)
@@ -284,7 +335,9 @@ impl GpuElementwise for CpuBackend {
         let n = size as usize;
         let g = read_bf16(gate, n);
         let u = read_bf16(up, n);
-        let result: Vec<f32> = g.iter().zip(u.iter())
+        let result: Vec<f32> = g
+            .iter()
+            .zip(u.iter())
             .map(|(gi, ui)| {
                 let g_c = gi.min(limit);
                 let u_c = ui.clamp(-limit, limit);
@@ -307,7 +360,10 @@ impl GpuElementwise for CpuBackend {
 
         // Softmax over top-k
         let max_val = x[top_indices[0]];
-        let exps: Vec<f32> = top_indices.iter().map(|&i| (x[i] - max_val).exp()).collect();
+        let exps: Vec<f32> = top_indices
+            .iter()
+            .map(|&i| (x[i] - max_val).exp())
+            .collect();
         let sum: f32 = exps.iter().sum();
         let probs: Vec<f32> = exps.iter().map(|e| e / sum).collect();
 
@@ -333,7 +389,14 @@ impl GpuEmbed for CpuBackend {
         write_bytes_at(out, 0, row);
     }
 
-    fn embed_lookup_batch(&self, table: &CpuTensor, token_ids: &CpuTensor, out: &CpuTensor, batch_size: u32, hidden_dim: u32) {
+    fn embed_lookup_batch(
+        &self,
+        table: &CpuTensor,
+        token_ids: &CpuTensor,
+        out: &CpuTensor,
+        batch_size: u32,
+        hidden_dim: u32,
+    ) {
         let dim = hidden_dim as usize;
         let ids: &[u32] = bytemuck::cast_slice(&token_ids.data[..batch_size as usize * 4]);
         for (b, &tid) in ids.iter().enumerate() {
@@ -380,7 +443,7 @@ impl GpuMatmul for CpuBackend {
                     for block in 0..blocks_per_row {
                         let block_offset = row_offset + block * 20;
                         let scale: f32 = bytemuck::cast_slice::<u8, f32>(
-                            &weight.data[block_offset..block_offset + 4]
+                            &weight.data[block_offset..block_offset + 4],
                         )[0];
                         let nibbles = &weight.data[block_offset + 4..block_offset + 20];
                         for i in 0..16 {
@@ -400,7 +463,15 @@ impl GpuMatmul for CpuBackend {
         }
     }
 
-    fn matmul_batch(&self, weight: &CpuTensor, input: &CpuTensor, out: &CpuTensor, batch_size: u32, m: u32, k: u32) {
+    fn matmul_batch(
+        &self,
+        weight: &CpuTensor,
+        input: &CpuTensor,
+        out: &CpuTensor,
+        batch_size: u32,
+        m: u32,
+        k: u32,
+    ) {
         let mm = m as usize;
         let kk = k as usize;
         let bs = batch_size as usize;
@@ -430,15 +501,53 @@ impl GpuMatmul for CpuBackend {
 // ===========================================================================
 
 impl GpuRope for CpuBackend {
-    fn rope(&self, q: &CpuTensor, k: &CpuTensor, pos: u32, rope_theta: f32, num_heads: u32, num_kv_heads: u32, head_dim: u32) {
-        self.rope_partial(q, k, pos, rope_theta, num_heads, num_kv_heads, head_dim, head_dim);
+    fn rope(
+        &self,
+        q: &CpuTensor,
+        k: &CpuTensor,
+        pos: u32,
+        rope_theta: f32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) {
+        self.rope_partial(
+            q,
+            k,
+            pos,
+            rope_theta,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            head_dim,
+        );
     }
 
-    fn rope_batch(&self, _q: &CpuTensor, _k: &CpuTensor, _positions: &CpuTensor, _rope_theta: f32, _batch_size: u32, _num_heads: u32, _num_kv_heads: u32, _head_dim: u32) {
+    fn rope_batch(
+        &self,
+        _q: &CpuTensor,
+        _k: &CpuTensor,
+        _positions: &CpuTensor,
+        _rope_theta: f32,
+        _batch_size: u32,
+        _num_heads: u32,
+        _num_kv_heads: u32,
+        _head_dim: u32,
+    ) {
         unimplemented!("CpuBackend::rope_batch")
     }
 
-    fn rope_partial(&self, q: &CpuTensor, k: &CpuTensor, pos: u32, rope_theta: f32, num_heads: u32, num_kv_heads: u32, head_dim: u32, rotary_dim: u32) {
+    fn rope_partial(
+        &self,
+        q: &CpuTensor,
+        k: &CpuTensor,
+        pos: u32,
+        rope_theta: f32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        rotary_dim: u32,
+    ) {
         let hd = head_dim as usize;
         let rd = rotary_dim as usize;
         let half_rd = rd / 2;
@@ -513,8 +622,7 @@ impl GpuRope for CpuBackend {
             } else if wavelength > low_freq_wavelen {
                 inv_freq_base / factor
             } else {
-                let smooth = (low_freq_wavelen / wavelength - 1.0)
-                    / (beta_fast / beta_slow - 1.0);
+                let smooth = (low_freq_wavelen / wavelength - 1.0) / (beta_fast / beta_slow - 1.0);
                 (1.0 - smooth) * (inv_freq_base / factor) + smooth * inv_freq_base
             }
         };
@@ -578,7 +686,19 @@ impl GpuRope for CpuBackend {
 // ===========================================================================
 
 impl GpuAttention for CpuBackend {
-    fn attention(&self, q: &CpuTensor, k_cache: &CpuTensor, v_cache: &CpuTensor, out: &CpuTensor, seq_len: u32, num_heads: u32, num_kv_heads: u32, head_dim: u32, window_size: u32, attn_scale: f32) {
+    fn attention(
+        &self,
+        q: &CpuTensor,
+        k_cache: &CpuTensor,
+        v_cache: &CpuTensor,
+        out: &CpuTensor,
+        seq_len: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        window_size: u32,
+        attn_scale: f32,
+    ) {
         let sl = seq_len as usize;
         let nh = num_heads as usize;
         let nkv = num_kv_heads as usize;
@@ -641,14 +761,29 @@ impl GpuAttention for CpuBackend {
         write_bf16(out, &out_data);
     }
 
-    fn copy_to_kv_cache(&self, src: &CpuTensor, cache: &CpuTensor, pos: u32, num_kv_heads: u32, head_dim: u32) {
+    fn copy_to_kv_cache(
+        &self,
+        src: &CpuTensor,
+        cache: &CpuTensor,
+        pos: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) {
         let kv_dim = num_kv_heads as usize * head_dim as usize;
         let byte_offset = pos as usize * kv_dim * 2; // bf16
         let byte_count = kv_dim * 2;
         write_bytes_at(cache, byte_offset, &src.data[..byte_count]);
     }
 
-    fn copy_to_paged_kv_cache(&self, src: &CpuTensor, pool: &CpuTensor, block_table: &CpuTensor, pos: u32, num_kv_heads: u32, head_dim: u32) {
+    fn copy_to_paged_kv_cache(
+        &self,
+        src: &CpuTensor,
+        pool: &CpuTensor,
+        block_table: &CpuTensor,
+        pos: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) {
         let kv_dim = num_kv_heads as usize * head_dim as usize;
         let block_size = 16usize; // BLOCK_SIZE
         let block_idx = pos as usize / block_size;
@@ -661,7 +796,21 @@ impl GpuAttention for CpuBackend {
         write_bytes_at(pool, dst_offset, &src.data[..kv_dim * 2]);
     }
 
-    fn paged_attention(&self, q: &CpuTensor, k_pool: &CpuTensor, v_pool: &CpuTensor, block_table: &CpuTensor, out: &CpuTensor, seq_len: u32, num_heads: u32, num_kv_heads: u32, head_dim: u32, window_size: u32, attn_scale: f32, sinks: Option<&CpuTensor>) {
+    fn paged_attention(
+        &self,
+        q: &CpuTensor,
+        k_pool: &CpuTensor,
+        v_pool: &CpuTensor,
+        block_table: &CpuTensor,
+        out: &CpuTensor,
+        seq_len: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        window_size: u32,
+        attn_scale: f32,
+        sinks: Option<&CpuTensor>,
+    ) {
         let sl = seq_len as usize;
         let nh = num_heads as usize;
         let nkv = num_kv_heads as usize;
@@ -744,11 +893,34 @@ impl GpuAttention for CpuBackend {
         write_bf16(out, &out_data);
     }
 
-    fn copy_to_paged_kv_cache_batch(&self, _src: &CpuTensor, _pool: &CpuTensor, _block_table: &CpuTensor, _positions: &CpuTensor, _batch_size: u32, _num_kv_heads: u32, _head_dim: u32) {
+    fn copy_to_paged_kv_cache_batch(
+        &self,
+        _src: &CpuTensor,
+        _pool: &CpuTensor,
+        _block_table: &CpuTensor,
+        _positions: &CpuTensor,
+        _batch_size: u32,
+        _num_kv_heads: u32,
+        _head_dim: u32,
+    ) {
         unimplemented!("CpuBackend::copy_to_paged_kv_cache_batch")
     }
 
-    fn prefill_attention(&self, q: &CpuTensor, k: &CpuTensor, v: &CpuTensor, out: &CpuTensor, chunk_size: u32, _start_pos: u32, num_heads: u32, num_kv_heads: u32, head_dim: u32, window_size: u32, attn_scale: f32, sinks: Option<&CpuTensor>) {
+    fn prefill_attention(
+        &self,
+        q: &CpuTensor,
+        k: &CpuTensor,
+        v: &CpuTensor,
+        out: &CpuTensor,
+        chunk_size: u32,
+        _start_pos: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        window_size: u32,
+        attn_scale: f32,
+        sinks: Option<&CpuTensor>,
+    ) {
         let cs = chunk_size as usize;
         let nh = num_heads as usize;
         let nkv = num_kv_heads as usize;
@@ -777,14 +949,19 @@ impl GpuAttention for CpuBackend {
                     0
                 };
 
-                let scale = if attn_scale > 0.0 { attn_scale } else { 1.0 / (hd as f32).sqrt() };
+                let scale = if attn_scale > 0.0 {
+                    attn_scale
+                } else {
+                    1.0 / (hd as f32).sqrt()
+                };
 
                 // Compute attention scores
                 let effective_len = attend_len - attend_start;
                 let mut scores = vec![0.0f32; effective_len];
                 for s in 0..effective_len {
                     let pos = attend_start + s;
-                    let k_head = &k_data[pos * kv_stride + kv_h * hd..pos * kv_stride + (kv_h + 1) * hd];
+                    let k_head =
+                        &k_data[pos * kv_stride + kv_h * hd..pos * kv_stride + (kv_h + 1) * hd];
                     let mut dot = 0.0f32;
                     for d in 0..hd {
                         dot += q_head[d] * k_head[d];
@@ -819,7 +996,8 @@ impl GpuAttention for CpuBackend {
                 let out_offset = qi * q_stride + h * hd;
                 for s in 0..effective_len {
                     let pos = attend_start + s;
-                    let v_head = &v_data[pos * kv_stride + kv_h * hd..pos * kv_stride + (kv_h + 1) * hd];
+                    let v_head =
+                        &v_data[pos * kv_stride + kv_h * hd..pos * kv_stride + (kv_h + 1) * hd];
                     for d in 0..hd {
                         out_data[out_offset + d] += scores[s] * v_head[d];
                     }
@@ -836,11 +1014,63 @@ impl GpuAttention for CpuBackend {
 // ===========================================================================
 
 impl GpuDeltaNet for CpuBackend {
-    fn conv1d_depthwise_single(&self, _input: &CpuTensor, _history: &CpuTensor, _weight: &CpuTensor, _out: &CpuTensor, _dim: u32, _kernel_size: u32) { unimplemented!("CpuBackend::conv1d_depthwise_single") }
-    fn conv1d_shift_history(&self, _history: &CpuTensor, _input: &CpuTensor, _dim: u32, _kernel_size: u32) { unimplemented!("CpuBackend::conv1d_shift_history") }
-    fn l2_normalize_heads(&self, _data: &CpuTensor, _num_heads: u32, _head_dim: u32, _elem_offset: u32) { unimplemented!("CpuBackend::l2_normalize_heads") }
-    fn deltanet_decay_gate(&self, _x: &CpuTensor, _dt_bias: &CpuTensor, _a_log: &CpuTensor, _out: &CpuTensor, _size: u32) { unimplemented!("CpuBackend::deltanet_decay_gate") }
-    fn deltanet_step(&self, _state: &CpuTensor, _q: &CpuTensor, _k: &CpuTensor, _v: &CpuTensor, _alpha: &CpuTensor, _beta: &CpuTensor, _out: &CpuTensor, _num_qk_heads: u32, _num_v_heads: u32, _head_dim: u32, _q_offset: u32, _k_offset: u32, _v_offset: u32) { unimplemented!("CpuBackend::deltanet_step") }
+    fn conv1d_depthwise_single(
+        &self,
+        _input: &CpuTensor,
+        _history: &CpuTensor,
+        _weight: &CpuTensor,
+        _out: &CpuTensor,
+        _dim: u32,
+        _kernel_size: u32,
+    ) {
+        unimplemented!("CpuBackend::conv1d_depthwise_single")
+    }
+    fn conv1d_shift_history(
+        &self,
+        _history: &CpuTensor,
+        _input: &CpuTensor,
+        _dim: u32,
+        _kernel_size: u32,
+    ) {
+        unimplemented!("CpuBackend::conv1d_shift_history")
+    }
+    fn l2_normalize_heads(
+        &self,
+        _data: &CpuTensor,
+        _num_heads: u32,
+        _head_dim: u32,
+        _elem_offset: u32,
+    ) {
+        unimplemented!("CpuBackend::l2_normalize_heads")
+    }
+    fn deltanet_decay_gate(
+        &self,
+        _x: &CpuTensor,
+        _dt_bias: &CpuTensor,
+        _a_log: &CpuTensor,
+        _out: &CpuTensor,
+        _size: u32,
+    ) {
+        unimplemented!("CpuBackend::deltanet_decay_gate")
+    }
+    fn deltanet_step(
+        &self,
+        _state: &CpuTensor,
+        _q: &CpuTensor,
+        _k: &CpuTensor,
+        _v: &CpuTensor,
+        _alpha: &CpuTensor,
+        _beta: &CpuTensor,
+        _out: &CpuTensor,
+        _num_qk_heads: u32,
+        _num_v_heads: u32,
+        _head_dim: u32,
+        _q_offset: u32,
+        _k_offset: u32,
+        _v_offset: u32,
+    ) {
+        unimplemented!("CpuBackend::deltanet_step")
+    }
 }
 
 // ===========================================================================
@@ -852,7 +1082,13 @@ impl GpuAllReduce for CpuBackend {
         // No-op: single process, nothing to reduce.
     }
 
-    fn all_gather(&self, _tensor: &CpuTensor, _output: &CpuTensor, _local_size: u32, _full_size: u32) {
+    fn all_gather(
+        &self,
+        _tensor: &CpuTensor,
+        _output: &CpuTensor,
+        _local_size: u32,
+        _full_size: u32,
+    ) {
         // No-op: single process, tensor is already the full result.
     }
 }
@@ -952,7 +1188,11 @@ mod tests {
     fn test_add() {
         let b = CpuBackend;
         let a = b.upload_tensor(&bf16_bytes(&[1.0, 2.0, 3.0, 4.0]), &[4], TensorDtype::BF16);
-        let bv = b.upload_tensor(&bf16_bytes(&[10.0, 20.0, 30.0, 40.0]), &[4], TensorDtype::BF16);
+        let bv = b.upload_tensor(
+            &bf16_bytes(&[10.0, 20.0, 30.0, 40.0]),
+            &[4],
+            TensorDtype::BF16,
+        );
         let out = b.alloc_tensor(&[4], TensorDtype::BF16);
         b.add(&a, &bv, &out, 4);
         assert_bf16_close(&out, &[11.0, 22.0, 33.0, 44.0], 0.1);
@@ -1049,7 +1289,11 @@ mod tests {
     fn test_bias_add_batch() {
         let b = CpuBackend;
         // 2 batches, dim=3
-        let input = b.upload_tensor(&bf16_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), &[2, 3], TensorDtype::BF16);
+        let input = b.upload_tensor(
+            &bf16_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            &[2, 3],
+            TensorDtype::BF16,
+        );
         let bias = b.upload_tensor(&bf16_bytes(&[0.1, 0.2, 0.3]), &[3], TensorDtype::BF16);
         let out = b.alloc_tensor(&[2, 3], TensorDtype::BF16);
         b.bias_add_batch(&input, &bias, &out, 2, 3);
@@ -1120,7 +1364,8 @@ mod tests {
         // 2 rows of dim=4
         let input = b.upload_tensor(
             &bf16_bytes(&[1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0]),
-            &[2, 4], TensorDtype::BF16,
+            &[2, 4],
+            TensorDtype::BF16,
         );
         let weight = b.upload_tensor(&bf16_bytes(&[1.0, 1.0, 1.0, 1.0]), &[4], TensorDtype::BF16);
         let out = b.alloc_tensor(&[2, 4], TensorDtype::BF16);
@@ -1157,12 +1402,13 @@ mod tests {
     fn test_embed_lookup_batch() {
         let b = CpuBackend;
         let table_data = bf16_bytes(&[
-            0.1, 0.2,  // token 0
-            1.1, 1.2,  // token 1
-            2.1, 2.2,  // token 2
+            0.1, 0.2, // token 0
+            1.1, 1.2, // token 1
+            2.1, 2.2, // token 2
         ]);
         let table = b.upload_tensor(&table_data, &[3, 2], TensorDtype::BF16);
-        let token_ids = b.upload_tensor(bytemuck::cast_slice(&[2u32, 0u32]), &[2], TensorDtype::F32);
+        let token_ids =
+            b.upload_tensor(bytemuck::cast_slice(&[2u32, 0u32]), &[2], TensorDtype::F32);
         let out = b.alloc_tensor(&[2, 2], TensorDtype::BF16);
         b.embed_lookup_batch(&table, &token_ids, &out, 2, 2);
         assert_bf16_close(&out, &[2.1, 2.2, 0.1, 0.2], 0.05);
@@ -1178,7 +1424,8 @@ mod tests {
         // 2x2 "identity-like" weight (diagonal = 1, rest = 0)
         let weight = b.upload_tensor(
             &bf16_bytes(&[1.0, 0.0, 0.0, 1.0]),
-            &[2, 2], TensorDtype::BF16,
+            &[2, 2],
+            TensorDtype::BF16,
         );
         let input = b.upload_tensor(&bf16_bytes(&[3.0, 7.0]), &[2], TensorDtype::BF16);
         let out = b.alloc_tensor(&[2], TensorDtype::BF16);
@@ -1196,7 +1443,8 @@ mod tests {
         // Expected: [6, 15]
         let weight = b.upload_tensor(
             &bf16_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
-            &[2, 3], TensorDtype::BF16,
+            &[2, 3],
+            TensorDtype::BF16,
         );
         let input = b.upload_tensor(&bf16_bytes(&[1.0, 1.0, 1.0]), &[3], TensorDtype::BF16);
         let out = b.alloc_tensor(&[2], TensorDtype::BF16);
@@ -1210,11 +1458,13 @@ mod tests {
         // Weight [2, 3], batch of 2 inputs
         let weight = b.upload_tensor(
             &bf16_bytes(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0]), // extract dim 0 and dim 1
-            &[2, 3], TensorDtype::BF16,
+            &[2, 3],
+            TensorDtype::BF16,
         );
         let input = b.upload_tensor(
             &bf16_bytes(&[5.0, 6.0, 7.0, 8.0, 9.0, 10.0]),
-            &[2, 3], TensorDtype::BF16,
+            &[2, 3],
+            TensorDtype::BF16,
         );
         let out = b.alloc_tensor(&[2, 2], TensorDtype::BF16);
         b.matmul_batch(&weight, &input, &out, 2, 2, 3);
@@ -1244,7 +1494,11 @@ mod tests {
 
         // Expected: 32 * (1 * 1.0) = 32.0
         let result = read_bf16(&out, 1);
-        assert!((result[0] - 32.0).abs() < 1.0, "Q4 matmul result: {}", result[0]);
+        assert!(
+            (result[0] - 32.0).abs() < 1.0,
+            "Q4 matmul result: {}",
+            result[0]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1271,7 +1525,10 @@ mod tests {
         b.rope(&q, &k, 5, 10000.0, 1, 1, 4);
         let q_after = read_bf16(&q, 4);
         // Values should differ from original at non-zero position
-        let differs = q_after.iter().zip(original.iter()).any(|(a, o)| (a - o).abs() > 0.01);
+        let differs = q_after
+            .iter()
+            .zip(original.iter())
+            .any(|(a, o)| (a - o).abs() > 0.01);
         assert!(differs, "RoPE at pos=5 should modify values");
     }
 
@@ -1324,7 +1581,9 @@ mod tests {
         let out = b.alloc_tensor(&[kv_dim], TensorDtype::BF16);
 
         let attn_scale = 1.0 / (head_dim as f32).sqrt();
-        b.attention(&q, &k_cache, &v_cache, &out, 3, num_heads, num_heads, head_dim, 0, attn_scale);
+        b.attention(
+            &q, &k_cache, &v_cache, &out, 3, num_heads, num_heads, head_dim, 0, attn_scale,
+        );
 
         // Since all V vectors are [1, 0], the output should be close to [1, 0]
         // (softmax of any scores still sums to 1, so weighted sum of identical V = V)
@@ -1354,17 +1613,37 @@ mod tests {
     fn test_silu_mul_clamp() {
         let b = CpuBackend;
         // Large gate values should be clamped.
-        let gate = b.upload_tensor(&bf16_bytes(&[0.0, 1.0, 10.0, -10.0]), &[4], TensorDtype::BF16);
+        let gate = b.upload_tensor(
+            &bf16_bytes(&[0.0, 1.0, 10.0, -10.0]),
+            &[4],
+            TensorDtype::BF16,
+        );
         let up = b.upload_tensor(&bf16_bytes(&[1.0, 1.0, 1.0, 1.0]), &[4], TensorDtype::BF16);
         let out = b.alloc_tensor(&[4], TensorDtype::BF16);
         b.silu_mul_clamp(&gate, &up, &out, 4, 2.0);
         let result = read_bf16(&out, 4);
         // silu(0)*1 = 0, silu(1)*1 ≈ 0.731, silu(10)*1 ≈ 10 (clamped to 2.0),
         // silu(-10)*1 ≈ 0 (stays within [-2, 2])
-        assert!((result[0] - 0.0).abs() < 0.05, "silu_clamp[0]={}", result[0]);
-        assert!((result[1] - 0.731).abs() < 0.05, "silu_clamp[1]={}", result[1]);
-        assert!((result[2] - 2.0).abs() < 0.05, "silu_clamp[2]={} should be clamped to 2.0", result[2]);
-        assert!(result[3].abs() < 0.05, "silu_clamp[3]={} should be near 0", result[3]);
+        assert!(
+            (result[0] - 0.0).abs() < 0.05,
+            "silu_clamp[0]={}",
+            result[0]
+        );
+        assert!(
+            (result[1] - 0.731).abs() < 0.05,
+            "silu_clamp[1]={}",
+            result[1]
+        );
+        assert!(
+            (result[2] - 2.0).abs() < 0.05,
+            "silu_clamp[2]={} should be clamped to 2.0",
+            result[2]
+        );
+        assert!(
+            result[3].abs() < 0.05,
+            "silu_clamp[3]={} should be near 0",
+            result[3]
+        );
     }
 
     #[test]
@@ -1380,8 +1659,13 @@ mod tests {
         let clamped = read_bf16(&out_clamped, 3);
         let plain = read_bf16(&out_plain, 3);
         for i in 0..3 {
-            assert!((clamped[i] - plain[i]).abs() < 0.05,
-                "silu_mul_clamp with high limit should match silu_mul: [{}] {} vs {}", i, clamped[i], plain[i]);
+            assert!(
+                (clamped[i] - plain[i]).abs() < 0.05,
+                "silu_mul_clamp with high limit should match silu_mul: [{}] {} vs {}",
+                i,
+                clamped[i],
+                plain[i]
+            );
         }
     }
 
@@ -1391,12 +1675,15 @@ mod tests {
 
     /// CPU reference for gpt_oss_gated_act.
     fn gpt_oss_gated_act_cpu(gate: &[f32], up: &[f32], alpha: f32, limit: f32) -> Vec<f32> {
-        gate.iter().zip(up).map(|(&g, &u)| {
-            let g_c = g.min(limit);
-            let u_c = u.clamp(-limit, limit);
-            let glu = g_c / (1.0 + (-g_c * alpha).exp());
-            (u_c + 1.0) * glu
-        }).collect()
+        gate.iter()
+            .zip(up)
+            .map(|(&g, &u)| {
+                let g_c = g.min(limit);
+                let u_c = u.clamp(-limit, limit);
+                let glu = g_c / (1.0 + (-g_c * alpha).exp());
+                (u_c + 1.0) * glu
+            })
+            .collect()
     }
 
     #[test]
@@ -1416,8 +1703,13 @@ mod tests {
         let expected = gpt_oss_gated_act_cpu(&gate_vals, &up_vals, alpha, limit);
         for i in 0..6 {
             let tol = expected[i].abs() * 0.01 + 0.01;
-            assert!((result[i] - expected[i]).abs() < tol,
-                "gpt_oss_gated_act[{}]: got {} expected {}", i, result[i], expected[i]);
+            assert!(
+                (result[i] - expected[i]).abs() < tol,
+                "gpt_oss_gated_act[{}]: got {} expected {}",
+                i,
+                result[i],
+                expected[i]
+            );
         }
     }
 
@@ -1439,14 +1731,26 @@ mod tests {
 
         // gate=10 → g_c=7, glu=7*sigmoid(7*1.702) ≈ 7.0 (sigmoid ≈ 1)
         // up=0 → u_c=0, out=(0+1)*glu = glu ≈ 7.0
-        assert!((result[0] - 7.0).abs() < 0.1, "gate clamped: got {}", result[0]);
+        assert!(
+            (result[0] - 7.0).abs() < 0.1,
+            "gate clamped: got {}",
+            result[0]
+        );
 
         // gate=-10 → g_c=-10 (no lower clamp), sigmoid(-10*1.702) ≈ 0, glu ≈ 0
         assert!(result[1].abs() < 0.01, "negative gate: got {}", result[1]);
 
         // gate=0 → glu=0, out=0 regardless of up
-        assert!(result[2].abs() < 0.01, "zero gate, large up: got {}", result[2]);
-        assert!(result[3].abs() < 0.01, "zero gate, negative up: got {}", result[3]);
+        assert!(
+            result[2].abs() < 0.01,
+            "zero gate, large up: got {}",
+            result[2]
+        );
+        assert!(
+            result[3].abs() < 0.01,
+            "zero gate, negative up: got {}",
+            result[3]
+        );
     }
 
     #[test]
@@ -1468,7 +1772,11 @@ mod tests {
         b.gpt_oss_gated_act(&gate2, &up2, &out2, 1, 1.702, 7.0);
         let result2 = read_bf16(&out2, 1);
         // glu = 2 / (1 + exp(-2*1.702)) ≈ 2 * 0.967 ≈ 1.934
-        assert!(result2[0] > 1.5, "up=0 with gate=2 should give non-zero: got {}", result2[0]);
+        assert!(
+            result2[0] > 1.5,
+            "up=0 with gate=2 should give non-zero: got {}",
+            result2[0]
+        );
 
         // Very negative gate (-100): sigmoid(-100*1.702) ≈ 0, so glu ≈ 0
         let gate3 = b.upload_tensor(&bf16_bytes(&[-100.0]), &[1], TensorDtype::BF16);
@@ -1476,7 +1784,11 @@ mod tests {
         let out3 = b.alloc_tensor(&[1], TensorDtype::BF16);
         b.gpt_oss_gated_act(&gate3, &up3, &out3, 1, 1.702, 7.0);
         let result3 = read_bf16(&out3, 1);
-        assert!(result3[0].abs() < 0.01, "very negative gate: got {}", result3[0]);
+        assert!(
+            result3[0].abs() < 0.01,
+            "very negative gate: got {}",
+            result3[0]
+        );
     }
 
     #[test]
@@ -1497,8 +1809,13 @@ mod tests {
         let expected = gpt_oss_gated_act_cpu(&gate_vals, &up_vals, alpha, limit);
         for i in 0..n {
             let tol = expected[i].abs() * 0.02 + 0.01;
-            assert!((result[i] - expected[i]).abs() < tol,
-                "large size [{}]: got {} expected {}", i, result[i], expected[i]);
+            assert!(
+                (result[i] - expected[i]).abs() < tol,
+                "large size [{}]: got {} expected {}",
+                i,
+                result[i],
+                expected[i]
+            );
         }
     }
 
@@ -1521,7 +1838,10 @@ mod tests {
         let k = b.upload_tensor(&bf16_bytes(&[1.0, 0.0, 0.0, 0.0]), &[4], TensorDtype::BF16);
         b.rope_yarn(&q, &k, 5, 10000.0, 1, 1, 4, 32.0, 32.0, 1.0, 4096);
         let q_after = read_bf16(&q, 4);
-        let differs = q_after.iter().zip(original.iter()).any(|(a, o)| (a - o).abs() > 0.01);
+        let differs = q_after
+            .iter()
+            .zip(original.iter())
+            .any(|(a, o)| (a - o).abs() > 0.01);
         assert!(differs, "YaRN RoPE at pos=5 should modify values");
     }
 
@@ -1660,11 +1980,7 @@ mod tests {
         fn test_metal_vs_cpu_embed_lookup() {
             let cpu = CpuBackend;
             let metal = MetalBackend::new().unwrap();
-            let table = bf16_bytes(&[
-                0.1, 0.2, 0.3,
-                1.1, 1.2, 1.3,
-                2.1, 2.2, 2.3,
-            ]);
+            let table = bf16_bytes(&[0.1, 0.2, 0.3, 1.1, 1.2, 1.3, 2.1, 2.2, 2.3]);
 
             let ct = cpu.upload_tensor(&table, &[3, 3], TensorDtype::BF16);
             let cout = cpu.alloc_tensor(&[3], TensorDtype::BF16);
@@ -1707,11 +2023,13 @@ mod tests {
         /// Deterministic pseudo-random data for tests.  Simple LCG seeded per call.
         fn make_test_data(count: usize, seed: u32) -> Vec<f32> {
             let mut state = seed;
-            (0..count).map(|_| {
-                state = state.wrapping_mul(1103515245).wrapping_add(12345);
-                // Map to [-1, 1] range — realistic for normalised hidden states.
-                ((state >> 16) as f32 / 32768.0) - 1.0
-            }).collect()
+            (0..count)
+                .map(|_| {
+                    state = state.wrapping_mul(1103515245).wrapping_add(12345);
+                    // Map to [-1, 1] range — realistic for normalised hidden states.
+                    ((state >> 16) as f32 / 32768.0) - 1.0
+                })
+                .collect()
         }
 
         /// Test flat attention (head_dim=64): Metal vs CPU.
@@ -1732,19 +2050,75 @@ mod tests {
             let k_cache_data = bf16_bytes(&make_test_data(max_seq as usize * kv_dim, 123));
             let v_cache_data = bf16_bytes(&make_test_data(max_seq as usize * kv_dim, 456));
 
-            let cq = cpu.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            let ck = cpu.upload_tensor(&k_cache_data, &[max_seq as usize, kv_dim], TensorDtype::BF16);
-            let cv = cpu.upload_tensor(&v_cache_data, &[max_seq as usize, kv_dim], TensorDtype::BF16);
-            let cout = cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            cpu.attention(&cq, &ck, &cv, &cout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+            let cq = cpu.upload_tensor(
+                &q_data,
+                &[num_heads as usize, head_dim as usize],
+                TensorDtype::BF16,
+            );
+            let ck = cpu.upload_tensor(
+                &k_cache_data,
+                &[max_seq as usize, kv_dim],
+                TensorDtype::BF16,
+            );
+            let cv = cpu.upload_tensor(
+                &v_cache_data,
+                &[max_seq as usize, kv_dim],
+                TensorDtype::BF16,
+            );
+            let cout =
+                cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+            cpu.attention(
+                &cq,
+                &ck,
+                &cv,
+                &cout,
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                0,
+                attn_scale,
+            );
 
-            let mq = metal.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            let mk = metal.upload_tensor(&k_cache_data, &[max_seq as usize, kv_dim], TensorDtype::BF16);
-            let mv = metal.upload_tensor(&v_cache_data, &[max_seq as usize, kv_dim], TensorDtype::BF16);
-            let mout = metal.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            metal.attention(&mq, &mk, &mv, &mout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+            let mq = metal.upload_tensor(
+                &q_data,
+                &[num_heads as usize, head_dim as usize],
+                TensorDtype::BF16,
+            );
+            let mk = metal.upload_tensor(
+                &k_cache_data,
+                &[max_seq as usize, kv_dim],
+                TensorDtype::BF16,
+            );
+            let mv = metal.upload_tensor(
+                &v_cache_data,
+                &[max_seq as usize, kv_dim],
+                TensorDtype::BF16,
+            );
+            let mout =
+                metal.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+            metal.attention(
+                &mq,
+                &mk,
+                &mv,
+                &mout,
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                0,
+                attn_scale,
+            );
 
-            assert_tensors_close(&cpu, &cout, &metal, &mout, (num_heads * head_dim) as usize, 0.15, "attention_hd64");
+            assert_tensors_close(
+                &cpu,
+                &cout,
+                &metal,
+                &mout,
+                (num_heads * head_dim) as usize,
+                0.15,
+                "attention_hd64",
+            );
         }
 
         /// Test flat attention (head_dim=128): catches hardcoded head_dim=64 in Metal.
@@ -1765,19 +2139,75 @@ mod tests {
             let k_cache_data = bf16_bytes(&make_test_data(max_seq as usize * kv_dim, 123));
             let v_cache_data = bf16_bytes(&make_test_data(max_seq as usize * kv_dim, 456));
 
-            let cq = cpu.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            let ck = cpu.upload_tensor(&k_cache_data, &[max_seq as usize, kv_dim], TensorDtype::BF16);
-            let cv = cpu.upload_tensor(&v_cache_data, &[max_seq as usize, kv_dim], TensorDtype::BF16);
-            let cout = cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            cpu.attention(&cq, &ck, &cv, &cout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+            let cq = cpu.upload_tensor(
+                &q_data,
+                &[num_heads as usize, head_dim as usize],
+                TensorDtype::BF16,
+            );
+            let ck = cpu.upload_tensor(
+                &k_cache_data,
+                &[max_seq as usize, kv_dim],
+                TensorDtype::BF16,
+            );
+            let cv = cpu.upload_tensor(
+                &v_cache_data,
+                &[max_seq as usize, kv_dim],
+                TensorDtype::BF16,
+            );
+            let cout =
+                cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+            cpu.attention(
+                &cq,
+                &ck,
+                &cv,
+                &cout,
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                0,
+                attn_scale,
+            );
 
-            let mq = metal.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            let mk = metal.upload_tensor(&k_cache_data, &[max_seq as usize, kv_dim], TensorDtype::BF16);
-            let mv = metal.upload_tensor(&v_cache_data, &[max_seq as usize, kv_dim], TensorDtype::BF16);
-            let mout = metal.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            metal.attention(&mq, &mk, &mv, &mout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+            let mq = metal.upload_tensor(
+                &q_data,
+                &[num_heads as usize, head_dim as usize],
+                TensorDtype::BF16,
+            );
+            let mk = metal.upload_tensor(
+                &k_cache_data,
+                &[max_seq as usize, kv_dim],
+                TensorDtype::BF16,
+            );
+            let mv = metal.upload_tensor(
+                &v_cache_data,
+                &[max_seq as usize, kv_dim],
+                TensorDtype::BF16,
+            );
+            let mout =
+                metal.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+            metal.attention(
+                &mq,
+                &mk,
+                &mv,
+                &mout,
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                0,
+                attn_scale,
+            );
 
-            assert_tensors_close(&cpu, &cout, &metal, &mout, (num_heads * head_dim) as usize, 0.15, "attention_hd128");
+            assert_tensors_close(
+                &cpu,
+                &cout,
+                &metal,
+                &mout,
+                (num_heads * head_dim) as usize,
+                0.15,
+                "attention_hd128",
+            );
         }
 
         /// Test paged attention (head_dim=64): Metal vs CPU with block table.
@@ -1812,7 +2242,8 @@ mod tests {
             let cbt = cpu.upload_tensor(&block_table_bytes, &[block_table.len()], TensorDtype::F32);
             let mk_pool = metal.upload_tensor(&k_pool_data, &[pool_size], TensorDtype::BF16);
             let mv_pool = metal.upload_tensor(&v_pool_data, &[pool_size], TensorDtype::BF16);
-            let mbt = metal.upload_tensor(&block_table_bytes, &[block_table.len()], TensorDtype::F32);
+            let mbt =
+                metal.upload_tensor(&block_table_bytes, &[block_table.len()], TensorDtype::F32);
 
             for pos in 0..seq_len {
                 let kv_vec = bf16_bytes(&make_test_data(kv_dim, 1000 + pos));
@@ -1825,15 +2256,59 @@ mod tests {
                 metal.copy_to_paged_kv_cache(&msrc, &mv_pool, &mbt, pos, num_kv_heads, head_dim);
             }
 
-            let cq = cpu.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            let cout = cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            cpu.paged_attention(&cq, &ck_pool, &cv_pool, &cbt, &cout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
+            let cq = cpu.upload_tensor(
+                &q_data,
+                &[num_heads as usize, head_dim as usize],
+                TensorDtype::BF16,
+            );
+            let cout =
+                cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+            cpu.paged_attention(
+                &cq,
+                &ck_pool,
+                &cv_pool,
+                &cbt,
+                &cout,
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                0,
+                attn_scale,
+                None,
+            );
 
-            let mq = metal.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            let mout = metal.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            metal.paged_attention(&mq, &mk_pool, &mv_pool, &mbt, &mout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
+            let mq = metal.upload_tensor(
+                &q_data,
+                &[num_heads as usize, head_dim as usize],
+                TensorDtype::BF16,
+            );
+            let mout =
+                metal.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+            metal.paged_attention(
+                &mq,
+                &mk_pool,
+                &mv_pool,
+                &mbt,
+                &mout,
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                0,
+                attn_scale,
+                None,
+            );
 
-            assert_tensors_close(&cpu, &cout, &metal, &mout, (num_heads * head_dim) as usize, 0.15, "paged_attn_hd64");
+            assert_tensors_close(
+                &cpu,
+                &cout,
+                &metal,
+                &mout,
+                (num_heads * head_dim) as usize,
+                0.15,
+                "paged_attn_hd64",
+            );
         }
 
         /// Test paged attention (head_dim=128): catches hardcoded head_dim=64.
@@ -1865,7 +2340,8 @@ mod tests {
             let cbt = cpu.upload_tensor(&block_table_bytes, &[block_table.len()], TensorDtype::F32);
             let mk_pool = metal.upload_tensor(&k_pool_data, &[pool_size], TensorDtype::BF16);
             let mv_pool = metal.upload_tensor(&v_pool_data, &[pool_size], TensorDtype::BF16);
-            let mbt = metal.upload_tensor(&block_table_bytes, &[block_table.len()], TensorDtype::F32);
+            let mbt =
+                metal.upload_tensor(&block_table_bytes, &[block_table.len()], TensorDtype::F32);
 
             for pos in 0..seq_len {
                 let kv_vec = bf16_bytes(&make_test_data(kv_dim, 1000 + pos));
@@ -1878,15 +2354,59 @@ mod tests {
                 metal.copy_to_paged_kv_cache(&msrc, &mv_pool, &mbt, pos, num_kv_heads, head_dim);
             }
 
-            let cq = cpu.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            let cout = cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            cpu.paged_attention(&cq, &ck_pool, &cv_pool, &cbt, &cout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
+            let cq = cpu.upload_tensor(
+                &q_data,
+                &[num_heads as usize, head_dim as usize],
+                TensorDtype::BF16,
+            );
+            let cout =
+                cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+            cpu.paged_attention(
+                &cq,
+                &ck_pool,
+                &cv_pool,
+                &cbt,
+                &cout,
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                0,
+                attn_scale,
+                None,
+            );
 
-            let mq = metal.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            let mout = metal.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            metal.paged_attention(&mq, &mk_pool, &mv_pool, &mbt, &mout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
+            let mq = metal.upload_tensor(
+                &q_data,
+                &[num_heads as usize, head_dim as usize],
+                TensorDtype::BF16,
+            );
+            let mout =
+                metal.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+            metal.paged_attention(
+                &mq,
+                &mk_pool,
+                &mv_pool,
+                &mbt,
+                &mout,
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                0,
+                attn_scale,
+                None,
+            );
 
-            assert_tensors_close(&cpu, &cout, &metal, &mout, (num_heads * head_dim) as usize, 0.15, "paged_attn_hd128");
+            assert_tensors_close(
+                &cpu,
+                &cout,
+                &metal,
+                &mout,
+                (num_heads * head_dim) as usize,
+                0.15,
+                "paged_attn_hd128",
+            );
         }
 
         /// Test fused paged attention (head_dim=64): KV write + attention in one dispatch.
@@ -1908,12 +2428,17 @@ mod tests {
 
             let pool_size = (num_physical_blocks * block_size) as usize * kv_dim;
 
-            let ck_pool = cpu.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
-            let cv_pool = cpu.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
+            let ck_pool =
+                cpu.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
+            let cv_pool =
+                cpu.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
             let cbt = cpu.upload_tensor(&block_table_bytes, &[block_table.len()], TensorDtype::F32);
-            let mk_pool = metal.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
-            let mv_pool = metal.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
-            let mbt = metal.upload_tensor(&block_table_bytes, &[block_table.len()], TensorDtype::F32);
+            let mk_pool =
+                metal.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
+            let mv_pool =
+                metal.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
+            let mbt =
+                metal.upload_tensor(&block_table_bytes, &[block_table.len()], TensorDtype::F32);
 
             // Write 9 positions via fused path, check the 10th.
             for pos in 0..10u32 {
@@ -1921,20 +2446,68 @@ mod tests {
                 let k_data = bf16_bytes(&make_test_data(kv_dim, 1000 + pos));
                 let v_data = bf16_bytes(&make_test_data(kv_dim, 2000 + pos));
 
-                let cq = cpu.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+                let cq = cpu.upload_tensor(
+                    &q_data,
+                    &[num_heads as usize, head_dim as usize],
+                    TensorDtype::BF16,
+                );
                 let ck = cpu.upload_tensor(&k_data, &[kv_dim], TensorDtype::BF16);
                 let cv_in = cpu.upload_tensor(&v_data, &[kv_dim], TensorDtype::BF16);
-                let cout = cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-                cpu.paged_attention_fused(&cq, &ck, &cv_in, &ck_pool, &cv_pool, &cbt, &cout, pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
+                let cout =
+                    cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+                cpu.paged_attention_fused(
+                    &cq,
+                    &ck,
+                    &cv_in,
+                    &ck_pool,
+                    &cv_pool,
+                    &cbt,
+                    &cout,
+                    pos,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    0,
+                    attn_scale,
+                    None,
+                );
 
-                let mq = metal.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+                let mq = metal.upload_tensor(
+                    &q_data,
+                    &[num_heads as usize, head_dim as usize],
+                    TensorDtype::BF16,
+                );
                 let mk = metal.upload_tensor(&k_data, &[kv_dim], TensorDtype::BF16);
                 let mv_in = metal.upload_tensor(&v_data, &[kv_dim], TensorDtype::BF16);
-                let mout = metal.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-                metal.paged_attention_fused(&mq, &mk, &mv_in, &mk_pool, &mv_pool, &mbt, &mout, pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
+                let mout =
+                    metal.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+                metal.paged_attention_fused(
+                    &mq,
+                    &mk,
+                    &mv_in,
+                    &mk_pool,
+                    &mv_pool,
+                    &mbt,
+                    &mout,
+                    pos,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    0,
+                    attn_scale,
+                    None,
+                );
 
                 if pos == 9 {
-                    assert_tensors_close(&cpu, &cout, &metal, &mout, (num_heads * head_dim) as usize, 0.15, "paged_attn_fused_hd64");
+                    assert_tensors_close(
+                        &cpu,
+                        &cout,
+                        &metal,
+                        &mout,
+                        (num_heads * head_dim) as usize,
+                        0.15,
+                        "paged_attn_fused_hd64",
+                    );
                 }
             }
         }
@@ -1958,32 +2531,85 @@ mod tests {
 
             let pool_size = (num_physical_blocks * block_size) as usize * kv_dim;
 
-            let ck_pool = cpu.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
-            let cv_pool = cpu.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
+            let ck_pool =
+                cpu.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
+            let cv_pool =
+                cpu.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
             let cbt = cpu.upload_tensor(&block_table_bytes, &[block_table.len()], TensorDtype::F32);
-            let mk_pool = metal.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
-            let mv_pool = metal.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
-            let mbt = metal.upload_tensor(&block_table_bytes, &[block_table.len()], TensorDtype::F32);
+            let mk_pool =
+                metal.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
+            let mv_pool =
+                metal.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
+            let mbt =
+                metal.upload_tensor(&block_table_bytes, &[block_table.len()], TensorDtype::F32);
 
             for pos in 0..10u32 {
                 let q_data = bf16_bytes(&make_test_data((num_heads * head_dim) as usize, 42 + pos));
                 let k_data = bf16_bytes(&make_test_data(kv_dim, 1000 + pos));
                 let v_data = bf16_bytes(&make_test_data(kv_dim, 2000 + pos));
 
-                let cq = cpu.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+                let cq = cpu.upload_tensor(
+                    &q_data,
+                    &[num_heads as usize, head_dim as usize],
+                    TensorDtype::BF16,
+                );
                 let ck = cpu.upload_tensor(&k_data, &[kv_dim], TensorDtype::BF16);
                 let cv_in = cpu.upload_tensor(&v_data, &[kv_dim], TensorDtype::BF16);
-                let cout = cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-                cpu.paged_attention_fused(&cq, &ck, &cv_in, &ck_pool, &cv_pool, &cbt, &cout, pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
+                let cout =
+                    cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+                cpu.paged_attention_fused(
+                    &cq,
+                    &ck,
+                    &cv_in,
+                    &ck_pool,
+                    &cv_pool,
+                    &cbt,
+                    &cout,
+                    pos,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    0,
+                    attn_scale,
+                    None,
+                );
 
-                let mq = metal.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+                let mq = metal.upload_tensor(
+                    &q_data,
+                    &[num_heads as usize, head_dim as usize],
+                    TensorDtype::BF16,
+                );
                 let mk = metal.upload_tensor(&k_data, &[kv_dim], TensorDtype::BF16);
                 let mv_in = metal.upload_tensor(&v_data, &[kv_dim], TensorDtype::BF16);
-                let mout = metal.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-                metal.paged_attention_fused(&mq, &mk, &mv_in, &mk_pool, &mv_pool, &mbt, &mout, pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
+                let mout =
+                    metal.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+                metal.paged_attention_fused(
+                    &mq,
+                    &mk,
+                    &mv_in,
+                    &mk_pool,
+                    &mv_pool,
+                    &mbt,
+                    &mout,
+                    pos,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    0,
+                    attn_scale,
+                    None,
+                );
 
                 if pos == 9 {
-                    assert_tensors_close(&cpu, &cout, &metal, &mout, (num_heads * head_dim) as usize, 0.15, "paged_attn_fused_hd128");
+                    assert_tensors_close(
+                        &cpu,
+                        &cout,
+                        &metal,
+                        &mout,
+                        (num_heads * head_dim) as usize,
+                        0.15,
+                        "paged_attn_fused_hd128",
+                    );
                 }
             }
         }
@@ -2007,19 +2633,71 @@ mod tests {
             let k_data = bf16_bytes(&make_test_data(chunk_size as usize * kv_stride, 123));
             let v_data = bf16_bytes(&make_test_data(chunk_size as usize * kv_stride, 456));
 
-            let cq = cpu.upload_tensor(&q_data, &[chunk_size as usize, q_stride], TensorDtype::BF16);
-            let ck = cpu.upload_tensor(&k_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
-            let cv = cpu.upload_tensor(&v_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
+            let cq =
+                cpu.upload_tensor(&q_data, &[chunk_size as usize, q_stride], TensorDtype::BF16);
+            let ck = cpu.upload_tensor(
+                &k_data,
+                &[chunk_size as usize, kv_stride],
+                TensorDtype::BF16,
+            );
+            let cv = cpu.upload_tensor(
+                &v_data,
+                &[chunk_size as usize, kv_stride],
+                TensorDtype::BF16,
+            );
             let cout = cpu.alloc_tensor(&[chunk_size as usize, q_stride], TensorDtype::BF16);
-            cpu.prefill_attention(&cq, &ck, &cv, &cout, chunk_size, start_pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
+            cpu.prefill_attention(
+                &cq,
+                &ck,
+                &cv,
+                &cout,
+                chunk_size,
+                start_pos,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                0,
+                attn_scale,
+                None,
+            );
 
-            let mq = metal.upload_tensor(&q_data, &[chunk_size as usize, q_stride], TensorDtype::BF16);
-            let mk = metal.upload_tensor(&k_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
-            let mv = metal.upload_tensor(&v_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
+            let mq =
+                metal.upload_tensor(&q_data, &[chunk_size as usize, q_stride], TensorDtype::BF16);
+            let mk = metal.upload_tensor(
+                &k_data,
+                &[chunk_size as usize, kv_stride],
+                TensorDtype::BF16,
+            );
+            let mv = metal.upload_tensor(
+                &v_data,
+                &[chunk_size as usize, kv_stride],
+                TensorDtype::BF16,
+            );
             let mout = metal.alloc_tensor(&[chunk_size as usize, q_stride], TensorDtype::BF16);
-            metal.prefill_attention(&mq, &mk, &mv, &mout, chunk_size, start_pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
+            metal.prefill_attention(
+                &mq,
+                &mk,
+                &mv,
+                &mout,
+                chunk_size,
+                start_pos,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                0,
+                attn_scale,
+                None,
+            );
 
-            assert_tensors_close(&cpu, &cout, &metal, &mout, chunk_size as usize * q_stride, 0.15, "prefill_attn_hd64");
+            assert_tensors_close(
+                &cpu,
+                &cout,
+                &metal,
+                &mout,
+                chunk_size as usize * q_stride,
+                0.15,
+                "prefill_attn_hd64",
+            );
         }
 
         /// Test prefill attention (head_dim=128): catches hardcoded head_dim=64.
@@ -2041,19 +2719,71 @@ mod tests {
             let k_data = bf16_bytes(&make_test_data(chunk_size as usize * kv_stride, 123));
             let v_data = bf16_bytes(&make_test_data(chunk_size as usize * kv_stride, 456));
 
-            let cq = cpu.upload_tensor(&q_data, &[chunk_size as usize, q_stride], TensorDtype::BF16);
-            let ck = cpu.upload_tensor(&k_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
-            let cv = cpu.upload_tensor(&v_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
+            let cq =
+                cpu.upload_tensor(&q_data, &[chunk_size as usize, q_stride], TensorDtype::BF16);
+            let ck = cpu.upload_tensor(
+                &k_data,
+                &[chunk_size as usize, kv_stride],
+                TensorDtype::BF16,
+            );
+            let cv = cpu.upload_tensor(
+                &v_data,
+                &[chunk_size as usize, kv_stride],
+                TensorDtype::BF16,
+            );
             let cout = cpu.alloc_tensor(&[chunk_size as usize, q_stride], TensorDtype::BF16);
-            cpu.prefill_attention(&cq, &ck, &cv, &cout, chunk_size, start_pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
+            cpu.prefill_attention(
+                &cq,
+                &ck,
+                &cv,
+                &cout,
+                chunk_size,
+                start_pos,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                0,
+                attn_scale,
+                None,
+            );
 
-            let mq = metal.upload_tensor(&q_data, &[chunk_size as usize, q_stride], TensorDtype::BF16);
-            let mk = metal.upload_tensor(&k_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
-            let mv = metal.upload_tensor(&v_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
+            let mq =
+                metal.upload_tensor(&q_data, &[chunk_size as usize, q_stride], TensorDtype::BF16);
+            let mk = metal.upload_tensor(
+                &k_data,
+                &[chunk_size as usize, kv_stride],
+                TensorDtype::BF16,
+            );
+            let mv = metal.upload_tensor(
+                &v_data,
+                &[chunk_size as usize, kv_stride],
+                TensorDtype::BF16,
+            );
             let mout = metal.alloc_tensor(&[chunk_size as usize, q_stride], TensorDtype::BF16);
-            metal.prefill_attention(&mq, &mk, &mv, &mout, chunk_size, start_pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
+            metal.prefill_attention(
+                &mq,
+                &mk,
+                &mv,
+                &mout,
+                chunk_size,
+                start_pos,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                0,
+                attn_scale,
+                None,
+            );
 
-            assert_tensors_close(&cpu, &cout, &metal, &mout, chunk_size as usize * q_stride, 0.15, "prefill_attn_hd128");
+            assert_tensors_close(
+                &cpu,
+                &cout,
+                &metal,
+                &mout,
+                chunk_size as usize * q_stride,
+                0.15,
+                "prefill_attn_hd128",
+            );
         }
     }
 
@@ -2117,10 +2847,12 @@ mod tests {
         /// Deterministic pseudo-random data for tests.
         fn make_test_data(count: usize, seed: u32) -> Vec<f32> {
             let mut state = seed;
-            (0..count).map(|_| {
-                state = state.wrapping_mul(1103515245).wrapping_add(12345);
-                ((state >> 16) as f32 / 32768.0) - 1.0
-            }).collect()
+            (0..count)
+                .map(|_| {
+                    state = state.wrapping_mul(1103515245).wrapping_add(12345);
+                    ((state >> 16) as f32 / 32768.0) - 1.0
+                })
+                .collect()
         }
 
         // -------------------------------------------------------------------
@@ -2368,11 +3100,7 @@ mod tests {
         fn test_cuda_vs_cpu_embed_lookup() {
             let cpu = CpuBackend;
             let cuda = CudaBackend::new().unwrap();
-            let table = bf16_bytes(&[
-                0.1, 0.2, 0.3,
-                1.1, 1.2, 1.3,
-                2.1, 2.2, 2.3,
-            ]);
+            let table = bf16_bytes(&[0.1, 0.2, 0.3, 1.1, 1.2, 1.3, 2.1, 2.2, 2.3]);
 
             let ct = cpu.upload_tensor(&table, &[3, 3], TensorDtype::BF16);
             let cout = cpu.alloc_tensor(&[3], TensorDtype::BF16);
@@ -2389,11 +3117,7 @@ mod tests {
         fn test_cuda_vs_cpu_embed_lookup_batch() {
             let cpu = CpuBackend;
             let cuda = CudaBackend::new().unwrap();
-            let table = bf16_bytes(&[
-                0.1, 0.2,
-                1.1, 1.2,
-                2.1, 2.2,
-            ]);
+            let table = bf16_bytes(&[0.1, 0.2, 1.1, 1.2, 2.1, 2.2]);
             let token_ids: Vec<u8> = bytemuck::cast_slice(&[2u32, 0u32]).to_vec();
 
             let ct = cpu.upload_tensor(&table, &[3, 2], TensorDtype::BF16);
@@ -2543,19 +3267,75 @@ mod tests {
             let k_cache_data = bf16_bytes(&make_test_data(max_seq as usize * kv_dim, 123));
             let v_cache_data = bf16_bytes(&make_test_data(max_seq as usize * kv_dim, 456));
 
-            let cq = cpu.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            let ck = cpu.upload_tensor(&k_cache_data, &[max_seq as usize, kv_dim], TensorDtype::BF16);
-            let cv = cpu.upload_tensor(&v_cache_data, &[max_seq as usize, kv_dim], TensorDtype::BF16);
-            let cout = cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            cpu.attention(&cq, &ck, &cv, &cout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+            let cq = cpu.upload_tensor(
+                &q_data,
+                &[num_heads as usize, head_dim as usize],
+                TensorDtype::BF16,
+            );
+            let ck = cpu.upload_tensor(
+                &k_cache_data,
+                &[max_seq as usize, kv_dim],
+                TensorDtype::BF16,
+            );
+            let cv = cpu.upload_tensor(
+                &v_cache_data,
+                &[max_seq as usize, kv_dim],
+                TensorDtype::BF16,
+            );
+            let cout =
+                cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+            cpu.attention(
+                &cq,
+                &ck,
+                &cv,
+                &cout,
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                0,
+                attn_scale,
+            );
 
-            let gq = cuda.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            let gk = cuda.upload_tensor(&k_cache_data, &[max_seq as usize, kv_dim], TensorDtype::BF16);
-            let gv = cuda.upload_tensor(&v_cache_data, &[max_seq as usize, kv_dim], TensorDtype::BF16);
-            let gout = cuda.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            cuda.attention(&gq, &gk, &gv, &gout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale);
+            let gq = cuda.upload_tensor(
+                &q_data,
+                &[num_heads as usize, head_dim as usize],
+                TensorDtype::BF16,
+            );
+            let gk = cuda.upload_tensor(
+                &k_cache_data,
+                &[max_seq as usize, kv_dim],
+                TensorDtype::BF16,
+            );
+            let gv = cuda.upload_tensor(
+                &v_cache_data,
+                &[max_seq as usize, kv_dim],
+                TensorDtype::BF16,
+            );
+            let gout =
+                cuda.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+            cuda.attention(
+                &gq,
+                &gk,
+                &gv,
+                &gout,
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                0,
+                attn_scale,
+            );
 
-            assert_tensors_close_bf16(&cpu, &cout, &cuda, &gout, (num_heads * head_dim) as usize, 0.15, "attention_hd128");
+            assert_tensors_close_bf16(
+                &cpu,
+                &cout,
+                &cuda,
+                &gout,
+                (num_heads * head_dim) as usize,
+                0.15,
+                "attention_hd128",
+            );
         }
 
         #[test]
@@ -2586,7 +3366,8 @@ mod tests {
             let cbt = cpu.upload_tensor(&block_table_bytes, &[block_table.len()], TensorDtype::F32);
             let gk_pool = cuda.upload_tensor(&k_pool_data, &[pool_size], TensorDtype::BF16);
             let gv_pool = cuda.upload_tensor(&v_pool_data, &[pool_size], TensorDtype::BF16);
-            let gbt = cuda.upload_tensor(&block_table_bytes, &[block_table.len()], TensorDtype::F32);
+            let gbt =
+                cuda.upload_tensor(&block_table_bytes, &[block_table.len()], TensorDtype::F32);
 
             for pos in 0..seq_len {
                 let kv_vec = bf16_bytes(&make_test_data(kv_dim, 1000 + pos));
@@ -2599,15 +3380,59 @@ mod tests {
                 cuda.copy_to_paged_kv_cache(&gsrc, &gv_pool, &gbt, pos, num_kv_heads, head_dim);
             }
 
-            let cq = cpu.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            let cout = cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            cpu.paged_attention(&cq, &ck_pool, &cv_pool, &cbt, &cout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
+            let cq = cpu.upload_tensor(
+                &q_data,
+                &[num_heads as usize, head_dim as usize],
+                TensorDtype::BF16,
+            );
+            let cout =
+                cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+            cpu.paged_attention(
+                &cq,
+                &ck_pool,
+                &cv_pool,
+                &cbt,
+                &cout,
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                0,
+                attn_scale,
+                None,
+            );
 
-            let gq = cuda.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            let gout = cuda.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-            cuda.paged_attention(&gq, &gk_pool, &gv_pool, &gbt, &gout, seq_len, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
+            let gq = cuda.upload_tensor(
+                &q_data,
+                &[num_heads as usize, head_dim as usize],
+                TensorDtype::BF16,
+            );
+            let gout =
+                cuda.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+            cuda.paged_attention(
+                &gq,
+                &gk_pool,
+                &gv_pool,
+                &gbt,
+                &gout,
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                0,
+                attn_scale,
+                None,
+            );
 
-            assert_tensors_close_bf16(&cpu, &cout, &cuda, &gout, (num_heads * head_dim) as usize, 0.15, "paged_attn_hd128");
+            assert_tensors_close_bf16(
+                &cpu,
+                &cout,
+                &cuda,
+                &gout,
+                (num_heads * head_dim) as usize,
+                0.15,
+                "paged_attn_hd128",
+            );
         }
 
         #[test]
@@ -2628,32 +3453,85 @@ mod tests {
 
             let pool_size = (num_physical_blocks * block_size) as usize * kv_dim;
 
-            let ck_pool = cpu.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
-            let cv_pool = cpu.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
+            let ck_pool =
+                cpu.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
+            let cv_pool =
+                cpu.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
             let cbt = cpu.upload_tensor(&block_table_bytes, &[block_table.len()], TensorDtype::F32);
-            let gk_pool = cuda.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
-            let gv_pool = cuda.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
-            let gbt = cuda.upload_tensor(&block_table_bytes, &[block_table.len()], TensorDtype::F32);
+            let gk_pool =
+                cuda.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
+            let gv_pool =
+                cuda.upload_tensor(&vec![0u8; pool_size * 2], &[pool_size], TensorDtype::BF16);
+            let gbt =
+                cuda.upload_tensor(&block_table_bytes, &[block_table.len()], TensorDtype::F32);
 
             for pos in 0..10u32 {
                 let q_data = bf16_bytes(&make_test_data((num_heads * head_dim) as usize, 42 + pos));
                 let k_data = bf16_bytes(&make_test_data(kv_dim, 1000 + pos));
                 let v_data = bf16_bytes(&make_test_data(kv_dim, 2000 + pos));
 
-                let cq = cpu.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+                let cq = cpu.upload_tensor(
+                    &q_data,
+                    &[num_heads as usize, head_dim as usize],
+                    TensorDtype::BF16,
+                );
                 let ck = cpu.upload_tensor(&k_data, &[kv_dim], TensorDtype::BF16);
                 let cv_in = cpu.upload_tensor(&v_data, &[kv_dim], TensorDtype::BF16);
-                let cout = cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-                cpu.paged_attention_fused(&cq, &ck, &cv_in, &ck_pool, &cv_pool, &cbt, &cout, pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
+                let cout =
+                    cpu.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+                cpu.paged_attention_fused(
+                    &cq,
+                    &ck,
+                    &cv_in,
+                    &ck_pool,
+                    &cv_pool,
+                    &cbt,
+                    &cout,
+                    pos,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    0,
+                    attn_scale,
+                    None,
+                );
 
-                let gq = cuda.upload_tensor(&q_data, &[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+                let gq = cuda.upload_tensor(
+                    &q_data,
+                    &[num_heads as usize, head_dim as usize],
+                    TensorDtype::BF16,
+                );
                 let gk = cuda.upload_tensor(&k_data, &[kv_dim], TensorDtype::BF16);
                 let gv_in = cuda.upload_tensor(&v_data, &[kv_dim], TensorDtype::BF16);
-                let gout = cuda.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
-                cuda.paged_attention_fused(&gq, &gk, &gv_in, &gk_pool, &gv_pool, &gbt, &gout, pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
+                let gout =
+                    cuda.alloc_tensor(&[num_heads as usize, head_dim as usize], TensorDtype::BF16);
+                cuda.paged_attention_fused(
+                    &gq,
+                    &gk,
+                    &gv_in,
+                    &gk_pool,
+                    &gv_pool,
+                    &gbt,
+                    &gout,
+                    pos,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    0,
+                    attn_scale,
+                    None,
+                );
 
                 if pos == 9 {
-                    assert_tensors_close_bf16(&cpu, &cout, &cuda, &gout, (num_heads * head_dim) as usize, 0.15, "paged_attn_fused_hd128");
+                    assert_tensors_close_bf16(
+                        &cpu,
+                        &cout,
+                        &cuda,
+                        &gout,
+                        (num_heads * head_dim) as usize,
+                        0.15,
+                        "paged_attn_fused_hd128",
+                    );
                 }
             }
         }
@@ -2676,19 +3554,71 @@ mod tests {
             let k_data = bf16_bytes(&make_test_data(chunk_size as usize * kv_stride, 123));
             let v_data = bf16_bytes(&make_test_data(chunk_size as usize * kv_stride, 456));
 
-            let cq = cpu.upload_tensor(&q_data, &[chunk_size as usize, q_stride], TensorDtype::BF16);
-            let ck = cpu.upload_tensor(&k_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
-            let cv = cpu.upload_tensor(&v_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
+            let cq =
+                cpu.upload_tensor(&q_data, &[chunk_size as usize, q_stride], TensorDtype::BF16);
+            let ck = cpu.upload_tensor(
+                &k_data,
+                &[chunk_size as usize, kv_stride],
+                TensorDtype::BF16,
+            );
+            let cv = cpu.upload_tensor(
+                &v_data,
+                &[chunk_size as usize, kv_stride],
+                TensorDtype::BF16,
+            );
             let cout = cpu.alloc_tensor(&[chunk_size as usize, q_stride], TensorDtype::BF16);
-            cpu.prefill_attention(&cq, &ck, &cv, &cout, chunk_size, start_pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
+            cpu.prefill_attention(
+                &cq,
+                &ck,
+                &cv,
+                &cout,
+                chunk_size,
+                start_pos,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                0,
+                attn_scale,
+                None,
+            );
 
-            let gq = cuda.upload_tensor(&q_data, &[chunk_size as usize, q_stride], TensorDtype::BF16);
-            let gk = cuda.upload_tensor(&k_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
-            let gv = cuda.upload_tensor(&v_data, &[chunk_size as usize, kv_stride], TensorDtype::BF16);
+            let gq =
+                cuda.upload_tensor(&q_data, &[chunk_size as usize, q_stride], TensorDtype::BF16);
+            let gk = cuda.upload_tensor(
+                &k_data,
+                &[chunk_size as usize, kv_stride],
+                TensorDtype::BF16,
+            );
+            let gv = cuda.upload_tensor(
+                &v_data,
+                &[chunk_size as usize, kv_stride],
+                TensorDtype::BF16,
+            );
             let gout = cuda.alloc_tensor(&[chunk_size as usize, q_stride], TensorDtype::BF16);
-            cuda.prefill_attention(&gq, &gk, &gv, &gout, chunk_size, start_pos, num_heads, num_kv_heads, head_dim, 0, attn_scale, None);
+            cuda.prefill_attention(
+                &gq,
+                &gk,
+                &gv,
+                &gout,
+                chunk_size,
+                start_pos,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                0,
+                attn_scale,
+                None,
+            );
 
-            assert_tensors_close_bf16(&cpu, &cout, &cuda, &gout, chunk_size as usize * q_stride, 0.15, "prefill_attn_hd128");
+            assert_tensors_close_bf16(
+                &cpu,
+                &cout,
+                &cuda,
+                &gout,
+                chunk_size as usize * q_stride,
+                0.15,
+                "prefill_attn_hd128",
+            );
         }
     }
 }

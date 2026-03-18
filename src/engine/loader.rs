@@ -30,8 +30,8 @@ use std::path::Path;
 use crate::gpu::{self, GpuCore};
 use crate::model;
 use crate::model::config::ModelArch;
-use crate::model::{kv_cache, loader};
 use crate::model::tokenizer::Tokenizer;
+use crate::model::{kv_cache, loader};
 
 use super::InferenceEngine;
 
@@ -90,7 +90,10 @@ fn load_and_run_single_gpu(
     let max_tokens = kv_pool.max_tokens();
     eprintln!(
         "memory: {:.0} MB weights, {:.0} MB KV cache ({} blocks, {} max tokens), {:.0} MB GPU budget",
-        weight_mb, kv_mb, num_blocks, max_tokens,
+        weight_mb,
+        kv_mb,
+        num_blocks,
+        max_tokens,
         gpu_budget as f64 / (1024.0 * 1024.0),
     );
     eprintln!("max {} concurrent sequences", max_active);

@@ -75,13 +75,8 @@ pub(crate) mod tp {
                 let plan = ShardingPlan::derive(&config, device, false)?;
 
                 // Load sharded weights.
-                let weights = loader::load_weights(
-                    &*backend,
-                    model_dir,
-                    &config,
-                    quantize,
-                    Some(&plan),
-                )?;
+                let weights =
+                    loader::load_weights(&*backend, model_dir, &config, quantize, Some(&plan))?;
 
                 if rank == 0 {
                     eprintln!(
@@ -104,16 +99,10 @@ pub(crate) mod tp {
                 // The backend is boxed and stored in the same struct, so it
                 // outlives the model.  This is the same pattern used by many
                 // self-referential struct solutions.
-                let backend_ref: &'static CudaBackend = unsafe {
-                    &*(&*backend as *const CudaBackend)
-                };
+                let backend_ref: &'static CudaBackend =
+                    unsafe { &*(&*backend as *const CudaBackend) };
 
-                let model = Model::new_tp(
-                    config.clone(),
-                    weights,
-                    backend_ref,
-                    world_size,
-                )?;
+                let model = Model::new_tp(config.clone(), weights, backend_ref, world_size)?;
 
                 ranks.push(RankState {
                     model,
@@ -135,20 +124,26 @@ pub(crate) mod tp {
         pub fn forward_single_paged(&self, token_id: u32) -> anyhow::Result<()> {
             if self.world_size == 1 {
                 let r = &self.ranks[0];
-                return r.model.forward_single_paged(
-                    token_id, &r.kv_pool, &r.seq_state,
-                );
+                return r
+                    .model
+                    .forward_single_paged(token_id, &r.kv_pool, &r.seq_state);
             }
 
             // Fan out to all ranks.
             std::thread::scope(|s| {
-                let handles: Vec<_> = self.ranks.iter().map(|rank| {
-                    s.spawn(move || {
-                        rank.model.forward_single_paged(
-                            token_id, &rank.kv_pool, &rank.seq_state,
-                        )
+                let handles: Vec<_> = self
+                    .ranks
+                    .iter()
+                    .map(|rank| {
+                        s.spawn(move || {
+                            rank.model.forward_single_paged(
+                                token_id,
+                                &rank.kv_pool,
+                                &rank.seq_state,
+                            )
+                        })
                     })
-                }).collect();
+                    .collect();
 
                 for h in handles {
                     h.join().unwrap()?;
@@ -162,18 +157,28 @@ pub(crate) mod tp {
             if self.world_size == 1 {
                 let r = &self.ranks[0];
                 return r.model.forward_prefill_paged(
-                    tokens, &r.kv_pool, &r.seq_state, &r.prefill_bufs,
+                    tokens,
+                    &r.kv_pool,
+                    &r.seq_state,
+                    &r.prefill_bufs,
                 );
             }
 
             std::thread::scope(|s| {
-                let handles: Vec<_> = self.ranks.iter().map(|rank| {
-                    s.spawn(move || {
-                        rank.model.forward_prefill_paged(
-                            tokens, &rank.kv_pool, &rank.seq_state, &rank.prefill_bufs,
-                        )
+                let handles: Vec<_> = self
+                    .ranks
+                    .iter()
+                    .map(|rank| {
+                        s.spawn(move || {
+                            rank.model.forward_prefill_paged(
+                                tokens,
+                                &rank.kv_pool,
+                                &rank.seq_state,
+                                &rank.prefill_bufs,
+                            )
+                        })
                     })
-                }).collect();
+                    .collect();
 
                 for h in handles {
                     h.join().unwrap()?;
@@ -246,7 +251,8 @@ pub(crate) mod tp {
 
         /// Create a new per-rank KV state set for a new sequence.
         pub fn new_sequence(&self) -> Vec<SeqKvState<CudaBackend>> {
-            self.ranks.iter()
+            self.ranks
+                .iter()
                 .map(|r| r.kv_pool.new_sequence(r.model.backend))
                 .collect()
         }
@@ -305,15 +311,23 @@ pub(crate) mod tp {
         ) -> anyhow::Result<()> {
             if self.world_size == 1 {
                 let r = &self.ranks[0];
-                return r.model.forward_single_paged(token_id, &r.kv_pool, &states[0]);
+                return r
+                    .model
+                    .forward_single_paged(token_id, &r.kv_pool, &states[0]);
             }
 
             std::thread::scope(|s| {
-                let handles: Vec<_> = self.ranks.iter().zip(states.iter()).map(|(rank, state)| {
-                    s.spawn(move || {
-                        rank.model.forward_single_paged(token_id, &rank.kv_pool, state)
+                let handles: Vec<_> = self
+                    .ranks
+                    .iter()
+                    .zip(states.iter())
+                    .map(|(rank, state)| {
+                        s.spawn(move || {
+                            rank.model
+                                .forward_single_paged(token_id, &rank.kv_pool, state)
+                        })
                     })
-                }).collect();
+                    .collect();
 
                 for h in handles {
                     h.join().unwrap()?;
@@ -330,15 +344,30 @@ pub(crate) mod tp {
         ) -> anyhow::Result<()> {
             if self.world_size == 1 {
                 let r = &self.ranks[0];
-                return r.model.forward_prefill_paged(tokens, &r.kv_pool, &states[0], &r.prefill_bufs);
+                return r.model.forward_prefill_paged(
+                    tokens,
+                    &r.kv_pool,
+                    &states[0],
+                    &r.prefill_bufs,
+                );
             }
 
             std::thread::scope(|s| {
-                let handles: Vec<_> = self.ranks.iter().zip(states.iter()).map(|(rank, state)| {
-                    s.spawn(move || {
-                        rank.model.forward_prefill_paged(tokens, &rank.kv_pool, state, &rank.prefill_bufs)
+                let handles: Vec<_> = self
+                    .ranks
+                    .iter()
+                    .zip(states.iter())
+                    .map(|(rank, state)| {
+                        s.spawn(move || {
+                            rank.model.forward_prefill_paged(
+                                tokens,
+                                &rank.kv_pool,
+                                state,
+                                &rank.prefill_bufs,
+                            )
+                        })
                     })
-                }).collect();
+                    .collect();
 
                 for h in handles {
                     h.join().unwrap()?;

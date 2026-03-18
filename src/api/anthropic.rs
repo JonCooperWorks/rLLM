@@ -210,13 +210,10 @@ pub(crate) async fn messages(
         response_tx,
     };
 
-    state
-        .request_tx
-        .try_send(worker_req)
-        .map_err(|e| match e {
-            std::sync::mpsc::TrySendError::Full(_) => StatusCode::SERVICE_UNAVAILABLE,
-            std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        })?;
+    state.request_tx.try_send(worker_req).map_err(|e| match e {
+        std::sync::mpsc::TrySendError::Full(_) => StatusCode::SERVICE_UNAVAILABLE,
+        std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    })?;
 
     if req.stream && !has_tools {
         Ok(messages_stream(state, response_rx).await)
@@ -276,10 +273,8 @@ async fn messages_blocking(
 
     // Add tool_use blocks for each tool call.
     for call in &tool_calls {
-        let input: serde_json::Value =
-            serde_json::from_str(&call.function.arguments).unwrap_or(serde_json::Value::Object(
-                serde_json::Map::new(),
-            ));
+        let input: serde_json::Value = serde_json::from_str(&call.function.arguments)
+            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
         content.push(ContentBlock::ToolUse {
             id: call.id.clone(),
             name: call.function.name.clone(),

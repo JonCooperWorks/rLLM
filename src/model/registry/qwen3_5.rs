@@ -52,7 +52,8 @@
 // ===========================================================================
 
 use crate::gpu::{
-    GpuAllReduce, GpuAttention, GpuCore, GpuDeltaNet, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
+    GpuAllReduce, GpuAttention, GpuCore, GpuDeltaNet, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm,
+    GpuRope,
 };
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives::{self, Dims};
@@ -80,7 +81,9 @@ fn dn_layer_index(config: &crate::model::config::ModelConfig, layer_idx: usize) 
 }
 
 /// Run the DeltaNet attention sub-block for a single token.
-fn deltanet_attention_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuDeltaNet + GpuAllReduce>(
+fn deltanet_attention_block<
+    B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuDeltaNet + GpuAllReduce,
+>(
     m: &Model<'_, B>,
     layer_idx: usize,
     d: &Dims,
@@ -123,49 +126,74 @@ fn deltanet_attention_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + 
     let linear_norm = layer.linear_norm.as_ref().unwrap();
 
     // Step 1: RMSNorm → norm_buf.
-    m.backend.rms_norm(&m.hidden, &layer.input_layernorm, d.eps, &m.norm_buf);
+    m.backend
+        .rms_norm(&m.hidden, &layer.input_layernorm, d.eps, &m.norm_buf);
 
     // Step 2: Fused QKV matmul.
-    m.backend.matmul(in_proj_qkv, &m.norm_buf, qkv_buf, conv_dim, d.hidden_size);
+    m.backend
+        .matmul(in_proj_qkv, &m.norm_buf, qkv_buf, conv_dim, d.hidden_size);
 
     // Step 3: Gate projections.
-    m.backend.matmul(in_proj_a, &m.norm_buf, &m.q_buf, num_v_heads, d.hidden_size);
-    m.backend.matmul(in_proj_b, &m.norm_buf, &m.k_buf, num_v_heads, d.hidden_size);
-    m.backend.matmul(in_proj_z, &m.norm_buf, z_buf, v_dim, d.hidden_size);
+    m.backend
+        .matmul(in_proj_a, &m.norm_buf, &m.q_buf, num_v_heads, d.hidden_size);
+    m.backend
+        .matmul(in_proj_b, &m.norm_buf, &m.k_buf, num_v_heads, d.hidden_size);
+    m.backend
+        .matmul(in_proj_z, &m.norm_buf, z_buf, v_dim, d.hidden_size);
 
     // Step 4: Causal depthwise Conv1D on concatenated QKV.
-    m.backend.conv1d_depthwise_single(qkv_buf, conv_history, conv1d_weight, conv_out, conv_dim, kernel_size);
+    m.backend.conv1d_depthwise_single(
+        qkv_buf,
+        conv_history,
+        conv1d_weight,
+        conv_out,
+        conv_dim,
+        kernel_size,
+    );
 
     // Update conv history: shift left and append current token's QKV.
-    m.backend.conv1d_shift_history(conv_history, qkv_buf, conv_dim, kernel_size);
+    m.backend
+        .conv1d_shift_history(conv_history, qkv_buf, conv_dim, kernel_size);
 
     // Step 5: L2 normalize Q and K (per head, in-place on conv_out).
     m.backend.l2_normalize_heads(conv_out, num_qk_heads, hd, 0);
-    m.backend.l2_normalize_heads(conv_out, num_qk_heads, hd, qk_dim);
+    m.backend
+        .l2_normalize_heads(conv_out, num_qk_heads, hd, qk_dim);
 
     // Step 6: Compute decay and update gates.
-    m.backend.deltanet_decay_gate(&m.q_buf, dt_bias, a_log, alpha_buf, num_v_heads);
+    m.backend
+        .deltanet_decay_gate(&m.q_buf, dt_bias, a_log, alpha_buf, num_v_heads);
     m.backend.sigmoid(&m.k_buf, beta_buf, num_v_heads);
 
     // Step 7-8: DeltaNet state update + output computation.
     m.backend.deltanet_step(
-        state, conv_out, conv_out, conv_out,
-        alpha_buf, beta_buf, attn_out,
-        num_qk_heads, num_v_heads, hd,
-        0,       // Q offset
-        qk_dim,  // K offset
-        qk_dim * 2,  // V offset
+        state,
+        conv_out,
+        conv_out,
+        conv_out,
+        alpha_buf,
+        beta_buf,
+        attn_out,
+        num_qk_heads,
+        num_v_heads,
+        hd,
+        0,          // Q offset
+        qk_dim,     // K offset
+        qk_dim * 2, // V offset
     );
 
     // Step 9: Output gate — rmsnorm(attn_out, learned_norm) * silu(z).
-    m.backend.rms_norm_batch(attn_out, linear_norm, d.eps, norm_out, num_v_heads);
+    m.backend
+        .rms_norm_batch(attn_out, linear_norm, d.eps, norm_out, num_v_heads);
     m.backend.silu(z_buf, z_buf, v_dim);
     m.backend.mul(norm_out, z_buf, attn_out, v_dim);
 
     // Step 10: Output projection + AllReduce (row-split) + residual add.
-    m.backend.matmul(out_proj, attn_out, &m.norm_buf, d.hidden_size, v_dim);
+    m.backend
+        .matmul(out_proj, attn_out, &m.norm_buf, d.hidden_size, v_dim);
     m.backend.all_reduce_sum(&m.norm_buf, d.hidden_size); // no-op when world_size=1
-    m.backend.add(&m.hidden, &m.norm_buf, &m.hidden, d.hidden_size);
+    m.backend
+        .add(&m.hidden, &m.norm_buf, &m.hidden, d.hidden_size);
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +220,12 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
     let moe_output = m.moe_output.as_ref().unwrap();
 
     // Step 1: RMSNorm → norm_buf.
-    m.backend.rms_norm(&m.hidden, &layer.post_attention_layernorm, d.eps, &m.norm_buf);
+    m.backend.rms_norm(
+        &m.hidden,
+        &layer.post_attention_layernorm,
+        d.eps,
+        &m.norm_buf,
+    );
 
     // Step 2: Core MoE expert dispatch → moe_output.
     // Uses the shared primitive (same as Qwen3Moe, Mixtral, etc.).
@@ -223,23 +256,41 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
         let se_inter = m.config.shared_expert_intermediate_size as u32;
 
         // Compute scalar gate: sigmoid(se_gate @ norm_buf) → single f32.
-        m.backend.matmul(se_gate, &m.norm_buf, &m.up_buf, 1, d.hidden_size);
+        m.backend
+            .matmul(se_gate, &m.norm_buf, &m.up_buf, 1, d.hidden_size);
         let mut gate_bytes = vec![0u8; m.backend.tensor_byte_count(&m.up_buf)];
         m.backend.copy_to_host(&m.up_buf, &mut gate_bytes);
-        let gate_val: f32 = 1.0 / (1.0 + (-bytemuck::cast_slice::<u8, half::bf16>(&gate_bytes)[0].to_f32()).exp());
+        let gate_val: f32 =
+            1.0 / (1.0 + (-bytemuck::cast_slice::<u8, half::bf16>(&gate_bytes)[0].to_f32()).exp());
 
         // Shared expert SwiGLU FFN.
-        m.backend.matmul(se_gate_proj, &m.norm_buf, moe_gate_buf, se_inter, d.hidden_size);
-        m.backend.matmul(se_up_proj, &m.norm_buf, moe_up_buf, se_inter, d.hidden_size);
-        m.backend.silu_mul(moe_gate_buf, moe_up_buf, moe_gate_buf, se_inter);
-        m.backend.matmul(se_down_proj, moe_gate_buf, &m.gate_buf, d.hidden_size, se_inter);
+        m.backend.matmul(
+            se_gate_proj,
+            &m.norm_buf,
+            moe_gate_buf,
+            se_inter,
+            d.hidden_size,
+        );
+        m.backend
+            .matmul(se_up_proj, &m.norm_buf, moe_up_buf, se_inter, d.hidden_size);
+        m.backend
+            .silu_mul(moe_gate_buf, moe_up_buf, moe_gate_buf, se_inter);
+        m.backend.matmul(
+            se_down_proj,
+            moe_gate_buf,
+            &m.gate_buf,
+            d.hidden_size,
+            se_inter,
+        );
 
         // Add gated shared expert output to MoE output.
-        m.backend.scale_add(moe_output, &m.gate_buf, gate_val, d.hidden_size);
+        m.backend
+            .scale_add(moe_output, &m.gate_buf, gate_val, d.hidden_size);
     }
 
     // Step 4: Residual add: hidden += moe_output.
-    m.backend.add(&m.hidden, moe_output, &m.hidden, d.hidden_size);
+    m.backend
+        .add(&m.hidden, moe_output, &m.hidden, d.hidden_size);
 }
 
 // ---------------------------------------------------------------------------
@@ -255,14 +306,25 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
 // gate_proj/up_proj/down_proj per layer.
 // ---------------------------------------------------------------------------
 
-fn ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce>(m: &Model<'_, B>, layer_idx: usize, d: &Dims) {
+fn ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce>(
+    m: &Model<'_, B>,
+    layer_idx: usize,
+    d: &Dims,
+) {
     if m.config.is_moe() {
         moe_ffn_block(m, layer_idx, d);
     } else {
         let layer = &m.weights.layers[layer_idx];
         primitives::ffn_block(
-            m.backend, layer, &m.hidden, &m.norm_buf, &m.gate_buf, &m.up_buf,
-            d.eps, d.hidden_size, d.inter_size,
+            m.backend,
+            layer,
+            &m.hidden,
+            &m.norm_buf,
+            &m.gate_buf,
+            &m.up_buf,
+            d.eps,
+            d.hidden_size,
+            d.inter_size,
         );
     }
 }
@@ -272,7 +334,17 @@ fn ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce>(m
 // ===========================================================================
 
 /// Single-token forward pass using an external paged KV cache.
-pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed + GpuDeltaNet + GpuAllReduce>(
+pub(crate) fn forward_single_paged<
+    B: GpuCore
+        + GpuNorm
+        + GpuMatmul
+        + GpuRope
+        + GpuAttention
+        + GpuElementwise
+        + GpuEmbed
+        + GpuDeltaNet
+        + GpuAllReduce,
+>(
     m: &Model<'_, B>,
     token_id: u32,
     pool: &KvPool<B>,
@@ -291,42 +363,80 @@ pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
         } else {
             let layer = &m.weights.layers[layer_idx];
 
-            m.backend.rms_norm(&m.hidden, &layer.input_layernorm, d.eps, &m.norm_buf);
+            m.backend
+                .rms_norm(&m.hidden, &layer.input_layernorm, d.eps, &m.norm_buf);
             primitives::qkv_projection_qdim(
-                m.backend, layer, &m.norm_buf, &m.q_buf, &m.k_buf, &m.v_buf,
-                d.q_dim, d.hidden_size, d.kv_dim,
+                m.backend,
+                layer,
+                &m.norm_buf,
+                &m.q_buf,
+                &m.k_buf,
+                &m.v_buf,
+                d.q_dim,
+                d.hidden_size,
+                d.kv_dim,
             );
 
             if let (Some(q_norm), Some(k_norm)) = (&layer.q_norm, &layer.k_norm) {
-                m.backend.rms_norm_batch(&m.q_buf, q_norm, d.eps, &m.q_buf, d.num_heads);
-                m.backend.rms_norm_batch(&m.k_buf, k_norm, d.eps, &m.k_buf, d.num_kv_heads);
+                m.backend
+                    .rms_norm_batch(&m.q_buf, q_norm, d.eps, &m.q_buf, d.num_heads);
+                m.backend
+                    .rms_norm_batch(&m.k_buf, k_norm, d.eps, &m.k_buf, d.num_kv_heads);
             }
 
             m.backend.rope_partial(
-                &m.q_buf, &m.k_buf, pos, d.rope_theta,
-                d.num_heads, d.num_kv_heads, d.head_dim, rotary_dim,
+                &m.q_buf,
+                &m.k_buf,
+                pos,
+                d.rope_theta,
+                d.num_heads,
+                d.num_kv_heads,
+                d.head_dim,
+                rotary_dim,
             );
 
             let z_buf = m.dn_z_buf.as_ref();
             if has_output_gate {
                 let attn_z_proj = layer.attn_z_proj.as_ref().unwrap();
-                m.backend.matmul(attn_z_proj, &m.norm_buf, z_buf.unwrap(), d.q_dim, d.hidden_size);
+                m.backend.matmul(
+                    attn_z_proj,
+                    &m.norm_buf,
+                    z_buf.unwrap(),
+                    d.q_dim,
+                    d.hidden_size,
+                );
             }
 
             let kv_idx = m.kv_layer_map[layer_idx].unwrap();
             m.backend.copy_to_paged_kv_cache(
-                &m.k_buf, &pool.k_pool[kv_idx], &seq_state.block_table_gpu,
-                pos, d.num_kv_heads, d.head_dim,
+                &m.k_buf,
+                &pool.k_pool[kv_idx],
+                &seq_state.block_table_gpu,
+                pos,
+                d.num_kv_heads,
+                d.head_dim,
             );
             m.backend.copy_to_paged_kv_cache(
-                &m.v_buf, &pool.v_pool[kv_idx], &seq_state.block_table_gpu,
-                pos, d.num_kv_heads, d.head_dim,
+                &m.v_buf,
+                &pool.v_pool[kv_idx],
+                &seq_state.block_table_gpu,
+                pos,
+                d.num_kv_heads,
+                d.head_dim,
             );
             m.backend.paged_attention(
-                &m.q_buf, &pool.k_pool[kv_idx], &pool.v_pool[kv_idx],
-                &seq_state.block_table_gpu, &m.attn_out,
-                pos + 1, d.num_heads, d.num_kv_heads, d.head_dim,
-                0, 0.0, None,
+                &m.q_buf,
+                &pool.k_pool[kv_idx],
+                &pool.v_pool[kv_idx],
+                &seq_state.block_table_gpu,
+                &m.attn_out,
+                pos + 1,
+                d.num_heads,
+                d.num_kv_heads,
+                d.head_dim,
+                0,
+                0.0,
+                None,
             );
 
             if has_output_gate {
@@ -336,8 +446,13 @@ pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
             }
 
             primitives::o_proj_residual_qdim(
-                m.backend, layer, &m.attn_out, &m.norm_buf, &m.hidden,
-                d.hidden_size, d.q_dim,
+                m.backend,
+                layer,
+                &m.attn_out,
+                &m.norm_buf,
+                &m.hidden,
+                d.hidden_size,
+                d.q_dim,
             );
         }
 
@@ -345,8 +460,14 @@ pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
     }
 
     primitives::final_norm_and_lm_head(
-        m.backend, &m.weights, &m.hidden, &m.norm_buf, &m.logits_buf,
-        d.eps, d.hidden_size, m.config.vocab_size as u32,
+        m.backend,
+        &m.weights,
+        &m.hidden,
+        &m.norm_buf,
+        &m.logits_buf,
+        d.eps,
+        d.hidden_size,
+        m.config.vocab_size as u32,
     );
 
     Ok(())
@@ -369,7 +490,17 @@ pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
 // ===========================================================================
 
 /// Batched prefill for Qwen 3.5 hybrid model.
-pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed + GpuDeltaNet + GpuAllReduce>(
+pub(crate) fn forward_prefill_paged<
+    B: GpuCore
+        + GpuNorm
+        + GpuMatmul
+        + GpuRope
+        + GpuAttention
+        + GpuElementwise
+        + GpuEmbed
+        + GpuDeltaNet
+        + GpuAllReduce,
+>(
     m: &Model<'_, B>,
     tokens: &[u32],
     pool: &KvPool<B>,
@@ -401,10 +532,8 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
 
             for t in 0..tokens.len() {
                 let offset = t * hidden_byte_size;
-                m.backend.copy_to_tensor(
-                    &m.hidden,
-                    &host_hidden[offset..offset + hidden_byte_size],
-                );
+                m.backend
+                    .copy_to_tensor(&m.hidden, &host_hidden[offset..offset + hidden_byte_size]);
 
                 // Run DeltaNet attention + FFN on this single token.
                 deltanet_attention_block(m, layer_idx, &d);
@@ -413,32 +542,43 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
                 // Copy updated hidden back.
                 let mut token_hidden = vec![0u8; hidden_byte_size];
                 m.backend.copy_to_host(&m.hidden, &mut token_hidden);
-                host_hidden[offset..offset + hidden_byte_size]
-                    .copy_from_slice(&token_hidden);
+                host_hidden[offset..offset + hidden_byte_size].copy_from_slice(&token_hidden);
             }
 
             // Upload modified hidden states back to batch buffer.
             m.backend.copy_to_tensor(&bufs.hidden, &host_hidden);
-
         } else {
             // --- GQA layer: fully batched (GEMM + prefill attention) ---
             let has_output_gate = m.config.attn_output_gate;
 
             m.backend.rms_norm_batch(
-                &bufs.hidden, &layer.input_layernorm, d.eps, &bufs.norm_buf, bs,
+                &bufs.hidden,
+                &layer.input_layernorm,
+                d.eps,
+                &bufs.norm_buf,
+                bs,
             );
 
             primitives::qkv_projection_batch_qdim(
-                m.backend, layer, bufs, bs, d.q_dim, d.hidden_size, d.kv_dim,
+                m.backend,
+                layer,
+                bufs,
+                bs,
+                d.q_dim,
+                d.hidden_size,
+                d.kv_dim,
             );
 
             // QK-norm (batched): treat [batch_size * num_heads, head_dim] as batch.
             if let (Some(q_norm), Some(k_norm)) = (&layer.q_norm, &layer.k_norm) {
+                m.backend
+                    .rms_norm_batch(&bufs.q_buf, q_norm, d.eps, &bufs.q_buf, bs * d.num_heads);
                 m.backend.rms_norm_batch(
-                    &bufs.q_buf, q_norm, d.eps, &bufs.q_buf, bs * d.num_heads,
-                );
-                m.backend.rms_norm_batch(
-                    &bufs.k_buf, k_norm, d.eps, &bufs.k_buf, bs * d.num_kv_heads,
+                    &bufs.k_buf,
+                    k_norm,
+                    d.eps,
+                    &bufs.k_buf,
+                    bs * d.num_kv_heads,
                 );
             }
 
@@ -446,8 +586,12 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
             if has_output_gate {
                 let attn_z_proj = layer.attn_z_proj.as_ref().unwrap();
                 m.backend.matmul_batch(
-                    attn_z_proj, &bufs.norm_buf, &bufs.gate_buf,
-                    bs, d.q_dim, d.hidden_size,
+                    attn_z_proj,
+                    &bufs.norm_buf,
+                    &bufs.gate_buf,
+                    bs,
+                    d.q_dim,
+                    d.hidden_size,
                 );
             }
 
@@ -470,18 +614,22 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
                     let token_pos = start_pos + t as u32;
                     let mut q_upload = vec![0u8; q_tensor_bytes];
                     let mut k_upload = vec![0u8; k_tensor_bytes];
-                    q_upload[..q_row_bytes].copy_from_slice(
-                        &host_q[t * q_row_bytes..(t + 1) * q_row_bytes],
-                    );
-                    k_upload[..k_row_bytes].copy_from_slice(
-                        &host_k[t * k_row_bytes..(t + 1) * k_row_bytes],
-                    );
+                    q_upload[..q_row_bytes]
+                        .copy_from_slice(&host_q[t * q_row_bytes..(t + 1) * q_row_bytes]);
+                    k_upload[..k_row_bytes]
+                        .copy_from_slice(&host_k[t * k_row_bytes..(t + 1) * k_row_bytes]);
                     m.backend.copy_to_tensor(&m.q_buf, &q_upload);
                     m.backend.copy_to_tensor(&m.k_buf, &k_upload);
 
                     m.backend.rope_partial(
-                        &m.q_buf, &m.k_buf, token_pos, d.rope_theta,
-                        d.num_heads, d.num_kv_heads, d.head_dim, rotary_dim,
+                        &m.q_buf,
+                        &m.k_buf,
+                        token_pos,
+                        d.rope_theta,
+                        d.num_heads,
+                        d.num_kv_heads,
+                        d.head_dim,
+                        rotary_dim,
                     );
 
                     let mut q_out = vec![0u8; q_tensor_bytes];
@@ -499,63 +647,100 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
             }
             let kv_idx = m.kv_layer_map[layer_idx].unwrap();
             m.backend.copy_to_paged_kv_cache_batch(
-                &bufs.k_buf, &pool.k_pool[kv_idx], &seq_state.block_table_gpu,
-                &bufs.positions, bs, d.num_kv_heads, d.head_dim,
+                &bufs.k_buf,
+                &pool.k_pool[kv_idx],
+                &seq_state.block_table_gpu,
+                &bufs.positions,
+                bs,
+                d.num_kv_heads,
+                d.head_dim,
             );
             m.backend.copy_to_paged_kv_cache_batch(
-                &bufs.v_buf, &pool.v_pool[kv_idx], &seq_state.block_table_gpu,
-                &bufs.positions, bs, d.num_kv_heads, d.head_dim,
+                &bufs.v_buf,
+                &pool.v_pool[kv_idx],
+                &seq_state.block_table_gpu,
+                &bufs.positions,
+                bs,
+                d.num_kv_heads,
+                d.head_dim,
             );
             m.backend.prefill_attention(
-                &bufs.q_buf, &bufs.k_buf, &bufs.v_buf, &bufs.attn_out,
-                bs, start_pos, d.num_heads, d.num_kv_heads, d.head_dim,
-                0, 0.0, None,
+                &bufs.q_buf,
+                &bufs.k_buf,
+                &bufs.v_buf,
+                &bufs.attn_out,
+                bs,
+                start_pos,
+                d.num_heads,
+                d.num_kv_heads,
+                d.head_dim,
+                0,
+                0.0,
+                None,
             );
             // GQA output gate (batched): attn_out = attn_out * sigmoid(z).
             if has_output_gate {
                 let total_elems = bs * d.q_dim;
-                m.backend.sigmoid_bf16(&bufs.gate_buf, &bufs.gate_buf, total_elems);
-                m.backend.mul(&bufs.attn_out, &bufs.gate_buf, &bufs.attn_out, total_elems);
+                m.backend
+                    .sigmoid_bf16(&bufs.gate_buf, &bufs.gate_buf, total_elems);
+                m.backend
+                    .mul(&bufs.attn_out, &bufs.gate_buf, &bufs.attn_out, total_elems);
             }
 
             primitives::o_proj_residual_batch_qdim(
-                m.backend, layer, bufs, bs, d.hidden_size, d.q_dim,
+                m.backend,
+                layer,
+                bufs,
+                bs,
+                d.hidden_size,
+                d.q_dim,
             );
 
             // FFN sub-block: MoE requires token-by-token routing (each token
             // picks different experts), so we round-trip through host memory.
             // Dense models can use batched GEMM for the entire prefill chunk.
             if m.config.is_moe() {
-                let hidden_byte_size = m.config.hidden_size * crate::gpu::TensorDtype::BF16.byte_size();
+                let hidden_byte_size =
+                    m.config.hidden_size * crate::gpu::TensorDtype::BF16.byte_size();
                 let full_bytes = m.backend.tensor_byte_count(&bufs.hidden);
                 let mut host_hidden = vec![0u8; full_bytes];
                 m.backend.copy_to_host(&bufs.hidden, &mut host_hidden);
 
                 for t in 0..tokens.len() {
                     let offset = t * hidden_byte_size;
-                    m.backend.copy_to_tensor(
-                        &m.hidden,
-                        &host_hidden[offset..offset + hidden_byte_size],
-                    );
+                    m.backend
+                        .copy_to_tensor(&m.hidden, &host_hidden[offset..offset + hidden_byte_size]);
                     moe_ffn_block(m, layer_idx, &d);
                     let mut token_hidden = vec![0u8; hidden_byte_size];
                     m.backend.copy_to_host(&m.hidden, &mut token_hidden);
-                    host_hidden[offset..offset + hidden_byte_size]
-                        .copy_from_slice(&token_hidden);
+                    host_hidden[offset..offset + hidden_byte_size].copy_from_slice(&token_hidden);
                 }
 
                 m.backend.copy_to_tensor(&bufs.hidden, &host_hidden);
             } else {
                 primitives::ffn_block_batch(
-                    m.backend, layer, bufs, d.eps, bs, d.hidden_size, d.inter_size,
+                    m.backend,
+                    layer,
+                    bufs,
+                    d.eps,
+                    bs,
+                    d.hidden_size,
+                    d.inter_size,
                 );
             }
         }
     }
 
     primitives::final_norm_and_lm_head_prefill(
-        m.backend, &m.weights, bufs, &m.norm_buf, &m.logits_buf,
-        d.eps, bs, m.config.hidden_size, m.config.vocab_size as u32,
+        m.backend,
+        &m.weights,
+        bufs,
+        &m.norm_buf,
+        &m.logits_buf,
+        d.eps,
+        bs,
+        m.config.hidden_size,
+        m.config.vocab_size as u32,
     );
 
     Ok(())

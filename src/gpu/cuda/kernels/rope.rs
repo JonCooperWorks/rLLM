@@ -107,12 +107,14 @@ impl GpuRope for CudaBackend {
         let block = 256.min(total_pairs);
         let cfg = CudaBackend::cfg_1d(total_pairs, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_rope)
+            self.stream
+                .launch_builder(&self.fn_rope)
                 .arg(&params)
                 .arg(&q.buf)
                 .arg(&k.buf)
                 .launch(cfg)
-        }.expect("rope launch failed");
+        }
+        .expect("rope launch failed");
     }
 
     fn rope_batch(
@@ -138,13 +140,15 @@ impl GpuRope for CudaBackend {
         let block = 256.min(total);
         let cfg = CudaBackend::cfg_1d(total, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_rope_batch)
+            self.stream
+                .launch_builder(&self.fn_rope_batch)
                 .arg(&params)
                 .arg(&q.buf)
                 .arg(&k.buf)
                 .arg(&positions.buf)
                 .launch(cfg)
-        }.expect("rope_batch launch failed");
+        }
+        .expect("rope_batch launch failed");
     }
 
     fn rope_partial(
@@ -171,12 +175,14 @@ impl GpuRope for CudaBackend {
         let block = 256.min(total_pairs);
         let cfg = CudaBackend::cfg_1d(total_pairs, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_rope_partial)
+            self.stream
+                .launch_builder(&self.fn_rope_partial)
                 .arg(&params)
                 .arg(&q.buf)
                 .arg(&k.buf)
                 .launch(cfg)
-        }.expect("rope_partial launch failed");
+        }
+        .expect("rope_partial launch failed");
     }
 
     fn rope_yarn(
@@ -208,12 +214,14 @@ impl GpuRope for CudaBackend {
         let block = 256.min(total_pairs);
         let cfg = CudaBackend::cfg_1d(total_pairs, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_rope_yarn)
+            self.stream
+                .launch_builder(&self.fn_rope_yarn)
                 .arg(&params)
                 .arg(&q.buf)
                 .arg(&k.buf)
                 .launch(cfg)
-        }.expect("rope_yarn launch failed");
+        }
+        .expect("rope_yarn launch failed");
     }
 
     fn rope_yarn_batch(
@@ -247,12 +255,14 @@ impl GpuRope for CudaBackend {
         let block = 256.min(total);
         let cfg = CudaBackend::cfg_1d(total, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_rope_yarn_batch)
+            self.stream
+                .launch_builder(&self.fn_rope_yarn_batch)
                 .arg(&params)
                 .arg(&q.buf)
                 .arg(&k.buf)
                 .arg(&positions.buf)
                 .launch(cfg)
-        }.expect("rope_yarn_batch launch failed");
+        }
+        .expect("rope_yarn_batch launch failed");
     }
 }

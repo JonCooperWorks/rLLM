@@ -103,7 +103,16 @@ fn layer_window_size(config: &crate::model::config::ModelConfig, layer_idx: usiz
 // ===========================================================================
 
 /// Single-token forward pass using an external paged KV cache.
-pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed + GpuAllReduce>(
+pub(crate) fn forward_single_paged<
+    B: GpuCore
+        + GpuNorm
+        + GpuMatmul
+        + GpuRope
+        + GpuAttention
+        + GpuElementwise
+        + GpuEmbed
+        + GpuAllReduce,
+>(
     m: &Model<'_, B>,
     token_id: u32,
     pool: &KvPool<B>,
@@ -127,7 +136,8 @@ pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
     primitives::embed_token(m.backend, &m.weights, token_id, &m.hidden, d.hidden_size);
     // Scale embeddings by sqrt(hidden_size) — Gemma's way of ensuring the
     // embedding vectors start at the right magnitude for the residual stream.
-    m.backend.scalar_mul(&m.hidden, &m.hidden, embed_scale, d.hidden_size);
+    m.backend
+        .scalar_mul(&m.hidden, &m.hidden, embed_scale, d.hidden_size);
     profile::record(m.backend, t, Component::Embed);
 
     for layer_idx in 0..m.config.num_hidden_layers {
@@ -139,46 +149,83 @@ pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
         let t = profile::begin(m.backend);
 
         // Pre-attention norm.
-        m.backend.rms_norm(&m.hidden, &layer.input_layernorm, d.eps, &m.norm_buf);
+        m.backend
+            .rms_norm(&m.hidden, &layer.input_layernorm, d.eps, &m.norm_buf);
 
         // Q/K/V projections (q_dim may differ from hidden_size, e.g. 4B: 2048 vs 2560).
         primitives::qkv_projection_qdim(
-            m.backend, layer, &m.norm_buf, &m.q_buf, &m.k_buf, &m.v_buf,
-            d.q_dim, d.hidden_size, d.kv_dim,
+            m.backend,
+            layer,
+            &m.norm_buf,
+            &m.q_buf,
+            &m.k_buf,
+            &m.v_buf,
+            d.q_dim,
+            d.hidden_size,
+            d.kv_dim,
         );
 
         // QK-norm: per-head RMSNorm on Q and K after projection, before RoPE.
         if let (Some(q_norm), Some(k_norm)) = (&layer.q_norm, &layer.k_norm) {
-            m.backend.rms_norm_batch(&m.q_buf, q_norm, d.eps, &m.q_buf, d.num_heads);
-            m.backend.rms_norm_batch(&m.k_buf, k_norm, d.eps, &m.k_buf, d.num_kv_heads);
+            m.backend
+                .rms_norm_batch(&m.q_buf, q_norm, d.eps, &m.q_buf, d.num_heads);
+            m.backend
+                .rms_norm_batch(&m.k_buf, k_norm, d.eps, &m.k_buf, d.num_kv_heads);
         }
 
         // RoPE with layer-specific theta (local vs global).
         primitives::apply_rope(
-            m.backend, &m.q_buf, &m.k_buf, pos, rope_theta,
-            d.num_heads, d.num_kv_heads, d.head_dim,
+            m.backend,
+            &m.q_buf,
+            &m.k_buf,
+            pos,
+            rope_theta,
+            d.num_heads,
+            d.num_kv_heads,
+            d.head_dim,
         );
 
         // Paged KV cache write + attention with sliding window + custom scale.
         primitives::paged_kv_and_attention(
-            m.backend, &m.k_buf, &m.v_buf, &m.q_buf, &m.attn_out,
-            pool, seq_state, layer_idx, pos,
-            d.num_heads, d.num_kv_heads, d.head_dim,
-            window_size, attn_scale, None,
+            m.backend,
+            &m.k_buf,
+            &m.v_buf,
+            &m.q_buf,
+            &m.attn_out,
+            pool,
+            seq_state,
+            layer_idx,
+            pos,
+            d.num_heads,
+            d.num_kv_heads,
+            d.head_dim,
+            window_size,
+            attn_scale,
+            None,
         );
 
         // O projection into norm_buf (reused as scratch).
         // O weight shape: [hidden_size, q_dim] — maps attention output back to residual stream.
-        m.backend.matmul(&layer.o_proj, &m.attn_out, &m.norm_buf, d.hidden_size, d.q_dim);
+        m.backend.matmul(
+            &layer.o_proj,
+            &m.attn_out,
+            &m.norm_buf,
+            d.hidden_size,
+            d.q_dim,
+        );
 
         // Post-attention norm (sandwich norm): normalise before adding to residual.
         // This is the key Gemma 3 difference — Llama skips this step.
         m.backend.rms_norm(
-            &m.norm_buf, &layer.post_attention_layernorm, d.eps, &m.norm_buf,
+            &m.norm_buf,
+            &layer.post_attention_layernorm,
+            d.eps,
+            &m.norm_buf,
         );
 
         // Residual add.
-        m.backend.add(&m.hidden, &m.norm_buf, &m.hidden, d.hidden_size);
+        m.backend
+            .add(&m.hidden, &m.norm_buf, &m.hidden, d.hidden_size);
         profile::record(m.backend, t, Component::Attention);
 
         // --- FFN sub-block (with sandwich norms + GeGLU) ---
@@ -186,35 +233,64 @@ pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
 
         // Pre-FFN norm.
         let pre_ffn_norm = layer.pre_feedforward_layernorm.as_ref().unwrap();
-        m.backend.rms_norm(&m.hidden, pre_ffn_norm, d.eps, &m.norm_buf);
+        m.backend
+            .rms_norm(&m.hidden, pre_ffn_norm, d.eps, &m.norm_buf);
 
         // Gate and up projections.
-        m.backend.matmul(&layer.gate_proj, &m.norm_buf, &m.gate_buf, d.inter_size, d.hidden_size);
-        m.backend.matmul(&layer.up_proj, &m.norm_buf, &m.up_buf, d.inter_size, d.hidden_size);
+        m.backend.matmul(
+            &layer.gate_proj,
+            &m.norm_buf,
+            &m.gate_buf,
+            d.inter_size,
+            d.hidden_size,
+        );
+        m.backend.matmul(
+            &layer.up_proj,
+            &m.norm_buf,
+            &m.up_buf,
+            d.inter_size,
+            d.hidden_size,
+        );
 
         // GeGLU or SwiGLU activation.
         if uses_geglu {
-            m.backend.gelu_mul(&m.gate_buf, &m.up_buf, &m.gate_buf, d.inter_size);
+            m.backend
+                .gelu_mul(&m.gate_buf, &m.up_buf, &m.gate_buf, d.inter_size);
         } else {
-            m.backend.silu_mul(&m.gate_buf, &m.up_buf, &m.gate_buf, d.inter_size);
+            m.backend
+                .silu_mul(&m.gate_buf, &m.up_buf, &m.gate_buf, d.inter_size);
         }
 
         // Down projection.
-        m.backend.matmul(&layer.down_proj, &m.gate_buf, &m.norm_buf, d.hidden_size, d.inter_size);
+        m.backend.matmul(
+            &layer.down_proj,
+            &m.gate_buf,
+            &m.norm_buf,
+            d.hidden_size,
+            d.inter_size,
+        );
 
         // Post-FFN norm (sandwich norm).
         let post_ffn_norm = layer.post_feedforward_layernorm.as_ref().unwrap();
-        m.backend.rms_norm(&m.norm_buf, post_ffn_norm, d.eps, &m.norm_buf);
+        m.backend
+            .rms_norm(&m.norm_buf, post_ffn_norm, d.eps, &m.norm_buf);
 
         // Residual add.
-        m.backend.add(&m.hidden, &m.norm_buf, &m.hidden, d.hidden_size);
+        m.backend
+            .add(&m.hidden, &m.norm_buf, &m.hidden, d.hidden_size);
         profile::record(m.backend, t, Component::Ffn);
     }
 
     let t = profile::begin(m.backend);
     primitives::final_norm_and_lm_head(
-        m.backend, &m.weights, &m.hidden, &m.norm_buf, &m.logits_buf,
-        d.eps, d.hidden_size, m.config.vocab_size as u32,
+        m.backend,
+        &m.weights,
+        &m.hidden,
+        &m.norm_buf,
+        &m.logits_buf,
+        d.eps,
+        d.hidden_size,
+        m.config.vocab_size as u32,
     );
     profile::record(m.backend, t, Component::Other);
 
@@ -235,7 +311,16 @@ pub(crate) fn forward_single_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + 
 // ===========================================================================
 
 /// Batched prefill: process entire prompt in one GEMM-based forward pass.
-pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed + GpuAllReduce>(
+pub(crate) fn forward_prefill_paged<
+    B: GpuCore
+        + GpuNorm
+        + GpuMatmul
+        + GpuRope
+        + GpuAttention
+        + GpuElementwise
+        + GpuEmbed
+        + GpuAllReduce,
+>(
     m: &Model<'_, B>,
     tokens: &[u32],
     pool: &KvPool<B>,
@@ -258,7 +343,8 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
     primitives::embed_batch(m.backend, &m.weights, bufs, bs, d.hidden_size);
 
     // Scale all embeddings by sqrt(hidden_size).
-    m.backend.scalar_mul(&bufs.hidden, &bufs.hidden, embed_scale, bs * d.hidden_size);
+    m.backend
+        .scalar_mul(&bufs.hidden, &bufs.hidden, embed_scale, bs * d.hidden_size);
 
     for layer_idx in 0..m.config.num_hidden_layers {
         let layer = &m.weights.layers[layer_idx];
@@ -266,73 +352,165 @@ pub(crate) fn forward_prefill_paged<B: GpuCore + GpuNorm + GpuMatmul + GpuRope +
         let window_size = layer_window_size(&m.config, layer_idx);
 
         // Pre-attention norm (batched).
-        m.backend.rms_norm_batch(&bufs.hidden, &layer.input_layernorm, d.eps, &bufs.norm_buf, bs);
-        primitives::qkv_projection_batch_qdim(m.backend, layer, bufs, bs, d.q_dim, d.hidden_size, d.kv_dim);
+        m.backend.rms_norm_batch(
+            &bufs.hidden,
+            &layer.input_layernorm,
+            d.eps,
+            &bufs.norm_buf,
+            bs,
+        );
+        primitives::qkv_projection_batch_qdim(
+            m.backend,
+            layer,
+            bufs,
+            bs,
+            d.q_dim,
+            d.hidden_size,
+            d.kv_dim,
+        );
 
         // QK-norm: per-head RMSNorm on Q and K after projection, before RoPE.
         if let (Some(q_norm), Some(k_norm)) = (&layer.q_norm, &layer.k_norm) {
-            m.backend.rms_norm_batch(&bufs.q_buf, q_norm, d.eps, &bufs.q_buf, bs * d.num_heads);
-            m.backend.rms_norm_batch(&bufs.k_buf, k_norm, d.eps, &bufs.k_buf, bs * d.num_kv_heads);
+            m.backend
+                .rms_norm_batch(&bufs.q_buf, q_norm, d.eps, &bufs.q_buf, bs * d.num_heads);
+            m.backend
+                .rms_norm_batch(&bufs.k_buf, k_norm, d.eps, &bufs.k_buf, bs * d.num_kv_heads);
         }
 
         // RoPE with per-layer theta.
-        primitives::apply_rope_batch(m.backend, bufs, rope_theta, bs, d.num_heads, d.num_kv_heads, d.head_dim);
+        primitives::apply_rope_batch(
+            m.backend,
+            bufs,
+            rope_theta,
+            bs,
+            d.num_heads,
+            d.num_kv_heads,
+            d.head_dim,
+        );
 
         // KV cache write + prefill attention with sliding window.
         primitives::paged_kv_and_prefill_attention(
-            m.backend, bufs, pool, seq_state, layer_idx,
-            bs, start_pos, d.num_heads, d.num_kv_heads, d.head_dim,
-            window_size, attn_scale, None,
+            m.backend,
+            bufs,
+            pool,
+            seq_state,
+            layer_idx,
+            bs,
+            start_pos,
+            d.num_heads,
+            d.num_kv_heads,
+            d.head_dim,
+            window_size,
+            attn_scale,
+            None,
         );
 
         // O projection (batched): O weight [hidden_size, q_dim].
         m.backend.matmul_batch(
-            &layer.o_proj, &bufs.attn_out, &bufs.norm_buf,
-            bs, d.hidden_size, d.q_dim,
+            &layer.o_proj,
+            &bufs.attn_out,
+            &bufs.norm_buf,
+            bs,
+            d.hidden_size,
+            d.q_dim,
         );
 
         // Post-attention norm (batched sandwich norm).
         m.backend.rms_norm_batch(
-            &bufs.norm_buf, &layer.post_attention_layernorm, d.eps, &bufs.norm_buf, bs,
+            &bufs.norm_buf,
+            &layer.post_attention_layernorm,
+            d.eps,
+            &bufs.norm_buf,
+            bs,
         );
 
         // Residual add.
-        m.backend.add(&bufs.hidden, &bufs.norm_buf, &bufs.hidden, bs * d.hidden_size);
+        m.backend.add(
+            &bufs.hidden,
+            &bufs.norm_buf,
+            &bufs.hidden,
+            bs * d.hidden_size,
+        );
 
         // --- FFN sub-block with sandwich norms + GeGLU ---
 
         // Pre-FFN norm (batched).
         let pre_ffn_norm = layer.pre_feedforward_layernorm.as_ref().unwrap();
-        m.backend.rms_norm_batch(&bufs.hidden, pre_ffn_norm, d.eps, &bufs.norm_buf, bs);
+        m.backend
+            .rms_norm_batch(&bufs.hidden, pre_ffn_norm, d.eps, &bufs.norm_buf, bs);
 
         // Gate/up projections (GEMM).
-        m.backend.matmul_batch(&layer.gate_proj, &bufs.norm_buf, &bufs.gate_buf, bs, d.inter_size, d.hidden_size);
-        m.backend.matmul_batch(&layer.up_proj, &bufs.norm_buf, &bufs.up_buf, bs, d.inter_size, d.hidden_size);
+        m.backend.matmul_batch(
+            &layer.gate_proj,
+            &bufs.norm_buf,
+            &bufs.gate_buf,
+            bs,
+            d.inter_size,
+            d.hidden_size,
+        );
+        m.backend.matmul_batch(
+            &layer.up_proj,
+            &bufs.norm_buf,
+            &bufs.up_buf,
+            bs,
+            d.inter_size,
+            d.hidden_size,
+        );
 
         // GeGLU or SwiGLU activation.
         if uses_geglu {
-            m.backend.gelu_mul(&bufs.gate_buf, &bufs.up_buf, &bufs.gate_buf, bs * d.inter_size);
+            m.backend.gelu_mul(
+                &bufs.gate_buf,
+                &bufs.up_buf,
+                &bufs.gate_buf,
+                bs * d.inter_size,
+            );
         } else {
-            m.backend.silu_mul(&bufs.gate_buf, &bufs.up_buf, &bufs.gate_buf, bs * d.inter_size);
+            m.backend.silu_mul(
+                &bufs.gate_buf,
+                &bufs.up_buf,
+                &bufs.gate_buf,
+                bs * d.inter_size,
+            );
         }
 
         // Down projection.
-        m.backend.matmul_batch(&layer.down_proj, &bufs.gate_buf, &bufs.norm_buf, bs, d.hidden_size, d.inter_size);
+        m.backend.matmul_batch(
+            &layer.down_proj,
+            &bufs.gate_buf,
+            &bufs.norm_buf,
+            bs,
+            d.hidden_size,
+            d.inter_size,
+        );
 
         // Post-FFN norm (batched sandwich norm).
         let post_ffn_norm = layer.post_feedforward_layernorm.as_ref().unwrap();
-        m.backend.rms_norm_batch(&bufs.norm_buf, post_ffn_norm, d.eps, &bufs.norm_buf, bs);
+        m.backend
+            .rms_norm_batch(&bufs.norm_buf, post_ffn_norm, d.eps, &bufs.norm_buf, bs);
 
         // Residual add.
-        m.backend.add(&bufs.hidden, &bufs.norm_buf, &bufs.hidden, bs * d.hidden_size);
+        m.backend.add(
+            &bufs.hidden,
+            &bufs.norm_buf,
+            &bufs.hidden,
+            bs * d.hidden_size,
+        );
 
         // Submit this layer's work so the GPU starts executing while we encode the next layer.
         m.backend.submit();
     }
 
     primitives::final_norm_and_lm_head_prefill(
-        m.backend, &m.weights, bufs, &m.norm_buf, &m.logits_buf,
-        d.eps, bs, m.config.hidden_size, m.config.vocab_size as u32,
+        m.backend,
+        &m.weights,
+        bufs,
+        &m.norm_buf,
+        &m.logits_buf,
+        d.eps,
+        bs,
+        m.config.hidden_size,
+        m.config.vocab_size as u32,
     );
 
     Ok(())

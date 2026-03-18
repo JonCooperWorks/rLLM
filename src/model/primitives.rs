@@ -2,7 +2,7 @@
 // Shared transformer primitives — building blocks that model families compose.
 //
 // These functions implement the common operations found in most transformer
-// architectures (Llama, Qwen, DeepSeek, etc.).  Each model family's forward
+// architectures (Llama, Qwen, Gemma, etc.).  Each model family's forward
 // pass calls these primitives in its own specific order with its own
 // configuration (e.g., with or without QKV bias).
 //
@@ -18,11 +18,11 @@
 use crate::gpu::{
     GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
 };
-use crate::model::config::RopeScaling;
+use crate::model::PrefillBuffers;
 use crate::model::config::ModelConfig;
+use crate::model::config::RopeScaling;
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::loader::{ExpertWeights, LayerWeights, ModelWeights};
-use crate::model::PrefillBuffers;
 
 // ===========================================================================
 // Dims — pre-computed dimension constants extracted from ModelConfig.
@@ -132,7 +132,13 @@ pub(crate) fn final_norm_and_lm_head<B: GpuNorm + GpuMatmul>(
 ) {
     backend.rms_norm(hidden, &weights.norm_weight, eps, norm_buf);
     let lm_head_weight = weights.lm_head.as_ref().unwrap_or(&weights.embed_tokens);
-    backend.matmul(lm_head_weight, norm_buf, logits_buf, vocab_size, hidden_size);
+    backend.matmul(
+        lm_head_weight,
+        norm_buf,
+        logits_buf,
+        vocab_size,
+        hidden_size,
+    );
 }
 
 // ===========================================================================
@@ -209,7 +215,15 @@ pub(crate) fn apply_rope<B: GpuRope>(
     num_kv_heads: u32,
     head_dim: u32,
 ) {
-    backend.rope(q_buf, k_buf, pos, rope_theta, num_heads, num_kv_heads, head_dim);
+    backend.rope(
+        q_buf,
+        k_buf,
+        pos,
+        rope_theta,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+    );
 }
 
 /// Write K/V to paged cache and compute attention.
@@ -241,11 +255,20 @@ pub(crate) fn paged_kv_and_attention<B: GpuAttention>(
     sinks: Option<&B::Tensor>,
 ) {
     backend.paged_attention_fused(
-        q_buf, k_buf, v_buf,
-        &pool.k_pool[layer_idx], &pool.v_pool[layer_idx],
-        &seq_state.block_table_gpu, attn_out,
-        pos, num_heads, num_kv_heads, head_dim,
-        window_size, attn_scale, sinks,
+        q_buf,
+        k_buf,
+        v_buf,
+        &pool.k_pool[layer_idx],
+        &pool.v_pool[layer_idx],
+        &seq_state.block_table_gpu,
+        attn_out,
+        pos,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        window_size,
+        attn_scale,
+        sinks,
     );
 }
 
@@ -299,10 +322,22 @@ pub(crate) fn ffn_block<B: GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce>(
     inter_size: u32,
 ) {
     backend.rms_norm(hidden, &layer.post_attention_layernorm, eps, norm_buf);
-    backend.matmul(&layer.gate_proj, norm_buf, gate_buf, inter_size, hidden_size);
+    backend.matmul(
+        &layer.gate_proj,
+        norm_buf,
+        gate_buf,
+        inter_size,
+        hidden_size,
+    );
     backend.matmul(&layer.up_proj, norm_buf, up_buf, inter_size, hidden_size);
     backend.silu_mul(gate_buf, up_buf, gate_buf, inter_size);
-    backend.matmul(&layer.down_proj, gate_buf, norm_buf, hidden_size, inter_size);
+    backend.matmul(
+        &layer.down_proj,
+        gate_buf,
+        norm_buf,
+        hidden_size,
+        inter_size,
+    );
     backend.all_reduce_sum(norm_buf, hidden_size); // no-op when world_size=1
     backend.add(hidden, norm_buf, hidden, hidden_size);
 }
@@ -362,9 +397,19 @@ pub(crate) fn moe_ffn_block<B: GpuNorm + GpuMatmul + GpuElementwise>(
 
     // Core expert dispatch → moe_output.
     moe_expert_dispatch(
-        backend, router_gate, experts,
-        norm_buf, moe_gate_buf, moe_up_buf, moe_output, routing_output, down_buf,
-        hidden_size, moe_inter, num_experts, num_experts_per_tok,
+        backend,
+        router_gate,
+        experts,
+        norm_buf,
+        moe_gate_buf,
+        moe_up_buf,
+        moe_output,
+        routing_output,
+        down_buf,
+        hidden_size,
+        moe_inter,
+        num_experts,
+        num_experts_per_tok,
     );
 
     // Residual add: hidden += moe_output.
@@ -399,10 +444,21 @@ pub(crate) fn moe_expert_dispatch<B: GpuMatmul + GpuElementwise>(
     num_experts_per_tok: usize,
 ) {
     // Router matmul — compute per-expert scores.
-    backend.matmul(router_gate, norm_buf, moe_gate_buf, num_experts as u32, hidden_size);
+    backend.matmul(
+        router_gate,
+        norm_buf,
+        moe_gate_buf,
+        num_experts as u32,
+        hidden_size,
+    );
 
     // GPU-side top-k + softmax.
-    backend.top_k_softmax(moe_gate_buf, routing_output, num_experts as u32, num_experts_per_tok as u32);
+    backend.top_k_softmax(
+        moe_gate_buf,
+        routing_output,
+        num_experts as u32,
+        num_experts_per_tok as u32,
+    );
 
     // Read routing results to CPU.
     let k = num_experts_per_tok;
@@ -421,10 +477,28 @@ pub(crate) fn moe_expert_dispatch<B: GpuMatmul + GpuElementwise>(
 
     for &(expert_idx, routing_weight) in &selected {
         let expert = &experts[expert_idx];
-        backend.matmul(&expert.gate_proj, norm_buf, moe_gate_buf, moe_inter, hidden_size);
-        backend.matmul(&expert.up_proj, norm_buf, moe_up_buf, moe_inter, hidden_size);
+        backend.matmul(
+            &expert.gate_proj,
+            norm_buf,
+            moe_gate_buf,
+            moe_inter,
+            hidden_size,
+        );
+        backend.matmul(
+            &expert.up_proj,
+            norm_buf,
+            moe_up_buf,
+            moe_inter,
+            hidden_size,
+        );
         backend.silu_mul(moe_gate_buf, moe_up_buf, moe_gate_buf, moe_inter);
-        backend.matmul(&expert.down_proj, moe_gate_buf, down_buf, hidden_size, moe_inter);
+        backend.matmul(
+            &expert.down_proj,
+            moe_gate_buf,
+            down_buf,
+            hidden_size,
+            moe_inter,
+        );
         backend.scale_add(moe_output, down_buf, routing_weight, hidden_size);
     }
 }
@@ -458,7 +532,11 @@ pub(crate) fn embed_batch<B: GpuEmbed>(
     hidden_size: u32,
 ) {
     backend.embed_lookup_batch(
-        &weights.embed_tokens, &bufs.token_ids, &bufs.hidden, bs, hidden_size,
+        &weights.embed_tokens,
+        &bufs.token_ids,
+        &bufs.hidden,
+        bs,
+        hidden_size,
     );
 }
 
@@ -471,9 +549,30 @@ pub(crate) fn qkv_projection_batch<B: GpuMatmul>(
     hidden_size: u32,
     kv_dim: u32,
 ) {
-    backend.matmul_batch(&layer.q_proj, &bufs.norm_buf, &bufs.q_buf, bs, hidden_size, hidden_size);
-    backend.matmul_batch(&layer.k_proj, &bufs.norm_buf, &bufs.k_buf, bs, kv_dim, hidden_size);
-    backend.matmul_batch(&layer.v_proj, &bufs.norm_buf, &bufs.v_buf, bs, kv_dim, hidden_size);
+    backend.matmul_batch(
+        &layer.q_proj,
+        &bufs.norm_buf,
+        &bufs.q_buf,
+        bs,
+        hidden_size,
+        hidden_size,
+    );
+    backend.matmul_batch(
+        &layer.k_proj,
+        &bufs.norm_buf,
+        &bufs.k_buf,
+        bs,
+        kv_dim,
+        hidden_size,
+    );
+    backend.matmul_batch(
+        &layer.v_proj,
+        &bufs.norm_buf,
+        &bufs.v_buf,
+        bs,
+        kv_dim,
+        hidden_size,
+    );
 }
 
 /// Batched QKV projection with explicit q_dim (for q_dim ≠ hidden_size).
@@ -486,9 +585,30 @@ pub(crate) fn qkv_projection_batch_qdim<B: GpuMatmul>(
     hidden_size: u32,
     kv_dim: u32,
 ) {
-    backend.matmul_batch(&layer.q_proj, &bufs.norm_buf, &bufs.q_buf, bs, q_dim, hidden_size);
-    backend.matmul_batch(&layer.k_proj, &bufs.norm_buf, &bufs.k_buf, bs, kv_dim, hidden_size);
-    backend.matmul_batch(&layer.v_proj, &bufs.norm_buf, &bufs.v_buf, bs, kv_dim, hidden_size);
+    backend.matmul_batch(
+        &layer.q_proj,
+        &bufs.norm_buf,
+        &bufs.q_buf,
+        bs,
+        q_dim,
+        hidden_size,
+    );
+    backend.matmul_batch(
+        &layer.k_proj,
+        &bufs.norm_buf,
+        &bufs.k_buf,
+        bs,
+        kv_dim,
+        hidden_size,
+    );
+    backend.matmul_batch(
+        &layer.v_proj,
+        &bufs.norm_buf,
+        &bufs.v_buf,
+        bs,
+        kv_dim,
+        hidden_size,
+    );
 }
 
 /// Apply QKV bias in batched mode (broadcast-add).
@@ -522,8 +642,14 @@ pub(crate) fn apply_rope_batch<B: GpuRope>(
     head_dim: u32,
 ) {
     backend.rope_batch(
-        &bufs.q_buf, &bufs.k_buf, &bufs.positions,
-        rope_theta, bs, num_heads, num_kv_heads, head_dim,
+        &bufs.q_buf,
+        &bufs.k_buf,
+        &bufs.positions,
+        rope_theta,
+        bs,
+        num_heads,
+        num_kv_heads,
+        head_dim,
     );
 }
 
@@ -547,17 +673,36 @@ pub(crate) fn paged_kv_and_prefill_attention<B: GpuAttention>(
     sinks: Option<&B::Tensor>,
 ) {
     backend.copy_to_paged_kv_cache_batch(
-        &bufs.k_buf, &pool.k_pool[layer_idx], &seq_state.block_table_gpu,
-        &bufs.positions, bs, num_kv_heads, head_dim,
+        &bufs.k_buf,
+        &pool.k_pool[layer_idx],
+        &seq_state.block_table_gpu,
+        &bufs.positions,
+        bs,
+        num_kv_heads,
+        head_dim,
     );
     backend.copy_to_paged_kv_cache_batch(
-        &bufs.v_buf, &pool.v_pool[layer_idx], &seq_state.block_table_gpu,
-        &bufs.positions, bs, num_kv_heads, head_dim,
+        &bufs.v_buf,
+        &pool.v_pool[layer_idx],
+        &seq_state.block_table_gpu,
+        &bufs.positions,
+        bs,
+        num_kv_heads,
+        head_dim,
     );
     backend.prefill_attention(
-        &bufs.q_buf, &bufs.k_buf, &bufs.v_buf, &bufs.attn_out,
-        bs, start_pos, num_heads, num_kv_heads, head_dim,
-        window_size, attn_scale, sinks,
+        &bufs.q_buf,
+        &bufs.k_buf,
+        &bufs.v_buf,
+        &bufs.attn_out,
+        bs,
+        start_pos,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        window_size,
+        attn_scale,
+        sinks,
     );
 }
 
@@ -569,7 +714,14 @@ pub(crate) fn o_proj_residual_batch<B: GpuMatmul + GpuElementwise + GpuAllReduce
     bs: u32,
     hidden_size: u32,
 ) {
-    backend.matmul_batch(&layer.o_proj, &bufs.attn_out, &bufs.norm_buf, bs, hidden_size, hidden_size);
+    backend.matmul_batch(
+        &layer.o_proj,
+        &bufs.attn_out,
+        &bufs.norm_buf,
+        bs,
+        hidden_size,
+        hidden_size,
+    );
     backend.all_reduce_sum(&bufs.norm_buf, bs * hidden_size); // no-op when world_size=1
     backend.add(&bufs.hidden, &bufs.norm_buf, &bufs.hidden, bs * hidden_size);
 }
@@ -583,7 +735,14 @@ pub(crate) fn o_proj_residual_batch_qdim<B: GpuMatmul + GpuElementwise + GpuAllR
     hidden_size: u32,
     q_dim: u32,
 ) {
-    backend.matmul_batch(&layer.o_proj, &bufs.attn_out, &bufs.norm_buf, bs, hidden_size, q_dim);
+    backend.matmul_batch(
+        &layer.o_proj,
+        &bufs.attn_out,
+        &bufs.norm_buf,
+        bs,
+        hidden_size,
+        q_dim,
+    );
     backend.all_reduce_sum(&bufs.norm_buf, bs * hidden_size); // no-op when world_size=1
     backend.add(&bufs.hidden, &bufs.norm_buf, &bufs.hidden, bs * hidden_size);
 }
@@ -598,11 +757,43 @@ pub(crate) fn ffn_block_batch<B: GpuNorm + GpuMatmul + GpuElementwise + GpuAllRe
     hidden_size: u32,
     inter_size: u32,
 ) {
-    backend.rms_norm_batch(&bufs.hidden, &layer.post_attention_layernorm, eps, &bufs.norm_buf, bs);
-    backend.matmul_batch(&layer.gate_proj, &bufs.norm_buf, &bufs.gate_buf, bs, inter_size, hidden_size);
-    backend.matmul_batch(&layer.up_proj, &bufs.norm_buf, &bufs.up_buf, bs, inter_size, hidden_size);
-    backend.silu_mul(&bufs.gate_buf, &bufs.up_buf, &bufs.gate_buf, bs * inter_size);
-    backend.matmul_batch(&layer.down_proj, &bufs.gate_buf, &bufs.norm_buf, bs, hidden_size, inter_size);
+    backend.rms_norm_batch(
+        &bufs.hidden,
+        &layer.post_attention_layernorm,
+        eps,
+        &bufs.norm_buf,
+        bs,
+    );
+    backend.matmul_batch(
+        &layer.gate_proj,
+        &bufs.norm_buf,
+        &bufs.gate_buf,
+        bs,
+        inter_size,
+        hidden_size,
+    );
+    backend.matmul_batch(
+        &layer.up_proj,
+        &bufs.norm_buf,
+        &bufs.up_buf,
+        bs,
+        inter_size,
+        hidden_size,
+    );
+    backend.silu_mul(
+        &bufs.gate_buf,
+        &bufs.up_buf,
+        &bufs.gate_buf,
+        bs * inter_size,
+    );
+    backend.matmul_batch(
+        &layer.down_proj,
+        &bufs.gate_buf,
+        &bufs.norm_buf,
+        bs,
+        hidden_size,
+        inter_size,
+    );
     backend.all_reduce_sum(&bufs.norm_buf, bs * hidden_size); // no-op when world_size=1
     backend.add(&bufs.hidden, &bufs.norm_buf, &bufs.hidden, bs * hidden_size);
 }
@@ -631,10 +822,19 @@ pub(crate) fn final_norm_and_lm_head_prefill<B: GpuCore + GpuNorm + GpuMatmul>(
     backend.copy_to_host(&bufs.norm_buf, &mut host_buf);
     let chunk_size = bs as usize;
     let last_row_start = (chunk_size - 1) * hidden_byte_size;
-    backend.copy_to_tensor(norm_buf, &host_buf[last_row_start..last_row_start + hidden_byte_size]);
+    backend.copy_to_tensor(
+        norm_buf,
+        &host_buf[last_row_start..last_row_start + hidden_byte_size],
+    );
 
     let lm_head_weight = weights.lm_head.as_ref().unwrap_or(&weights.embed_tokens);
-    backend.matmul(lm_head_weight, norm_buf, logits_buf, vocab_size, hidden_size as u32);
+    backend.matmul(
+        lm_head_weight,
+        norm_buf,
+        logits_buf,
+        vocab_size,
+        hidden_size as u32,
+    );
 }
 
 // ===========================================================================
@@ -691,7 +891,13 @@ pub(crate) fn moe_expert_dispatch_biased<B: GpuMatmul + GpuElementwise>(
     swiglu_limit: f32,
 ) {
     // Router matmul → per-expert scores.
-    backend.matmul(router_gate, norm_buf, moe_gate_buf, num_experts as u32, hidden_size);
+    backend.matmul(
+        router_gate,
+        norm_buf,
+        moe_gate_buf,
+        num_experts as u32,
+        hidden_size,
+    );
 
     // Router bias (GPT-OSS).
     if let Some(bias) = router_bias {
@@ -699,7 +905,12 @@ pub(crate) fn moe_expert_dispatch_biased<B: GpuMatmul + GpuElementwise>(
     }
 
     // GPU-side top-k + softmax.
-    backend.top_k_softmax(moe_gate_buf, routing_output, num_experts as u32, num_experts_per_tok as u32);
+    backend.top_k_softmax(
+        moe_gate_buf,
+        routing_output,
+        num_experts as u32,
+        num_experts_per_tok as u32,
+    );
 
     // Read routing results to CPU.
     let k = num_experts_per_tok;
@@ -720,8 +931,20 @@ pub(crate) fn moe_expert_dispatch_biased<B: GpuMatmul + GpuElementwise>(
         let expert = &experts[expert_idx];
 
         // Gate and up projections.
-        backend.matmul(&expert.gate_proj, norm_buf, moe_gate_buf, moe_inter, hidden_size);
-        backend.matmul(&expert.up_proj, norm_buf, moe_up_buf, moe_inter, hidden_size);
+        backend.matmul(
+            &expert.gate_proj,
+            norm_buf,
+            moe_gate_buf,
+            moe_inter,
+            hidden_size,
+        );
+        backend.matmul(
+            &expert.up_proj,
+            norm_buf,
+            moe_up_buf,
+            moe_inter,
+            hidden_size,
+        );
 
         // Expert gate and up biases (split during loading).
         if let Some(ref g_bias) = expert.gate_bias {
@@ -734,13 +957,26 @@ pub(crate) fn moe_expert_dispatch_biased<B: GpuMatmul + GpuElementwise>(
         // GPT-OSS gated activation: NOT standard SwiGLU.
         // Uses alpha=1.702 (fixed by architecture), asymmetric clamping, and (up+1) offset.
         if swiglu_limit > 0.0 {
-            backend.gpt_oss_gated_act(moe_gate_buf, moe_up_buf, moe_gate_buf, moe_inter, 1.702, swiglu_limit);
+            backend.gpt_oss_gated_act(
+                moe_gate_buf,
+                moe_up_buf,
+                moe_gate_buf,
+                moe_inter,
+                1.702,
+                swiglu_limit,
+            );
         } else {
             backend.silu_mul(moe_gate_buf, moe_up_buf, moe_gate_buf, moe_inter);
         }
 
         // Down projection.
-        backend.matmul(&expert.down_proj, moe_gate_buf, down_buf, hidden_size, moe_inter);
+        backend.matmul(
+            &expert.down_proj,
+            moe_gate_buf,
+            down_buf,
+            hidden_size,
+            moe_inter,
+        );
 
         // Expert down bias.
         if let Some(ref d_bias) = expert.down_bias {
@@ -775,9 +1011,21 @@ pub(crate) fn moe_ffn_block_biased<B: GpuNorm + GpuMatmul + GpuElementwise>(
 ) {
     backend.rms_norm(hidden, post_attn_norm, eps, norm_buf);
     moe_expert_dispatch_biased(
-        backend, router_gate, router_bias, experts,
-        norm_buf, moe_gate_buf, moe_up_buf, moe_output, routing_output, down_buf,
-        hidden_size, moe_inter, num_experts, num_experts_per_tok, swiglu_limit,
+        backend,
+        router_gate,
+        router_bias,
+        experts,
+        norm_buf,
+        moe_gate_buf,
+        moe_up_buf,
+        moe_output,
+        routing_output,
+        down_buf,
+        hidden_size,
+        moe_inter,
+        num_experts,
+        num_experts_per_tok,
+        swiglu_limit,
     );
     backend.add(hidden, moe_output, hidden, hidden_size);
 }
@@ -799,8 +1047,13 @@ pub(crate) fn apply_rope_yarn<B: GpuRope>(
     scaling: &RopeScaling,
 ) {
     backend.rope_yarn(
-        q_buf, k_buf, pos, rope_theta,
-        num_heads, num_kv_heads, head_dim,
+        q_buf,
+        k_buf,
+        pos,
+        rope_theta,
+        num_heads,
+        num_kv_heads,
+        head_dim,
         scaling.factor as f32,
         scaling.beta_fast as f32,
         scaling.beta_slow as f32,
@@ -820,8 +1073,14 @@ pub(crate) fn apply_rope_yarn_batch<B: GpuRope>(
     scaling: &RopeScaling,
 ) {
     backend.rope_yarn_batch(
-        &bufs.q_buf, &bufs.k_buf, &bufs.positions,
-        rope_theta, bs, num_heads, num_kv_heads, head_dim,
+        &bufs.q_buf,
+        &bufs.k_buf,
+        &bufs.positions,
+        rope_theta,
+        bs,
+        num_heads,
+        num_kv_heads,
+        head_dim,
         scaling.factor as f32,
         scaling.beta_fast as f32,
         scaling.beta_slow as f32,

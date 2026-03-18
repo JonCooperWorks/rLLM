@@ -120,9 +120,18 @@ pub(crate) trait GpuAttention: GpuCore {
         self.copy_to_paged_kv_cache(k, k_pool, block_table, pos, num_kv_heads, head_dim);
         self.copy_to_paged_kv_cache(v, v_pool, block_table, pos, num_kv_heads, head_dim);
         self.paged_attention(
-            q, k_pool, v_pool, block_table, out,
-            pos + 1, num_heads, num_kv_heads, head_dim,
-            window_size, attn_scale, sinks,
+            q,
+            k_pool,
+            v_pool,
+            block_table,
+            out,
+            pos + 1,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            window_size,
+            attn_scale,
+            sinks,
         );
     }
 

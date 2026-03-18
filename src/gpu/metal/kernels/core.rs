@@ -16,8 +16,8 @@ use metal::MTLResourceOptions;
 
 use super::super::backend::MetalBackend;
 use super::super::tensor::MetalTensor;
-use crate::gpu::ops::GpuCore;
 use crate::gpu::TensorDtype;
+use crate::gpu::ops::GpuCore;
 
 impl GpuCore for MetalBackend {
     type Tensor = MetalTensor;

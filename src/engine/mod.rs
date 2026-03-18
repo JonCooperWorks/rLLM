@@ -51,8 +51,8 @@
 // ===========================================================================
 
 pub(crate) mod dispatch;
-pub(crate) mod multi_gpu;
 pub(crate) mod loader;
+pub(crate) mod multi_gpu;
 
 use std::collections::{HashMap, VecDeque};
 
@@ -344,12 +344,15 @@ pub(crate) fn run_step<D: Dispatch>(
     let mut finished = Vec::new();
     for (id, seq) in finished_pairs {
         let text = tokenizer.decode(&seq.generated_tokens).unwrap_or_default();
-        let reason =
-            if seq.generated_tokens.last().map_or(false, |&t| tokenizer.is_eos(t)) {
-                FinishReason::Eos
-            } else {
-                FinishReason::MaxTokens
-            };
+        let reason = if seq
+            .generated_tokens
+            .last()
+            .map_or(false, |&t| tokenizer.is_eos(t))
+        {
+            FinishReason::Eos
+        } else {
+            FinishReason::MaxTokens
+        };
         finished.push(FinishedSequence {
             id,
             tokens: seq.generated_tokens,
@@ -438,17 +441,9 @@ impl<'a, B: GpuBackend> Dispatch for SingleGpuDispatch<'a, B> {
         Ok(())
     }
 
-    fn forward_prefill(
-        &self,
-        tokens: &[u32],
-        state: &SeqKvState<B>,
-    ) -> anyhow::Result<()> {
-        self.model.forward_prefill_paged(
-            tokens,
-            &self.kv_pool,
-            state,
-            &self.prefill_bufs,
-        )
+    fn forward_prefill(&self, tokens: &[u32], state: &SeqKvState<B>) -> anyhow::Result<()> {
+        self.model
+            .forward_prefill_paged(tokens, &self.kv_pool, state, &self.prefill_bufs)
     }
 
     fn finish_prefill(state: &mut SeqKvState<B>, token_count: usize) {
@@ -690,11 +685,7 @@ mod tests {
             Ok(())
         }
 
-        fn forward_prefill(
-            &self,
-            _tokens: &[u32],
-            _state: &MockSeqState,
-        ) -> anyhow::Result<()> {
+        fn forward_prefill(&self, _tokens: &[u32], _state: &MockSeqState) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -707,11 +698,7 @@ mod tests {
             Ok(())
         }
 
-        fn forward_decode(
-            &self,
-            _token: u32,
-            _state: &MockSeqState,
-        ) -> anyhow::Result<()> {
+        fn forward_decode(&self, _token: u32, _state: &MockSeqState) -> anyhow::Result<()> {
             Ok(())
         }
 

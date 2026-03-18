@@ -243,13 +243,10 @@ pub(crate) async fn chat_completions(
         response_tx,
     };
 
-    state
-        .request_tx
-        .try_send(worker_req)
-        .map_err(|e| match e {
-            std::sync::mpsc::TrySendError::Full(_) => StatusCode::SERVICE_UNAVAILABLE,
-            std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        })?;
+    state.request_tx.try_send(worker_req).map_err(|e| match e {
+        std::sync::mpsc::TrySendError::Full(_) => StatusCode::SERVICE_UNAVAILABLE,
+        std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    })?;
 
     // For non-streaming with tools, we need to collect all text to detect
     // tool calls.  For streaming without tools, we can stream directly.
@@ -425,13 +422,10 @@ pub(crate) async fn completions(
         response_tx,
     };
 
-    state
-        .request_tx
-        .try_send(worker_req)
-        .map_err(|e| match e {
-            std::sync::mpsc::TrySendError::Full(_) => StatusCode::SERVICE_UNAVAILABLE,
-            std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        })?;
+    state.request_tx.try_send(worker_req).map_err(|e| match e {
+        std::sync::mpsc::TrySendError::Full(_) => StatusCode::SERVICE_UNAVAILABLE,
+        std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    })?;
 
     if req.stream {
         Ok(completions_stream(state, response_rx).await)

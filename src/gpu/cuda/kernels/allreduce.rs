@@ -26,9 +26,7 @@ impl GpuAllReduce for CudaBackend {
         };
 
         // Get the raw device pointer from the tensor buffer.
-        let (dptr, _guard) = cudarc::driver::DevicePtr::<u8>::device_ptr(
-            &tensor.buf, &self.stream,
-        );
+        let (dptr, _guard) = cudarc::driver::DevicePtr::<u8>::device_ptr(&tensor.buf, &self.stream);
 
         // In-place AllReduce: src == dst, count = number of bf16 elements.
         unsafe {
@@ -56,12 +54,10 @@ impl GpuAllReduce for CudaBackend {
             return; // Single GPU — no-op.
         };
 
-        let (src_ptr, _guard1) = cudarc::driver::DevicePtr::<u8>::device_ptr(
-            &tensor.buf, &self.stream,
-        );
-        let (dst_ptr, _guard2) = cudarc::driver::DevicePtr::<u8>::device_ptr(
-            &output.buf, &self.stream,
-        );
+        let (src_ptr, _guard1) =
+            cudarc::driver::DevicePtr::<u8>::device_ptr(&tensor.buf, &self.stream);
+        let (dst_ptr, _guard2) =
+            cudarc::driver::DevicePtr::<u8>::device_ptr(&output.buf, &self.stream);
 
         unsafe {
             cudarc::nccl::result::all_gather(

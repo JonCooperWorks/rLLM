@@ -73,14 +73,16 @@ impl GpuDeltaNet for CudaBackend {
         let block = 256.min(dim);
         let cfg = CudaBackend::cfg_1d(dim, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_conv1d_depthwise)
+            self.stream
+                .launch_builder(&self.fn_conv1d_depthwise)
                 .arg(&params)
                 .arg(&input.buf)
                 .arg(&history.buf)
                 .arg(&weight.buf)
                 .arg(&out.buf)
                 .launch(cfg)
-        }.expect("conv1d_depthwise_single launch failed");
+        }
+        .expect("conv1d_depthwise_single launch failed");
     }
 
     fn conv1d_shift_history(
@@ -94,12 +96,14 @@ impl GpuDeltaNet for CudaBackend {
         let block = 256.min(dim);
         let cfg = CudaBackend::cfg_1d(dim, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_conv1d_shift)
+            self.stream
+                .launch_builder(&self.fn_conv1d_shift)
                 .arg(&params)
                 .arg(&history.buf)
                 .arg(&input.buf)
                 .launch(cfg)
-        }.expect("conv1d_shift_history launch failed");
+        }
+        .expect("conv1d_shift_history launch failed");
     }
 
     fn l2_normalize_heads(
@@ -117,11 +121,13 @@ impl GpuDeltaNet for CudaBackend {
         // One block per head, 256 threads per block.
         let cfg = CudaBackend::cfg_blocks(num_heads, 256);
         unsafe {
-            self.stream.launch_builder(&self.fn_l2_normalize)
+            self.stream
+                .launch_builder(&self.fn_l2_normalize)
                 .arg(&params)
                 .arg(&data.buf)
                 .launch(cfg)
-        }.expect("l2_normalize_heads launch failed");
+        }
+        .expect("l2_normalize_heads launch failed");
     }
 
     fn deltanet_decay_gate(
@@ -136,14 +142,16 @@ impl GpuDeltaNet for CudaBackend {
         let block = 256.min(size);
         let cfg = CudaBackend::cfg_1d(size, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_decay_gate)
+            self.stream
+                .launch_builder(&self.fn_decay_gate)
                 .arg(&params)
                 .arg(&x.buf)
                 .arg(&dt_bias.buf)
                 .arg(&a_log.buf)
                 .arg(&out.buf)
                 .launch(cfg)
-        }.expect("deltanet_decay_gate launch failed");
+        }
+        .expect("deltanet_decay_gate launch failed");
     }
 
     fn deltanet_step(
@@ -173,7 +181,8 @@ impl GpuDeltaNet for CudaBackend {
         // One block per QK-head, 256 threads per block.
         let cfg = CudaBackend::cfg_blocks(num_qk_heads, 256);
         unsafe {
-            self.stream.launch_builder(&self.fn_deltanet_step)
+            self.stream
+                .launch_builder(&self.fn_deltanet_step)
                 .arg(&params)
                 .arg(&state.buf)
                 .arg(&q.buf)
@@ -183,6 +192,7 @@ impl GpuDeltaNet for CudaBackend {
                 .arg(&beta.buf)
                 .arg(&out.buf)
                 .launch(cfg)
-        }.expect("deltanet_step launch failed");
+        }
+        .expect("deltanet_step launch failed");
     }
 }

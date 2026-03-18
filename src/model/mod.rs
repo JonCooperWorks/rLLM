@@ -34,12 +34,11 @@
 //   just the current one.  The KV cache stores the K and V projections for
 //   every token processed so far, avoiding redundant recomputation.
 //
-//   Layout: flat arrays of shape [max_seq_len, num_kv_heads * head_dim].
-//   Each layer has its own K cache and V cache.  Position `pos` is written
-//   once when that token is processed, then read by all future tokens.
-//
-//   Memory: 2 (K+V) x 16 layers x 4096 positions x 8 heads x 64 dim x 2 bytes
-//         = ~64 MB for the full cache.
+//   Layout: paged allocation from a shared pool (see kv_cache.rs).  Memory
+//   is allocated in fixed-size blocks (16 tokens each) on demand.  Each
+//   sequence gets a block table mapping logical blocks to physical ones.
+//   This enables continuous batching — sequences can be added/removed
+//   without fragmenting GPU memory.
 //
 // Buffer reuse:
 //   Scratch buffers are allocated once at model creation and reused every
@@ -72,10 +71,10 @@ use self::kv_cache::{KvPool, SeqKvState};
 use self::loader::ModelWeights;
 use crate::gpu::{GpuBackend, GpuCore, GpuElementwise, TensorDtype};
 
-/// Maximum sequence length supported by the flat KV cache.
-/// Llama 3.2 supports up to 131072 with RoPE scaling, but we cap at 4096
-/// for the flat cache mode.  The paged cache mode supports the same limit
-/// (256 blocks x 16 positions = 4096) but allocates memory on demand.
+/// Maximum sequence length supported by the flat KV cache (legacy mode).
+/// The paged cache mode supports up to 131072 tokens (8192 blocks x 16
+/// positions) and is the primary code path.  This constant is only used
+/// by the flat cache allocation path.
 const MAX_SEQ_LEN: usize = 4096;
 
 /// The transformer model: weights, KV cache, scratch buffers, and a backend reference.
@@ -155,14 +154,14 @@ pub(crate) struct Model<'a, B: GpuCore> {
     // sum of expert outputs before adding to the residual stream.
     // -----------------------------------------------------------------------
     #[allow(dead_code)]
-    pub(crate) router_logits: Option<B::Tensor>,    // [num_experts] f32
-    pub(crate) moe_gate_buf: Option<B::Tensor>,    // [moe_inter] bf16
-    pub(crate) moe_up_buf: Option<B::Tensor>,      // [moe_inter] bf16
-    pub(crate) moe_output: Option<B::Tensor>,      // [hidden_size] bf16
+    pub(crate) router_logits: Option<B::Tensor>, // [num_experts] f32
+    pub(crate) moe_gate_buf: Option<B::Tensor>, // [moe_inter] bf16
+    pub(crate) moe_up_buf: Option<B::Tensor>,   // [moe_inter] bf16
+    pub(crate) moe_output: Option<B::Tensor>,   // [hidden_size] bf16
     /// GPU-side routing output: [2 * num_experts_per_tok] f32 pairs of
     /// (expert_index, routing_weight).  Eliminates per-layer GPU→CPU sync
     /// for top-k selection.
-    pub(crate) routing_output: Option<B::Tensor>,  // [2*k] f32
+    pub(crate) routing_output: Option<B::Tensor>, // [2*k] f32
 
     // -----------------------------------------------------------------------
     // DeltaNet state (Qwen 3.5 hybrid models only).
@@ -171,17 +170,17 @@ pub(crate) struct Model<'a, B: GpuCore> {
     // state matrix per QK-head (in f32 for precision), plus a Conv1D history
     // buffer for causal convolution.  These persist across tokens.
     // -----------------------------------------------------------------------
-    pub(crate) deltanet_states: Option<Vec<B::Tensor>>,       // per-DeltaNet-layer f32 state
+    pub(crate) deltanet_states: Option<Vec<B::Tensor>>, // per-DeltaNet-layer f32 state
     pub(crate) deltanet_conv_history: Option<Vec<B::Tensor>>, // per-DeltaNet-layer bf16 history
 
     // DeltaNet scratch buffers (reused every forward pass).
-    pub(crate) dn_qkv_buf: Option<B::Tensor>,    // [qk_dim*2 + v_dim] bf16 — fused QKV output
-    pub(crate) dn_alpha_buf: Option<B::Tensor>,   // [num_v_heads] f32 — decay gates
-    pub(crate) dn_beta_buf: Option<B::Tensor>,    // [num_v_heads] f32 — update gates
-    pub(crate) dn_z_buf: Option<B::Tensor>,       // [v_dim] bf16 — output gate
-    pub(crate) dn_conv_out: Option<B::Tensor>,    // [conv_dim] bf16 — conv1d output
-    pub(crate) dn_attn_out: Option<B::Tensor>,    // [v_dim] bf16 — DeltaNet attention output
-    pub(crate) dn_norm_out: Option<B::Tensor>,    // [v_dim] bf16 — RMSNorm-no-weight output
+    pub(crate) dn_qkv_buf: Option<B::Tensor>, // [qk_dim*2 + v_dim] bf16 — fused QKV output
+    pub(crate) dn_alpha_buf: Option<B::Tensor>, // [num_v_heads] f32 — decay gates
+    pub(crate) dn_beta_buf: Option<B::Tensor>, // [num_v_heads] f32 — update gates
+    pub(crate) dn_z_buf: Option<B::Tensor>,   // [v_dim] bf16 — output gate
+    pub(crate) dn_conv_out: Option<B::Tensor>, // [conv_dim] bf16 — conv1d output
+    pub(crate) dn_attn_out: Option<B::Tensor>, // [v_dim] bf16 — DeltaNet attention output
+    pub(crate) dn_norm_out: Option<B::Tensor>, // [v_dim] bf16 — RMSNorm-no-weight output
 
     // KV layer mapping: layer_idx → kv_pool_idx (None for DeltaNet layers).
     pub(crate) kv_layer_map: Vec<Option<usize>>,
@@ -263,7 +262,11 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
             k_cache.push(backend.alloc_tensor(&[1, kv_dim], TensorDtype::BF16));
             v_cache.push(backend.alloc_tensor(&[1, kv_dim], TensorDtype::BF16));
         }
-        let kv_mode = KvMode::Flat { k_cache, v_cache, pos: 0 };
+        let kv_mode = KvMode::Flat {
+            k_cache,
+            v_cache,
+            pos: 0,
+        };
 
         Self::new_with_kv_mode_tp(config, weights, backend, kv_mode, world_size)
     }
@@ -291,9 +294,9 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
             let dn_qk_dim = config.linear_num_key_heads * config.linear_key_head_dim;
             let dn_v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
             (
-                q_dim.max(dn_qk_dim),        // GQA Q vs DeltaNet Q
-                kv_dim.max(dn_qk_dim),       // GQA KV vs DeltaNet K
-                q_dim.max(dn_v_dim),          // GQA attn_out vs DeltaNet V output
+                q_dim.max(dn_qk_dim),  // GQA Q vs DeltaNet Q
+                kv_dim.max(dn_qk_dim), // GQA KV vs DeltaNet K
+                q_dim.max(dn_v_dim),   // GQA attn_out vs DeltaNet V output
             )
         } else {
             (q_dim, kv_dim, q_dim)
@@ -329,8 +332,17 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
             };
 
         // DeltaNet state and scratch buffers: only for hybrid models.
-        let (deltanet_states, deltanet_conv_history, dn_qkv_buf, dn_alpha_buf,
-             dn_beta_buf, dn_z_buf, dn_conv_out, dn_attn_out, dn_norm_out) = if is_hybrid {
+        let (
+            deltanet_states,
+            deltanet_conv_history,
+            dn_qkv_buf,
+            dn_alpha_buf,
+            dn_beta_buf,
+            dn_z_buf,
+            dn_conv_out,
+            dn_attn_out,
+            dn_norm_out,
+        ) = if is_hybrid {
             let num_qk_heads = config.linear_num_key_heads;
             let num_v_heads = config.linear_num_value_heads;
             let hd = config.linear_key_head_dim;
@@ -341,17 +353,18 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
             let kernel_size = config.linear_conv_kernel_dim;
 
             // State matrices: one [num_qk_heads * v_per_qk * hd * hd] f32 per DeltaNet layer.
-            let num_dn_layers = config.layer_types.iter()
-                .filter(|t| t.as_str() == "linear_attention").count();
+            let num_dn_layers = config
+                .layer_types
+                .iter()
+                .filter(|t| t.as_str() == "linear_attention")
+                .count();
             let state_size = num_qk_heads * v_per_qk * hd * hd;
             let mut states = Vec::with_capacity(num_dn_layers);
             let mut conv_histories = Vec::with_capacity(num_dn_layers);
             for _ in 0..num_dn_layers {
                 states.push(backend.alloc_tensor(&[state_size], TensorDtype::F32));
-                conv_histories.push(backend.alloc_tensor(
-                    &[(kernel_size - 1) * conv_dim],
-                    TensorDtype::BF16,
-                ));
+                conv_histories
+                    .push(backend.alloc_tensor(&[(kernel_size - 1) * conv_dim], TensorDtype::BF16));
             }
 
             // Zero-initialise states and conv histories.
@@ -440,7 +453,8 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
         // across both layer types (DeltaNet and GQA), with TP-aware splitting.
         let (eff_q_dim, eff_kv_dim, eff_attn_dim) = if is_hybrid {
             let dn_qk_dim = (config.linear_num_key_heads / world_size) * config.linear_key_head_dim;
-            let dn_v_dim = (config.linear_num_value_heads / world_size) * config.linear_value_head_dim;
+            let dn_v_dim =
+                (config.linear_num_value_heads / world_size) * config.linear_value_head_dim;
             (
                 q_dim.max(dn_qk_dim),
                 kv_dim.max(dn_qk_dim),
@@ -478,8 +492,17 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
             };
 
         // DeltaNet state and scratch buffers: TP-aware sizes.
-        let (deltanet_states, deltanet_conv_history, dn_qkv_buf, dn_alpha_buf,
-             dn_beta_buf, dn_z_buf, dn_conv_out, dn_attn_out, dn_norm_out) = if is_hybrid {
+        let (
+            deltanet_states,
+            deltanet_conv_history,
+            dn_qkv_buf,
+            dn_alpha_buf,
+            dn_beta_buf,
+            dn_z_buf,
+            dn_conv_out,
+            dn_attn_out,
+            dn_norm_out,
+        ) = if is_hybrid {
             let num_qk_heads = config.linear_num_key_heads / world_size;
             let num_v_heads = config.linear_num_value_heads / world_size;
             let hd = config.linear_key_head_dim;
@@ -489,17 +512,18 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
             let conv_dim = qk_dim * 2 + v_dim;
             let kernel_size = config.linear_conv_kernel_dim;
 
-            let num_dn_layers = config.layer_types.iter()
-                .filter(|t| t.as_str() == "linear_attention").count();
+            let num_dn_layers = config
+                .layer_types
+                .iter()
+                .filter(|t| t.as_str() == "linear_attention")
+                .count();
             let state_size = num_qk_heads * v_per_qk * hd * hd;
             let mut states = Vec::with_capacity(num_dn_layers);
             let mut conv_histories = Vec::with_capacity(num_dn_layers);
             for _ in 0..num_dn_layers {
                 states.push(backend.alloc_tensor(&[state_size], TensorDtype::F32));
-                conv_histories.push(backend.alloc_tensor(
-                    &[(kernel_size - 1) * conv_dim],
-                    TensorDtype::BF16,
-                ));
+                conv_histories
+                    .push(backend.alloc_tensor(&[(kernel_size - 1) * conv_dim], TensorDtype::BF16));
             }
             for s in &states {
                 backend.fill_zero(s, state_size as u32);
@@ -620,15 +644,31 @@ impl<'a, B: GpuBackend> Model<'a, B> {
         seq_state: &SeqKvState<B>,
     ) -> anyhow::Result<()> {
         match self.arch {
-            ModelArch::Gemma3 => registry::gemma::forward_single_paged(self, token_id, pool, seq_state),
-            ModelArch::GptOss => registry::gpt_oss::forward_single_paged(self, token_id, pool, seq_state),
-            ModelArch::Llama => registry::llama::forward_single_paged(self, token_id, pool, seq_state),
-            ModelArch::Mistral => registry::mistral::forward_single_paged(self, token_id, pool, seq_state),
-            ModelArch::Mixtral => registry::mixtral::forward_single_paged(self, token_id, pool, seq_state),
+            ModelArch::Gemma3 => {
+                registry::gemma::forward_single_paged(self, token_id, pool, seq_state)
+            }
+            ModelArch::GptOss => {
+                registry::gpt_oss::forward_single_paged(self, token_id, pool, seq_state)
+            }
+            ModelArch::Llama => {
+                registry::llama::forward_single_paged(self, token_id, pool, seq_state)
+            }
+            ModelArch::Mistral => {
+                registry::mistral::forward_single_paged(self, token_id, pool, seq_state)
+            }
+            ModelArch::Mixtral => {
+                registry::mixtral::forward_single_paged(self, token_id, pool, seq_state)
+            }
             ModelArch::Phi => registry::phi::forward_single_paged(self, token_id, pool, seq_state),
-            ModelArch::Qwen2 => registry::qwen::forward_single_paged(self, token_id, pool, seq_state),
-            ModelArch::Qwen3Moe => registry::qwen3_moe::forward_single_paged(self, token_id, pool, seq_state),
-            ModelArch::Qwen3_5 => registry::qwen3_5::forward_single_paged(self, token_id, pool, seq_state),
+            ModelArch::Qwen2 => {
+                registry::qwen::forward_single_paged(self, token_id, pool, seq_state)
+            }
+            ModelArch::Qwen3Moe => {
+                registry::qwen3_moe::forward_single_paged(self, token_id, pool, seq_state)
+            }
+            ModelArch::Qwen3_5 => {
+                registry::qwen3_5::forward_single_paged(self, token_id, pool, seq_state)
+            }
         }
     }
 
@@ -650,15 +690,33 @@ impl<'a, B: GpuBackend> Model<'a, B> {
         bufs: &PrefillBuffers<B>,
     ) -> anyhow::Result<()> {
         match self.arch {
-            ModelArch::Gemma3 => registry::gemma::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
-            ModelArch::GptOss => registry::gpt_oss::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
-            ModelArch::Llama => registry::llama::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
-            ModelArch::Mistral => registry::mistral::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
-            ModelArch::Mixtral => registry::mixtral::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
-            ModelArch::Phi => registry::phi::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
-            ModelArch::Qwen2 => registry::qwen::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
-            ModelArch::Qwen3Moe => registry::qwen3_moe::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
-            ModelArch::Qwen3_5 => registry::qwen3_5::forward_prefill_paged(self, tokens, pool, seq_state, bufs),
+            ModelArch::Gemma3 => {
+                registry::gemma::forward_prefill_paged(self, tokens, pool, seq_state, bufs)
+            }
+            ModelArch::GptOss => {
+                registry::gpt_oss::forward_prefill_paged(self, tokens, pool, seq_state, bufs)
+            }
+            ModelArch::Llama => {
+                registry::llama::forward_prefill_paged(self, tokens, pool, seq_state, bufs)
+            }
+            ModelArch::Mistral => {
+                registry::mistral::forward_prefill_paged(self, tokens, pool, seq_state, bufs)
+            }
+            ModelArch::Mixtral => {
+                registry::mixtral::forward_prefill_paged(self, tokens, pool, seq_state, bufs)
+            }
+            ModelArch::Phi => {
+                registry::phi::forward_prefill_paged(self, tokens, pool, seq_state, bufs)
+            }
+            ModelArch::Qwen2 => {
+                registry::qwen::forward_prefill_paged(self, tokens, pool, seq_state, bufs)
+            }
+            ModelArch::Qwen3Moe => {
+                registry::qwen3_moe::forward_prefill_paged(self, tokens, pool, seq_state, bufs)
+            }
+            ModelArch::Qwen3_5 => {
+                registry::qwen3_5::forward_prefill_paged(self, tokens, pool, seq_state, bufs)
+            }
         }
     }
 }

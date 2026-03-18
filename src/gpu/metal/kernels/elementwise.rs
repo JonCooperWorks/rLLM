@@ -244,13 +244,7 @@ impl GpuElementwise for MetalBackend {
         );
     }
 
-    fn top_k_softmax(
-        &self,
-        logits: &MetalTensor,
-        output: &MetalTensor,
-        num_experts: u32,
-        k: u32,
-    ) {
+    fn top_k_softmax(&self, logits: &MetalTensor, output: &MetalTensor, num_experts: u32, k: u32) {
         let params = TopKParams { num_experts, k };
         self.dispatch_async(
             &self.pipeline_top_k_softmax,

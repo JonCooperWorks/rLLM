@@ -9,8 +9,7 @@
 //   worker loop (run_worker_loop) that drives any InferenceEngine.
 //
 // Module layout:
-//   mod.rs        — server setup, shared types, run_worker_loop
-//   worker.rs     — spawn_worker() factory (single-GPU or multi-GPU)
+//   mod.rs        — server setup, shared types, spawn_worker, run_worker_loop
 //   openai.rs     — /v1/chat/completions, /v1/completions, /v1/models
 //   anthropic.rs  — /v1/messages
 //   tls.rs        — TLS support (manual certs, Let's Encrypt)
@@ -24,8 +23,9 @@
 //                    [Engine<B> or MultiGpuEngine — server doesn't know which]
 //
 // The worker loop is GPU-topology-agnostic.  It calls add_request / step /
-// abort_sequence / has_work / tokenizer on the trait object.  The worker.rs
-// module handles single-GPU vs multi-GPU setup behind a single spawn_worker().
+// abort_sequence / has_work / tokenizer on the trait object.  spawn_worker()
+// delegates to engine::loader::load_and_run() which handles single-GPU vs
+// multi-GPU setup.
 //
 // Why a dedicated worker thread?
 //   The model borrows the GPU backend and has mutable scratch buffers.
@@ -162,7 +162,10 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // On macOS (Metal), fall back to single GPU with a warning.
     #[cfg(not(feature = "cuda"))]
     if tp > 1 {
-        eprintln!("warning: --tp {} ignored (multi-GPU requires CUDA + NCCL), using single GPU", tp);
+        eprintln!(
+            "warning: --tp {} ignored (multi-GPU requires CUDA + NCCL), using single GPU",
+            tp
+        );
         tp = 1;
     }
 
@@ -341,8 +344,8 @@ struct RequestContext {
 // engine.step(), streams tokens back to clients, and cleans up finished
 // or disconnected sequences.
 //
-// worker::spawn_worker() delegates to this function after constructing
-// the appropriate engine (single-GPU or multi-GPU).
+// spawn_worker() (above) delegates to this function via
+// engine::loader::load_and_run() after constructing the appropriate engine.
 // ---------------------------------------------------------------------------
 
 /// Run the continuous batching loop for any InferenceEngine.
@@ -359,8 +362,12 @@ fn run_worker_loop(
         // 1. Drain all pending requests (non-blocking).
         while let Ok(req) = request_rx.try_recv() {
             let prompt_token_count = req.prompt_tokens.len();
-            let seq_id =
-                engine.add_request(req.prompt_tokens, req.max_tokens, req.temperature, req.top_p);
+            let seq_id = engine.add_request(
+                req.prompt_tokens,
+                req.max_tokens,
+                req.temperature,
+                req.top_p,
+            );
             registry.insert(
                 seq_id,
                 RequestContext {
@@ -470,5 +477,3 @@ fn run_worker_loop(
 
     Ok(())
 }
-
-

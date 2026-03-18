@@ -126,17 +126,23 @@ impl GpuAttention for CudaBackend {
             window_size,
             attn_scale,
         };
-        let func = if head_dim > 128 { &self.fn_attention_hd256 } else { &self.fn_attention };
+        let func = if head_dim > 128 {
+            &self.fn_attention_hd256
+        } else {
+            &self.fn_attention
+        };
         let cfg = CudaBackend::cfg_blocks(num_heads, 256);
         unsafe {
-            self.stream.launch_builder(func)
+            self.stream
+                .launch_builder(func)
                 .arg(&params)
                 .arg(&q.buf)
                 .arg(&k_cache.buf)
                 .arg(&v_cache.buf)
                 .arg(&out.buf)
                 .launch(cfg)
-        }.expect("attention launch failed");
+        }
+        .expect("attention launch failed");
     }
 
     fn copy_to_kv_cache(
@@ -156,12 +162,14 @@ impl GpuAttention for CudaBackend {
         let block = 256.min(size);
         let cfg = CudaBackend::cfg_1d(size, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_copy_kv)
+            self.stream
+                .launch_builder(&self.fn_copy_kv)
                 .arg(&params)
                 .arg(&src.buf)
                 .arg(&cache.buf)
                 .launch(cfg)
-        }.expect("copy_to_kv_cache launch failed");
+        }
+        .expect("copy_to_kv_cache launch failed");
     }
 
     fn copy_to_paged_kv_cache(
@@ -183,13 +191,15 @@ impl GpuAttention for CudaBackend {
         let block = 256.min(size);
         let cfg = CudaBackend::cfg_1d(size, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_paged_copy_kv)
+            self.stream
+                .launch_builder(&self.fn_paged_copy_kv)
                 .arg(&params)
                 .arg(&src.buf)
                 .arg(&pool.buf)
                 .arg(&block_table.buf)
                 .launch(cfg)
-        }.expect("copy_to_paged_kv_cache launch failed");
+        }
+        .expect("copy_to_paged_kv_cache launch failed");
     }
 
     fn paged_attention(
@@ -218,10 +228,15 @@ impl GpuAttention for CudaBackend {
             has_sinks: if sinks.is_some() { 1 } else { 0 },
         };
         let sinks_buf = sinks.map(|s| &s.buf).unwrap_or(&out.buf);
-        let func = if head_dim > 128 { &self.fn_paged_attention_hd256 } else { &self.fn_paged_attention };
+        let func = if head_dim > 128 {
+            &self.fn_paged_attention_hd256
+        } else {
+            &self.fn_paged_attention
+        };
         let cfg = CudaBackend::cfg_blocks(num_heads, 256);
         unsafe {
-            self.stream.launch_builder(func)
+            self.stream
+                .launch_builder(func)
                 .arg(&params)
                 .arg(&q.buf)
                 .arg(&k_pool.buf)
@@ -230,7 +245,8 @@ impl GpuAttention for CudaBackend {
                 .arg(&out.buf)
                 .arg(sinks_buf)
                 .launch(cfg)
-        }.expect("paged_attention launch failed");
+        }
+        .expect("paged_attention launch failed");
     }
 
     fn copy_to_paged_kv_cache_batch(
@@ -254,14 +270,16 @@ impl GpuAttention for CudaBackend {
         let block = 256.min(total);
         let cfg = CudaBackend::cfg_1d(total, block);
         unsafe {
-            self.stream.launch_builder(&self.fn_paged_copy_kv_batch)
+            self.stream
+                .launch_builder(&self.fn_paged_copy_kv_batch)
                 .arg(&params)
                 .arg(&src.buf)
                 .arg(&pool.buf)
                 .arg(&block_table.buf)
                 .arg(&positions.buf)
                 .launch(cfg)
-        }.expect("copy_to_paged_kv_cache_batch launch failed");
+        }
+        .expect("copy_to_paged_kv_cache_batch launch failed");
     }
 
     fn paged_attention_fused(
@@ -299,7 +317,8 @@ impl GpuAttention for CudaBackend {
         };
         let cfg = CudaBackend::cfg_blocks(num_heads, 256);
         unsafe {
-            self.stream.launch_builder(func)
+            self.stream
+                .launch_builder(func)
                 .arg(&params)
                 .arg(&q.buf)
                 .arg(&k.buf)
@@ -310,7 +329,8 @@ impl GpuAttention for CudaBackend {
                 .arg(&out.buf)
                 .arg(sinks_buf)
                 .launch(cfg)
-        }.expect("paged_attention_fused launch failed");
+        }
+        .expect("paged_attention_fused launch failed");
     }
 
     fn prefill_attention(
@@ -347,7 +367,8 @@ impl GpuAttention for CudaBackend {
         };
         let cfg = CudaBackend::cfg_blocks(num_blocks, 256);
         unsafe {
-            self.stream.launch_builder(func)
+            self.stream
+                .launch_builder(func)
                 .arg(&params)
                 .arg(&q.buf)
                 .arg(&k.buf)
@@ -355,6 +376,7 @@ impl GpuAttention for CudaBackend {
                 .arg(&out.buf)
                 .arg(sinks_buf)
                 .launch(cfg)
-        }.expect("prefill_attention launch failed");
+        }
+        .expect("prefill_attention launch failed");
     }
 }

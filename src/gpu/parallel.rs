@@ -24,7 +24,7 @@
 //      and the AllReduce calls are no-ops for single GPU
 //
 // Why derive from config instead of annotating models?
-//   rLLM supports 8 architectures.  They all use the same transformer
+//   rLLM supports 9 architectures.  They all use the same transformer
 //   pattern (QKV → attention → O → FFN).  Annotating each model's forward
 //   pass with sharding info would be 8x the maintenance and easy to get
 //   wrong.  Deriving from config means adding a new model automatically
@@ -774,9 +774,10 @@ mod tests {
         }
 
         // Expert 0 should NOT be in rank 1's plan.
-        assert!(plan
-            .get("model.layers.0.mlp.experts.0.gate_proj.weight")
-            .is_none());
+        assert!(
+            plan.get("model.layers.0.mlp.experts.0.gate_proj.weight")
+                .is_none()
+        );
 
         // Router gate is always replicated.
         let router = plan.get("model.layers.0.mlp.gate.weight").unwrap();
@@ -810,7 +811,12 @@ mod tests {
         };
         let result = ShardingPlan::derive(&config, device, false);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("num_key_value_heads"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("num_key_value_heads")
+        );
     }
 
     #[test]
@@ -824,7 +830,12 @@ mod tests {
         };
         let result = ShardingPlan::derive(&config, device, false);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("intermediate_size"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("intermediate_size")
+        );
     }
 
     #[test]
@@ -838,8 +849,7 @@ mod tests {
         }
 
         // Rank 0 gets rows 0-1: [0,1,2,3, 4,5,6,7]
-        let (sliced, shape) =
-            slice_tensor_data(&data, &[4, 4], &SplitDimension::Column, 0, 2, 2);
+        let (sliced, shape) = slice_tensor_data(&data, &[4, 4], &SplitDimension::Column, 0, 2, 2);
         assert_eq!(shape, [2, 4]);
         assert_eq!(sliced.len(), 2 * 4 * 2); // 2 rows × 4 cols × 2 bytes
 
@@ -849,8 +859,7 @@ mod tests {
         assert_eq!(u16::from_le_bytes([sliced[14], sliced[15]]), 7);
 
         // Rank 1 gets rows 2-3: [8,9,10,11, 12,13,14,15]
-        let (sliced, shape) =
-            slice_tensor_data(&data, &[4, 4], &SplitDimension::Column, 1, 2, 2);
+        let (sliced, shape) = slice_tensor_data(&data, &[4, 4], &SplitDimension::Column, 1, 2, 2);
         assert_eq!(shape, [2, 4]);
         assert_eq!(u16::from_le_bytes([sliced[0], sliced[1]]), 8);
         assert_eq!(u16::from_le_bytes([sliced[14], sliced[15]]), 15);
@@ -866,8 +875,7 @@ mod tests {
         }
 
         // Rank 0 should get: [0,1, 4,5, 8,9, 12,13]
-        let (sliced, shape) =
-            slice_tensor_data(&data, &[4, 4], &SplitDimension::Row, 0, 2, 2);
+        let (sliced, shape) = slice_tensor_data(&data, &[4, 4], &SplitDimension::Row, 0, 2, 2);
         assert_eq!(shape, [4, 2]);
         assert_eq!(sliced.len(), 4 * 2 * 2); // 4 rows × 2 cols × 2 bytes
 
@@ -878,8 +886,7 @@ mod tests {
         assert_eq!(vals, vec![0, 1, 4, 5, 8, 9, 12, 13]);
 
         // Rank 1 should get: [2,3, 6,7, 10,11, 14,15]
-        let (sliced, _) =
-            slice_tensor_data(&data, &[4, 4], &SplitDimension::Row, 1, 2, 2);
+        let (sliced, _) = slice_tensor_data(&data, &[4, 4], &SplitDimension::Row, 1, 2, 2);
         let vals: Vec<u16> = sliced
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -919,10 +926,7 @@ mod tests {
         }))
         .unwrap();
         config.weight_prefix = "model.".to_string();
-        config.layer_types = vec![
-            "linear_attention".into(),
-            "full_attention".into(),
-        ];
+        config.layer_types = vec!["linear_attention".into(), "full_attention".into()];
         config
     }
 
@@ -939,39 +943,52 @@ mod tests {
         let plan = ShardingPlan::derive(&config, device, false).unwrap();
 
         // DeltaNet weight names must use `linear_attn` prefix (matching safetensors).
-        let qkv = plan.get("model.layers.0.linear_attn.in_proj_qkv.weight").unwrap();
+        let qkv = plan
+            .get("model.layers.0.linear_attn.in_proj_qkv.weight")
+            .unwrap();
         assert_eq!(qkv.split, SplitDimension::Column);
         // Q(4*128) + K(4*128) + V(4*128) = 1536 → shard = 768
         assert_eq!(qkv.original_shape, [1536, 2048]);
         assert_eq!(qkv.shard_shape, [768, 2048]);
 
         // in_proj_a: [num_value_heads=4, hidden=2048] → Column → shard [2, 2048]
-        let a = plan.get("model.layers.0.linear_attn.in_proj_a.weight").unwrap();
+        let a = plan
+            .get("model.layers.0.linear_attn.in_proj_a.weight")
+            .unwrap();
         assert_eq!(a.split, SplitDimension::Column);
         assert_eq!(a.original_shape, [4, 2048]);
         assert_eq!(a.shard_shape, [2, 2048]);
 
         // in_proj_b: same as in_proj_a
-        let b = plan.get("model.layers.0.linear_attn.in_proj_b.weight").unwrap();
+        let b = plan
+            .get("model.layers.0.linear_attn.in_proj_b.weight")
+            .unwrap();
         assert_eq!(b.split, SplitDimension::Column);
         assert_eq!(b.shard_shape, [2, 2048]);
 
         // in_proj_z: [v_dim=512, hidden=2048] → Column → shard [256, 2048]
-        let z = plan.get("model.layers.0.linear_attn.in_proj_z.weight").unwrap();
+        let z = plan
+            .get("model.layers.0.linear_attn.in_proj_z.weight")
+            .unwrap();
         assert_eq!(z.split, SplitDimension::Column);
         assert_eq!(z.original_shape, [512, 2048]);
         assert_eq!(z.shard_shape, [256, 2048]);
 
         // out_proj: [hidden=2048, v_dim=512] → Row → shard [2048, 256]
-        let out = plan.get("model.layers.0.linear_attn.out_proj.weight").unwrap();
+        let out = plan
+            .get("model.layers.0.linear_attn.out_proj.weight")
+            .unwrap();
         assert_eq!(out.split, SplitDimension::Row);
         assert_eq!(out.original_shape, [2048, 512]);
         assert_eq!(out.shard_shape, [2048, 256]);
 
         // Verify `deltanet` prefix does NOT appear in plan weight names.
         for ws in &plan.weights {
-            assert!(!ws.name.contains(".deltanet."),
-                "plan key '{}' uses wrong prefix — should be 'linear_attn'", ws.name);
+            assert!(
+                !ws.name.contains(".deltanet."),
+                "plan key '{}' uses wrong prefix — should be 'linear_attn'",
+                ws.name
+            );
         }
 
         // Both layers should have standard attention entries.

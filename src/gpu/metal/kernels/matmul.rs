@@ -18,8 +18,8 @@ use metal::MTLSize;
 
 use super::super::backend::MetalBackend;
 use super::super::tensor::MetalTensor;
-use crate::gpu::ops::GpuMatmul;
 use crate::gpu::TensorDtype;
+use crate::gpu::ops::GpuMatmul;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

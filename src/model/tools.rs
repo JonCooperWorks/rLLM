@@ -271,7 +271,9 @@ fn parse_tool_calls_chatml(text: &str) -> (String, Vec<ToolCall>) {
     // Extract all <tool_call>...</tool_call> blocks.
     while let Some(start) = cleaned.find("<tool_call>") {
         let end_tag = "</tool_call>";
-        let end = cleaned[start..].find(end_tag).map(|i| start + i + end_tag.len());
+        let end = cleaned[start..]
+            .find(end_tag)
+            .map(|i| start + i + end_tag.len());
 
         if let Some(end) = end {
             let block = &cleaned[start + "<tool_call>".len()..end - end_tag.len()];
@@ -389,11 +391,7 @@ fn parse_bare_json_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
         }
     }
 
-    if calls.is_empty() {
-        None
-    } else {
-        Some(calls)
-    }
+    if calls.is_empty() { None } else { Some(calls) }
 }
 
 /// Remove JSON tool call objects from text (for cleaning content when
@@ -426,9 +424,7 @@ fn strip_json_tool_calls(text: &str) -> String {
 /// (the "ipython" role is what Meta trained the model on).
 pub(crate) fn format_tool_result_llama(tool_call_id: &str, content: &str) -> String {
     let _ = tool_call_id; // Llama doesn't use tool_call_id in the template.
-    format!(
-        "<|start_header_id|>ipython<|end_header_id|>\n\n{content}<|eot_id|>"
-    )
+    format!("<|start_header_id|>ipython<|end_header_id|>\n\n{content}<|eot_id|>")
 }
 
 /// Format a tool result message for ChatML-family templates (Qwen, Phi, etc.).
@@ -540,7 +536,8 @@ mod tests {
 
     #[test]
     fn test_parse_tool_call_mistral() {
-        let text = "Sure!\n[TOOL_CALLS][{\"name\": \"get_weather\", \"arguments\": {\"city\": \"NYC\"}}]";
+        let text =
+            "Sure!\n[TOOL_CALLS][{\"name\": \"get_weather\", \"arguments\": {\"city\": \"NYC\"}}]";
         let (content, calls) = parse_tool_calls(ModelArch::Mistral, text);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_weather");
@@ -576,7 +573,10 @@ mod tests {
         let json = r#"{"type": "function", "function": {"name": "test", "description": "A test function", "parameters": {"type": "object"}}}"#;
         let tool: ToolDefinition = serde_json::from_str(json).unwrap();
         assert_eq!(tool.function.name, "test");
-        assert_eq!(tool.function.description.as_deref(), Some("A test function"));
+        assert_eq!(
+            tool.function.description.as_deref(),
+            Some("A test function")
+        );
     }
 
     #[test]
@@ -597,7 +597,12 @@ mod tests {
     fn test_chatml_rejects_bare_json() {
         // ChatML archs must NOT parse bare JSON — only <tool_call> markers.
         let text = "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"LA\"}}";
-        for arch in [ModelArch::Qwen2, ModelArch::Phi, ModelArch::Gemma3, ModelArch::GptOss] {
+        for arch in [
+            ModelArch::Qwen2,
+            ModelArch::Phi,
+            ModelArch::Gemma3,
+            ModelArch::GptOss,
+        ] {
             let (content, calls) = parse_tool_calls(arch, text);
             assert!(calls.is_empty(), "arch {arch:?} should not parse bare JSON");
             assert_eq!(content, text);

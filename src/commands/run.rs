@@ -69,7 +69,10 @@ pub(crate) fn exec(mut args: RunArgs) -> anyhow::Result<()> {
     // On macOS (Metal), fall back to single GPU with a warning.
     #[cfg(not(feature = "cuda"))]
     if args.tp > 1 {
-        eprintln!("warning: --tp {} ignored (multi-GPU requires CUDA + NCCL), using single GPU", args.tp);
+        eprintln!(
+            "warning: --tp {} ignored (multi-GPU requires CUDA + NCCL), using single GPU",
+            args.tp
+        );
         args.tp = 1;
     }
 
@@ -90,8 +93,8 @@ pub(crate) fn exec(mut args: RunArgs) -> anyhow::Result<()> {
     let chat = args.chat;
     let system = args.system.clone();
 
-    use std::cell::Cell;
     use crate::model::config::ModelArch;
+    use std::cell::Cell;
     let arch_cell: Cell<Option<ModelArch>> = Cell::new(None);
 
     engine::loader::load_and_run(
@@ -99,7 +102,9 @@ pub(crate) fn exec(mut args: RunArgs) -> anyhow::Result<()> {
         args.quantize,
         args.tp,
         1, // single sequence
-        |_tok, arch| { arch_cell.set(Some(arch)); },
+        |_tok, arch| {
+            arch_cell.set(Some(arch));
+        },
         |eng| {
             let arch = arch_cell.get().unwrap();
 

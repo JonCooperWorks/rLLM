@@ -40,9 +40,7 @@ impl Drop for NcclComm {
 ///
 /// Creates one raw `ncclComm_t` per device using `ncclCommInitAll` (the
 /// single-process multi-device initialization path).
-pub(crate) fn init_nccl_comms(
-    world_size: usize,
-) -> anyhow::Result<Vec<Arc<NcclComm>>> {
+pub(crate) fn init_nccl_comms(world_size: usize) -> anyhow::Result<Vec<Arc<NcclComm>>> {
     // Validate device count.
     let device_count = CudaContext::device_count()
         .map_err(|e| anyhow::anyhow!("failed to query CUDA device count: {e}"))?;
