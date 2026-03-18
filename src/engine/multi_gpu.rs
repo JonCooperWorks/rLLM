@@ -1,39 +1,30 @@
 // ===========================================================================
-// Multi-GPU inference engine — wraps MultiGpuInference in the InferenceEngine
-// trait so the API worker loop can drive multi-GPU batching without knowing
-// the GPU topology.
+// Multi-GPU inference engine — wraps MultiGpuInference behind the Dispatch
+// trait so the shared run_step() loop can drive multi-GPU batching without
+// knowing the GPU topology.
 //
 // LEARNING OVERVIEW
 //
 // What this file does:
-//   Adapts the N-rank MultiGpuInference (which fans forward passes across
-//   GPUs via thread::scope + NCCL) to the same InferenceEngine interface
-//   that the single-GPU Engine uses.  The API server's worker loop calls
-//   add_request / step / abort_sequence / has_work — identical to the
-//   single-GPU path.
+//   Implements Dispatch for multi-GPU inference.  MultiGpuDispatch wraps
+//   MultiGpuInference (which fans forward passes across GPUs via thread::scope
+//   + NCCL) and provides the same Dispatch interface as SingleGpuDispatch.
 //
-// Why a separate wrapper (not integrated into Engine)?
-//   Engine<'a, B> owns one Model<B> with one KV pool.  Multi-GPU has N
-//   models, N backends, N KV pools — one per rank.  Rather than threading
-//   rank arrays through the existing Engine, we build a thin adapter that
-//   manages per-sequence per-rank KV states and delegates forward passes
-//   to MultiGpuInference.
+//   The engine step loop (run_step in engine/mod.rs) is shared between
+//   single-GPU and multi-GPU — this module only provides the GPU-specific
+//   dispatch operations.
 //
-// Sequence lifecycle:
-//   add_request → queued with prompt tokens
-//   step():
-//     1. Admit queued requests (check KV capacity on rank 0 as heuristic)
-//     2. Prefill: drain prompt, allocate KV slots on all ranks, fan-out
-//        GEMM forward pass, sample first token
-//     3. Decode: allocate one KV slot on all ranks, fan-out single-token
-//        forward pass, sample next token
-//     4. Collect finished sequences (EOS or max_tokens)
-//   abort_sequence → free KV blocks on all ranks
+// SeqState = Vec<SeqKvState<CudaBackend>>:
+//   Multi-GPU needs one KV state per rank per sequence, because each GPU
+//   has its own KV pool with its own block allocator.  The Dispatch trait's
+//   associated SeqState type abstracts this — run_step() doesn't know it's
+//   a Vec.
 //
 // Related files:
-//   - engine/mod.rs       — InferenceEngine trait, single-GPU Engine
+//   - engine/dispatch.rs  — Dispatch trait
+//   - engine/mod.rs       — run_step(), InferenceEngine trait, Engine
 //   - gpu/multi_gpu.rs    — MultiGpuInference: fan-out, NCCL, per-rank state
-//   - api/mod.rs          — worker loop (shared between single- and multi-GPU)
+//   - api/multi_gpu.rs    — spawns MultiGpuEngine for the API server
 // ===========================================================================
 
 #[cfg(feature = "cuda")]
@@ -41,56 +32,108 @@ pub(crate) use imp::MultiGpuEngine;
 
 #[cfg(feature = "cuda")]
 mod imp {
-    use std::collections::{HashMap, VecDeque};
-
-    use crate::engine::scheduler::SeqId;
-    use crate::engine::{FinishReason, FinishedSequence, InferenceEngine, StepOutput};
+    use crate::engine::dispatch::Dispatch;
+    use crate::engine::scheduler::{Scheduler, SeqId, SequenceRequest};
+    use crate::engine::{run_step, FinishReason, FinishedSequence, InferenceEngine, StepOutput};
     use crate::gpu::cuda::CudaBackend;
     use crate::gpu::multi_gpu::tp::MultiGpuInference;
     use crate::model::kv_cache::SeqKvState;
-    use crate::model::sampler;
     use crate::model::tokenizer::Tokenizer;
 
-    /// A queued request waiting for admission.
-    struct PendingRequest {
-        prompt_tokens: Vec<u32>,
-        max_gen_tokens: usize,
-        temperature: f32,
-        top_p: f32,
+    // -----------------------------------------------------------------------
+    // MultiGpuDispatch — Dispatch implementation for multi-GPU inference.
+    //
+    // Each method fans out to N ranks via MultiGpuInference.  The SeqState
+    // is Vec<SeqKvState<CudaBackend>> — one KV state per rank.
+    // -----------------------------------------------------------------------
+
+    /// Multi-GPU dispatch: wraps MultiGpuInference for N-rank fan-out.
+    pub(crate) struct MultiGpuDispatch {
+        pub multi: MultiGpuInference,
     }
 
-    /// Per-sequence state in the multi-GPU engine.
-    struct MultiGpuSeq {
-        /// Per-rank KV cache state (one SeqKvState per GPU).
-        kv_states: Vec<SeqKvState<CudaBackend>>,
-        /// Prompt tokens still needing prefill.
-        pending_prefill: VecDeque<u32>,
-        /// Generated tokens so far.
-        generated_tokens: Vec<u32>,
-        /// Maximum tokens to generate after prefill.
-        max_gen_tokens: usize,
-        /// Sampling temperature.
-        temperature: f32,
-        /// Top-p (nucleus) sampling threshold.
-        top_p: f32,
-        /// Whether this sequence has finished.
-        finished: bool,
+    impl Dispatch for MultiGpuDispatch {
+        type SeqState = Vec<SeqKvState<CudaBackend>>;
+
+        fn new_seq_state(&self) -> Self::SeqState {
+            self.multi.new_sequence()
+        }
+
+        fn free_seq_state(&mut self, state: &Self::SeqState) {
+            self.multi.free_sequence(state);
+        }
+
+        fn free_block_count(&self) -> usize {
+            // Use rank 0's free block count as an admission heuristic.
+            // All ranks have identical block counts.
+            self.multi.ranks[0].kv_pool.free_block_count()
+        }
+
+        fn prepare_prefill(
+            &mut self,
+            state: &mut Self::SeqState,
+            token_count: usize,
+        ) -> anyhow::Result<()> {
+            self.multi.ensure_slots_for(state, token_count)
+        }
+
+        fn forward_prefill(
+            &self,
+            tokens: &[u32],
+            state: &Self::SeqState,
+        ) -> anyhow::Result<()> {
+            self.multi.forward_prefill_paged_with(tokens, state)
+        }
+
+        fn finish_prefill(state: &mut Self::SeqState, token_count: usize) {
+            MultiGpuInference::advance_by_for(state, token_count);
+        }
+
+        fn prepare_decode(&mut self, state: &mut Self::SeqState) -> anyhow::Result<()> {
+            self.multi.ensure_slot_for(state)
+        }
+
+        fn forward_decode(
+            &self,
+            token: u32,
+            state: &Self::SeqState,
+        ) -> anyhow::Result<()> {
+            self.multi.forward_single_paged_with(token, state)
+        }
+
+        fn finish_decode(state: &mut Self::SeqState) {
+            MultiGpuInference::advance_for(state);
+        }
+
+        fn sample(
+            &self,
+            temperature: f32,
+            top_p: f32,
+            rng: &mut impl rand::Rng,
+        ) -> anyhow::Result<u32> {
+            crate::model::sampler::sample(
+                self.multi.backend(),
+                self.multi.logits(),
+                temperature,
+                top_p,
+                rng,
+            )
+        }
     }
+
+    // -----------------------------------------------------------------------
+    // MultiGpuEngine — InferenceEngine impl using MultiGpuDispatch.
+    // -----------------------------------------------------------------------
 
     /// Multi-GPU inference engine implementing InferenceEngine.
     ///
     /// Manages multiple concurrent sequences across N GPU ranks, providing
     /// the same add_request/step/abort/has_work interface as the single-GPU
-    /// Engine.
+    /// Engine.  Uses the shared run_step() loop with MultiGpuDispatch.
     pub(crate) struct MultiGpuEngine {
-        multi: MultiGpuInference,
+        dispatch: MultiGpuDispatch,
+        scheduler: Scheduler<Vec<SeqKvState<CudaBackend>>>,
         tokenizer: Tokenizer,
-        /// Waiting queue (FCFS).
-        waiting: VecDeque<(SeqId, PendingRequest)>,
-        /// Active sequences being processed.
-        active: HashMap<SeqId, MultiGpuSeq>,
-        next_id: SeqId,
-        max_active: usize,
     }
 
     impl MultiGpuEngine {
@@ -100,45 +143,10 @@ mod imp {
             max_active: usize,
         ) -> Self {
             Self {
-                multi,
+                dispatch: MultiGpuDispatch { multi },
+                scheduler: Scheduler::new(max_active),
                 tokenizer,
-                waiting: VecDeque::new(),
-                active: HashMap::new(),
-                next_id: 0,
-                max_active,
             }
-        }
-
-        /// Admit waiting requests into the active set.
-        fn schedule(&mut self) -> Vec<SeqId> {
-            let mut admitted = Vec::new();
-
-            while !self.waiting.is_empty() && self.active.len() < self.max_active {
-                // Use rank 0's free block count as an admission heuristic.
-                // All ranks have identical block counts.
-                let (_, req) = self.waiting.front().unwrap();
-                let prompt_blocks =
-                    crate::model::kv_cache::blocks_needed_for(req.prompt_tokens.len());
-                if self.multi.ranks[0].kv_pool.free_block_count() < prompt_blocks {
-                    break;
-                }
-
-                let (id, req) = self.waiting.pop_front().unwrap();
-                let kv_states = self.multi.new_sequence();
-                let seq = MultiGpuSeq {
-                    kv_states,
-                    pending_prefill: req.prompt_tokens.into(),
-                    generated_tokens: Vec::new(),
-                    max_gen_tokens: req.max_gen_tokens,
-                    temperature: req.temperature,
-                    top_p: req.top_p,
-                    finished: false,
-                };
-                self.active.insert(id, seq);
-                admitted.push(id);
-            }
-
-            admitted
         }
     }
 
@@ -150,160 +158,24 @@ mod imp {
             temperature: f32,
             top_p: f32,
         ) -> SeqId {
-            let id = self.next_id;
-            self.next_id += 1;
-            self.waiting.push_back((
-                id,
-                PendingRequest {
-                    prompt_tokens,
-                    max_gen_tokens,
-                    temperature,
-                    top_p,
-                },
-            ));
-            id
-        }
-
-        fn step(&mut self) -> anyhow::Result<StepOutput> {
-            let mut rng = rand::rng();
-            let mut step_tokens: Vec<(SeqId, u32)> = Vec::new();
-
-            // 1. Admit waiting requests.
-            self.schedule();
-
-            // 2. Prefill: drain all pending tokens for each prefilling sequence.
-            let prefilling_ids: Vec<SeqId> = self
-                .active
-                .iter()
-                .filter(|(_, seq)| !seq.pending_prefill.is_empty() && !seq.finished)
-                .map(|(&id, _)| id)
-                .collect();
-
-            for id in prefilling_ids {
-                let seq = self.active.get_mut(&id).unwrap();
-                let tokens: Vec<u32> = seq.pending_prefill.drain(..).collect();
-                let chunk_size = tokens.len();
-                let temperature = seq.temperature;
-                let top_p = seq.top_p;
-
-                // Allocate KV slots on all ranks.
-                self.multi
-                    .ensure_slots_for(&mut seq.kv_states, chunk_size)?;
-
-                // Run batched prefill forward pass across all ranks.
-                self.multi
-                    .forward_prefill_paged_with(&tokens, &seq.kv_states)?;
-                MultiGpuInference::advance_by_for(&mut seq.kv_states, chunk_size);
-
-                // Sample first token from rank 0's logits.
-                let next_token = sampler::sample(
-                    self.multi.backend(),
-                    self.multi.logits(),
-                    temperature,
-                    top_p,
-                    &mut rng,
-                )?;
-                seq.generated_tokens.push(next_token);
-                step_tokens.push((id, next_token));
-
-                if self.tokenizer.is_eos(next_token)
-                    || seq.generated_tokens.len() >= seq.max_gen_tokens
-                {
-                    seq.finished = true;
-                }
-            }
-
-            // 3. Decode: one token per active sequence.
-            let decoding_ids: Vec<SeqId> = self
-                .active
-                .iter()
-                .filter(|(_, seq)| seq.pending_prefill.is_empty() && !seq.finished)
-                .map(|(&id, _)| id)
-                .collect();
-
-            for id in decoding_ids {
-                let seq = self.active.get_mut(&id).unwrap();
-                let token = *seq.generated_tokens.last().unwrap();
-                let temperature = seq.temperature;
-                let top_p = seq.top_p;
-
-                // Allocate one KV slot on all ranks.
-                self.multi.ensure_slot_for(&mut seq.kv_states)?;
-
-                // Run single-token forward pass across all ranks.
-                self.multi
-                    .forward_single_paged_with(token, &seq.kv_states)?;
-                MultiGpuInference::advance_for(&mut seq.kv_states);
-
-                // Sample next token from rank 0's logits.
-                let next_token = sampler::sample(
-                    self.multi.backend(),
-                    self.multi.logits(),
-                    temperature,
-                    top_p,
-                    &mut rng,
-                )?;
-                seq.generated_tokens.push(next_token);
-                step_tokens.push((id, next_token));
-
-                if self.tokenizer.is_eos(next_token)
-                    || seq.generated_tokens.len() >= seq.max_gen_tokens
-                {
-                    seq.finished = true;
-                }
-            }
-
-            // 4. Collect finished sequences.
-            let finished_ids: Vec<SeqId> = self
-                .active
-                .iter()
-                .filter(|(_, seq)| seq.finished)
-                .map(|(&id, _)| id)
-                .collect();
-
-            let mut finished = Vec::new();
-            for id in finished_ids {
-                if let Some(seq) = self.active.remove(&id) {
-                    self.multi.free_sequence(&seq.kv_states);
-                    let text = self
-                        .tokenizer
-                        .decode(&seq.generated_tokens)
-                        .unwrap_or_default();
-                    let reason = if seq
-                        .generated_tokens
-                        .last()
-                        .map_or(false, |&t| self.tokenizer.is_eos(t))
-                    {
-                        FinishReason::Eos
-                    } else {
-                        FinishReason::MaxTokens
-                    };
-                    finished.push(FinishedSequence {
-                        id,
-                        tokens: seq.generated_tokens,
-                        text,
-                        reason,
-                    });
-                }
-            }
-
-            Ok(StepOutput {
-                tokens: step_tokens,
-                finished,
+            self.scheduler.add_request(SequenceRequest {
+                prompt_tokens,
+                max_gen_tokens,
+                temperature,
+                top_p,
             })
         }
 
+        fn step(&mut self) -> anyhow::Result<StepOutput> {
+            run_step(&mut self.dispatch, &mut self.scheduler, &self.tokenizer)
+        }
+
         fn abort_sequence(&mut self, id: SeqId) {
-            // Remove from waiting queue.
-            self.waiting.retain(|(wid, _)| *wid != id);
-            // Remove from active set and free KV blocks on all ranks.
-            if let Some(seq) = self.active.remove(&id) {
-                self.multi.free_sequence(&seq.kv_states);
-            }
+            self.scheduler.abort_sequence(id, &mut self.dispatch);
         }
 
         fn has_work(&self) -> bool {
-            !self.waiting.is_empty() || !self.active.is_empty()
+            self.scheduler.has_work()
         }
 
         fn tokenizer(&self) -> &Tokenizer {

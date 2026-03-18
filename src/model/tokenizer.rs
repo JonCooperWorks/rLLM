@@ -197,6 +197,22 @@ impl Tokenizer {
         self.encode_chat(&formatted)
     }
 
+    /// Create a minimal tokenizer for testing.
+    ///
+    /// Uses an empty BPE model (no real vocabulary) — only `is_eos()` works
+    /// correctly.  `decode()` returns empty strings, which is fine for engine
+    /// step tests that only care about token IDs and sequence lifecycle.
+    #[cfg(test)]
+    pub fn for_test(eos_token_ids: Vec<u32>) -> Self {
+        use tokenizers::models::bpe::BPE;
+        let inner = HfTokenizer::new(BPE::default());
+        Self {
+            inner,
+            eos_token_ids,
+            bos_token_id: None,
+        }
+    }
+
     /// Check if a token ID is an end-of-sequence signal.
     /// Used to stop the generation loop.
     pub fn is_eos(&self, token_id: u32) -> bool {

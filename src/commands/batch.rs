@@ -10,7 +10,6 @@
 use std::path::PathBuf;
 
 use crate::engine::{self, InferenceEngine};
-use crate::engine::scheduler;
 use crate::gpu::{self, GpuCore};
 use crate::model;
 use crate::model::{kv_cache, loader};
@@ -101,13 +100,13 @@ pub(crate) fn exec(args: BatchArgs) -> anyhow::Result<()> {
 
     let model = model::Model::new(config, weights, &backend)?;
 
-    // Create scheduler and engine.
-    let sched = scheduler::Scheduler::new(kv_pool, prompts.len());
+    // Create engine (owns model, KV pool, scheduler).
     let mut eng: Box<dyn InferenceEngine> = Box::new(engine::Engine::new(
         model,
-        sched,
+        kv_pool,
         tokenizer,
         &backend,
+        prompts.len(),
     ));
 
     // Submit all prompts.

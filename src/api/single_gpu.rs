@@ -16,7 +16,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::engine;
-use crate::engine::scheduler;
 use crate::gpu::{self, GpuCore};
 use crate::model;
 use crate::model::loader;
@@ -73,13 +72,13 @@ pub(super) fn spawn_worker(model_dir: PathBuf, quantize: bool) -> anyhow::Result
 
             let max_active = 32;
             eprintln!("max {} concurrent sequences", max_active);
-            let sched = scheduler::Scheduler::new(kv_pool, max_active);
 
             let mut eng = engine::Engine::new(
                 model,
-                sched,
+                kv_pool,
                 engine_tokenizer,
                 &backend,
+                max_active,
             );
 
             super::run_worker_loop(&mut eng, request_rx)
