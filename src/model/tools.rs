@@ -16,8 +16,14 @@
 //      uses <tool_call> markers, Mistral uses [AVAILABLE_TOOLS], etc.).
 //
 //   3. Output parsing — detecting and extracting tool calls from the model's
-//      generated text.  The model outputs tool calls as structured text
-//      (JSON with markers) that we parse into ToolCall structs.
+//      generated text.  Each architecture has a dedicated parser that only
+//      recognises the markers/format its formatter produces:
+//        - Llama: bare JSON objects (no markers — matches its format prompt)
+//        - Mistral/Mixtral: [TOOL_CALLS] marker
+//        - Qwen, Phi, Gemma, GPT-OSS: <tool_call> XML markers (ChatML)
+//      Both `format_tool_system_prompt()` and `parse_tool_calls()` use
+//      exhaustive matches on `ModelArch` — adding a new architecture forces
+//      the developer to choose both a formatter and a parser.
 //
 // How tool calling works end-to-end:
 //   1. Client sends a request with `tools` (list of function definitions).
@@ -233,61 +239,75 @@ fn format_tools_chatml(tools: &[ToolDefinition]) -> String {
 ///
 /// Returns (content_text, tool_calls).  If no tool calls are found,
 /// tool_calls is empty and content_text is the full original text.
+///
+/// This match is intentionally exhaustive (no wildcard arm) so that adding a
+/// new `ModelArch` variant forces the developer to choose the correct parser
+/// — mirroring the exhaustive match in `format_tool_system_prompt`.
 pub(crate) fn parse_tool_calls(arch: ModelArch, text: &str) -> (String, Vec<ToolCall>) {
     match arch {
+        ModelArch::Llama => parse_tool_calls_llama(text),
         ModelArch::Mistral | ModelArch::Mixtral => parse_tool_calls_mistral(text),
-        // Llama, Qwen, Phi, Gemma, GPT-OSS all check for <tool_call> markers first,
-        // then fall back to bare JSON detection.
-        _ => parse_tool_calls_generic(text),
+        ModelArch::Qwen2 | ModelArch::Qwen3Moe | ModelArch::Qwen3_5 | ModelArch::GptOss => {
+            parse_tool_calls_chatml(text)
+        }
+        ModelArch::Phi => parse_tool_calls_chatml(text),
+        ModelArch::Gemma3 => parse_tool_calls_chatml(text),
     }
 }
 
-/// Parse <tool_call>...</tool_call> markers (Qwen/ChatML style) with bare JSON fallback.
+/// Parse <tool_call>...</tool_call> markers (Qwen/ChatML style).
 ///
-/// Tries three strategies in order:
-///   1. <tool_call> XML markers (Qwen instruct format)
-///   2. Bare JSON objects with a "name" field (Llama, generic fallback)
-///   3. No tool calls found → return original text
-fn parse_tool_calls_generic(text: &str) -> (String, Vec<ToolCall>) {
-    // Strategy 1: <tool_call> markers.
-    if text.contains("<tool_call>") {
-        let mut calls = Vec::new();
-        let mut cleaned = text.to_string();
+/// Only recognises explicit `<tool_call>` markers — no bare-JSON fallback.
+/// The corresponding formatter (`format_tools_chatml`) instructs the model to
+/// use these markers, so anything *without* them is treated as normal text.
+fn parse_tool_calls_chatml(text: &str) -> (String, Vec<ToolCall>) {
+    if !text.contains("<tool_call>") {
+        return (text.to_string(), Vec::new());
+    }
 
-        // Extract all <tool_call>...</ tool_call> blocks.
-        while let Some(start) = cleaned.find("<tool_call>") {
-            let end_tag = "</tool_call>";
-            let end = cleaned[start..].find(end_tag).map(|i| start + i + end_tag.len());
+    let mut calls = Vec::new();
+    let mut cleaned = text.to_string();
 
-            if let Some(end) = end {
-                let block = &cleaned[start + "<tool_call>".len()..end - end_tag.len()];
-                if let Some(call) = parse_json_tool_call(block.trim()) {
-                    calls.push(call);
-                }
-                cleaned.replace_range(start..end, "");
-            } else {
-                // Unclosed tag — try to parse the rest as a tool call.
-                let block = &cleaned[start + "<tool_call>".len()..];
-                if let Some(call) = parse_json_tool_call(block.trim()) {
-                    calls.push(call);
-                }
-                cleaned.truncate(start);
-                break;
+    // Extract all <tool_call>...</tool_call> blocks.
+    while let Some(start) = cleaned.find("<tool_call>") {
+        let end_tag = "</tool_call>";
+        let end = cleaned[start..].find(end_tag).map(|i| start + i + end_tag.len());
+
+        if let Some(end) = end {
+            let block = &cleaned[start + "<tool_call>".len()..end - end_tag.len()];
+            if let Some(call) = parse_json_tool_call(block.trim()) {
+                calls.push(call);
             }
-        }
-
-        if !calls.is_empty() {
-            return (cleaned.trim().to_string(), calls);
+            cleaned.replace_range(start..end, "");
+        } else {
+            // Unclosed tag — try to parse the rest as a tool call.
+            let block = &cleaned[start + "<tool_call>".len()..];
+            if let Some(call) = parse_json_tool_call(block.trim()) {
+                calls.push(call);
+            }
+            cleaned.truncate(start);
+            break;
         }
     }
 
-    // Strategy 2: bare JSON with "name" key (common for Llama tool calling).
+    if !calls.is_empty() {
+        return (cleaned.trim().to_string(), calls);
+    }
+
+    (text.to_string(), Vec::new())
+}
+
+/// Parse bare JSON tool calls (Llama format).
+///
+/// Llama's tool-call format instructs the model to respond with a plain JSON
+/// object `{"name": "...", "arguments": {...}}` — no markers.  This parser is
+/// only used for Llama so the bare-JSON heuristic doesn't accidentally fire
+/// for other architectures.
+fn parse_tool_calls_llama(text: &str) -> (String, Vec<ToolCall>) {
     if let Some(calls) = parse_bare_json_tool_calls(text) {
         let cleaned = strip_json_tool_calls(text);
         return (cleaned, calls);
     }
-
-    // Strategy 3: no tool calls found.
     (text.to_string(), Vec::new())
 }
 
@@ -571,5 +591,16 @@ mod tests {
         let text = "{\"name\": \"a\", \"arguments\": {\"x\": 1}}\n{\"name\": \"b\", \"arguments\": {\"y\": 2}}";
         let (_, calls) = parse_tool_calls(ModelArch::Llama, text);
         assert_eq!(calls.len(), 2);
+    }
+
+    #[test]
+    fn test_chatml_rejects_bare_json() {
+        // ChatML archs must NOT parse bare JSON — only <tool_call> markers.
+        let text = "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"LA\"}}";
+        for arch in [ModelArch::Qwen2, ModelArch::Phi, ModelArch::Gemma3, ModelArch::GptOss] {
+            let (content, calls) = parse_tool_calls(arch, text);
+            assert!(calls.is_empty(), "arch {arch:?} should not parse bare JSON");
+            assert_eq!(content, text);
+        }
     }
 }
