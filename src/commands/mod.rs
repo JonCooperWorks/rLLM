@@ -1,12 +1,14 @@
 // ===========================================================================
 // CLI subcommands — one module per command.
 //
-//   run.rs   — `rllm run`   — single-prompt inference
-//   batch.rs — `rllm batch` — batched inference from a file
-//   serve.rs — `rllm serve` — HTTP API server
+//   run.rs      — `rllm run`      — single-prompt inference
+//   batch.rs    — `rllm batch`    — batched inference from a file
+//   serve.rs    — `rllm serve`    — HTTP API server
+//   quantize.rs — `rllm quantize` — offline weight quantization (bf16 → Q4)
 // ===========================================================================
 
 mod batch;
+mod quantize;
 mod run;
 mod serve;
 
@@ -20,6 +22,8 @@ pub(crate) enum Command {
     Batch(batch::BatchArgs),
     /// Start an OpenAI/Anthropic-compatible API server.
     Serve(serve::ServeArgs),
+    /// Pre-quantize model weights from bf16 to Q4 on disk.
+    Quantize(quantize::QuantizeArgs),
 }
 
 impl Command {
@@ -28,6 +32,7 @@ impl Command {
             Command::Run(args) => run::exec(args),
             Command::Batch(args) => batch::exec(args),
             Command::Serve(args) => serve::exec(args),
+            Command::Quantize(args) => quantize::exec(args),
         }
     }
 }

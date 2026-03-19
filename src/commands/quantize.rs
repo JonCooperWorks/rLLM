@@ -1,0 +1,632 @@
+// ===========================================================================
+// `rllm quantize` — Offline weight quantization.
+//
+// Pre-quantizes bf16 safetensors weights to Q4 format on disk, so that
+// subsequent loads (`rllm run`, `rllm serve`) skip the on-load quantization
+// step entirely.  This is a pure-CPU operation — no GPU backend needed.
+//
+// Output format:
+//   Standard safetensors files with Q4 blocks stored as Dtype::U8 tensors.
+//   File-level metadata marks the file as quantized:
+//     "quantization" = "rllm-q4"
+//     "rllm_q4:<tensor_name>" = "m,k"   (original logical shape)
+//
+//   Non-quantizable tensors (norms, embeddings, biases) pass through as bf16.
+//   The output directory is self-contained: includes config.json, tokenizer
+//   files, and the quantized safetensors.
+//
+// Related files:
+//   gpu/mod.rs          — quantize_bf16_to_q4(), q4_byte_count()
+//   model/loader.rs     — load_safetensors_files(), pre-quantized detection
+//   model/config.rs     — ModelConfig parsing
+// ===========================================================================
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use safetensors::tensor::TensorView;
+use safetensors::SafeTensors;
+
+use crate::gpu::{q4_byte_count, quantize_bf16_to_q4};
+
+#[derive(clap::Args)]
+pub(crate) struct QuantizeArgs {
+    /// Path to input model directory (contains config.json, tokenizer.json, *.safetensors).
+    #[arg(long)]
+    model: PathBuf,
+
+    /// Path to output directory for quantized model.
+    #[arg(long)]
+    output: PathBuf,
+}
+
+/// Maximum bytes per output shard (5 GB).  Keeps files manageable and
+/// matches the HuggingFace convention for large models.
+const SHARD_LIMIT: usize = 5 * 1024 * 1024 * 1024;
+
+pub(crate) fn exec(args: QuantizeArgs) -> anyhow::Result<()> {
+    let input_dir = &args.model;
+    let output_dir = &args.output;
+
+    // Validate input directory.
+    anyhow::ensure!(
+        input_dir.join("config.json").exists(),
+        "no config.json found in {}",
+        input_dir.display()
+    );
+
+    // Create output directory.
+    std::fs::create_dir_all(output_dir)?;
+
+    // Load and parse safetensors from input.
+    let (mmaps, weight_map) = crate::model::loader::load_safetensors_files(input_dir)?;
+    let shards: Vec<SafeTensors> = mmaps
+        .iter()
+        .map(|m| SafeTensors::deserialize(m))
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("failed to parse safetensors: {e}"))?;
+
+    // Collect all tensors across shards in a stable order.
+    let all_tensors = collect_all_tensors(&shards, &weight_map);
+
+    eprintln!(
+        "found {} tensors across {} shard(s)",
+        all_tensors.len(),
+        mmaps.len()
+    );
+
+    // Process tensors: quantize or pass through.
+    let mut output_tensors: Vec<OutputTensor> = Vec::with_capacity(all_tensors.len());
+    let mut quantized_count = 0usize;
+    let mut original_bytes = 0u64;
+    let mut quantized_bytes = 0u64;
+
+    for (name, view) in &all_tensors {
+        let shape = view.shape();
+        let data = view.data();
+
+        if should_quantize(name, shape, view.dtype()) {
+            let m = shape[0];
+            let k = shape[1];
+            let q4_data = quantize_bf16_to_q4(data, m, k);
+
+            original_bytes += data.len() as u64;
+            quantized_bytes += q4_data.len() as u64;
+            quantized_count += 1;
+
+            output_tensors.push(OutputTensor {
+                name: name.clone(),
+                data: TensorData::Owned(q4_data),
+                dtype: safetensors::Dtype::U8,
+                shape: vec![q4_byte_count(m, k)],
+                q4_original_shape: Some((m, k)),
+            });
+        } else {
+            original_bytes += data.len() as u64;
+            quantized_bytes += data.len() as u64;
+
+            output_tensors.push(OutputTensor {
+                name: name.clone(),
+                data: TensorData::Borrowed(data),
+                dtype: view.dtype(),
+                shape: shape.to_vec(),
+                q4_original_shape: None,
+            });
+        }
+    }
+
+    // Write output shards.
+    let shard_count = write_shards(&output_tensors, output_dir)?;
+
+    // Copy config and tokenizer files.
+    copy_support_files(input_dir, output_dir)?;
+
+    // Print summary.
+    let ratio = if quantized_bytes > 0 {
+        original_bytes as f64 / quantized_bytes as f64
+    } else {
+        1.0
+    };
+    eprintln!(
+        "quantized {quantized_count}/{} tensors across {shard_count} shard(s)",
+        output_tensors.len()
+    );
+    eprintln!(
+        "size: {:.1} MB → {:.1} MB ({:.1}x compression)",
+        original_bytes as f64 / 1e6,
+        quantized_bytes as f64 / 1e6,
+        ratio
+    );
+    eprintln!("output: {}", output_dir.display());
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tensor collection — gathers all tensors across shards in deterministic order.
+// ---------------------------------------------------------------------------
+
+fn collect_all_tensors<'a>(
+    shards: &'a [SafeTensors<'a>],
+    weight_map: &HashMap<String, usize>,
+) -> Vec<(String, TensorView<'a>)> {
+    if weight_map.is_empty() {
+        // Single-file model: iterate the one shard.
+        let mut tensors: Vec<_> = shards[0].iter().map(|(n, v)| (n.to_string(), v)).collect();
+        tensors.sort_by(|a, b| a.0.cmp(&b.0));
+        tensors
+    } else {
+        // Multi-shard: use weight_map to find each tensor's shard.
+        let mut tensors: Vec<(String, TensorView<'a>)> = Vec::new();
+        for (name, &shard_idx) in weight_map {
+            if let Ok(view) = shards[shard_idx].tensor(name) {
+                tensors.push((name.clone(), view));
+            }
+        }
+        tensors.sort_by(|a, b| a.0.cmp(&b.0));
+        tensors
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Quantization eligibility — name-based heuristic matching existing loader.
+// ---------------------------------------------------------------------------
+
+/// Determine if a tensor should be quantized based on its name, shape, and dtype.
+///
+/// Criteria (matching the on-load quantization in loader.rs):
+///   - 2D weight tensor (not bias)
+///   - Name contains a projection keyword (q_proj, k_proj, etc.) or is lm_head
+///   - Inner dimension (k) divisible by 32 (Q4 block size)
+///   - Not a norm, embedding, conv1d, or router tensor
+///   - Source dtype is bf16 (the only format we quantize from)
+fn should_quantize(name: &str, shape: &[usize], dtype: safetensors::Dtype) -> bool {
+    // Must be bf16 and 2D.
+    if dtype != safetensors::Dtype::BF16 || shape.len() != 2 {
+        return false;
+    }
+
+    // Must end with .weight (not .bias).
+    if !name.ends_with(".weight") {
+        return false;
+    }
+
+    // Inner dimension must be divisible by Q4 block size.
+    let k = shape[1];
+    if k % 32 != 0 {
+        return false;
+    }
+
+    // Exclude norms, embeddings, conv1d, routers.
+    let exclude = ["layernorm", "norm", "embed_tokens", "conv1d", "router"];
+    if exclude.iter().any(|ex| name.contains(ex)) {
+        return false;
+    }
+
+    // Must contain a quantizable projection name.
+    let proj_names = [
+        "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "in_proj",
+        "out_proj", "lm_head",
+    ];
+    proj_names.iter().any(|p| name.contains(p))
+}
+
+// ---------------------------------------------------------------------------
+// Output writing — serialize quantized + passthrough tensors to safetensors.
+// ---------------------------------------------------------------------------
+
+enum TensorData<'a> {
+    Owned(Vec<u8>),
+    Borrowed(&'a [u8]),
+}
+
+impl<'a> TensorData<'a> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            TensorData::Owned(v) => v,
+            TensorData::Borrowed(s) => s,
+        }
+    }
+}
+
+struct OutputTensor<'a> {
+    name: String,
+    data: TensorData<'a>,
+    dtype: safetensors::Dtype,
+    shape: Vec<usize>,
+    /// If Some, this tensor was quantized from a [m, k] bf16 weight.
+    q4_original_shape: Option<(usize, usize)>,
+}
+
+/// Write output tensors to one or more safetensors shard files.
+/// Returns the number of shards written.
+fn write_shards(tensors: &[OutputTensor], output_dir: &std::path::Path) -> anyhow::Result<usize> {
+    // Partition tensors into shards based on SHARD_LIMIT.
+    let mut shard_assignments: Vec<Vec<usize>> = vec![vec![]];
+    let mut current_shard_size = 0usize;
+
+    for (i, tensor) in tensors.iter().enumerate() {
+        let tensor_size = tensor.data.as_slice().len();
+        if current_shard_size > 0 && current_shard_size + tensor_size > SHARD_LIMIT {
+            shard_assignments.push(vec![]);
+            current_shard_size = 0;
+        }
+        shard_assignments.last_mut().unwrap().push(i);
+        current_shard_size += tensor_size;
+    }
+
+    let num_shards = shard_assignments.len();
+
+    // Write each shard.
+    for (shard_idx, tensor_indices) in shard_assignments.iter().enumerate() {
+        // Build metadata for this shard.
+        let mut metadata: HashMap<String, String> = HashMap::new();
+        metadata.insert("quantization".to_string(), "rllm-q4".to_string());
+
+        // Build tensor views for serialization.
+        let mut views: Vec<(String, TensorView)> = Vec::with_capacity(tensor_indices.len());
+
+        for &idx in tensor_indices {
+            let t = &tensors[idx];
+
+            // Record original shape for Q4 tensors.
+            if let Some((m, k)) = t.q4_original_shape {
+                metadata.insert(format!("rllm_q4:{}", t.name), format!("{m},{k}"));
+            }
+
+            let view = TensorView::new(t.dtype, t.shape.clone(), t.data.as_slice())
+                .map_err(|e| anyhow::anyhow!("failed to create TensorView for '{}': {e}", t.name))?;
+            views.push((t.name.clone(), view));
+        }
+
+        // Determine output filename.
+        let filename = if num_shards == 1 {
+            "model.safetensors".to_string()
+        } else {
+            format!(
+                "model-{:05}-of-{:05}.safetensors",
+                shard_idx + 1,
+                num_shards
+            )
+        };
+
+        let output_path = output_dir.join(&filename);
+        eprintln!("writing {filename}...");
+
+        let meta = Some(metadata);
+        safetensors::tensor::serialize_to_file(views, &meta, &output_path)
+            .map_err(|e| anyhow::anyhow!("failed to write {filename}: {e}"))?;
+    }
+
+    // Write index file for multi-shard output.
+    if num_shards > 1 {
+        let mut weight_map = serde_json::Map::new();
+        for (shard_idx, tensor_indices) in shard_assignments.iter().enumerate() {
+            let filename = format!(
+                "model-{:05}-of-{:05}.safetensors",
+                shard_idx + 1,
+                num_shards
+            );
+            for &idx in tensor_indices {
+                weight_map.insert(
+                    tensors[idx].name.clone(),
+                    serde_json::Value::String(filename.clone()),
+                );
+            }
+        }
+        let index = serde_json::json!({ "weight_map": weight_map });
+        let index_path = output_dir.join("model.safetensors.index.json");
+        std::fs::write(&index_path, serde_json::to_string_pretty(&index)?)?;
+        eprintln!("wrote index file");
+    }
+
+    Ok(num_shards)
+}
+
+// ---------------------------------------------------------------------------
+// Copy support files (config, tokenizer) to the output directory.
+// ---------------------------------------------------------------------------
+
+fn copy_support_files(
+    input_dir: &std::path::Path,
+    output_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    let files = ["config.json", "tokenizer.json", "tokenizer_config.json"];
+    for name in &files {
+        let src = input_dir.join(name);
+        if src.exists() {
+            std::fs::copy(&src, output_dir.join(name))?;
+            eprintln!("copied {name}");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_should_quantize_q_proj() {
+        assert!(should_quantize(
+            "model.layers.0.self_attn.q_proj.weight",
+            &[2048, 2048],
+            safetensors::Dtype::BF16,
+        ));
+    }
+
+    #[test]
+    fn test_should_not_quantize_norm() {
+        assert!(!should_quantize(
+            "model.layers.0.input_layernorm.weight",
+            &[2048],
+            safetensors::Dtype::BF16,
+        ));
+    }
+
+    #[test]
+    fn test_should_not_quantize_embed() {
+        assert!(!should_quantize(
+            "model.embed_tokens.weight",
+            &[128256, 2048],
+            safetensors::Dtype::BF16,
+        ));
+    }
+
+    #[test]
+    fn test_should_not_quantize_bias() {
+        assert!(!should_quantize(
+            "model.layers.0.self_attn.q_proj.bias",
+            &[2048],
+            safetensors::Dtype::BF16,
+        ));
+    }
+
+    #[test]
+    fn test_should_not_quantize_f32() {
+        assert!(!should_quantize(
+            "model.layers.0.self_attn.q_proj.weight",
+            &[2048, 2048],
+            safetensors::Dtype::F32,
+        ));
+    }
+
+    #[test]
+    fn test_should_quantize_lm_head() {
+        assert!(should_quantize(
+            "lm_head.weight",
+            &[128256, 4096],
+            safetensors::Dtype::BF16,
+        ));
+    }
+
+    #[test]
+    fn test_should_not_quantize_k_not_div_32() {
+        assert!(!should_quantize(
+            "model.layers.0.self_attn.q_proj.weight",
+            &[2048, 100],
+            safetensors::Dtype::BF16,
+        ));
+    }
+
+    #[test]
+    fn test_should_not_quantize_router() {
+        assert!(!should_quantize(
+            "model.layers.0.mlp.router.weight",
+            &[128, 2048],
+            safetensors::Dtype::BF16,
+        ));
+    }
+
+    #[test]
+    fn test_should_quantize_gate_proj() {
+        assert!(should_quantize(
+            "model.layers.0.mlp.gate_proj.weight",
+            &[8192, 2048],
+            safetensors::Dtype::BF16,
+        ));
+    }
+
+    // --- End-to-end tests ---
+
+    /// Build a minimal bf16 safetensors file with the given tensors.
+    fn make_bf16_safetensors(tensors: &[(&str, Vec<usize>)]) -> Vec<u8> {
+        use half::bf16;
+
+        let mut views_data: Vec<(String, Vec<u8>, Vec<usize>)> = Vec::new();
+        for (name, shape) in tensors {
+            let n_elements: usize = shape.iter().product();
+            // Fill with a simple pattern so we can verify round-trip correctness.
+            let values: Vec<bf16> = (0..n_elements)
+                .map(|i| bf16::from_f32((i % 17) as f32 * 0.1 - 0.8))
+                .collect();
+            let bytes: Vec<u8> = bytemuck::cast_slice(&values).to_vec();
+            views_data.push((name.to_string(), bytes, shape.clone()));
+        }
+
+        let tv_refs: Vec<(String, TensorView)> = views_data
+            .iter()
+            .map(|(name, data, shape)| {
+                let tv = TensorView::new(safetensors::Dtype::BF16, shape.clone(), data).unwrap();
+                (name.clone(), tv)
+            })
+            .collect();
+
+        safetensors::serialize(tv_refs, &None).unwrap()
+    }
+
+    /// Create a minimal model directory with config.json and a safetensors file.
+    fn setup_test_model(dir: &std::path::Path, tensors: &[(&str, Vec<usize>)]) {
+        let st_bytes = make_bf16_safetensors(tensors);
+        std::fs::write(dir.join("model.safetensors"), st_bytes).unwrap();
+
+        // Minimal config.json (just enough fields to exist — quantize doesn't parse it).
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"model_type":"llama","hidden_size":64,"num_hidden_layers":1,"num_attention_heads":2,"vocab_size":128}"#,
+        )
+        .unwrap();
+
+        std::fs::write(dir.join("tokenizer.json"), "{}").unwrap();
+    }
+
+    #[test]
+    fn test_end_to_end_quantize_produces_valid_output() {
+        let input_dir = tempfile::tempdir().unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+
+        // Create a model with one quantizable tensor and one passthrough tensor.
+        let m = 4;
+        let k = 64; // divisible by 32
+        setup_test_model(
+            input_dir.path(),
+            &[
+                ("model.layers.0.self_attn.q_proj.weight", vec![m, k]),
+                ("model.layers.0.input_layernorm.weight", vec![64]),
+            ],
+        );
+
+        // Run quantize.
+        exec(QuantizeArgs {
+            model: input_dir.path().to_path_buf(),
+            output: output_dir.path().to_path_buf(),
+        })
+        .unwrap();
+
+        // Verify output file exists.
+        let output_st = output_dir.path().join("model.safetensors");
+        assert!(output_st.exists(), "output safetensors file should exist");
+
+        // Verify support files were copied.
+        assert!(output_dir.path().join("config.json").exists());
+        assert!(output_dir.path().join("tokenizer.json").exists());
+
+        // Parse the output safetensors and check metadata.
+        let data = std::fs::read(&output_st).unwrap();
+        let (_, metadata) = SafeTensors::read_metadata(&data).unwrap();
+        let meta = metadata.metadata().as_ref().unwrap();
+
+        assert_eq!(meta.get("quantization").unwrap(), "rllm-q4");
+        assert_eq!(
+            meta.get("rllm_q4:model.layers.0.self_attn.q_proj.weight")
+                .unwrap(),
+            &format!("{m},{k}")
+        );
+        // Norm tensor should NOT have a q4 metadata entry.
+        assert!(
+            meta.get("rllm_q4:model.layers.0.input_layernorm.weight")
+                .is_none()
+        );
+
+        // Verify the Q4 tensor has the correct byte count.
+        let st = SafeTensors::deserialize(&data).unwrap();
+        let q_proj = st
+            .tensor("model.layers.0.self_attn.q_proj.weight")
+            .unwrap();
+        assert_eq!(q_proj.dtype(), safetensors::Dtype::U8);
+        let expected_bytes = crate::gpu::q4_byte_count(m, k);
+        assert_eq!(q_proj.data().len(), expected_bytes);
+
+        // Verify the norm tensor passed through as bf16 unchanged.
+        let norm = st
+            .tensor("model.layers.0.input_layernorm.weight")
+            .unwrap();
+        assert_eq!(norm.dtype(), safetensors::Dtype::BF16);
+        assert_eq!(norm.shape(), &[64]);
+    }
+
+    #[test]
+    fn test_end_to_end_quantize_matches_on_load_quantize() {
+        // Verify that pre-quantized Q4 bytes are identical to on-load quantization.
+        use half::bf16;
+
+        let m = 2;
+        let k = 32;
+        let n_elements = m * k;
+        let values: Vec<bf16> = (0..n_elements)
+            .map(|i| bf16::from_f32((i % 17) as f32 * 0.1 - 0.8))
+            .collect();
+        let bf16_bytes: &[u8] = bytemuck::cast_slice(&values);
+
+        // On-load path: quantize_bf16_to_q4 directly.
+        let on_load_q4 = crate::gpu::quantize_bf16_to_q4(bf16_bytes, m, k);
+
+        // Offline path: build safetensors, run quantize, read back.
+        let input_dir = tempfile::tempdir().unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+
+        setup_test_model(
+            input_dir.path(),
+            &[("model.layers.0.self_attn.q_proj.weight", vec![m, k])],
+        );
+
+        exec(QuantizeArgs {
+            model: input_dir.path().to_path_buf(),
+            output: output_dir.path().to_path_buf(),
+        })
+        .unwrap();
+
+        let data = std::fs::read(output_dir.path().join("model.safetensors")).unwrap();
+        let st = SafeTensors::deserialize(&data).unwrap();
+        let offline_q4 = st
+            .tensor("model.layers.0.self_attn.q_proj.weight")
+            .unwrap();
+
+        assert_eq!(
+            offline_q4.data(),
+            on_load_q4.as_slice(),
+            "offline and on-load quantization must produce identical Q4 bytes"
+        );
+    }
+
+    #[test]
+    fn test_end_to_end_quantize_multiple_tensors() {
+        let input_dir = tempfile::tempdir().unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+
+        // Several quantizable + non-quantizable tensors.
+        setup_test_model(
+            input_dir.path(),
+            &[
+                ("model.layers.0.self_attn.q_proj.weight", vec![8, 64]),
+                ("model.layers.0.self_attn.k_proj.weight", vec![4, 64]),
+                ("model.layers.0.self_attn.v_proj.weight", vec![4, 64]),
+                ("model.layers.0.self_attn.o_proj.weight", vec![8, 64]),
+                ("model.layers.0.mlp.gate_proj.weight", vec![16, 64]),
+                ("model.layers.0.mlp.up_proj.weight", vec![16, 64]),
+                ("model.layers.0.mlp.down_proj.weight", vec![8, 64]),
+                ("model.layers.0.input_layernorm.weight", vec![64]),
+                ("model.layers.0.post_attention_layernorm.weight", vec![64]),
+                ("model.embed_tokens.weight", vec![128, 64]),
+            ],
+        );
+
+        exec(QuantizeArgs {
+            model: input_dir.path().to_path_buf(),
+            output: output_dir.path().to_path_buf(),
+        })
+        .unwrap();
+
+        let data = std::fs::read(output_dir.path().join("model.safetensors")).unwrap();
+        let (_, metadata) = SafeTensors::read_metadata(&data).unwrap();
+        let meta = metadata.metadata().as_ref().unwrap();
+        let st = SafeTensors::deserialize(&data).unwrap();
+
+        // Count Q4 tensors from metadata.
+        let q4_count = meta.keys().filter(|k| k.starts_with("rllm_q4:")).count();
+        assert_eq!(q4_count, 7, "7 projection weights should be quantized");
+
+        // Verify all tensors are present and accessible.
+        assert_eq!(st.len(), 10);
+
+        // Spot-check: embed_tokens should remain bf16.
+        let embed = st.tensor("model.embed_tokens.weight").unwrap();
+        assert_eq!(embed.dtype(), safetensors::Dtype::BF16);
+
+        // Spot-check: gate_proj should be U8 (Q4).
+        let gate = st
+            .tensor("model.layers.0.mlp.gate_proj.weight")
+            .unwrap();
+        assert_eq!(gate.dtype(), safetensors::Dtype::U8);
+    }
+}

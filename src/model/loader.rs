@@ -102,6 +102,10 @@ struct TensorStore<'a> {
     /// Maps tensor names to shard indices.  Empty for single-file models
     /// (all tensors are in shards[0]).
     weight_map: HashMap<String, usize>,
+    /// Pre-quantized Q4 tensors: name → original (m, k) shape.
+    /// Populated from safetensors metadata when loading a model quantized
+    /// by `rllm quantize`.  Empty for normal bf16 models.
+    q4_map: HashMap<String, (usize, usize)>,
 }
 
 impl<'a> TensorStore<'a> {
@@ -117,13 +121,18 @@ impl<'a> TensorStore<'a> {
                 .map_err(|e| anyhow::anyhow!("tensor '{name}' not found: {e}"))
         }
     }
+
+    /// Check if a tensor is pre-quantized Q4, returning its original shape.
+    fn q4_shape(&self, name: &str) -> Option<(usize, usize)> {
+        self.q4_map.get(name).copied()
+    }
 }
 
 /// Load safetensors files from a model directory.
 ///
 /// Returns the mmaps (kept alive for the SafeTensors references) and a weight
 /// map for sharded models.
-fn load_safetensors_files(model_dir: &Path) -> anyhow::Result<(Vec<Mmap>, HashMap<String, usize>)> {
+pub(crate) fn load_safetensors_files(model_dir: &Path) -> anyhow::Result<(Vec<Mmap>, HashMap<String, usize>)> {
     // Case 1: single model.safetensors file.
     let single = model_dir.join("model.safetensors");
     if single.exists() {
@@ -575,7 +584,42 @@ pub(crate) fn load_weights<B: GpuCore>(
         .collect::<Result<_, _>>()
         .map_err(|e| anyhow::anyhow!("failed to parse safetensors: {e}"))?;
 
-    let store = TensorStore { shards, weight_map };
+    // Detect pre-quantized models (produced by `rllm quantize`).
+    // Each shard's metadata may contain "rllm_q4:<name>" = "m,k" entries.
+    // We parse metadata from each mmap via read_metadata() since the
+    // SafeTensors struct doesn't expose the __metadata__ dict directly.
+    let mut q4_map: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut is_prequantized = false;
+    for mmap in &mmaps {
+        if let Ok((_, metadata)) = SafeTensors::read_metadata(mmap.as_ref()) {
+            if let Some(meta) = metadata.metadata() {
+                if meta.get("quantization").map(|v| v.as_str()) == Some("rllm-q4") {
+                    is_prequantized = true;
+                    for (key, val) in meta {
+                        if let Some(tensor_name) = key.strip_prefix("rllm_q4:") {
+                            if let Some((m_str, k_str)) = val.split_once(',') {
+                                if let (Ok(m), Ok(k)) = (m_str.parse(), k_str.parse()) {
+                                    q4_map.insert(tensor_name.to_string(), (m, k));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if is_prequantized {
+        eprintln!(
+            "detected pre-quantized model ({} Q4 tensors), skipping on-load quantization",
+            q4_map.len()
+        );
+    }
+
+    let store = TensorStore {
+        shards,
+        weight_map,
+        q4_map,
+    };
 
     let hidden = config.hidden_size;
     let wp = &config.weight_prefix; // "model." or "model.language_model."
@@ -1913,12 +1957,27 @@ fn load_fused_experts<B: GpuCore>(
 // ---------------------------------------------------------------------------
 
 /// Upload a single tensor from the store to GPU memory (bf16 or f32).
+///
+/// If the tensor is in the store's Q4 map (pre-quantized by `rllm quantize`),
+/// uploads the raw Q4 bytes directly with the original logical shape.
 fn upload_tensor<B: GpuCore>(
     store: &TensorStore,
     backend: &B,
     name: &str,
     expected_shape: &[usize],
 ) -> anyhow::Result<B::Tensor> {
+    // Pre-quantized Q4: raw U8 bytes, upload directly as Q4.
+    if let Some((m, k)) = store.q4_shape(name) {
+        let view = store.tensor(name)?;
+        let expected_bytes = crate::gpu::q4_byte_count(m, k);
+        anyhow::ensure!(
+            view.data().len() == expected_bytes,
+            "pre-quantized tensor '{name}' byte count mismatch: expected {expected_bytes}, got {}",
+            view.data().len()
+        );
+        return Ok(backend.upload_tensor(view.data(), &[m, k], TensorDtype::Q4));
+    }
+
     let view = store.tensor(name)?;
 
     let shape = view.shape();
@@ -1975,6 +2034,9 @@ fn upload_norm_residual<B: GpuCore>(
 /// When `quantize` is true, delegates to `backend.quantize_upload()` which
 /// each backend can override to use its own format (e.g. Q4 for Metal,
 /// INT4 for CUDA).
+///
+/// Pre-quantized tensors (in the store's Q4 map) are uploaded directly —
+/// the `quantize` flag is ignored since they're already Q4.
 fn upload_maybe_quantized<B: GpuCore>(
     store: &TensorStore,
     backend: &B,
@@ -1982,6 +2044,11 @@ fn upload_maybe_quantized<B: GpuCore>(
     expected_shape: &[usize],
     quantize: bool,
 ) -> anyhow::Result<B::Tensor> {
+    // Pre-quantized: upload_tensor handles Q4 map lookup.
+    if store.q4_shape(name).is_some() {
+        return upload_tensor(store, backend, name, expected_shape);
+    }
+
     if !quantize {
         return upload_tensor(store, backend, name, expected_shape);
     }

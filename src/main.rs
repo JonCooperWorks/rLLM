@@ -4,9 +4,10 @@
 // Entry point.  Parses CLI arguments and dispatches to the appropriate
 // subcommand.  Each command lives in its own module under `commands/`:
 //
-//   rllm run   — single-prompt inference    (commands/run.rs)
-//   rllm batch — batched inference from file (commands/batch.rs)
-//   rllm serve — HTTP API server            (commands/serve.rs)
+//   rllm run      — single-prompt inference         (commands/run.rs)
+//   rllm batch    — batched inference from file      (commands/batch.rs)
+//   rllm serve    — HTTP API server                  (commands/serve.rs)
+//   rllm quantize — offline bf16→Q4 weight quantization (commands/quantize.rs)
 // ===========================================================================
 
 mod api;
