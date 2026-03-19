@@ -135,12 +135,53 @@ pub(crate) fn unix_timestamp() -> u64 {
 // Server entry point.
 // ---------------------------------------------------------------------------
 
+/// Validate TLS-related CLI args before doing any heavy work.
+///
+/// Returns the resolved TlsMode on success, or a descriptive error
+/// if the configuration is invalid (missing certs, unreadable files, etc.).
+fn validate_tls_args(args: &ServeArgs) -> anyhow::Result<tls::TlsMode> {
+    if args.letsencrypt {
+        let domain = args.domain.clone().unwrap(); // guaranteed by clap `requires`
+        return Ok(tls::TlsMode::LetsEncrypt {
+            domain,
+            email: args.letsencrypt_email.clone(),
+            cache_dir: args.cert_cache_dir.clone(),
+        });
+    }
+
+    if let (Some(cert), Some(key)) = (&args.cert, &args.private_key) {
+        if !cert.exists() {
+            anyhow::bail!("TLS certificate not found: {}", cert.display());
+        }
+        if !key.exists() {
+            anyhow::bail!("TLS private key not found: {}", key.display());
+        }
+        return Ok(tls::TlsMode::Manual {
+            cert: cert.clone(),
+            key: key.clone(),
+        });
+    }
+
+    if args.dangerous_no_tls {
+        return Ok(tls::TlsMode::None);
+    }
+
+    anyhow::bail!(
+        "no TLS configuration provided. Use --cert/--private-key or --letsencrypt \
+         to enable TLS, or pass --dangerous-no-tls to serve over plain HTTP."
+    )
+}
+
 /// Start the API server.  Called from `main()` when `rllm serve` is invoked.
 ///
 /// Loads the model in a dedicated worker thread, then starts axum on the
 /// tokio runtime.  This function blocks until the server shuts down.
 pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
-    eprintln!("loading model from {}...", args.model.display());
+    // ------------------------------------------------------------------
+    // 1. Validate CLI args before doing any heavy work (model loading).
+    //    Fail fast on missing TLS config, bad cert paths, etc.
+    // ------------------------------------------------------------------
+    let tls_mode = validate_tls_args(&args)?;
 
     let model_name = args
         .model
@@ -148,15 +189,36 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "rllm-model".into());
 
-    // Spawn the inference worker thread.
-    // The worker loads backend/tokenizer/weights/model and runs the Engine
-    // step loop.  We get back the request sender plus shared tokenizer/arch
-    // for handler-side tokenization.
+    if !args.model.join("config.json").exists() {
+        anyhow::bail!(
+            "model directory '{}' does not contain config.json",
+            args.model.display()
+        );
+    }
+
+    let scheme = if matches!(tls_mode, tls::TlsMode::None) {
+        "http"
+    } else {
+        "https"
+    };
+    let addr = format!("{}:{}", args.host, args.port);
+
+    // ------------------------------------------------------------------
+    // 2. Load model.
+    // ------------------------------------------------------------------
+    eprintln!();
+    eprintln!("  rllm — loading {}", model_name);
+    eprintln!("  ----------------------------------------");
+    if args.quantize {
+        eprintln!("  mode      : Q4 quantized");
+    } else {
+        eprintln!("  mode      : bf16");
+    }
+
     // Resolve --tp 0 → auto-detect available GPUs.
     let mut tp = args.tp;
     if tp == 0 {
         tp = gpu::device_count();
-        eprintln!("auto-detected {} GPU(s)", tp);
     }
 
     // Multi-GPU tensor parallelism is CUDA-only (requires NCCL).
@@ -164,10 +226,14 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     #[cfg(not(feature = "cuda"))]
     if tp > 1 {
         eprintln!(
-            "warning: --tp {} ignored (multi-GPU requires CUDA + NCCL), using single GPU",
+            "  warning   : --tp {} ignored (multi-GPU requires CUDA + NCCL), using single GPU",
             tp
         );
         tp = 1;
+    }
+
+    if tp > 1 {
+        eprintln!("  tp        : {} GPUs", tp);
     }
 
     let WorkerHandle {
@@ -176,7 +242,13 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         arch,
     } = spawn_worker(args.model.clone(), args.quantize, tp)?;
 
-    eprintln!("model ready: {}", model_name);
+    // ------------------------------------------------------------------
+    // 3. Start HTTP server.
+    // ------------------------------------------------------------------
+    eprintln!("  ----------------------------------------");
+    eprintln!("  endpoint  : {scheme}://{addr}/v1/chat/completions");
+    eprintln!("  health    : {scheme}://{addr}/health");
+    eprintln!();
 
     let state = Arc::new(ServerState {
         request_tx,
@@ -200,43 +272,6 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .route("/health", axum::routing::get(|| async { "ok" }))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state);
-
-    let addr = format!("{}:{}", args.host, args.port);
-
-    // Determine TLS mode from CLI args.
-    let tls_mode = if args.letsencrypt {
-        let domain = args.domain.clone().unwrap(); // guaranteed by clap `requires`
-        eprintln!(
-            "TLS: Let's Encrypt for {domain} (cache: {})",
-            args.cert_cache_dir.display()
-        );
-        tls::TlsMode::LetsEncrypt {
-            domain,
-            email: args.letsencrypt_email.clone(),
-            cache_dir: args.cert_cache_dir.clone(),
-        }
-    } else if let (Some(cert), Some(key)) = (&args.cert, &args.private_key) {
-        eprintln!("TLS: manual certs ({}, {})", cert.display(), key.display());
-        tls::TlsMode::Manual {
-            cert: cert.clone(),
-            key: key.clone(),
-        }
-    } else if args.dangerous_no_tls {
-        eprintln!("WARNING: running without TLS — traffic is unencrypted");
-        tls::TlsMode::None
-    } else {
-        anyhow::bail!(
-            "no TLS configuration provided. Use --cert/--private-key or --letsencrypt \
-             to enable TLS, or pass --dangerous-no-tls to serve over plain HTTP."
-        );
-    };
-
-    let scheme = if matches!(tls_mode, tls::TlsMode::None) {
-        "http"
-    } else {
-        "https"
-    };
-    eprintln!("serving on {scheme}://{addr}");
 
     // Build the tokio runtime here (not in main) so the rest of the binary
     // stays synchronous.  The inference worker is a plain std::thread —
@@ -479,14 +514,20 @@ fn run_worker_loop(
                 } else {
                     0.0
                 };
+                let stop_label = match stop_reason {
+                    StopReason::EndOfSequence => "eos",
+                    StopReason::MaxTokens => "max_tokens",
+                    StopReason::ToolCalls => "tool_calls",
+                };
                 eprintln!(
-                    "seq {}: {} prompt, {} generated, TTFT {:.0} ms, {:.1} tok/s decode, {:.2}s total",
+                    "  seq {:>3}  |  {} prompt + {} gen  |  TTFT {:.0} ms  |  {:.1} tok/s  |  {:.2}s  |  {}",
                     finished.id,
                     ctx.prompt_token_count,
                     ctx.generated_count,
                     ttft_ms.unwrap_or(0.0),
                     tok_per_sec,
                     total_secs,
+                    stop_label,
                 );
 
                 let _ = ctx.response_tx.blocking_send(InferenceEvent::Done {

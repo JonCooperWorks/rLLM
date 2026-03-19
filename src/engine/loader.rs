@@ -26,6 +26,7 @@
 // ===========================================================================
 
 use std::path::Path;
+use std::time::Instant;
 
 use crate::gpu::{self, GpuCore};
 use crate::model;
@@ -66,15 +67,25 @@ fn load_and_run_single_gpu(
     on_ready: impl FnOnce(&Tokenizer, ModelArch),
     run: impl FnOnce(&mut dyn InferenceEngine) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    let t_start = Instant::now();
+
     let backend = gpu::create_backend()?;
     eprintln!("gpu: {}", backend.device_name());
 
+    let t_load = Instant::now();
     let loader::LoadedModel {
         config,
         arch,
         tokenizer,
         weights,
     } = loader::load_model(&backend, model_dir, quantize)?;
+    let load_secs = t_load.elapsed().as_secs_f64();
+
+    if quantize {
+        eprintln!("loaded + quantized in {:.2}s", load_secs);
+    } else {
+        eprintln!("loaded in {:.2}s", load_secs);
+    }
 
     let model = model::Model::new(config.clone(), weights, &backend)?;
 
@@ -97,6 +108,7 @@ fn load_and_run_single_gpu(
         gpu_budget as f64 / (1024.0 * 1024.0),
     );
     eprintln!("max {} concurrent sequences", max_active);
+    eprintln!("ready in {:.2}s", t_start.elapsed().as_secs_f64());
 
     on_ready(&tokenizer, arch);
 
@@ -118,6 +130,8 @@ fn load_and_run_multi_gpu(
     use crate::gpu::multi_gpu::tp::MultiGpuInference;
     use crate::model::{config, tokenizer};
 
+    let t_start = Instant::now();
+
     eprintln!("tensor parallelism: {} GPUs", tp);
 
     let config = config::ModelConfig::from_file(&model_dir.join("config.json"))?;
@@ -125,13 +139,21 @@ fn load_and_run_multi_gpu(
     let arch = config.arch()?;
     let tok = tokenizer::Tokenizer::from_file(&model_dir.join("tokenizer.json"), arch)?;
 
+    let t_load = Instant::now();
     let num_blocks = 256;
     let multi = MultiGpuInference::new(model_dir, config.clone(), quantize, tp, num_blocks)?;
+    let load_secs = t_load.elapsed().as_secs_f64();
 
+    if quantize {
+        eprintln!("loaded + quantized in {:.2}s", load_secs);
+    } else {
+        eprintln!("loaded in {:.2}s", load_secs);
+    }
     eprintln!(
         "multi-GPU inference ready ({} ranks, max {} concurrent sequences)",
         tp, max_active,
     );
+    eprintln!("ready in {:.2}s", t_start.elapsed().as_secs_f64());
 
     on_ready(&tok, arch);
 
