@@ -82,8 +82,9 @@ Tensor parallelism across 2 GPUs via NCCL. Measured via `rllm run --tp 2`, singl
 | Mistral 7B Instruct | 7.2B | 100 tok/s | 123 tok/s | 106 ms | 114 ms |
 | Llama 3.1 8B Instruct | 8.0B | 82 tok/s | 96 tok/s | 113 ms | 123 ms |
 | Gemma 3 27B Instruct | 27.4B | 35 tok/s | 45 tok/s | 140 ms | 126 ms |
+| Llama 3.1 70B Instruct | 70.6B | — | 26 tok/s | — | 535 ms |
 
-Small models (1B-4B) are bottlenecked by NCCL all-reduce latency — single GPU is faster. TP=2 shines for larger models: Gemma 27B gets 45 tok/s Q4 vs ~24 tok/s on a single A100. Q4 is 10-30% faster than bf16, consistent with GDDR7X bandwidth characteristics.
+Small models (1B-4B) are bottlenecked by NCCL all-reduce latency — single GPU is faster. TP=2 shines for larger models: Gemma 27B gets 45 tok/s Q4 vs ~24 tok/s on a single A100. Llama 70B Q4 (~44 GB) doesn't fit on a single 32 GB RTX 5090, but TP=2 splits it across both GPUs and sustains ~26 tok/s across 9 concurrent sequences via the HTTP server with continuous batching. Q4 is 10-30% faster than bf16, consistent with GDDR7X bandwidth characteristics.
 
 </details>
 
