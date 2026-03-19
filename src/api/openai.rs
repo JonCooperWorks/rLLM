@@ -241,7 +241,6 @@ pub(crate) async fn chat_completions(
         temperature: req.temperature,
         top_p: req.top_p,
         response_tx,
-        endpoint: "openai",
     };
 
     state.request_tx.try_send(worker_req).map_err(|e| match e {
@@ -421,7 +420,6 @@ pub(crate) async fn completions(
         temperature: req.temperature,
         top_p: req.top_p,
         response_tx,
-        endpoint: "openai",
     };
 
     state.request_tx.try_send(worker_req).map_err(|e| match e {

@@ -208,7 +208,6 @@ pub(crate) async fn messages(
         temperature: req.temperature.unwrap_or(1.0),
         top_p: req.top_p.unwrap_or(0.9),
         response_tx,
-        endpoint: "anthropic",
     };
 
     state.request_tx.try_send(worker_req).map_err(|e| match e {
