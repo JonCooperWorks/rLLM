@@ -46,6 +46,7 @@ pub(crate) mod tls;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::ServeArgs;
 use crate::engine;
@@ -334,6 +335,10 @@ struct RequestContext {
     token_ids: Vec<u32>,
     /// Number of characters already sent to the client.
     prev_text_len: usize,
+    /// When this request was submitted to the worker (for TTFT / tok/s logging).
+    created_at: Instant,
+    /// When the first token was generated (None until the first token event).
+    first_token_at: Option<Instant>,
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +381,8 @@ fn run_worker_loop(
                     generated_count: 0,
                     token_ids: Vec::new(),
                     prev_text_len: 0,
+                    created_at: Instant::now(),
+                    first_token_at: None,
                 },
             );
         }
@@ -399,6 +406,8 @@ fn run_worker_loop(
                             generated_count: 0,
                             token_ids: Vec::new(),
                             prev_text_len: 0,
+                            created_at: Instant::now(),
+                            first_token_at: None,
                         },
                     );
                 }
@@ -433,6 +442,9 @@ fn run_worker_loop(
                 let text = full_text[ctx.prev_text_len..].to_string();
                 ctx.prev_text_len = full_text.len();
                 ctx.generated_count += 1;
+                if ctx.first_token_at.is_none() {
+                    ctx.first_token_at = Some(Instant::now());
+                }
                 if ctx
                     .response_tx
                     .blocking_send(InferenceEvent::Token { text })
@@ -450,6 +462,33 @@ fn run_worker_loop(
                     engine::FinishReason::Eos => StopReason::EndOfSequence,
                     engine::FinishReason::MaxTokens => StopReason::MaxTokens,
                 };
+
+                // Log TTFT and tok/s for benchmarking.
+                let now = Instant::now();
+                let ttft_ms = ctx
+                    .first_token_at
+                    .map(|t| t.duration_since(ctx.created_at).as_secs_f64() * 1000.0);
+                let total_secs = now.duration_since(ctx.created_at).as_secs_f64();
+                let decode_tokens = ctx.generated_count.saturating_sub(1);
+                let decode_secs = ctx
+                    .first_token_at
+                    .map(|t| now.duration_since(t).as_secs_f64())
+                    .unwrap_or(0.0);
+                let tok_per_sec = if decode_secs > 0.0 {
+                    decode_tokens as f64 / decode_secs
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "seq {}: {} prompt, {} generated, TTFT {:.0} ms, {:.1} tok/s decode, {:.2}s total",
+                    finished.id,
+                    ctx.prompt_token_count,
+                    ctx.generated_count,
+                    ttft_ms.unwrap_or(0.0),
+                    tok_per_sec,
+                    total_secs,
+                );
+
                 let _ = ctx.response_tx.blocking_send(InferenceEvent::Done {
                     stop_reason,
                     prompt_tokens: ctx.prompt_token_count,

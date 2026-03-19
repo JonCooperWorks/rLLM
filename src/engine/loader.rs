@@ -122,18 +122,6 @@ fn load_and_run_multi_gpu(
 
     let config = config::ModelConfig::from_file(&model_dir.join("config.json"))?;
 
-    // MoE models (Mixtral, Qwen3 MoE, GPT-OSS) do not yet support multi-GPU
-    // tensor parallelism — the expert routing and per-expert dispatch produce
-    // incorrect results when expert weights are sharded across ranks.  Fall
-    // back to single GPU until expert-parallel AllReduce is implemented.
-    if config.is_moe() {
-        eprintln!(
-            "warning: MoE model detected ({}), multi-GPU not yet supported — falling back to single GPU",
-            config.model_type,
-        );
-        return load_and_run_single_gpu(model_dir, quantize, max_active, on_ready, run);
-    }
-
     let arch = config.arch()?;
     let tok = tokenizer::Tokenizer::from_file(&model_dir.join("tokenizer.json"), arch)?;
 

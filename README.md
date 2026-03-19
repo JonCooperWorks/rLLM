@@ -16,17 +16,17 @@ Platform selection uses OS-conditional compilation (`#[cfg(target_os)]`) — no 
 | Model | Type | Multi-GPU (`--tp`) |
 |---|---|---|
 | Llama 3.x | Dense | Yes |
-| Qwen 2.5 | Dense | Yes |
 | Mistral 7B | Dense | Yes |
-| Phi-4 | Dense | Yes |
 | Gemma 3 | Dense | Yes |
-| Qwen 3.5 | Dense (hybrid DeltaNet) | Yes |
-| DeepSeek-R1-Distill | Dense | Yes |
-| Mixtral 8x7B | MoE | No — single GPU only |
-| Qwen3 MoE | MoE | No — single GPU only |
-| GPT-OSS 20B | MoE | No — single GPU only |
+| Qwen 2.5 | Dense | No |
+| Qwen 3.5 | Dense (hybrid DeltaNet) | No |
+| Qwen3 MoE | MoE | No |
+| Phi-4 | Dense | No |
+| DeepSeek-R1-Distill | Dense | No |
+| Mixtral 8x7B | MoE | No |
+| GPT-OSS 20B | MoE | No |
 
-All models support bf16 and Q4 quantization. MoE models automatically fall back to single GPU when `--tp` is specified.
+All models support bf16 and Q4 quantization. Multi-GPU tensor parallelism (`--tp`) is currently supported for Llama, Mistral, and Gemma only.
 
 ## Benchmarks
 
@@ -78,15 +78,12 @@ Tensor parallelism across 2 GPUs via NCCL. Measured via `rllm run --tp 2`, singl
 |---|---|---|---|---|---|
 | Llama 3.2 1B Instruct | 1.2B | 178 tok/s | 173 tok/s | 70 ms | 75 ms |
 | Llama 3.2 3B Instruct | 3.2B | 112 tok/s | 125 tok/s | 85 ms | 87 ms |
-| Qwen 2.5 3B Instruct | 3.1B | 99 tok/s | 101 tok/s | 77 ms | 84 ms |
 | Gemma 3 4B Instruct | 4.3B | 82 tok/s | 89 tok/s | 47 ms | 47 ms |
-| Qwen 2.5 7B Instruct | 7.6B | 85 tok/s | 98 tok/s | 97 ms | 113 ms |
 | Mistral 7B Instruct | 7.2B | 100 tok/s | 123 tok/s | 106 ms | 114 ms |
 | Llama 3.1 8B Instruct | 8.0B | 82 tok/s | 96 tok/s | 113 ms | 123 ms |
-| Phi-4 | 14.7B | 56 tok/s | 73 tok/s | 124 ms | 133 ms |
 | Gemma 3 27B Instruct | 27.4B | 35 tok/s | 45 tok/s | 140 ms | 126 ms |
 
-Small models (1B-4B) are bottlenecked by NCCL all-reduce latency — single GPU is faster. TP=2 shines for larger models: Gemma 27B gets 45 tok/s Q4 vs ~24 tok/s on a single A100. Q4 is 10-30% faster than bf16, consistent with GDDR7X bandwidth characteristics. Mixtral 8x7B and Qwen3 MoE bf16 do not fit in 2×32 GB; Mixtral Q4 TP=2 is supported (expert weights are sharded per rank via the sharding plan).
+Small models (1B-4B) are bottlenecked by NCCL all-reduce latency — single GPU is faster. TP=2 shines for larger models: Gemma 27B gets 45 tok/s Q4 vs ~24 tok/s on a single A100. Q4 is 10-30% faster than bf16, consistent with GDDR7X bandwidth characteristics.
 
 </details>
 
@@ -117,8 +114,6 @@ Benchmarked on [RunPod](https://runpod.io?ref=249k2lel). Tensor parallelism acro
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
 | Llama 3.1 70B Instruct | 70.6B | 13.5 tok/s | 11.1 tok/s | 457 ms | 564 ms |
-| Qwen 2.5 72B Instruct | 72.7B | 12.9 tok/s | 11.0 tok/s | 408 ms | 516 ms |
-| Qwen3.5 122B-A10B | ~122B (~10B active) | — | 17.8 tok/s | — | 1,800 ms |
 
 </details>
 
@@ -156,7 +151,7 @@ Q4 is slower than bf16 for decode on H100 — unlike Apple Silicon where Q4 is a
 
 - **Multi-architecture** — Llama 3, Qwen 2.5, Mistral, Mixtral 8x7B, Qwen3 MoE, Qwen3.5, Phi-4, Gemma 3, DeepSeek-R1-Distill, and GPT-OSS from the same codebase
 - **Metal + CUDA backends** — SIMD-cooperative matmul, async command buffer dispatch
-- **Multi-GPU tensor parallelism** — split dense models across GPUs via NCCL (`--tp 2`); MoE models (Mixtral, Qwen3 MoE, GPT-OSS) automatically fall back to single GPU
+- **Multi-GPU tensor parallelism** — split models across GPUs via NCCL (`--tp 2`); currently supported for Llama, Mistral, and Gemma
 - **Batched prefill** — GEMM-based prompt processing (3-10x faster than token-by-token)
 - **Paged KV cache** — on-demand block allocation, shared across sequences
 - **Continuous batching** — concurrent multi-sequence inference via engine/scheduler
