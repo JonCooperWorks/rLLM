@@ -847,7 +847,7 @@ pub(crate) fn final_norm_and_lm_head_prefill<B: GpuCore + GpuNorm + GpuMatmul>(
 /// O projection + O-proj bias + residual add.
 /// For models with q_dim ≠ hidden_size and O-proj bias (GPT-OSS).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn o_proj_residual_qdim_biased<B: GpuMatmul + GpuElementwise>(
+pub(crate) fn o_proj_residual_qdim_biased<B: GpuMatmul + GpuElementwise + GpuAllReduce>(
     backend: &B,
     layer: &LayerWeights<B>,
     attn_out: &B::Tensor,
@@ -860,6 +860,7 @@ pub(crate) fn o_proj_residual_qdim_biased<B: GpuMatmul + GpuElementwise>(
     if let Some(ref o_bias) = layer.o_proj_bias {
         backend.add(norm_buf, o_bias, norm_buf, hidden_size);
     }
+    backend.all_reduce_sum(norm_buf, hidden_size); // no-op when world_size=1
     backend.add(hidden, norm_buf, hidden, hidden_size);
 }
 
@@ -1447,5 +1448,139 @@ mod tests {
         assert_eq!(dims_ws2.num_kv_heads, dims_ws1.num_kv_heads / 2);
         // inter_size IS divided.
         assert_eq!(dims_ws2.inter_size, dims_ws1.inter_size / 2);
+    }
+
+    // ===================================================================
+    // Source-level invariant: all_reduce_sum after row-split matmuls.
+    //
+    // In tensor parallelism, o_proj and down_proj are row-split across
+    // GPUs.  Each GPU computes a partial result that MUST be summed via
+    // all_reduce_sum before feeding into the next operation (norm or
+    // residual add).  Missing this call produces correct single-GPU
+    // output but gibberish in multi-GPU mode.
+    //
+    // These tests scan source files to enforce the invariant statically,
+    // catching the bug at compile/test time rather than at inference.
+    // ===================================================================
+
+    /// Scan a source file and verify that every inline matmul referencing
+    /// `o_proj` or `down_proj` is followed by `all_reduce_sum` before the
+    /// next `.add(` (residual connection).
+    ///
+    /// Returns a list of (line_number, description) for each violation.
+    fn check_all_reduce_after_row_split_matmuls(source: &str) -> Vec<(usize, String)> {
+        let mut violations = Vec::new();
+        let lines: Vec<&str> = source.lines().collect();
+
+        // Track: did we just see a matmul on o_proj/down_proj and haven't
+        // yet seen all_reduce_sum?
+        let mut pending_reduce: Option<(usize, String)> = None;
+
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+
+            // Detect inline o_proj/down_proj matmul calls.
+            // These appear as `&layer.o_proj,` or `&layer.down_proj,` inside
+            // a matmul/matmul_batch call.  We look for the weight reference
+            // lines that appear inside .matmul( blocks.
+            if (trimmed.contains("&layer.o_proj") || trimmed.contains("&layer.down_proj"))
+                && !trimmed.starts_with("//")
+            {
+                // Check context: is this inside a matmul call?
+                // Look up a few lines for `.matmul` or `.matmul_batch`.
+                let start = i.saturating_sub(3);
+                let context = &lines[start..=i];
+                let in_matmul = context
+                    .iter()
+                    .any(|l| l.contains(".matmul(") || l.contains(".matmul_batch("));
+
+                if in_matmul {
+                    let proj_name = if trimmed.contains("o_proj") {
+                        "o_proj"
+                    } else {
+                        "down_proj"
+                    };
+                    pending_reduce = Some((i + 1, proj_name.to_string()));
+                }
+            }
+
+            // If we see all_reduce_sum, clear the pending flag.
+            if trimmed.contains("all_reduce_sum") && !trimmed.starts_with("//") {
+                pending_reduce = None;
+            }
+
+            // If we see a residual .add( while a reduce is pending, that's a violation.
+            // Skip bias adds (they reference `bias` in the same line or nearby context).
+            if trimmed.contains(".add(") && !trimmed.starts_with("//") {
+                let is_bias_add = trimmed.contains("bias")
+                    || lines.get(i.wrapping_sub(1)).map_or(false, |l| l.contains("bias"));
+                if !is_bias_add {
+                    if let Some((line_num, ref proj)) = pending_reduce {
+                        violations.push((
+                            line_num,
+                            format!(
+                                "{} matmul (line {}) has no all_reduce_sum before residual add (line {})",
+                                proj,
+                                line_num,
+                                i + 1
+                            ),
+                        ));
+                        pending_reduce = None;
+                    }
+                }
+            }
+        }
+
+        violations
+    }
+
+    /// Verify all model registry files have all_reduce_sum after inline
+    /// o_proj/down_proj matmuls.
+    #[test]
+    fn test_model_registry_all_reduce_after_row_split_matmuls() {
+        let registry_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/model/registry");
+        let mut all_violations = Vec::new();
+
+        for entry in std::fs::read_dir(registry_dir).expect("can't read registry dir") {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().map_or(true, |e| e != "rs") {
+                continue;
+            }
+            let filename = path.file_name().unwrap().to_string_lossy().to_string();
+            if filename == "mod.rs" {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).unwrap();
+            let violations = check_all_reduce_after_row_split_matmuls(&source);
+            for (line, desc) in violations {
+                all_violations.push(format!("  {}:{} — {}", filename, line, desc));
+            }
+        }
+
+        assert!(
+            all_violations.is_empty(),
+            "Missing all_reduce_sum after row-split matmuls in model registry files:\n{}",
+            all_violations.join("\n")
+        );
+    }
+
+    /// Verify primitive helper functions have all_reduce_sum after o_proj/down_proj
+    /// matmuls (catches bugs in shared helpers like o_proj_residual_qdim_biased).
+    #[test]
+    fn test_primitives_all_reduce_after_row_split_matmuls() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/model/primitives.rs");
+        let source = std::fs::read_to_string(path).unwrap();
+        let violations = check_all_reduce_after_row_split_matmuls(&source);
+
+        let messages: Vec<String> = violations
+            .iter()
+            .map(|(line, desc)| format!("  primitives.rs:{} — {}", line, desc))
+            .collect();
+        assert!(
+            messages.is_empty(),
+            "Missing all_reduce_sum after row-split matmuls in primitives.rs:\n{}",
+            messages.join("\n")
+        );
     }
 }

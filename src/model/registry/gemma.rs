@@ -213,6 +213,8 @@ pub(crate) fn forward_single_paged<
             d.hidden_size,
             d.q_dim,
         );
+        // AllReduce: sum partial O-projection results across GPUs (tensor parallelism).
+        m.backend.all_reduce_sum(&m.norm_buf, d.hidden_size);
 
         // Post-attention norm (sandwich norm): normalise before adding to residual.
         // This is the key Gemma 3 difference — Llama skips this step.
@@ -269,6 +271,8 @@ pub(crate) fn forward_single_paged<
             d.hidden_size,
             d.inter_size,
         );
+        // AllReduce: sum partial down-projection results across GPUs (tensor parallelism).
+        m.backend.all_reduce_sum(&m.norm_buf, d.hidden_size);
 
         // Post-FFN norm (sandwich norm).
         let post_ffn_norm = layer.post_feedforward_layernorm.as_ref().unwrap();
@@ -414,6 +418,8 @@ pub(crate) fn forward_prefill_paged<
             d.hidden_size,
             d.q_dim,
         );
+        // AllReduce: sum partial O-projection results across GPUs (tensor parallelism).
+        m.backend.all_reduce_sum(&bufs.norm_buf, bs * d.hidden_size);
 
         // Post-attention norm (batched sandwich norm).
         m.backend.rms_norm_batch(
@@ -483,6 +489,8 @@ pub(crate) fn forward_prefill_paged<
             d.hidden_size,
             d.inter_size,
         );
+        // AllReduce: sum partial down-projection results across GPUs (tensor parallelism).
+        m.backend.all_reduce_sum(&bufs.norm_buf, bs * d.hidden_size);
 
         // Post-FFN norm (batched sandwich norm).
         let post_ffn_norm = layer.post_feedforward_layernorm.as_ref().unwrap();

@@ -33,7 +33,9 @@
 //   Dispatch:    model/mod.rs (forward_single/prefill_paged arms)
 // ===========================================================================
 
-use crate::gpu::{GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope};
+use crate::gpu::{
+    GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
+};
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives::{self, Dims};
 use crate::model::profile::{self, Component};
@@ -81,7 +83,14 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
 
 /// Single-token forward pass for GPT-OSS-20B.
 pub(crate) fn forward_single_paged<
-    B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed,
+    B: GpuCore
+        + GpuNorm
+        + GpuMatmul
+        + GpuRope
+        + GpuAttention
+        + GpuElementwise
+        + GpuEmbed
+        + GpuAllReduce,
 >(
     m: &Model<'_, B>,
     token_id: u32,
@@ -236,7 +245,14 @@ pub(crate) fn forward_single_paged<
 // ===========================================================================
 
 pub(crate) fn forward_prefill_paged<
-    B: GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention + GpuElementwise + GpuEmbed,
+    B: GpuCore
+        + GpuNorm
+        + GpuMatmul
+        + GpuRope
+        + GpuAttention
+        + GpuElementwise
+        + GpuEmbed
+        + GpuAllReduce,
 >(
     m: &Model<'_, B>,
     tokens: &[u32],
@@ -349,6 +365,9 @@ pub(crate) fn forward_prefill_paged<
             m.backend
                 .bias_add_batch(&bufs.norm_buf, o_bias, &bufs.norm_buf, bs, d.hidden_size);
         }
+        // AllReduce: sum partial O-projection results across GPUs (tensor parallelism).
+        m.backend
+            .all_reduce_sum(&bufs.norm_buf, bs * d.hidden_size);
         m.backend.add(
             &bufs.hidden,
             &bufs.norm_buf,
