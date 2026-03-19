@@ -73,6 +73,8 @@ pub(crate) struct WorkerRequest {
     pub top_p: f32,
     /// Per-request channel to send token events back to the handler.
     pub response_tx: tokio::sync::mpsc::Sender<InferenceEvent>,
+    /// Which API endpoint originated this request ("openai" or "anthropic").
+    pub endpoint: &'static str,
 }
 
 /// Events sent from the inference worker back to an HTTP handler.
@@ -246,7 +248,8 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // 3. Start HTTP server.
     // ------------------------------------------------------------------
     eprintln!("  ----------------------------------------");
-    eprintln!("  endpoint  : {scheme}://{addr}/v1/chat/completions");
+    eprintln!("  openai    : {scheme}://{addr}/v1/chat/completions");
+    eprintln!("  anthropic : {scheme}://{addr}/v1/messages");
     eprintln!("  health    : {scheme}://{addr}/health");
     eprintln!();
 
@@ -362,6 +365,8 @@ struct RequestContext {
     response_tx: tokio::sync::mpsc::Sender<InferenceEvent>,
     prompt_token_count: usize,
     generated_count: usize,
+    /// Which API endpoint originated this request ("openai" or "anthropic").
+    endpoint: &'static str,
     /// Running buffer of all generated token IDs for this sequence.
     /// Used for incremental decoding: we decode the full buffer each step
     /// and emit only the new characters.  This avoids SentencePiece Strip
@@ -414,6 +419,7 @@ fn run_worker_loop(
                     response_tx: req.response_tx,
                     prompt_token_count,
                     generated_count: 0,
+                    endpoint: req.endpoint,
                     token_ids: Vec::new(),
                     prev_text_len: 0,
                     created_at: Instant::now(),
@@ -439,6 +445,7 @@ fn run_worker_loop(
                             response_tx: req.response_tx,
                             prompt_token_count,
                             generated_count: 0,
+                            endpoint: req.endpoint,
                             token_ids: Vec::new(),
                             prev_text_len: 0,
                             created_at: Instant::now(),
@@ -520,8 +527,9 @@ fn run_worker_loop(
                     StopReason::ToolCalls => "tool_calls",
                 };
                 eprintln!(
-                    "  seq {:>3}  |  {} prompt + {} gen  |  TTFT {:.0} ms  |  {:.1} tok/s  |  {:.2}s  |  {}",
+                    "  seq {:>3}  |  {:>9}  |  {} prompt + {} gen  |  TTFT {:.0} ms  |  {:.1} tok/s  |  {:.2}s  |  {}",
                     finished.id,
+                    ctx.endpoint,
                     ctx.prompt_token_count,
                     ctx.generated_count,
                     ttft_ms.unwrap_or(0.0),
