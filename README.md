@@ -13,7 +13,20 @@ Platform selection uses OS-conditional compilation (`#[cfg(target_os)]`) — no 
 
 ## Supported Models
 
-Llama 3, Qwen 2.5, Mistral, Mixtral 8x7B, Qwen3 MoE, Qwen3.5, Phi-4, Gemma 3, DeepSeek-R1-Distill, GPT-OSS — all from the same codebase with bf16 and Q4 quantization.
+| Model | Type | Multi-GPU (`--tp`) |
+|---|---|---|
+| Llama 3.x | Dense | Yes |
+| Qwen 2.5 | Dense | Yes |
+| Mistral 7B | Dense | Yes |
+| Phi-4 | Dense | Yes |
+| Gemma 3 | Dense | Yes |
+| Qwen 3.5 | Dense (hybrid DeltaNet) | Yes |
+| DeepSeek-R1-Distill | Dense | Yes |
+| Mixtral 8x7B | MoE | No — single GPU only |
+| Qwen3 MoE | MoE | No — single GPU only |
+| GPT-OSS 20B | MoE | No — single GPU only |
+
+All models support bf16 and Q4 quantization. MoE models automatically fall back to single GPU when `--tp` is specified.
 
 ## Benchmarks
 
@@ -143,7 +156,7 @@ Q4 is slower than bf16 for decode on H100 — unlike Apple Silicon where Q4 is a
 
 - **Multi-architecture** — Llama 3, Qwen 2.5, Mistral, Mixtral 8x7B, Qwen3 MoE, Qwen3.5, Phi-4, Gemma 3, DeepSeek-R1-Distill, and GPT-OSS from the same codebase
 - **Metal + CUDA backends** — SIMD-cooperative matmul, async command buffer dispatch
-- **Multi-GPU tensor parallelism** — split models across GPUs via NCCL (`--tp 2`)
+- **Multi-GPU tensor parallelism** — split dense models across GPUs via NCCL (`--tp 2`); MoE models (Mixtral, Qwen3 MoE, GPT-OSS) automatically fall back to single GPU
 - **Batched prefill** — GEMM-based prompt processing (3-10x faster than token-by-token)
 - **Paged KV cache** — on-demand block allocation, shared across sequences
 - **Continuous batching** — concurrent multi-sequence inference via engine/scheduler
