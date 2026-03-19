@@ -103,7 +103,7 @@ pub(crate) fn forward_single_paged<
 ) -> anyhow::Result<()> {
     let d = m.dims();
     let pos = seq_state.seq_len as u32;
-    let moe_inter = m.config.moe_intermediate_size as u32;
+    let moe_inter = (m.config.moe_intermediate_size / m.world_size) as u32;
     let num_experts = m.config.num_experts;
     let num_experts_per_tok = m.config.num_experts_per_tok;
 
@@ -232,7 +232,7 @@ pub(crate) fn forward_prefill_paged<
     let d = m.dims();
     let bs = tokens.len() as u32;
     let start_pos = seq_state.seq_len as u32;
-    let moe_inter = m.config.moe_intermediate_size as u32;
+    let moe_inter = (m.config.moe_intermediate_size / m.world_size) as u32;
     let num_experts = m.config.num_experts;
     let num_experts_per_tok = m.config.num_experts_per_tok;
 

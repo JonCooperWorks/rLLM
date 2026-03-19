@@ -353,6 +353,19 @@ scripts/download-models.sh --big
 
 Gated models (Llama, Gemma, Mistral) require a HuggingFace token — set `HF_TOKEN` or run `hf auth login` first. Qwen models are open access.
 
+### Test
+
+```bash
+# Run all tests (CPU backend, no GPU required)
+cargo test
+
+# Run MoE tensor-parallelism buffer sizing tests
+cargo test primitives::tests
+
+# Run GPU kernel correctness tests (CPU reference impl)
+cargo test gpu::cpu::tests
+```
+
 ### Benchmark
 
 ```bash

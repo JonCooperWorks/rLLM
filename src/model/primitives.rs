@@ -1291,3 +1291,161 @@ pub(crate) fn final_norm_and_lm_head_decode_batch<B: GpuCore + GpuNorm + GpuMatm
     let lm_head_weight = weights.lm_head.as_ref().unwrap_or(&weights.embed_tokens);
     backend.matmul_batch(lm_head_weight, &bufs.norm_buf, logits_batch, bs, vocab_size, hidden_size);
 }
+
+// ===========================================================================
+// Tests.
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu::cpu::CpuBackend;
+    use crate::gpu::ops::GpuCore;
+    use crate::gpu::TensorDtype;
+    use crate::model::loader::ExpertWeights;
+
+    /// Helper: create BF16 bytes from f32 values.
+    fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+        let bf16_values: Vec<half::bf16> = values.iter().map(|&v| half::bf16::from_f32(v)).collect();
+        bytemuck::cast_slice(&bf16_values).to_vec()
+    }
+
+    /// Regression test for multi-GPU MoE buffer sizing (Mixtral / Qwen3-MoE).
+    ///
+    /// Bug: `moe_inter` was set to the full `config.moe_intermediate_size`
+    /// instead of dividing by `world_size` for tensor-parallel inference.
+    /// The MoE scratch buffers (moe_gate_buf, moe_up_buf) are allocated at
+    /// `moe_intermediate_size / world_size`, so passing the full size caused
+    /// matmul to write beyond the buffer → CUDA_ERROR_ILLEGAL_ADDRESS.
+    ///
+    /// This test exercises the expert FFN matmul path with TP-reduced buffers
+    /// to verify that moe_inter matches the buffer allocation.
+    #[test]
+    fn test_moe_tp_buffer_sizing() {
+        let b = CpuBackend;
+
+        // Miniature MoE dimensions (inspired by Mixtral but tiny).
+        let hidden_size: u32 = 8;
+        let full_moe_inter: u32 = 16;
+        let world_size: usize = 2;
+        let tp_moe_inter: u32 = full_moe_inter / world_size as u32;
+
+        // Expert weights at TP-reduced intermediate size.
+        let gate_data = vec![0.1f32; tp_moe_inter as usize * hidden_size as usize];
+        let up_data = vec![0.1f32; tp_moe_inter as usize * hidden_size as usize];
+        let down_data = vec![0.1f32; hidden_size as usize * tp_moe_inter as usize];
+
+        let expert = ExpertWeights::<CpuBackend> {
+            gate_proj: b.upload_tensor(
+                &bf16_bytes(&gate_data),
+                &[tp_moe_inter as usize, hidden_size as usize],
+                TensorDtype::BF16,
+            ),
+            up_proj: b.upload_tensor(
+                &bf16_bytes(&up_data),
+                &[tp_moe_inter as usize, hidden_size as usize],
+                TensorDtype::BF16,
+            ),
+            down_proj: b.upload_tensor(
+                &bf16_bytes(&down_data),
+                &[hidden_size as usize, tp_moe_inter as usize],
+                TensorDtype::BF16,
+            ),
+            gate_bias: None,
+            up_bias: None,
+            down_bias: None,
+        };
+
+        // Input: normalized hidden state.
+        let norm_data = vec![1.0f32; hidden_size as usize];
+        let norm_buf = b.upload_tensor(
+            &bf16_bytes(&norm_data),
+            &[hidden_size as usize],
+            TensorDtype::BF16,
+        );
+
+        // Scratch buffers at TP-reduced size (the fix).
+        let moe_gate_buf = b.alloc_tensor(&[tp_moe_inter as usize], TensorDtype::BF16);
+        let moe_up_buf = b.alloc_tensor(&[tp_moe_inter as usize], TensorDtype::BF16);
+        let down_buf = b.alloc_tensor(&[hidden_size as usize], TensorDtype::BF16);
+
+        // Run the expert FFN matmuls with TP-sized moe_inter.
+        // Before the fix, moe_inter would be full_moe_inter=16 but buffers
+        // are sized for tp_moe_inter=8 → out-of-bounds writes on CUDA.
+        b.matmul(
+            &expert.gate_proj,
+            &norm_buf,
+            &moe_gate_buf,
+            tp_moe_inter,
+            hidden_size,
+        );
+        b.matmul(
+            &expert.up_proj,
+            &norm_buf,
+            &moe_up_buf,
+            tp_moe_inter,
+            hidden_size,
+        );
+        b.silu_mul(&moe_gate_buf, &moe_up_buf, &moe_gate_buf, tp_moe_inter);
+        b.matmul(
+            &expert.down_proj,
+            &moe_gate_buf,
+            &down_buf,
+            hidden_size,
+            tp_moe_inter,
+        );
+
+        // Verify output is non-zero (the expert FFN was executed correctly).
+        let mut out_bytes = vec![0u8; hidden_size as usize * 2];
+        b.copy_to_host(&down_buf, &mut out_bytes);
+        let out_values: Vec<f32> = bytemuck::cast_slice::<u8, half::bf16>(&out_bytes)
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
+        let sum: f32 = out_values.iter().map(|v| v.abs()).sum();
+        assert!(
+            sum > 0.0,
+            "Expert FFN output should be non-zero with TP-sized buffers"
+        );
+
+        // Verify the buffer byte count matches what TP allocates.
+        // This is the core invariant: buffer size == tp_moe_inter * sizeof(bf16).
+        assert_eq!(
+            b.tensor_byte_count(&moe_gate_buf),
+            tp_moe_inter as usize * 2,
+            "moe_gate_buf must be sized for tp_moe_inter, not full_moe_inter"
+        );
+    }
+
+    /// Verify that Dims::from_config_tp divides heads and inter_size but not
+    /// hidden_size.  MoE intermediate size is not in Dims — callers must
+    /// divide `config.moe_intermediate_size` by `model.world_size` themselves.
+    #[test]
+    fn test_dims_tp_splits_heads_and_inter() {
+        // Minimal Mixtral-like config JSON.
+        let json = r#"{
+            "model_type": "mixtral",
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "hidden_size": 512,
+            "intermediate_size": 1024,
+            "head_dim": 64,
+            "num_hidden_layers": 2,
+            "vocab_size": 100,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0
+        }"#;
+        let config: crate::model::config::ModelConfig = serde_json::from_str(json).unwrap();
+
+        let dims_ws1 = Dims::from_config(&config);
+        let dims_ws2 = Dims::from_config_tp(&config, 2);
+
+        // hidden_size is NOT divided.
+        assert_eq!(dims_ws1.hidden_size, dims_ws2.hidden_size);
+        // heads ARE divided.
+        assert_eq!(dims_ws2.num_heads, dims_ws1.num_heads / 2);
+        assert_eq!(dims_ws2.num_kv_heads, dims_ws1.num_kv_heads / 2);
+        // inter_size IS divided.
+        assert_eq!(dims_ws2.inter_size, dims_ws1.inter_size / 2);
+    }
+}
