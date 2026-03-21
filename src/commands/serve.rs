@@ -29,6 +29,11 @@ pub(crate) struct ServeArgs {
     #[arg(long)]
     pub quantize: bool,
 
+    /// Stream MoE expert weights from SSD instead of loading all into GPU memory.
+    /// Enables serving large MoE models (e.g. 397B) that don't fit in VRAM.
+    #[arg(long)]
+    pub stream_experts: bool,
+
     /// Domain name (for Let's Encrypt certificate provisioning).
     #[arg(long)]
     pub domain: Option<String>,

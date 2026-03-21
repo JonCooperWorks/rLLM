@@ -240,7 +240,7 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         request_tx,
         tokenizer,
         arch,
-    } = spawn_worker(args.model.clone(), args.quantize, tp)?;
+    } = spawn_worker(args.model.clone(), args.quantize, args.stream_experts, tp)?;
 
     // ------------------------------------------------------------------
     // 3. Start HTTP server.
@@ -319,6 +319,7 @@ struct WorkerHandle {
 fn spawn_worker(
     model_dir: std::path::PathBuf,
     quantize: bool,
+    stream_experts: bool,
     tp: usize,
 ) -> anyhow::Result<WorkerHandle> {
     let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
@@ -329,9 +330,10 @@ fn spawn_worker(
     std::thread::spawn(move || {
         let max_active = 32;
 
-        let result = engine::loader::load_and_run(
+        let result = engine::loader::load_and_run_ext(
             &model_dir,
             quantize,
+            stream_experts,
             tp,
             max_active,
             |tok, arch| {

@@ -326,9 +326,9 @@ kernel void top_k_softmax(
     // Simple selection: repeatedly find the max and mark it used.
     // For k=8, n=128 this is 8 × 128 = 1024 comparisons — trivial.
 
-    // Use threadgroup memory for the f32 copy (max 256 experts).
-    float vals[256];
-    for (uint i = 0; i < n && i < 256; i++) {
+    // Use threadgroup memory for the f32 copy (max 1024 experts).
+    float vals[1024];
+    for (uint i = 0; i < n && i < 1024; i++) {
         vals[i] = float(logits[i]);
     }
 
