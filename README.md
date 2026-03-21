@@ -53,8 +53,9 @@ Measured via `rllm run --chat`, single run.
 | GPT-OSS 20B | 20.0B (3.6B active) | 6 tok/s | 34 tok/s | 4,800 ms | 425 ms |
 | Mixtral 8x7B Instruct | 46.7B (12.9B active) | — | 12 tok/s | — | 5,400 ms |
 | Qwen3.5 35B-A3B ⚡ | 35.1B (3.3B active) | **3.0 tok/s** | 0.5 tok/s | 2,600 ms | 10,600 ms |
+| Qwen3.5 397B-A17B ⚡ | 397B (17B active) | **0.1 tok/s** | — | 67,400 ms | — |
 
-⚡ = SSD expert streaming (`--stream-experts`).  Expert weights are read from NVMe on demand instead of loading all 60 GB to GPU.  bf16 streaming is 6x faster than Q4 because it skips CPU-side quantization — the bottleneck is I/O, not compute.
+⚡ = SSD expert streaming (`--stream-experts`).  Expert weights are read from NVMe on demand instead of loading all to GPU — the 397B model (751 GB on disk) runs on a 64 GB machine using ~20 GB GPU memory.  bf16 streaming is faster than Q4 because it skips CPU-side quantization — the bottleneck is I/O, not compute.
 
 Q4 quantization (`--quantize`) gives ~1.3-3.5x faster decode by reducing memory bandwidth. Mixtral requires Q4 (bf16 would need ~87 GB). Q4 is strongly recommended for models over ~8B params. Large models (Gemma 3 27B, Phi-4, Qwen3/3.5 MoE) run in bf16 but are slow because the weights consume most of the 64 GB unified memory. Dynamic KV cache sizing automatically adjusts block count based on available GPU memory.
 
