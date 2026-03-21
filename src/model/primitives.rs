@@ -16,7 +16,8 @@
 // ===========================================================================
 
 use crate::gpu::{
-    GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
+    GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuMoe, GpuNorm,
+    GpuRope,
 };
 use crate::model::PrefillBuffers;
 use crate::model::config::ModelConfig;
@@ -371,7 +372,7 @@ pub(crate) fn ffn_block<B: GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce>(
 ///   - `routing_output`: [2 * num_experts_per_tok] — GPU top-k output
 ///   - `down_buf`: [hidden_size] — scratch for expert down projection
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn moe_ffn_block<B: GpuNorm + GpuMatmul + GpuElementwise>(
+pub(crate) fn moe_ffn_block<B: GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
     backend: &B,
     // Weights
     post_attn_norm: &B::Tensor,
@@ -425,15 +426,19 @@ pub(crate) fn moe_ffn_block<B: GpuNorm + GpuMatmul + GpuElementwise>(
 ///
 /// On return, `moe_output` contains the weighted sum of selected expert outputs.
 /// The `norm_buf` (normalized hidden state) is consumed but not modified.
+///
+/// Uses the fused gate+up+SwiGLU kernel (GpuMoe) to halve per-expert
+/// dispatches: 2 kernels per expert (fused_gate_up_swiglu + down matmul)
+/// instead of 4 (gate matmul + up matmul + silu_mul + down matmul).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn moe_expert_dispatch<B: GpuMatmul + GpuElementwise>(
+pub(crate) fn moe_expert_dispatch<B: GpuMatmul + GpuElementwise + GpuMoe>(
     backend: &B,
     router_gate: &B::Tensor,
     experts: &[ExpertWeights<B>],
     // Buffers
     norm_buf: &B::Tensor,
     moe_gate_buf: &B::Tensor,
-    moe_up_buf: &B::Tensor,
+    _moe_up_buf: &B::Tensor,
     moe_output: &B::Tensor,
     routing_output: &B::Tensor,
     down_buf: &B::Tensor,
@@ -473,25 +478,23 @@ pub(crate) fn moe_expert_dispatch<B: GpuMatmul + GpuElementwise>(
         .collect();
 
     // Zero the accumulator, then run each selected expert's SwiGLU FFN.
+    // Fused gate+up+SwiGLU: 1 dispatch instead of 3 (gate + up + silu_mul).
     backend.fill_zero(moe_output, hidden_size);
 
     for &(expert_idx, routing_weight) in &selected {
         let expert = &experts[expert_idx];
-        backend.matmul(
+
+        // Fused: out = silu(gate_proj @ norm_buf) * (up_proj @ norm_buf).
+        backend.fused_gate_up_swiglu(
             &expert.gate_proj,
+            &expert.up_proj,
             norm_buf,
             moe_gate_buf,
             moe_inter,
             hidden_size,
         );
-        backend.matmul(
-            &expert.up_proj,
-            norm_buf,
-            moe_up_buf,
-            moe_inter,
-            hidden_size,
-        );
-        backend.silu_mul(moe_gate_buf, moe_up_buf, moe_gate_buf, moe_inter);
+
+        // Down projection (unchanged).
         backend.matmul(
             &expert.down_proj,
             moe_gate_buf,
@@ -501,6 +504,138 @@ pub(crate) fn moe_expert_dispatch<B: GpuMatmul + GpuElementwise>(
         );
         backend.scale_add(moe_output, down_buf, routing_weight, hidden_size);
     }
+}
+
+// ===========================================================================
+// SSD-streamed MoE expert dispatch.
+//
+// Same algorithm as moe_expert_dispatch, but loads expert weights from disk
+// on-demand instead of indexing into a resident Vec<ExpertWeights>.
+// See expert_stream.rs for the streaming infrastructure.
+// ===========================================================================
+
+/// MoE expert dispatch with SSD streaming — loads experts from disk on demand.
+///
+/// Functionally identical to `moe_expert_dispatch` but uses an ExpertStreamer
+/// to pread() selected expert weights from safetensors files instead of
+/// keeping all experts in GPU memory.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn moe_expert_dispatch_streamed<B: GpuMatmul + GpuElementwise + GpuMoe>(
+    backend: &B,
+    streamer: &crate::model::expert_stream::ExpertStreamer<B>,
+    layer_idx: usize,
+    router_gate: &B::Tensor,
+    // Buffers
+    norm_buf: &B::Tensor,
+    moe_gate_buf: &B::Tensor,
+    moe_output: &B::Tensor,
+    routing_output: &B::Tensor,
+    down_buf: &B::Tensor,
+    // Dimensions
+    hidden_size: u32,
+    moe_inter: u32,
+    num_experts: usize,
+    num_experts_per_tok: usize,
+) {
+    // Router matmul — compute per-expert scores (same as non-streamed).
+    backend.matmul(
+        router_gate,
+        norm_buf,
+        moe_gate_buf,
+        num_experts as u32,
+        hidden_size,
+    );
+
+    // GPU-side top-k + softmax.
+    backend.top_k_softmax(
+        moe_gate_buf,
+        routing_output,
+        num_experts as u32,
+        num_experts_per_tok as u32,
+    );
+
+    // Read routing results to CPU.
+    let k = num_experts_per_tok;
+    let routing_bytes = k * 2 * 4;
+    let buf_bytes = backend.tensor_byte_count(routing_output);
+    let mut routing_buf = vec![0u8; buf_bytes];
+    backend.copy_to_host(routing_output, &mut routing_buf);
+    let routing_data: &[f32] = bytemuck::cast_slice(&routing_buf[..routing_bytes]);
+
+    let selected: Vec<(usize, f32)> = (0..k)
+        .map(|i| (routing_data[2 * i] as usize, routing_data[2 * i + 1]))
+        .collect();
+
+    // Load selected experts from SSD into GPU buffer slots.
+    streamer.load_experts(backend, layer_idx, &selected);
+
+    // Run expert FFNs using the streamer's buffer slots.
+    backend.fill_zero(moe_output, hidden_size);
+
+    for (slot_idx, &(_expert_idx, routing_weight)) in selected.iter().enumerate() {
+        let slot = &streamer.slots[slot_idx];
+
+        // Fused gate+up+SwiGLU (same as non-streamed path).
+        backend.fused_gate_up_swiglu(
+            &slot.gate_proj,
+            &slot.up_proj,
+            norm_buf,
+            moe_gate_buf,
+            moe_inter,
+            hidden_size,
+        );
+
+        // Down projection.
+        backend.matmul(
+            &slot.down_proj,
+            moe_gate_buf,
+            down_buf,
+            hidden_size,
+            moe_inter,
+        );
+        backend.scale_add(moe_output, down_buf, routing_weight, hidden_size);
+    }
+}
+
+/// MoE FFN block with streaming: norm → stream-dispatch → residual.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn moe_ffn_block_streamed<B: GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
+    backend: &B,
+    streamer: &crate::model::expert_stream::ExpertStreamer<B>,
+    layer_idx: usize,
+    post_attn_norm: &B::Tensor,
+    router_gate: &B::Tensor,
+    hidden: &B::Tensor,
+    norm_buf: &B::Tensor,
+    moe_gate_buf: &B::Tensor,
+    moe_output: &B::Tensor,
+    routing_output: &B::Tensor,
+    down_buf: &B::Tensor,
+    eps: f32,
+    hidden_size: u32,
+    moe_inter: u32,
+    num_experts: usize,
+    num_experts_per_tok: usize,
+) {
+    backend.rms_norm(hidden, post_attn_norm, eps, norm_buf);
+
+    moe_expert_dispatch_streamed(
+        backend,
+        streamer,
+        layer_idx,
+        router_gate,
+        norm_buf,
+        moe_gate_buf,
+        moe_output,
+        routing_output,
+        down_buf,
+        hidden_size,
+        moe_inter,
+        num_experts,
+        num_experts_per_tok,
+    );
+
+    backend.add(hidden, moe_output, hidden, hidden_size);
 }
 
 // ===========================================================================

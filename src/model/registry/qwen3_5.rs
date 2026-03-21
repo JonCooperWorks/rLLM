@@ -52,8 +52,8 @@
 // ===========================================================================
 
 use crate::gpu::{
-    GpuAllReduce, GpuAttention, GpuCore, GpuDeltaNet, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm,
-    GpuRope,
+    GpuAllReduce, GpuAttention, GpuCore, GpuDeltaNet, GpuElementwise, GpuEmbed, GpuMatmul, GpuMoe,
+    GpuNorm, GpuRope,
 };
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives::{self, Dims};
@@ -206,7 +206,7 @@ fn deltanet_attention_block<
 // Flow: hidden += routed_experts(hidden) + gate * shared_expert(hidden)
 // ---------------------------------------------------------------------------
 
-fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
+fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
     m: &Model<'_, B>,
     layer_idx: usize,
     d: &Dims,
@@ -228,22 +228,40 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
     );
 
     // Step 2: Core MoE expert dispatch → moe_output.
-    // Uses the shared primitive (same as Qwen3Moe, Mixtral, etc.).
-    primitives::moe_expert_dispatch(
-        m.backend,
-        layer.router_gate.as_ref().unwrap(),
-        layer.experts.as_ref().unwrap(),
-        &m.norm_buf,
-        moe_gate_buf,
-        moe_up_buf,
-        moe_output,
-        m.routing_output.as_ref().unwrap(),
-        &m.gate_buf,
-        d.hidden_size,
-        moe_inter,
-        num_experts,
-        num_experts_per_tok,
-    );
+    // Uses streaming dispatch if experts are on SSD, else GPU-resident dispatch.
+    if let Some(ref streamer) = m.expert_streamer {
+        primitives::moe_expert_dispatch_streamed(
+            m.backend,
+            streamer,
+            layer_idx,
+            layer.router_gate.as_ref().unwrap(),
+            &m.norm_buf,
+            moe_gate_buf,
+            moe_output,
+            m.routing_output.as_ref().unwrap(),
+            &m.gate_buf,
+            d.hidden_size,
+            moe_inter,
+            num_experts,
+            num_experts_per_tok,
+        );
+    } else {
+        primitives::moe_expert_dispatch(
+            m.backend,
+            layer.router_gate.as_ref().unwrap(),
+            layer.experts.as_ref().unwrap(),
+            &m.norm_buf,
+            moe_gate_buf,
+            moe_up_buf,
+            moe_output,
+            m.routing_output.as_ref().unwrap(),
+            &m.gate_buf,
+            d.hidden_size,
+            moe_inter,
+            num_experts,
+            num_experts_per_tok,
+        );
+    }
 
     // Step 3: Shared expert (Qwen3.5-specific) — always-active, gated by sigmoid scalar.
     // Uses the same norm_buf from step 1 (still valid, expert dispatch doesn't modify it).
@@ -306,7 +324,7 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
 // gate_proj/up_proj/down_proj per layer.
 // ---------------------------------------------------------------------------
 
-fn ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce>(
+fn ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe + GpuAllReduce>(
     m: &Model<'_, B>,
     layer_idx: usize,
     d: &Dims,
@@ -343,6 +361,7 @@ pub(crate) fn forward_single_paged<
         + GpuElementwise
         + GpuEmbed
         + GpuDeltaNet
+        + GpuMoe
         + GpuAllReduce,
 >(
     m: &Model<'_, B>,
@@ -499,6 +518,7 @@ pub(crate) fn forward_prefill_paged<
         + GpuElementwise
         + GpuEmbed
         + GpuDeltaNet
+        + GpuMoe
         + GpuAllReduce,
 >(
     m: &Model<'_, B>,

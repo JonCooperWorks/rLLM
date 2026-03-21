@@ -46,6 +46,7 @@ mod deltanet;
 mod elementwise;
 mod embed;
 mod matmul;
+mod moe;
 mod norm;
 mod rope;
 
@@ -56,5 +57,6 @@ pub(crate) use deltanet::GpuDeltaNet;
 pub(crate) use elementwise::GpuElementwise;
 pub(crate) use embed::GpuEmbed;
 pub(crate) use matmul::GpuMatmul;
+pub(crate) use moe::GpuMoe;
 pub(crate) use norm::GpuNorm;
 pub(crate) use rope::GpuRope;

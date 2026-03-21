@@ -175,21 +175,37 @@ kernel void matvec_q4(
 
         // Unpack 16 bytes → 32 nibbles → 32 dequantised weights.
         // 4x unrolled: process 4 bytes (8 weights) per iteration.
+        //
+        // FMA optimisation (from flash-moe): precompute scale*x per element,
+        // then use fma(nibble, sx, -8*sx) instead of (nibble-8)*scale*x.
+        // This lets the GPU issue a single fused multiply-add per nibble
+        // instead of a subtract + two multiplies.  The -8*sx bias term is
+        // hoisted out of the nibble extraction path.
         for (uint i = 0; i < 16; i += 4) {
             uchar b0 = data[i];
             uchar b1 = data[i + 1];
             uchar b2 = data[i + 2];
             uchar b3 = data[i + 3];
 
-            // Each byte packs two 4-bit values: low nibble = even, high = odd.
-            acc += float(int(b0 & 0xF) - 8) * scale * float(x[x_base + i * 2]);
-            acc += float(int(b0 >> 4)  - 8) * scale * float(x[x_base + i * 2 + 1]);
-            acc += float(int(b1 & 0xF) - 8) * scale * float(x[x_base + i * 2 + 2]);
-            acc += float(int(b1 >> 4)  - 8) * scale * float(x[x_base + i * 2 + 3]);
-            acc += float(int(b2 & 0xF) - 8) * scale * float(x[x_base + i * 2 + 4]);
-            acc += float(int(b2 >> 4)  - 8) * scale * float(x[x_base + i * 2 + 5]);
-            acc += float(int(b3 & 0xF) - 8) * scale * float(x[x_base + i * 2 + 6]);
-            acc += float(int(b3 >> 4)  - 8) * scale * float(x[x_base + i * 2 + 7]);
+            // Precompute scale*x and bias (-8*scale*x) for each element.
+            float sx0 = scale * float(x[x_base + i * 2]);
+            float sx1 = scale * float(x[x_base + i * 2 + 1]);
+            float sx2 = scale * float(x[x_base + i * 2 + 2]);
+            float sx3 = scale * float(x[x_base + i * 2 + 3]);
+            float sx4 = scale * float(x[x_base + i * 2 + 4]);
+            float sx5 = scale * float(x[x_base + i * 2 + 5]);
+            float sx6 = scale * float(x[x_base + i * 2 + 6]);
+            float sx7 = scale * float(x[x_base + i * 2 + 7]);
+
+            // fma(nibble, scale*x, -8*scale*x) = (nibble - 8) * scale * x
+            acc = fma(float(b0 & 0xF), sx0, fma(-8.0f, sx0, acc));
+            acc = fma(float(b0 >> 4),  sx1, fma(-8.0f, sx1, acc));
+            acc = fma(float(b1 & 0xF), sx2, fma(-8.0f, sx2, acc));
+            acc = fma(float(b1 >> 4),  sx3, fma(-8.0f, sx3, acc));
+            acc = fma(float(b2 & 0xF), sx4, fma(-8.0f, sx4, acc));
+            acc = fma(float(b2 >> 4),  sx5, fma(-8.0f, sx5, acc));
+            acc = fma(float(b3 & 0xF), sx6, fma(-8.0f, sx6, acc));
+            acc = fma(float(b3 >> 4),  sx7, fma(-8.0f, sx7, acc));
         }
     }
 
@@ -336,20 +352,30 @@ kernel void gemm_q4(
         device const uchar* data = block_ptr + 4;
         uint x_base = block_idx * 32;
 
+        // FMA-optimised dequant (same as matvec_q4 — see comment there).
         for (uint i = 0; i < 16; i += 4) {
             uchar b0 = data[i];
             uchar b1 = data[i + 1];
             uchar b2 = data[i + 2];
             uchar b3 = data[i + 3];
 
-            acc += float(int(b0 & 0xF) - 8) * scale * float(x_vec[x_base + i * 2]);
-            acc += float(int(b0 >> 4)  - 8) * scale * float(x_vec[x_base + i * 2 + 1]);
-            acc += float(int(b1 & 0xF) - 8) * scale * float(x_vec[x_base + i * 2 + 2]);
-            acc += float(int(b1 >> 4)  - 8) * scale * float(x_vec[x_base + i * 2 + 3]);
-            acc += float(int(b2 & 0xF) - 8) * scale * float(x_vec[x_base + i * 2 + 4]);
-            acc += float(int(b2 >> 4)  - 8) * scale * float(x_vec[x_base + i * 2 + 5]);
-            acc += float(int(b3 & 0xF) - 8) * scale * float(x_vec[x_base + i * 2 + 6]);
-            acc += float(int(b3 >> 4)  - 8) * scale * float(x_vec[x_base + i * 2 + 7]);
+            float sx0 = scale * float(x_vec[x_base + i * 2]);
+            float sx1 = scale * float(x_vec[x_base + i * 2 + 1]);
+            float sx2 = scale * float(x_vec[x_base + i * 2 + 2]);
+            float sx3 = scale * float(x_vec[x_base + i * 2 + 3]);
+            float sx4 = scale * float(x_vec[x_base + i * 2 + 4]);
+            float sx5 = scale * float(x_vec[x_base + i * 2 + 5]);
+            float sx6 = scale * float(x_vec[x_base + i * 2 + 6]);
+            float sx7 = scale * float(x_vec[x_base + i * 2 + 7]);
+
+            acc = fma(float(b0 & 0xF), sx0, fma(-8.0f, sx0, acc));
+            acc = fma(float(b0 >> 4),  sx1, fma(-8.0f, sx1, acc));
+            acc = fma(float(b1 & 0xF), sx2, fma(-8.0f, sx2, acc));
+            acc = fma(float(b1 >> 4),  sx3, fma(-8.0f, sx3, acc));
+            acc = fma(float(b2 & 0xF), sx4, fma(-8.0f, sx4, acc));
+            acc = fma(float(b2 >> 4),  sx5, fma(-8.0f, sx5, acc));
+            acc = fma(float(b3 & 0xF), sx6, fma(-8.0f, sx6, acc));
+            acc = fma(float(b3 >> 4),  sx7, fma(-8.0f, sx7, acc));
         }
     }
 

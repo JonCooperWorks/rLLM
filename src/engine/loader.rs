@@ -52,10 +52,23 @@ pub(crate) fn load_and_run(
     on_ready: impl FnOnce(&Tokenizer, ModelArch),
     run: impl FnOnce(&mut dyn InferenceEngine) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    load_and_run_ext(model_dir, quantize, false, tp, max_active, on_ready, run)
+}
+
+/// Extended version with expert streaming support.
+pub(crate) fn load_and_run_ext(
+    model_dir: &Path,
+    quantize: bool,
+    stream_experts: bool,
+    tp: usize,
+    max_active: usize,
+    on_ready: impl FnOnce(&Tokenizer, ModelArch),
+    run: impl FnOnce(&mut dyn InferenceEngine) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     if tp > 1 {
         load_and_run_multi_gpu(model_dir, quantize, tp, max_active, on_ready, run)
     } else {
-        load_and_run_single_gpu(model_dir, quantize, max_active, on_ready, run)
+        load_and_run_single_gpu(model_dir, quantize, stream_experts, max_active, on_ready, run)
     }
 }
 
@@ -63,6 +76,7 @@ pub(crate) fn load_and_run(
 fn load_and_run_single_gpu(
     model_dir: &Path,
     quantize: bool,
+    stream_experts: bool,
     max_active: usize,
     on_ready: impl FnOnce(&Tokenizer, ModelArch),
     run: impl FnOnce(&mut dyn InferenceEngine) -> anyhow::Result<()>,
@@ -78,7 +92,8 @@ fn load_and_run_single_gpu(
         arch,
         tokenizer,
         weights,
-    } = loader::load_model(&backend, model_dir, quantize)?;
+        expert_index,
+    } = loader::load_model(&backend, model_dir, quantize, stream_experts)?;
     let load_secs = t_load.elapsed().as_secs_f64();
 
     if quantize {
@@ -87,7 +102,19 @@ fn load_and_run_single_gpu(
         eprintln!("loaded in {:.2}s", load_secs);
     }
 
-    let model = model::Model::new(config.clone(), weights, &backend)?;
+    let mut model = model::Model::new(config.clone(), weights, &backend)?;
+
+    // Set up expert streamer if SSD streaming was requested.
+    if let Some(index) = expert_index {
+        let k = config.num_experts_per_tok;
+        let streamer = model::expert_stream::ExpertStreamer::new(&backend, index, k);
+        model.expert_streamer = Some(streamer);
+        eprintln!(
+            "expert streaming: {} slots, {} MB per expert load",
+            k,
+            config.moe_intermediate_size * config.hidden_size * 2 * 3 / 1024 / 1024,
+        );
+    }
 
     // Dynamic KV cache sizing based on remaining GPU memory.
     let gpu_budget = backend.recommended_max_memory();

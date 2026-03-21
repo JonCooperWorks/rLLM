@@ -17,6 +17,7 @@ GpuRope          — rotary positional embeddings
 GpuAttention     — attention + KV cache
 GpuElementwise   — activations, arithmetic, MoE routing
 GpuEmbed         — embedding lookup
+GpuMoe           — fused MoE kernels (gate+up+SwiGLU, combine+residual)
 GpuDeltaNet      — Qwen 3.5 linear attention kernels
 GpuAllReduce     — collective communication for tensor parallelism
 ```
@@ -54,6 +55,7 @@ gpt_oss.rs     — GPT Open Source
 
 Config parsing: `src/model/config.rs` (`ModelArch` enum).
 Weight loading: `src/model/loader.rs` (safetensors, single + multi-shard, Q4 on-load).
+Expert streaming: `src/model/expert_stream.rs` (SSD-backed on-demand expert loading for large MoE models).
 
 ### Inference Engine (`src/engine/`)
 

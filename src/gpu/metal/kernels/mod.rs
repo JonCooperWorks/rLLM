@@ -25,5 +25,6 @@ mod deltanet;
 mod elementwise;
 mod embed;
 mod matmul;
+mod moe;
 mod norm;
 mod rope;

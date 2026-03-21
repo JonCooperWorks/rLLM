@@ -75,6 +75,7 @@ const METAL_SOURCE_ATTENTION: &str = include_str!("shaders/attention.metal");
 const METAL_SOURCE_ELEMENTWISE: &str = include_str!("shaders/elementwise.metal");
 const METAL_SOURCE_EMBED: &str = include_str!("shaders/embed.metal");
 const METAL_SOURCE_DELTANET: &str = include_str!("shaders/deltanet.metal");
+const METAL_SOURCE_MOE: &str = include_str!("shaders/moe.metal");
 
 // ---------------------------------------------------------------------------
 // MetalBackend — holds the Metal device, command queue, and all compiled
@@ -139,6 +140,11 @@ pub(crate) struct MetalBackend {
     pub(crate) pipeline_mul_elem: metal::ComputePipelineState,
     pub(crate) pipeline_deltanet_step: metal::ComputePipelineState,
     pub(crate) pipeline_rope_partial: metal::ComputePipelineState,
+
+    // Fused MoE kernels (flash-moe inspired).
+    pub(crate) pipeline_fused_gate_up_swiglu: metal::ComputePipelineState,
+    pub(crate) pipeline_fused_gate_up_swiglu_q4: metal::ComputePipelineState,
+    pub(crate) pipeline_moe_combine_residual: metal::ComputePipelineState,
 
     // GPT-OSS kernels.
     pub(crate) pipeline_silu_mul_clamp: metal::ComputePipelineState,
@@ -352,6 +358,26 @@ impl MetalBackend {
             &compile_opts,
         )?;
 
+        // Fused MoE kernels (flash-moe inspired).
+        let pipeline_fused_gate_up_swiglu = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_MOE,
+            "fused_gate_up_swiglu_bf16",
+            &compile_opts,
+        )?;
+        let pipeline_fused_gate_up_swiglu_q4 = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_MOE,
+            "fused_gate_up_swiglu_q4",
+            &compile_opts,
+        )?;
+        let pipeline_moe_combine_residual = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_MOE,
+            "moe_combine_residual",
+            &compile_opts,
+        )?;
+
         // GPT-OSS kernels.
         let pipeline_silu_mul_clamp = Self::make_pipeline(
             &device,
@@ -421,6 +447,9 @@ impl MetalBackend {
             pipeline_mul_elem,
             pipeline_deltanet_step,
             pipeline_rope_partial,
+            pipeline_fused_gate_up_swiglu,
+            pipeline_fused_gate_up_swiglu_q4,
+            pipeline_moe_combine_residual,
             pipeline_silu_mul_clamp,
             pipeline_gpt_oss_gated_act,
             pipeline_rope_yarn,

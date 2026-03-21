@@ -78,7 +78,7 @@
 // ===========================================================================
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use half::bf16;
 use memmap2::Mmap;
@@ -565,6 +565,17 @@ pub(crate) fn load_weights<B: GpuCore>(
     quantize: bool,
     sharding: Option<&crate::gpu::parallel::ShardingPlan>,
 ) -> anyhow::Result<ModelWeights<B>> {
+    load_weights_inner(backend, model_dir, config, quantize, sharding, false)
+}
+
+fn load_weights_inner<B: GpuCore>(
+    backend: &B,
+    model_dir: &Path,
+    config: &ModelConfig,
+    quantize: bool,
+    sharding: Option<&crate::gpu::parallel::ShardingPlan>,
+    skip_experts: bool,
+) -> anyhow::Result<ModelWeights<B>> {
     // Sharding support: when provided, each weight is sliced to this rank's
     // portion before uploading to GPU.  For world_size=1 the plan has no
     // entries, so all weights pass through unmodified.
@@ -670,6 +681,7 @@ pub(crate) fn load_weights<B: GpuCore>(
         )?;
         let ffn = load_ffn_weights(
             &store, backend, &prefix, config, &hints, i, quantize, sharding,
+            skip_experts,
         )?;
 
         layers.push(LayerWeights {
@@ -1424,6 +1436,7 @@ fn load_ffn_weights<B: GpuCore>(
     layer_idx: usize,
     quantize: bool,
     sharding: Option<&crate::gpu::parallel::ShardingPlan>,
+    skip_experts: bool,
 ) -> anyhow::Result<FfnLoaded<B>> {
     let hidden = config.hidden_size;
     let inter = config.intermediate_size;
@@ -1431,6 +1444,7 @@ fn load_ffn_weights<B: GpuCore>(
     if config.is_moe() {
         load_moe_ffn_weights(
             store, backend, prefix, config, hints, layer_idx, quantize, sharding,
+            skip_experts,
         )
     } else if hints.has_fused_qkv {
         // -----------------------------------------------------------------
@@ -1539,6 +1553,7 @@ fn load_moe_ffn_weights<B: GpuCore>(
     layer_idx: usize,
     quantize: bool,
     sharding: Option<&crate::gpu::parallel::ShardingPlan>,
+    skip_experts: bool,
 ) -> anyhow::Result<FfnLoaded<B>> {
     let hidden = config.hidden_size;
     let moe_inter = config.moe_intermediate_size;
@@ -1585,7 +1600,16 @@ fn load_moe_ffn_weights<B: GpuCore>(
     let fused_name = format!("{prefix}.mlp.experts.gate_up_proj");
     let is_fused = !is_mxfp4 && store.tensor(&fused_name).is_ok();
 
-    let expert_vec = if is_mxfp4 {
+    let expert_vec = if skip_experts {
+        if layer_idx == 0 {
+            eprintln!(
+                "  skipping {} experts per layer (streaming from SSD){}",
+                num_experts,
+                if is_fused { " [fused format]" } else { "" },
+            );
+        }
+        Vec::new()
+    } else if is_mxfp4 {
         load_mxfp4_experts(
             store,
             backend,
@@ -1727,7 +1751,7 @@ fn load_moe_ffn_weights<B: GpuCore>(
         down_proj: dummy3,
         router_gate: Some(router),
         router_bias: router_bias_tensor,
-        experts: Some(expert_vec),
+        experts: if skip_experts { None } else { Some(expert_vec) },
         shared_expert_gate_proj: se_gate_proj,
         shared_expert_up_proj: se_up_proj,
         shared_expert_down_proj: se_down_proj,
@@ -2152,15 +2176,20 @@ pub(crate) struct LoadedModel<B: GpuCore> {
     pub arch: ModelArch,
     pub tokenizer: Tokenizer,
     pub weights: ModelWeights<B>,
+    /// Expert index for SSD streaming (None when all experts are GPU-resident).
+    pub expert_index: Option<super::expert_stream::ExpertIndex>,
 }
 
 /// Load config, tokenizer, and weights from a model directory.
 ///
 /// Logs progress to stderr so the user sees what's happening.
+/// When `stream_experts` is true, expert weights are NOT loaded to GPU;
+/// instead, their file locations are recorded for on-demand SSD streaming.
 pub(crate) fn load_model<B: GpuCore>(
     backend: &B,
     model_dir: &Path,
     quantize: bool,
+    stream_experts: bool,
 ) -> anyhow::Result<LoadedModel<B>> {
     let config = ModelConfig::from_file(&model_dir.join("config.json"))?;
     let arch = config.arch()?;
@@ -2172,10 +2201,13 @@ pub(crate) fn load_model<B: GpuCore>(
     let tokenizer = Tokenizer::from_file(&model_dir.join("tokenizer.json"), arch)?;
     eprintln!("tokenizer loaded");
 
-    let weights = load_weights(backend, model_dir, &config, quantize, None)?;
+    let (weights, expert_index) = load_weights_maybe_streamed(
+        backend, model_dir, &config, quantize, stream_experts, None,
+    )?;
     eprintln!(
-        "weights loaded{}",
-        if quantize { " (Q4 quantised)" } else { "" }
+        "weights loaded{}{}",
+        if quantize { " (Q4 quantised)" } else { "" },
+        if expert_index.is_some() { " (experts streaming from SSD)" } else { "" },
     );
 
     Ok(LoadedModel {
@@ -2183,7 +2215,230 @@ pub(crate) fn load_model<B: GpuCore>(
         arch,
         tokenizer,
         weights,
+        expert_index,
     })
+}
+
+/// Load weights with optional expert streaming.
+///
+/// Returns (weights, optional expert_index).  When stream_experts is true and
+/// the model has MoE layers, expert weights are NOT uploaded to GPU — their
+/// file locations are recorded in the ExpertIndex for on-demand pread().
+fn load_weights_maybe_streamed<B: GpuCore>(
+    backend: &B,
+    model_dir: &Path,
+    config: &ModelConfig,
+    quantize: bool,
+    stream_experts: bool,
+    sharding: Option<&crate::gpu::parallel::ShardingPlan>,
+) -> anyhow::Result<(ModelWeights<B>, Option<super::expert_stream::ExpertIndex>)> {
+    if !stream_experts || !config.is_moe() {
+        let weights = load_weights(backend, model_dir, config, quantize, sharding)?;
+        return Ok((weights, None));
+    }
+
+    // Build expert index from safetensors headers (computes file offsets).
+    let expert_index = build_expert_index_from_safetensors(
+        model_dir, config, quantize,
+    )?;
+
+    // Load weights with skip_experts=true to avoid uploading expert data to GPU.
+    let weights = load_weights_inner(backend, model_dir, config, quantize, sharding, true)?;
+
+    Ok((weights, Some(expert_index)))
+}
+
+// ===========================================================================
+// Expert index building for SSD streaming.
+//
+// Reads safetensors file headers to locate expert tensors without loading
+// their data.  The resulting ExpertIndex maps (layer, expert_id) → file
+// offset for on-demand pread() during inference.
+// ===========================================================================
+
+fn build_expert_index_from_safetensors(
+    model_dir: &Path,
+    config: &ModelConfig,
+    quantize: bool,
+) -> anyhow::Result<super::expert_stream::ExpertIndex> {
+    use super::expert_stream::{FusedLayerInfo, PerExpertInfo, safetensors_data_start};
+
+    let hidden = config.hidden_size;
+    let moe_inter = config.moe_intermediate_size;
+    let num_experts = config.num_experts;
+    let num_layers = config.num_hidden_layers;
+
+    // Re-open shard files (need file handles for pread, not mmaps).
+    let (mmaps, weight_map) = load_safetensors_files(model_dir)?;
+
+    // Compute data_start for each shard (8 + header_len).
+    let data_starts: Vec<u64> = mmaps.iter().map(|m| safetensors_data_start(m)).collect();
+
+    // Parse safetensors to get tensor views (for data pointer offsets).
+    let shards: Vec<SafeTensors> = mmaps
+        .iter()
+        .map(|m| SafeTensors::deserialize(m).expect("failed to parse safetensors"))
+        .collect();
+
+    let store = TensorStore {
+        shards,
+        weight_map: weight_map.clone(),
+        q4_map: HashMap::new(),
+    };
+
+    // Determine the layer prefix pattern.
+    let prefix_base = format!("{}layers.", config.weight_prefix);
+
+    // Open file handles for pread.
+    let shard_paths = get_shard_paths(model_dir)?;
+    let shard_files: Vec<std::fs::File> = shard_paths
+        .iter()
+        .map(|p| std::fs::File::open(p).expect("failed to open shard for streaming"))
+        .collect();
+
+    // Detect fused vs per-expert format (same logic as load_ffn_weights).
+    let test_prefix = format!("{prefix_base}0");
+    let fused_name = format!("{test_prefix}.mlp.experts.gate_up_proj");
+    let is_fused = store.tensor(&fused_name).is_ok();
+
+    if is_fused {
+        // Fused format (Qwen3.5): gate_up_proj [num_experts, 2*moe_inter, hidden]
+        let mut layer_info = Vec::with_capacity(num_layers);
+
+        for layer_idx in 0..num_layers {
+            let prefix = format!("{prefix_base}{layer_idx}");
+            let gu_name = format!("{prefix}.mlp.experts.gate_up_proj");
+            let down_name = format!("{prefix}.mlp.experts.down_proj");
+
+            let gu_view = store.tensor(&gu_name)?;
+            let down_view = store.tensor(&down_name)?;
+
+            // Compute file offset: data pointer - mmap base + data_start
+            let gu_shard = shard_index(&weight_map, &gu_name);
+            let down_shard = shard_index(&weight_map, &down_name);
+
+            let gu_offset = tensor_file_offset(
+                gu_view.data(), mmaps[gu_shard].as_ref(), data_starts[gu_shard],
+            );
+            let down_offset = tensor_file_offset(
+                down_view.data(), mmaps[down_shard].as_ref(), data_starts[down_shard],
+            );
+
+            layer_info.push(FusedLayerInfo {
+                shard_gate_up: gu_shard,
+                shard_down: down_shard,
+                gate_up_file_offset: gu_offset,
+                down_file_offset: down_offset,
+            });
+        }
+
+        eprintln!("  built expert index: {} layers × {} experts (fused format)", num_layers, num_experts);
+
+        Ok(super::expert_stream::build_fused_expert_index(
+            layer_info, shard_files, hidden, moe_inter, num_experts, quantize,
+        ))
+    } else {
+        // Per-expert format (Qwen3-MoE, Mixtral): experts.{j}.gate_proj etc.
+        let mut layer_info = Vec::with_capacity(num_layers);
+
+        // Detect per-expert naming pattern.
+        let test_qwen = format!("{test_prefix}.mlp.experts.0.gate_proj.weight");
+        let test_mixtral = format!("{test_prefix}.block_sparse_moe.experts.0.w1.weight");
+        let is_qwen_naming = store.tensor(&test_qwen).is_ok();
+
+        for layer_idx in 0..num_layers {
+            let prefix = format!("{prefix_base}{layer_idx}");
+            let mut experts = Vec::with_capacity(num_experts);
+
+            for j in 0..num_experts {
+                let (gate_name, up_name, down_name) = if is_qwen_naming {
+                    (
+                        format!("{prefix}.mlp.experts.{j}.gate_proj.weight"),
+                        format!("{prefix}.mlp.experts.{j}.up_proj.weight"),
+                        format!("{prefix}.mlp.experts.{j}.down_proj.weight"),
+                    )
+                } else {
+                    // Mixtral naming: w1=gate, w3=up, w2=down
+                    (
+                        format!("{prefix}.block_sparse_moe.experts.{j}.w1.weight"),
+                        format!("{prefix}.block_sparse_moe.experts.{j}.w3.weight"),
+                        format!("{prefix}.block_sparse_moe.experts.{j}.w2.weight"),
+                    )
+                };
+
+                let gate_view = store.tensor(&gate_name)?;
+                let up_view = store.tensor(&up_name)?;
+                let down_view = store.tensor(&down_name)?;
+
+                let gate_shard = shard_index(&weight_map, &gate_name);
+                let up_shard = shard_index(&weight_map, &up_name);
+                let down_shard = shard_index(&weight_map, &down_name);
+
+                experts.push(PerExpertInfo {
+                    shard_gate: gate_shard,
+                    shard_up: up_shard,
+                    shard_down: down_shard,
+                    gate_file_offset: tensor_file_offset(
+                        gate_view.data(), mmaps[gate_shard].as_ref(), data_starts[gate_shard],
+                    ),
+                    up_file_offset: tensor_file_offset(
+                        up_view.data(), mmaps[up_shard].as_ref(), data_starts[up_shard],
+                    ),
+                    down_file_offset: tensor_file_offset(
+                        down_view.data(), mmaps[down_shard].as_ref(), data_starts[down_shard],
+                    ),
+                });
+            }
+
+            layer_info.push(experts);
+        }
+
+        eprintln!("  built expert index: {} layers × {} experts (per-expert format)", num_layers, num_experts);
+
+        Ok(super::expert_stream::build_per_expert_index(
+            layer_info, shard_files, hidden, moe_inter, quantize,
+        ))
+    }
+}
+
+/// Compute the absolute file offset of a tensor's data within its shard file.
+///
+/// pointer arithmetic: the tensor view's data slice is within the mmap,
+/// so its offset is (data_ptr - mmap_ptr) which already accounts for the
+/// safetensors header.
+fn tensor_file_offset(tensor_data: &[u8], mmap: &[u8], _data_start: u64) -> u64 {
+    let tensor_ptr = tensor_data.as_ptr() as usize;
+    let mmap_ptr = mmap.as_ptr() as usize;
+    (tensor_ptr - mmap_ptr) as u64
+}
+
+/// Get shard index for a tensor name (0 for single-file models).
+fn shard_index(weight_map: &HashMap<String, usize>, name: &str) -> usize {
+    weight_map.get(name).copied().unwrap_or(0)
+}
+
+/// Get ordered shard file paths for a model directory.
+fn get_shard_paths(model_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let single = model_dir.join("model.safetensors");
+    if single.exists() {
+        return Ok(vec![single]);
+    }
+
+    let index_path = model_dir.join("model.safetensors.index.json");
+    let index_str = std::fs::read_to_string(&index_path)?;
+    let index: serde_json::Value = serde_json::from_str(&index_str)?;
+    let wm = index["weight_map"].as_object().unwrap();
+
+    let mut shard_files: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for filename in wm.values() {
+        let f = filename.as_str().unwrap().to_string();
+        if seen.insert(f.clone()) {
+            shard_files.push(f);
+        }
+    }
+
+    Ok(shard_files.iter().map(|f| model_dir.join(f)).collect())
 }
 
 // ===========================================================================

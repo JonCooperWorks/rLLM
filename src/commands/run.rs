@@ -30,6 +30,11 @@ pub(crate) struct RunArgs {
     #[arg(long)]
     quantize: bool,
 
+    /// Stream MoE expert weights from SSD instead of loading all into GPU memory.
+    /// Enables running large MoE models (e.g. 397B) that don't fit in VRAM.
+    #[arg(long)]
+    stream_experts: bool,
+
     /// Sampling temperature.  T=0 → greedy (deterministic), T=1 → natural,
     /// T>1 → more random.  Default 1.0.
     #[arg(long, default_value = "1.0")]
@@ -97,9 +102,10 @@ pub(crate) fn exec(mut args: RunArgs) -> anyhow::Result<()> {
     use std::cell::Cell;
     let arch_cell: Cell<Option<ModelArch>> = Cell::new(None);
 
-    engine::loader::load_and_run(
+    engine::loader::load_and_run_ext(
         &args.model,
         args.quantize,
+        args.stream_experts,
         args.tp,
         1, // single sequence
         |_tok, arch| {

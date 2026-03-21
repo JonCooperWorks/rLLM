@@ -1216,6 +1216,112 @@ impl GpuAllReduce for CpuBackend {
 }
 
 // ===========================================================================
+// GpuMoe — fused MoE kernels (reference CPU implementation).
+// ===========================================================================
+
+impl GpuMoe for CpuBackend {
+    fn fused_gate_up_swiglu(
+        &self,
+        w_gate: &CpuTensor,
+        w_up: &CpuTensor,
+        input: &CpuTensor,
+        output: &CpuTensor,
+        m: u32,
+        k: u32,
+    ) {
+        let mm = m as usize;
+        let kk = k as usize;
+        let inp = read_bf16(input, kk);
+        let mut result = vec![0.0f32; mm];
+
+        match w_gate.dtype {
+            TensorDtype::BF16 => {
+                for row in 0..mm {
+                    let g_offset = row * kk * 2;
+                    let u_offset = row * kk * 2;
+                    let g_row = read_bf16_bytes(&w_gate.data[g_offset..], kk);
+                    let u_row = read_bf16_bytes(&w_up.data[u_offset..], kk);
+
+                    let mut acc_gate = 0.0f32;
+                    let mut acc_up = 0.0f32;
+                    for j in 0..kk {
+                        acc_gate += g_row[j] * inp[j];
+                        acc_up += u_row[j] * inp[j];
+                    }
+
+                    let silu = acc_gate / (1.0 + (-acc_gate).exp());
+                    result[row] = silu * acc_up;
+                }
+            }
+            TensorDtype::Q4 => {
+                let blocks_per_row = kk / 32;
+                for row in 0..mm {
+                    let row_offset = row * blocks_per_row * 20;
+                    let mut acc_gate = 0.0f32;
+                    let mut acc_up = 0.0f32;
+
+                    for block in 0..blocks_per_row {
+                        let g_off = row_offset + block * 20;
+                        let g_scale: f32 =
+                            bytemuck::cast_slice::<u8, f32>(&w_gate.data[g_off..g_off + 4])[0];
+                        let u_off = row_offset + block * 20;
+                        let u_scale: f32 =
+                            bytemuck::cast_slice::<u8, f32>(&w_up.data[u_off..u_off + 4])[0];
+
+                        for i in 0..16 {
+                            let gb = w_gate.data[g_off + 4 + i];
+                            let ub = w_up.data[u_off + 4 + i];
+                            let x_idx = block * 32 + i * 2;
+
+                            let glo = (gb & 0xF) as i32 - 8;
+                            let ghi = (gb >> 4) as i32 - 8;
+                            let ulo = (ub & 0xF) as i32 - 8;
+                            let uhi = (ub >> 4) as i32 - 8;
+
+                            acc_gate += glo as f32 * g_scale * inp[x_idx];
+                            acc_gate += ghi as f32 * g_scale * inp[x_idx + 1];
+                            acc_up += ulo as f32 * u_scale * inp[x_idx];
+                            acc_up += uhi as f32 * u_scale * inp[x_idx + 1];
+                        }
+                    }
+
+                    let silu = acc_gate / (1.0 + (-acc_gate).exp());
+                    result[row] = silu * acc_up;
+                }
+            }
+            _ => panic!("fused_gate_up_swiglu: unsupported dtype {:?}", w_gate.dtype),
+        }
+
+        write_bf16(output, &result);
+    }
+
+    fn moe_combine_residual(
+        &self,
+        residual: &CpuTensor,
+        expert_outputs: &CpuTensor,
+        weights: &[f32],
+        output: &CpuTensor,
+        hidden_size: u32,
+        k: u32,
+    ) {
+        let hs = hidden_size as usize;
+        let kk = k as usize;
+        let res = read_bf16(residual, hs);
+        let experts = read_bf16(expert_outputs, hs * kk);
+
+        let mut result = vec![0.0f32; hs];
+        for j in 0..hs {
+            let mut sum = res[j];
+            for i in 0..kk {
+                sum += weights[i] * experts[i * hs + j];
+            }
+            result[j] = sum;
+        }
+        write_bf16(output, &result);
+    }
+}
+
+// ===========================================================================
 // Tests — GPU kernel correctness via CpuBackend
 // ===========================================================================
 

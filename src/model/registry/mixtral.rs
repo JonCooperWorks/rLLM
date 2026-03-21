@@ -37,7 +37,8 @@
 // ===========================================================================
 
 use crate::gpu::{
-    GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
+    GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuMoe, GpuNorm,
+    GpuRope,
 };
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives::{self, Dims};
@@ -52,7 +53,7 @@ use crate::model::{Model, PrefillBuffers};
 // ---------------------------------------------------------------------------
 
 /// Run the MoE FFN block for a single token (delegates to shared primitive).
-fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
+fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
     m: &Model<'_, B>,
     layer_idx: usize,
     d: &Dims,
@@ -61,24 +62,45 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
     num_experts_per_tok: usize,
 ) {
     let layer = &m.weights.layers[layer_idx];
-    primitives::moe_ffn_block(
-        m.backend,
-        &layer.post_attention_layernorm,
-        layer.router_gate.as_ref().unwrap(),
-        layer.experts.as_ref().unwrap(),
-        &m.hidden,
-        &m.norm_buf,
-        m.moe_gate_buf.as_ref().unwrap(),
-        m.moe_up_buf.as_ref().unwrap(),
-        m.moe_output.as_ref().unwrap(),
-        m.routing_output.as_ref().unwrap(),
-        &m.gate_buf,
-        d.eps,
-        d.hidden_size,
-        moe_inter,
-        num_experts,
-        num_experts_per_tok,
-    );
+    if let Some(ref streamer) = m.expert_streamer {
+        primitives::moe_ffn_block_streamed(
+            m.backend,
+            streamer,
+            layer_idx,
+            &layer.post_attention_layernorm,
+            layer.router_gate.as_ref().unwrap(),
+            &m.hidden,
+            &m.norm_buf,
+            m.moe_gate_buf.as_ref().unwrap(),
+            m.moe_output.as_ref().unwrap(),
+            m.routing_output.as_ref().unwrap(),
+            &m.gate_buf,
+            d.eps,
+            d.hidden_size,
+            moe_inter,
+            num_experts,
+            num_experts_per_tok,
+        );
+    } else {
+        primitives::moe_ffn_block(
+            m.backend,
+            &layer.post_attention_layernorm,
+            layer.router_gate.as_ref().unwrap(),
+            layer.experts.as_ref().unwrap(),
+            &m.hidden,
+            &m.norm_buf,
+            m.moe_gate_buf.as_ref().unwrap(),
+            m.moe_up_buf.as_ref().unwrap(),
+            m.moe_output.as_ref().unwrap(),
+            m.routing_output.as_ref().unwrap(),
+            &m.gate_buf,
+            d.eps,
+            d.hidden_size,
+            moe_inter,
+            num_experts,
+            num_experts_per_tok,
+        );
+    }
 }
 
 // ===========================================================================
@@ -94,6 +116,7 @@ pub(crate) fn forward_single_paged<
         + GpuAttention
         + GpuElementwise
         + GpuEmbed
+        + GpuMoe
         + GpuAllReduce,
 >(
     m: &Model<'_, B>,
@@ -221,6 +244,7 @@ pub(crate) fn forward_prefill_paged<
         + GpuAttention
         + GpuElementwise
         + GpuEmbed
+        + GpuMoe
         + GpuAllReduce,
 >(
     m: &Model<'_, B>,

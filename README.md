@@ -20,6 +20,7 @@ Platform selection uses OS-conditional compilation (`#[cfg(target_os)]`) — no 
 | Gemma 3 | Dense | Yes |
 | Qwen 2.5 | Dense | No |
 | Qwen 3.5 | Dense (hybrid DeltaNet) | No |
+| Qwen 3.5 MoE | MoE (hybrid DeltaNet) | No |
 | Qwen3 MoE | MoE | No |
 | Phi-4 | Dense | No |
 | DeepSeek-R1-Distill | Dense | No |
@@ -51,6 +52,9 @@ Measured via `rllm run --chat`, single run.
 | Qwen3.5 35B-A3B | 35.1B (3.3B active) | 5 tok/s | 16 tok/s | 44,600 ms | 2,000 ms |
 | GPT-OSS 20B | 20.0B (3.6B active) | 6 tok/s | 34 tok/s | 4,800 ms | 425 ms |
 | Mixtral 8x7B Instruct | 46.7B (12.9B active) | — | 12 tok/s | — | 5,400 ms |
+| Qwen3.5 35B-A3B ⚡ | 35.1B (3.3B active) | **3.0 tok/s** | 0.5 tok/s | 2,600 ms | 10,600 ms |
+
+⚡ = SSD expert streaming (`--stream-experts`).  Expert weights are read from NVMe on demand instead of loading all 60 GB to GPU.  bf16 streaming is 6x faster than Q4 because it skips CPU-side quantization — the bottleneck is I/O, not compute.
 
 Q4 quantization (`--quantize`) gives ~1.3-3.5x faster decode by reducing memory bandwidth. Mixtral requires Q4 (bf16 would need ~87 GB). Q4 is strongly recommended for models over ~8B params. Large models (Gemma 3 27B, Phi-4, Qwen3/3.5 MoE) run in bf16 but are slow because the weights consume most of the 64 GB unified memory. Dynamic KV cache sizing automatically adjusts block count based on available GPU memory.
 
@@ -159,6 +163,7 @@ Q4 is slower than bf16 for decode on H100 — unlike Apple Silicon where Q4 is a
 - **Q4 quantization** — 4-bit block quantization on load (~3.2x memory reduction)
 - **bf16 inference** — native half-precision compute
 - **Mixture of Experts** — top-k expert routing with per-token dispatch (Mixtral, Qwen3 MoE, GPT-OSS)
+- **SSD expert streaming** — run MoE models larger than GPU memory by streaming experts from NVMe on demand (`--stream-experts`); fused gate+up+SwiGLU kernel reduces per-expert dispatches
 - **MXFP4 dequantization** — microscaling FP4 (E2M1 + E8M0 scales) weight loading for GPT-OSS
 - **API server** — OpenAI and Anthropic compatible HTTP endpoints with SSE streaming
 - **Chat templates** — Llama 3, ChatML (Qwen/GPT-OSS), Mistral/Mixtral, Phi, and Gemma instruct formats
@@ -177,6 +182,9 @@ cargo run --release -- run --model models/llama-3.2-1b --prompt "The meaning of 
 
 # Chat mode (auto-detects template per architecture)
 cargo run --release -- run --model models/llama-3.2-3b-instruct --prompt "Write a fibonacci function" --chat --temperature 0
+
+# SSD expert streaming (run MoE models larger than GPU memory)
+cargo run --release -- run --model models/qwen3.5-35b-a3b --prompt "Hello" --chat --stream-experts
 
 # Multi-GPU tensor parallelism (splits model across GPUs via NCCL)
 cargo run --release -- run --model models/llama-3.1-70b-instruct --prompt "Hello" --chat --tp 2
@@ -307,6 +315,7 @@ src/
 │   ├── tokenizer.rs     — BPE tokenizer with per-model special tokens
 │   ├── chat.rs          — Chat template formatter
 │   ├── kv_cache.rs      — Paged KV cache (block pool + per-sequence state)
+│   ├── expert_stream.rs — SSD expert streaming (pread-based on-demand loading)
 │   └── sampler.rs       — Temperature + top-p sampling
 ├── engine/              — Continuous batching loop + FCFS scheduler
 ├── api/                 — axum HTTP server, OpenAI + Anthropic handlers, TLS
@@ -328,6 +337,7 @@ src/
 | KV cache | Paged allocation (on-demand blocks, no waste) | — |
 | Attention | Fused single-pass softmax+V, head_dim-specialised pipelines | 1.3-2.8x |
 | Batching | Continuous batching (N sequences share the GPU) | ~Nx |
+| Expert streaming | SSD pread on demand, fused gate+up+SwiGLU kernel | runs models that don't fit in VRAM |
 | Tensor parallelism | NCCL all-reduce across GPUs (`--tp N`) | ~Nx bandwidth |
 
 ## Scripts

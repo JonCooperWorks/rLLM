@@ -57,6 +57,7 @@
 
 pub(crate) mod chat;
 pub(crate) mod config;
+pub(crate) mod expert_stream;
 pub(crate) mod kv_cache;
 pub(crate) mod loader;
 pub(crate) mod primitives;
@@ -184,6 +185,13 @@ pub(crate) struct Model<'a, B: GpuCore> {
 
     // KV layer mapping: layer_idx → kv_pool_idx (None for DeltaNet layers).
     pub(crate) kv_layer_map: Vec<Option<usize>>,
+
+    // SSD expert streaming (None when all experts are GPU-resident).
+    //
+    // When set, expert weights are NOT in LayerWeights::experts.  Instead,
+    // the streamer loads selected experts from disk on-demand during the
+    // MoE dispatch loop.  See expert_stream.rs.
+    pub(crate) expert_streamer: Option<expert_stream::ExpertStreamer<B>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -423,6 +431,7 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
             dn_attn_out,
             dn_norm_out,
             kv_layer_map,
+            expert_streamer: None,
         })
     }
 
@@ -580,6 +589,7 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
             dn_attn_out,
             dn_norm_out,
             kv_layer_map,
+            expert_streamer: None,
         })
     }
 

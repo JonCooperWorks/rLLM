@@ -14,3 +14,4 @@ big picture, then drill into subsystem docs as needed.
 | [Model Layer](model-layer.md) | Config parsing, weight loading, architecture dispatch, and forward pass implementations for nine model families |
 | [API Server](api-server.md) | HTTP server with OpenAI and Anthropic endpoint compatibility using a worker-thread architecture |
 | [Tool Calling](tool-calling.md) | Tool/function calling with per-architecture prompt formatting, output parsing, and both OpenAI and Anthropic API surfaces |
+| [Expert Streaming](expert-streaming.md) | SSD-backed MoE inference — stream expert weights from NVMe on demand for models that don't fit in GPU memory |
