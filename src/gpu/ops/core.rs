@@ -98,6 +98,35 @@ pub(crate) trait GpuCore: Send + Sync {
         byte_count: usize,
     );
 
+    /// Copy raw bytes from host into a GPU tensor on a dedicated transfer
+    /// stream, returning immediately.  The transfer may still be in flight.
+    ///
+    /// On CUDA, this uses a separate stream so the DMA engine works in
+    /// parallel with compute kernels.  On Metal/CPU, this falls back to
+    /// the synchronous `copy_to_tensor`.
+    ///
+    /// Callers must call `sync_transfers()` before reading the tensor data
+    /// from the compute stream.
+    ///
+    /// CUDA impl: gpu/cuda/kernels/core.rs
+    fn copy_to_tensor_async(&self, tensor: &Self::Tensor, src: &[u8]) {
+        self.copy_to_tensor(tensor, src);
+    }
+
+    /// Block the compute stream until all prior `copy_to_tensor_async`
+    /// transfers have completed.
+    ///
+    /// On CUDA: records an event on the transfer stream, then makes the
+    /// compute stream wait on that event.  Both operations are GPU-side
+    /// only — the CPU does not block.
+    ///
+    /// On Metal/CPU: no-op (async transfers fall back to synchronous).
+    ///
+    /// CUDA impl: gpu/cuda/kernels/core.rs
+    fn sync_transfers(&self) {
+        // Default: transfers are synchronous, nothing to wait for.
+    }
+
     /// Estimate the byte count of a 2D weight [m, k] after quantisation.
     ///
     /// Used by config.rs to predict GPU memory usage before loading weights.
