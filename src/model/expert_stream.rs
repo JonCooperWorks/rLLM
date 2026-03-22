@@ -107,8 +107,12 @@ pub(crate) struct ExpertIndex {
     /// Expert dimensions.
     pub hidden: usize,
     pub moe_inter: usize,
-    /// Whether to Q4-quantize experts when loading them into GPU buffers.
+    /// Whether to Q4-quantize experts on CPU when loading (on-the-fly quantize).
     pub quantize: bool,
+    /// Whether expert data on disk is already Q4 (pre-quantized model).
+    /// When true, pread reads Q4 bytes directly — no CPU quantize step needed.
+    /// This is the fast path: 3.2x less I/O than bf16 streaming.
+    pub prequantized: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -169,26 +173,32 @@ impl<B: GpuCore> ExpertStreamer<B> {
     pub fn new(backend: &B, index: ExpertIndex, k: usize) -> Self {
         let hidden = index.hidden;
         let moe_inter = index.moe_inter;
-        let quantize = index.quantize;
+        let use_q4 = index.quantize || index.prequantized;
 
-        let (gate_dtype, up_dtype, down_dtype) = if quantize {
-            (TensorDtype::Q4, TensorDtype::Q4, TensorDtype::Q4)
-        } else {
-            (TensorDtype::BF16, TensorDtype::BF16, TensorDtype::BF16)
-        };
+        let dtype = if use_q4 { TensorDtype::Q4 } else { TensorDtype::BF16 };
 
         let mut slots = Vec::with_capacity(k);
         for _ in 0..k {
             slots.push(ExpertSlot {
-                gate_proj: backend.alloc_tensor(&[moe_inter, hidden], gate_dtype),
-                up_proj: backend.alloc_tensor(&[moe_inter, hidden], up_dtype),
-                down_proj: backend.alloc_tensor(&[hidden, moe_inter], down_dtype),
+                gate_proj: backend.alloc_tensor(&[moe_inter, hidden], dtype),
+                up_proj: backend.alloc_tensor(&[moe_inter, hidden], dtype),
+                down_proj: backend.alloc_tensor(&[hidden, moe_inter], dtype),
             });
         }
 
-        // CPU read buffers: per-slot gate_up + down for parallel pread.
-        let gate_up_bytes = moe_inter * hidden * 2 * 2; // gate + up combined (bf16)
-        let down_bytes = hidden * moe_inter * 2;
+        // CPU read buffers: sized for the on-disk format.
+        // Pre-quantized: Q4 sizes (3.2x smaller).  Otherwise: bf16 sizes.
+        let (gate_up_bytes, down_bytes) = if index.prequantized {
+            (
+                crate::gpu::q4_byte_count(moe_inter * 2, hidden),
+                crate::gpu::q4_byte_count(hidden, moe_inter),
+            )
+        } else {
+            (
+                moe_inter * hidden * 2 * 2, // gate + up combined (bf16)
+                hidden * moe_inter * 2,
+            )
+        };
         let read_bufs = UnsafeCell::new(
             (0..k)
                 .map(|_| SlotReadBufs {
@@ -224,6 +234,7 @@ impl<B: GpuCore> ExpertStreamer<B> {
         let hidden = self.index.hidden;
         let moe_inter = self.index.moe_inter;
         let quantize = self.index.quantize;
+        let prequantized = self.index.prequantized;
 
         // Safety: single-threaded inference — no concurrent access to read_bufs
         // from other model code.  Within this function, each thread gets exclusive
@@ -235,6 +246,9 @@ impl<B: GpuCore> ExpertStreamer<B> {
         // Each thread reads one expert (gate+up + down).  pread() is thread-safe
         // (no shared file position), and File is Sync so &File is Send.
         // std::thread::scope ensures all threads join before we proceed to GPU upload.
+        //
+        // For pre-quantized models, reads are 3.2x smaller (Q4 vs bf16) — the
+        // main performance win of pre-quantization.
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(selected.len());
 
@@ -280,14 +294,25 @@ impl<B: GpuCore> ExpertStreamer<B> {
 
         // Phase 2: GPU upload (serial — Metal command encoding isn't thread-safe).
         //
-        // Optionally Q4-quantize on CPU before uploading.  The gate_up buffer
-        // holds [gate | up] contiguously, so we slice at gate_bytes to split.
+        // Three modes:
+        //   prequantized: data is already Q4 on disk → pread Q4 → copy_to_tensor (fastest)
+        //   quantize:     data is bf16 on disk → pread bf16 → CPU quantize → copy_to_tensor
+        //   neither:      data is bf16 on disk → pread bf16 → copy_to_tensor
         for (slot_idx, &(expert_idx, _)) in selected.iter().enumerate() {
             let loc = &self.index.layers[layer_idx][expert_idx];
             let slot = &self.slots[slot_idx];
             let bufs = &read_bufs[slot_idx];
 
-            if quantize {
+            if prequantized {
+                // Fast path: Q4 bytes from disk → GPU directly.  No CPU work.
+                backend.copy_to_tensor(&slot.gate_proj, &bufs.gate_up[..loc.gate_bytes]);
+                backend.copy_to_tensor(
+                    &slot.up_proj,
+                    &bufs.gate_up[loc.gate_bytes..loc.gate_bytes + loc.up_bytes],
+                );
+                backend.copy_to_tensor(&slot.down_proj, &bufs.down[..loc.down_bytes]);
+            } else if quantize {
+                // Slow path: bf16 from disk → Q4 on CPU → GPU.
                 let q4_gate = quantize_bf16_to_q4(
                     &bufs.gate_up[..loc.gate_bytes],
                     moe_inter,
@@ -309,6 +334,7 @@ impl<B: GpuCore> ExpertStreamer<B> {
                 );
                 backend.copy_to_tensor(&slot.down_proj, &q4_down);
             } else {
+                // bf16 path: raw bytes → GPU.
                 backend.copy_to_tensor(&slot.gate_proj, &bufs.gate_up[..loc.gate_bytes]);
                 backend.copy_to_tensor(
                     &slot.up_proj,
@@ -361,10 +387,24 @@ pub(crate) fn build_fused_expert_index(
     moe_inter: usize,
     num_experts: usize,
     quantize: bool,
+    prequantized: bool,
 ) -> ExpertIndex {
-    let gate_up_expert_bytes = moe_inter * 2 * hidden * 2; // bf16
-    let gate_bytes = moe_inter * hidden * 2;
-    let down_expert_bytes = hidden * moe_inter * 2;
+    // Byte sizes depend on whether experts are stored as Q4 or bf16 on disk.
+    // Q4 quantization is per-row, so fused gate+up Q4 data is still contiguous
+    // per expert: [gate Q4 rows | up Q4 rows] within each expert's slice.
+    let (gate_up_expert_bytes, gate_bytes, down_expert_bytes) = if prequantized {
+        (
+            crate::gpu::q4_byte_count(moe_inter * 2, hidden),
+            crate::gpu::q4_byte_count(moe_inter, hidden),
+            crate::gpu::q4_byte_count(hidden, moe_inter),
+        )
+    } else {
+        (
+            moe_inter * 2 * hidden * 2, // bf16
+            moe_inter * hidden * 2,
+            hidden * moe_inter * 2,
+        )
+    };
 
     let layers = layer_info
         .iter()
@@ -395,6 +435,7 @@ pub(crate) fn build_fused_expert_index(
         hidden,
         moe_inter,
         quantize,
+        prequantized,
     }
 }
 
@@ -410,9 +451,16 @@ pub(crate) fn build_per_expert_index(
     hidden: usize,
     moe_inter: usize,
     quantize: bool,
+    prequantized: bool,
 ) -> ExpertIndex {
-    let gate_bytes = moe_inter * hidden * 2;
-    let down_bytes = hidden * moe_inter * 2;
+    let (gate_bytes, down_bytes) = if prequantized {
+        (
+            crate::gpu::q4_byte_count(moe_inter, hidden),
+            crate::gpu::q4_byte_count(hidden, moe_inter),
+        )
+    } else {
+        (moe_inter * hidden * 2, hidden * moe_inter * 2)
+    };
 
     let layers = layer_info
         .iter()
@@ -439,6 +487,7 @@ pub(crate) fn build_per_expert_index(
         hidden,
         moe_inter,
         quantize,
+        prequantized,
     }
 }
 

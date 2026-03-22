@@ -69,54 +69,94 @@ pub(crate) fn exec(args: QuantizeArgs) -> anyhow::Result<()> {
     // Collect all tensors across shards in a stable order.
     let all_tensors = collect_all_tensors(&shards, &weight_map);
 
-    eprintln!(
-        "found {} tensors across {} shard(s)",
-        all_tensors.len(),
-        mmaps.len()
-    );
+    let num_tensors = all_tensors.len();
+    eprintln!("found {num_tensors} tensors across {} shard(s)", mmaps.len());
 
-    // Process tensors: quantize or pass through.
-    let mut output_tensors: Vec<OutputTensor> = Vec::with_capacity(all_tensors.len());
+    // Process and write tensors incrementally to avoid holding all Q4 data
+    // in memory.  For large MoE models (397B = 751 GB bf16 → 235 GB Q4),
+    // accumulating all output would exceed RAM.  Instead, we fill one output
+    // shard at a time and flush it to disk before starting the next.
     let mut quantized_count = 0usize;
     let mut original_bytes = 0u64;
     let mut quantized_bytes = 0u64;
+    let mut output_shard_count = 0usize;
 
-    for (name, view) in &all_tensors {
+    // Current shard accumulator — flushed when it exceeds SHARD_LIMIT.
+    let mut current_shard: Vec<OutputTensor> = Vec::new();
+    let mut current_shard_size = 0usize;
+
+    // Global weight_map for the index file (tensor name → shard filename).
+    let mut index_weight_map: Vec<(String, usize)> = Vec::new();
+
+    for (tensor_idx, (name, view)) in all_tensors.iter().enumerate() {
         let shape = view.shape();
         let data = view.data();
 
-        if should_quantize(name, shape, view.dtype()) {
-            let m = shape[0];
-            let k = shape[1];
+        let output = if should_quantize(name, shape, view.dtype()) {
+            // For 3D fused expert tensors [num_experts, rows, k], flatten to
+            // [num_experts * rows, k] — Q4 quantization is per-row so this
+            // produces identical results to quantizing each expert separately.
+            let (m, k) = if shape.len() == 3 {
+                (shape[0] * shape[1], shape[2])
+            } else {
+                (shape[0], shape[1])
+            };
             let q4_data = quantize_bf16_to_q4(data, m, k);
 
             original_bytes += data.len() as u64;
             quantized_bytes += q4_data.len() as u64;
             quantized_count += 1;
 
-            output_tensors.push(OutputTensor {
+            if tensor_idx % 10 == 0 || q4_data.len() > 100_000_000 {
+                eprintln!(
+                    "  [{}/{}] quantized {} ({:.0} MB → {:.0} MB)",
+                    tensor_idx + 1, num_tensors, name,
+                    data.len() as f64 / 1e6, q4_data.len() as f64 / 1e6,
+                );
+            }
+
+            OutputTensor {
                 name: name.clone(),
                 data: TensorData::Owned(q4_data),
                 dtype: safetensors::Dtype::U8,
                 shape: vec![q4_byte_count(m, k)],
                 q4_original_shape: Some((m, k)),
-            });
+            }
         } else {
             original_bytes += data.len() as u64;
             quantized_bytes += data.len() as u64;
 
-            output_tensors.push(OutputTensor {
+            OutputTensor {
                 name: name.clone(),
                 data: TensorData::Borrowed(data),
                 dtype: view.dtype(),
                 shape: shape.to_vec(),
                 q4_original_shape: None,
-            });
+            }
+        };
+
+        let tensor_size = output.data.as_slice().len();
+
+        // Flush current shard if adding this tensor would exceed the limit.
+        if current_shard_size > 0 && current_shard_size + tensor_size > SHARD_LIMIT {
+            write_single_shard(&current_shard, output_dir, output_shard_count, &mut index_weight_map)?;
+            output_shard_count += 1;
+            current_shard.clear();
+            current_shard_size = 0;
         }
+
+        current_shard_size += tensor_size;
+        current_shard.push(output);
     }
 
-    // Write output shards.
-    let shard_count = write_shards(&output_tensors, output_dir)?;
+    // Flush the final shard.
+    if !current_shard.is_empty() {
+        write_single_shard(&current_shard, output_dir, output_shard_count, &mut index_weight_map)?;
+        output_shard_count += 1;
+    }
+
+    // Rename shards now that we know the total count, and write index.
+    finalize_shards(output_dir, output_shard_count, &index_weight_map)?;
 
     // Copy config and tokenizer files.
     copy_support_files(input_dir, output_dir)?;
@@ -128,13 +168,12 @@ pub(crate) fn exec(args: QuantizeArgs) -> anyhow::Result<()> {
         1.0
     };
     eprintln!(
-        "quantized {quantized_count}/{} tensors across {shard_count} shard(s)",
-        output_tensors.len()
+        "quantized {quantized_count}/{num_tensors} tensors across {output_shard_count} shard(s)"
     );
     eprintln!(
-        "size: {:.1} MB → {:.1} MB ({:.1}x compression)",
-        original_bytes as f64 / 1e6,
-        quantized_bytes as f64 / 1e6,
+        "size: {:.1} GB → {:.1} GB ({:.1}x compression)",
+        original_bytes as f64 / 1e9,
+        quantized_bytes as f64 / 1e9,
         ratio
     );
     eprintln!("output: {}", output_dir.display());
@@ -175,25 +214,13 @@ fn collect_all_tensors<'a>(
 /// Determine if a tensor should be quantized based on its name, shape, and dtype.
 ///
 /// Criteria (matching the on-load quantization in loader.rs):
-///   - 2D weight tensor (not bias)
+///   - 2D weight tensor (not bias), OR 3D fused expert tensor
 ///   - Name contains a projection keyword (q_proj, k_proj, etc.) or is lm_head
 ///   - Inner dimension (k) divisible by 32 (Q4 block size)
 ///   - Not a norm, embedding, conv1d, or router tensor
 ///   - Source dtype is bf16 (the only format we quantize from)
 fn should_quantize(name: &str, shape: &[usize], dtype: safetensors::Dtype) -> bool {
-    // Must be bf16 and 2D.
-    if dtype != safetensors::Dtype::BF16 || shape.len() != 2 {
-        return false;
-    }
-
-    // Must end with .weight (not .bias).
-    if !name.ends_with(".weight") {
-        return false;
-    }
-
-    // Inner dimension must be divisible by Q4 block size.
-    let k = shape[1];
-    if k % 32 != 0 {
+    if dtype != safetensors::Dtype::BF16 {
         return false;
     }
 
@@ -203,12 +230,36 @@ fn should_quantize(name: &str, shape: &[usize], dtype: safetensors::Dtype) -> bo
         return false;
     }
 
-    // Must contain a quantizable projection name.
-    let proj_names = [
-        "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "in_proj",
-        "out_proj", "lm_head",
-    ];
-    proj_names.iter().any(|p| name.contains(p))
+    match shape.len() {
+        2 => {
+            // Standard 2D weight: [m, k].
+            if !name.ends_with(".weight") {
+                return false;
+            }
+            let k = shape[1];
+            if k % 32 != 0 {
+                return false;
+            }
+            let proj_names = [
+                "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",
+                "in_proj", "out_proj", "lm_head",
+            ];
+            proj_names.iter().any(|p| name.contains(p))
+        }
+        3 => {
+            // Fused expert tensor: [num_experts, rows, k].
+            // Qwen3.5 stores gate_up_proj [num_experts, 2*moe_inter, hidden] and
+            // down_proj [num_experts, hidden, moe_inter] as 3D tensors without
+            // a .weight suffix.  Q4 quantization is per-row, so flattening the
+            // first two dims to [num_experts * rows, k] works correctly.
+            let k = shape[2];
+            if k % 32 != 0 {
+                return false;
+            }
+            name.contains("experts") && (name.ends_with("gate_up_proj") || name.ends_with("down_proj"))
+        }
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -238,81 +289,67 @@ struct OutputTensor<'a> {
     q4_original_shape: Option<(usize, usize)>,
 }
 
-/// Write output tensors to one or more safetensors shard files.
-/// Returns the number of shards written.
-fn write_shards(tensors: &[OutputTensor], output_dir: &std::path::Path) -> anyhow::Result<usize> {
-    // Partition tensors into shards based on SHARD_LIMIT.
-    let mut shard_assignments: Vec<Vec<usize>> = vec![vec![]];
-    let mut current_shard_size = 0usize;
+/// Write one shard of tensors to disk.  Called incrementally as the shard fills.
+///
+/// Uses a temporary filename (`.tmp.{shard_idx}`) because we don't know the total
+/// shard count yet.  `finalize_shards()` renames to the final pattern afterwards.
+fn write_single_shard(
+    tensors: &[OutputTensor],
+    output_dir: &std::path::Path,
+    shard_idx: usize,
+    index_weight_map: &mut Vec<(String, usize)>,
+) -> anyhow::Result<()> {
+    let mut metadata: HashMap<String, String> = HashMap::new();
+    metadata.insert("quantization".to_string(), "rllm-q4".to_string());
 
-    for (i, tensor) in tensors.iter().enumerate() {
-        let tensor_size = tensor.data.as_slice().len();
-        if current_shard_size > 0 && current_shard_size + tensor_size > SHARD_LIMIT {
-            shard_assignments.push(vec![]);
-            current_shard_size = 0;
+    let mut views: Vec<(String, TensorView)> = Vec::with_capacity(tensors.len());
+
+    for t in tensors {
+        if let Some((m, k)) = t.q4_original_shape {
+            metadata.insert(format!("rllm_q4:{}", t.name), format!("{m},{k}"));
         }
-        shard_assignments.last_mut().unwrap().push(i);
-        current_shard_size += tensor_size;
+
+        let view = TensorView::new(t.dtype, t.shape.clone(), t.data.as_slice())
+            .map_err(|e| anyhow::anyhow!("failed to create TensorView for '{}': {e}", t.name))?;
+        views.push((t.name.clone(), view));
+
+        index_weight_map.push((t.name.clone(), shard_idx));
     }
 
-    let num_shards = shard_assignments.len();
+    let tmp_name = format!(".tmp.{shard_idx}.safetensors");
+    let output_path = output_dir.join(&tmp_name);
+    eprintln!("writing shard {} ({} tensors)...", shard_idx + 1, tensors.len());
 
-    // Write each shard.
-    for (shard_idx, tensor_indices) in shard_assignments.iter().enumerate() {
-        // Build metadata for this shard.
-        let mut metadata: HashMap<String, String> = HashMap::new();
-        metadata.insert("quantization".to_string(), "rllm-q4".to_string());
+    safetensors::tensor::serialize_to_file(views, &Some(metadata), &output_path)
+        .map_err(|e| anyhow::anyhow!("failed to write shard {shard_idx}: {e}"))?;
 
-        // Build tensor views for serialization.
-        let mut views: Vec<(String, TensorView)> = Vec::with_capacity(tensor_indices.len());
+    Ok(())
+}
 
-        for &idx in tensor_indices {
-            let t = &tensors[idx];
-
-            // Record original shape for Q4 tensors.
-            if let Some((m, k)) = t.q4_original_shape {
-                metadata.insert(format!("rllm_q4:{}", t.name), format!("{m},{k}"));
-            }
-
-            let view = TensorView::new(t.dtype, t.shape.clone(), t.data.as_slice())
-                .map_err(|e| anyhow::anyhow!("failed to create TensorView for '{}': {e}", t.name))?;
-            views.push((t.name.clone(), view));
-        }
-
-        // Determine output filename.
-        let filename = if num_shards == 1 {
+/// Rename temporary shard files to final names and write the index file.
+fn finalize_shards(
+    output_dir: &std::path::Path,
+    num_shards: usize,
+    index_weight_map: &[(String, usize)],
+) -> anyhow::Result<()> {
+    for shard_idx in 0..num_shards {
+        let tmp_name = format!(".tmp.{shard_idx}.safetensors");
+        let final_name = if num_shards == 1 {
             "model.safetensors".to_string()
         } else {
-            format!(
-                "model-{:05}-of-{:05}.safetensors",
-                shard_idx + 1,
-                num_shards
-            )
+            format!("model-{:05}-of-{:05}.safetensors", shard_idx + 1, num_shards)
         };
-
-        let output_path = output_dir.join(&filename);
-        eprintln!("writing {filename}...");
-
-        let meta = Some(metadata);
-        safetensors::tensor::serialize_to_file(views, &meta, &output_path)
-            .map_err(|e| anyhow::anyhow!("failed to write {filename}: {e}"))?;
+        std::fs::rename(
+            output_dir.join(&tmp_name),
+            output_dir.join(&final_name),
+        )?;
     }
 
-    // Write index file for multi-shard output.
     if num_shards > 1 {
         let mut weight_map = serde_json::Map::new();
-        for (shard_idx, tensor_indices) in shard_assignments.iter().enumerate() {
-            let filename = format!(
-                "model-{:05}-of-{:05}.safetensors",
-                shard_idx + 1,
-                num_shards
-            );
-            for &idx in tensor_indices {
-                weight_map.insert(
-                    tensors[idx].name.clone(),
-                    serde_json::Value::String(filename.clone()),
-                );
-            }
+        for (name, &shard_idx) in index_weight_map.iter().map(|(n, s)| (n, s)) {
+            let filename = format!("model-{:05}-of-{:05}.safetensors", shard_idx + 1, num_shards);
+            weight_map.insert(name.clone(), serde_json::Value::String(filename));
         }
         let index = serde_json::json!({ "weight_map": weight_map });
         let index_path = output_dir.join("model.safetensors.index.json");
@@ -320,7 +357,7 @@ fn write_shards(tensors: &[OutputTensor], output_dir: &std::path::Path) -> anyho
         eprintln!("wrote index file");
     }
 
-    Ok(num_shards)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

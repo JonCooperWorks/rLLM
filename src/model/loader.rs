@@ -1340,20 +1340,28 @@ fn load_standard_attention<B: GpuCore>(
     // We deinterleave into separate Q [q_dim, hidden] and Z [q_dim, hidden].
     let attn_output_gate = config.attn_output_gate;
     let head_dim = config.head_dim;
+    let q_proj_name = format!("{prefix}.self_attn.q_proj.weight");
     let (qp, z_proj) = if attn_output_gate {
-        let view = store.tensor(&format!("{prefix}.self_attn.q_proj.weight"))?;
+        let view = store.tensor(&q_proj_name)?;
         let raw = view.data();
         let fused_q_dim = q_dim * 2;
-        anyhow::ensure!(
-            view.shape() == [fused_q_dim, hidden],
-            "q_proj fused shape mismatch: expected [{}, {}], got {:?}",
-            fused_q_dim,
-            hidden,
-            view.shape()
-        );
-        let row_bytes = hidden * 2; // bf16
-        let hd_bytes = head_dim * row_bytes;
         let num_heads = config.num_attention_heads;
+
+        // Pre-quantized Q4 tensors are stored as 1D U8 — use q4_map for logical shape.
+        // Q4 is per-row, so we can deinterleave Q4 rows the same way as bf16 rows,
+        // just with a different bytes_per_row stride.
+        let is_q4 = store.q4_shape(&q_proj_name).is_some();
+        let row_bytes = if is_q4 {
+            (hidden / 32) * 20 // Q4: blocks_per_row * 20 bytes
+        } else {
+            anyhow::ensure!(
+                view.shape() == [fused_q_dim, hidden],
+                "q_proj fused shape mismatch: expected [{}, {}], got {:?}",
+                fused_q_dim, hidden, view.shape()
+            );
+            hidden * 2 // bf16
+        };
+        let hd_bytes = head_dim * row_bytes;
 
         // For TP, only deinterleave this rank's heads.
         let (start_head, end_head) = if let Some(plan) = sharding {
@@ -1366,7 +1374,8 @@ fn load_standard_attention<B: GpuCore>(
         let shard_q_dim = shard_heads * head_dim;
 
         // Deinterleave: for each head, first head_dim rows are Q,
-        // next head_dim rows are gate.
+        // next head_dim rows are gate.  Works identically for bf16 and Q4
+        // because Q4 quantization is per-row (rows are independent).
         let mut q_raw = Vec::with_capacity(shard_q_dim * row_bytes);
         let mut z_raw = Vec::with_capacity(shard_q_dim * row_bytes);
         for h in start_head..end_head {
@@ -1375,11 +1384,18 @@ fn load_standard_attention<B: GpuCore>(
             z_raw.extend_from_slice(&raw[base + hd_bytes..base + 2 * hd_bytes]);
         }
 
-        let q_tensor =
-            upload_raw_maybe_quantized(backend, &q_raw, &[shard_q_dim, hidden], quantize);
-        let z_tensor =
-            upload_raw_maybe_quantized(backend, &z_raw, &[shard_q_dim, hidden], quantize);
-        (q_tensor, Some(z_tensor))
+        if is_q4 {
+            // Already Q4 — upload directly.
+            let q_tensor = backend.upload_tensor(&q_raw, &[shard_q_dim, hidden], crate::gpu::TensorDtype::Q4);
+            let z_tensor = backend.upload_tensor(&z_raw, &[shard_q_dim, hidden], crate::gpu::TensorDtype::Q4);
+            (q_tensor, Some(z_tensor))
+        } else {
+            let q_tensor =
+                upload_raw_maybe_quantized(backend, &q_raw, &[shard_q_dim, hidden], quantize);
+            let z_tensor =
+                upload_raw_maybe_quantized(backend, &z_raw, &[shard_q_dim, hidden], quantize);
+            (q_tensor, Some(z_tensor))
+        }
     } else {
         let qp = upload_sharded(
             store,
@@ -2271,6 +2287,19 @@ fn build_expert_index_from_safetensors(
     // Load safetensors headers to compute tensor file offsets.
     let (mmaps, weight_map) = load_safetensors_files(model_dir)?;
 
+    // Detect pre-quantized model (rllm-q4 metadata).
+    let prequantized = mmaps.iter().any(|m| {
+        if let Ok((_, metadata)) = SafeTensors::read_metadata(m.as_ref()) {
+            if let Some(meta) = metadata.metadata() {
+                return meta.get("quantization").map(|v| v.as_str()) == Some("rllm-q4");
+            }
+        }
+        false
+    });
+    if prequantized {
+        eprintln!("  detected pre-quantized expert data (rllm-q4)");
+    }
+
     // Compute data_start for each shard (8 + header_len).
     let data_starts: Vec<u64> = mmaps.iter().map(|m| safetensors_data_start(m)).collect();
 
@@ -2335,7 +2364,7 @@ fn build_expert_index_from_safetensors(
         eprintln!("  built expert index: {} layers × {} experts (fused format)", num_layers, num_experts);
 
         Ok(super::expert_stream::build_fused_expert_index(
-            layer_info, shard_files, hidden, moe_inter, num_experts, quantize,
+            layer_info, shard_files, hidden, moe_inter, num_experts, quantize, prequantized,
         ))
     } else {
         // Per-expert format (Qwen3-MoE, Mixtral): experts.{j}.gate_proj etc.
@@ -2396,7 +2425,7 @@ fn build_expert_index_from_safetensors(
         eprintln!("  built expert index: {} layers × {} experts (per-expert format)", num_layers, num_experts);
 
         Ok(super::expert_stream::build_per_expert_index(
-            layer_info, shard_files, hidden, moe_inter, quantize,
+            layer_info, shard_files, hidden, moe_inter, quantize, prequantized,
         ))
     }
 }
