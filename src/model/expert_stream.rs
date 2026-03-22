@@ -69,6 +69,7 @@
 // ===========================================================================
 
 use std::cell::{Cell, UnsafeCell};
+use std::collections::HashMap;
 use std::fs::File;
 use std::sync::Arc;
 
@@ -198,27 +199,48 @@ struct SlotReadBufs {
 // ---------------------------------------------------------------------------
 // ExpertStreamer — manages GPU buffer slots and loads experts on demand.
 //
-// The streamer holds K pre-allocated GPU buffer slots (one per active
-// expert).  When the router selects experts, load_experts() reads their
-// weights from disk and copies them into the buffer slots.
+// The streamer holds a pool of GPU buffer slots as an LRU cache.  When
+// the router selects K experts, load_experts() checks the cache first:
+// cached experts skip the NVMe read + GPU upload entirely.  Only cache
+// misses trigger pread + DMA.  This is especially effective on CUDA where
+// each expert load requires a PCIe transfer — cache hits avoid both the
+// NVMe read AND the PCIe hop.
 //
-// Performance: parallel pread across K experts, fused gate+up reads for
-// models with contiguous gate/up layout (Qwen3.5).  On unified memory
-// backends (Metal), the GPU upload is merged into the same parallel pass
-// as the pread — each thread does pread→memcpy without a serial Phase 2.
+// The cache size defaults to 64 slots (~6 MB × 64 = ~384 MB for Q4
+// Qwen3.5-122B), which caches 25% of the 256 experts per layer.
+// Cross-layer locality (same expert selected in adjacent layers) and
+// cross-token locality (same expert popular across tokens) both benefit.
+//
+// Performance: parallel pread across cache misses, fused gate+up reads
+// for models with contiguous gate/up layout (Qwen3.5).  On unified
+// memory backends (Metal), the GPU upload is merged into the same
+// parallel pass as the pread.
 // ---------------------------------------------------------------------------
+
+/// Default number of expert cache slots.  64 slots × ~6 MB per Q4 expert
+/// = ~384 MB GPU memory for Qwen3.5-122B.  Larger caches improve hit
+/// rate but consume more VRAM.
+const DEFAULT_CACHE_SLOTS: usize = 64;
 
 pub(crate) struct ExpertStreamer<B: GpuCore> {
     /// Expert index (file locations for all experts).
     pub index: ExpertIndex,
-    /// Double-buffered GPU slots.  Compute reads from `slots[active]`,
-    /// async uploads target `slots[1 - active]`.  On Metal the two sets
-    /// behave identically (sync uploads); on CUDA the inactive set
-    /// receives DMA transfers while compute runs on the active set.
-    slots: [Vec<ExpertSlot<B>>; 2],
-    /// Which slot set (0 or 1) is ready for compute.  Uses `Cell` for
-    /// interior mutability — inference is single-threaded.
-    active: Cell<usize>,
+    /// LRU cache of GPU-resident expert weight buffers.
+    /// Size is configurable (default 64 slots).
+    cache: Vec<ExpertSlot<B>>,
+    /// Maps (layer_idx, expert_idx) → cache slot index for O(1) lookup.
+    cache_map: UnsafeCell<HashMap<(usize, usize), usize>>,
+    /// Monotonic counter for LRU tracking.  Each access bumps the slot's
+    /// last_used timestamp.  On eviction, the slot with the smallest
+    /// timestamp is chosen.
+    lru_clock: Cell<u64>,
+    /// Per-slot last-used timestamp for LRU eviction.
+    lru_timestamps: UnsafeCell<Vec<u64>>,
+    /// After load_experts(), maps slot_idx (0..K) → cache slot index.
+    /// Used by active_slot() to find the cached expert for each selected slot.
+    active_indices: UnsafeCell<Vec<usize>>,
+    /// Number of experts selected per token (K).
+    k: usize,
     /// Per-slot CPU read buffers for parallel pread → GPU upload.
     ///
     /// UnsafeCell because load_experts() needs to write to these buffers
@@ -245,17 +267,28 @@ pub(crate) struct ExpertSlot<B: GpuCore> {
 }
 
 impl<B: GpuCore> ExpertStreamer<B> {
-    /// Create a new streamer with K pre-allocated double-buffered slots.
+    /// Create a new streamer with an LRU cache of GPU buffer slots.
     ///
-    /// Each slot is sized for one expert's gate, up, and down projections.
-    /// If prequantized, slots are allocated as Q4 tensors (smaller).
-    /// Two sets are allocated (active + inactive) for double-buffering.
+    /// `k` is the number of experts per token (from the model config).
+    /// The cache holds `cache_slots` experts (default 64), so frequently
+    /// accessed experts remain GPU-resident across layers and tokens.
     pub fn new(backend: &B, index: ExpertIndex, k: usize) -> Self {
-        let slots_a = Self::allocate_slots(backend, &index, k);
-        let slots_b = Self::allocate_slots(backend, &index, k);
+        Self::new_with_cache(backend, index, k, DEFAULT_CACHE_SLOTS)
+    }
 
-        // CPU read buffers: sized for the on-disk format.
-        // Pre-quantized: Q4 sizes (3.2x smaller).  Otherwise: bf16 sizes.
+    /// Create a streamer with a specific cache size.
+    pub fn new_with_cache(
+        backend: &B,
+        index: ExpertIndex,
+        k: usize,
+        cache_slots: usize,
+    ) -> Self {
+        // Cache must hold at least K slots (one per active expert).
+        let cache_slots = cache_slots.max(k);
+        let cache = Self::allocate_slots(backend, &index, cache_slots);
+
+        // CPU read buffers: sized for the on-disk format.  Only K buffers
+        // needed — at most K experts are loaded from disk per call (misses).
         let hidden = index.hidden;
         let moe_inter = index.moe_inter;
         let (gate_up_bytes, down_bytes) = if index.prequantized {
@@ -286,22 +319,35 @@ impl<B: GpuCore> ExpertStreamer<B> {
                 .collect(),
         );
 
+        let expert_bytes = gate_up_bytes + down_bytes;
+        eprintln!(
+            "expert streaming: {} cache slots ({} MB), {} experts/tok, {} MB per expert load",
+            cache_slots,
+            cache_slots * expert_bytes / (1024 * 1024),
+            k,
+            expert_bytes / (1024 * 1024),
+        );
+
         ExpertStreamer {
             index,
-            slots: [slots_a, slots_b],
-            active: Cell::new(0),
+            cache,
+            cache_map: UnsafeCell::new(HashMap::with_capacity(cache_slots)),
+            lru_clock: Cell::new(0),
+            lru_timestamps: UnsafeCell::new(vec![0u64; cache_slots]),
+            active_indices: UnsafeCell::new(vec![0usize; k]),
+            k,
             read_bufs,
         }
     }
 
-    /// Allocate one set of K GPU buffer slots for expert weights.
-    fn allocate_slots(backend: &B, index: &ExpertIndex, k: usize) -> Vec<ExpertSlot<B>> {
+    /// Allocate GPU buffer slots for expert weights.
+    fn allocate_slots(backend: &B, index: &ExpertIndex, n: usize) -> Vec<ExpertSlot<B>> {
         let hidden = index.hidden;
         let moe_inter = index.moe_inter;
         let use_q4 = index.prequantized;
         let dtype = if use_q4 { TensorDtype::Q4 } else { TensorDtype::BF16 };
 
-        (0..k)
+        (0..n)
             .map(|_| ExpertSlot {
                 gate_proj: backend.alloc_tensor(&[moe_inter, hidden], dtype),
                 up_proj: backend.alloc_tensor(&[moe_inter, hidden], dtype),
@@ -310,46 +356,97 @@ impl<B: GpuCore> ExpertStreamer<B> {
             .collect()
     }
 
-    /// Get the active (ready-to-compute) expert slots.
-    pub fn active_slots(&self) -> &[ExpertSlot<B>] {
-        &self.slots[self.active.get()]
+    /// Get a cached expert slot after load_experts().
+    ///
+    /// `idx` is 0..K (the position in the selected experts list).
+    /// Returns a reference to the cache slot holding that expert's weights.
+    pub fn active_slot(&self, idx: usize) -> &ExpertSlot<B> {
+        let active_indices = unsafe { &*self.active_indices.get() };
+        &self.cache[active_indices[idx]]
     }
 
-    /// Load selected experts from disk into GPU buffer slots.
+    /// Find the LRU (least recently used) cache slot for eviction.
+    fn find_lru_slot(&self) -> usize {
+        let timestamps = unsafe { &*self.lru_timestamps.get() };
+        let mut min_ts = u64::MAX;
+        let mut min_idx = 0;
+        for (i, &ts) in timestamps.iter().enumerate() {
+            if ts < min_ts {
+                min_ts = ts;
+                min_idx = i;
+            }
+        }
+        min_idx
+    }
+
+    /// Load selected experts into GPU cache slots with LRU caching.
     ///
-    /// Fully parallel approach: each of K threads handles one expert end-to-end:
-    ///   1. pread expert weights from SSD (fused gate+up where possible)
-    ///   2. copy data into GPU buffer (memcpy to unified memory, or via trait)
+    /// For each selected expert:
+    ///   - Cache hit: skip NVMe read + GPU upload entirely (free).
+    ///   - Cache miss: evict LRU slot, pread from SSD, upload to GPU.
     ///
-    /// On unified memory backends (Metal/CPU), both phases run in the same
-    /// thread — the GPU upload is just a memcpy to buffer.contents(), which
-    /// is safe from multiple threads writing to disjoint buffers.  On CUDA
-    /// (where tensor_mut_ptr returns None), Phase 2 falls back to serial
-    /// copy_to_tensor after all threads join.
+    /// Cache hits avoid both the NVMe read AND the PCIe transfer (on CUDA),
+    /// which is the dominant cost for expert streaming on discrete GPUs.
     ///
     /// Safety: takes &self (not &mut) because inference is single-threaded and
-    /// GPU tensor writes already use interior mutability.  During parallel pread,
-    /// each thread accesses only its own slot's buffers — no cross-slot access.
+    /// GPU tensor writes already use interior mutability.
     pub fn load_experts(
         &self,
         backend: &B,
         layer_idx: usize,
         selected: &[(usize, f32)],
     ) {
-        // Safety: single-threaded inference — no concurrent access to read_bufs
-        // from other model code.  Within this function, each thread gets exclusive
-        // access to exactly one slot's buffers via iter_mut().
+        let cache_map = unsafe { &mut *self.cache_map.get() };
+        let timestamps = unsafe { &mut *self.lru_timestamps.get() };
+        let active_indices = unsafe { &mut *self.active_indices.get() };
         let read_bufs = unsafe { &mut *self.read_bufs.get() };
-        let active = self.active.get();
 
-        // Pre-fetch GPU buffer pointers before spawning threads.
-        // On Metal/CPU: Some([gate_ptr, up_ptr, down_ptr]) — direct memcpy target.
-        // On CUDA: None — must use copy_to_tensor after threads join.
-        let gpu_ptrs: Vec<Option<[SendPtr; 3]>> = selected
+        // Bump the LRU clock.
+        let clock = self.lru_clock.get() + 1;
+        self.lru_clock.set(clock);
+
+        // Phase 0: Classify each selected expert as hit or miss.
+        // Collect misses that need loading.
+        struct MissInfo {
+            slot_idx: usize,      // position in selected[] (0..K)
+            expert_idx: usize,    // global expert index
+            cache_slot: usize,    // cache slot to load into
+        }
+        let mut misses: Vec<MissInfo> = Vec::new();
+
+        for (slot_idx, &(expert_idx, _)) in selected.iter().enumerate() {
+            let key = (layer_idx, expert_idx);
+            if let Some(&cache_slot) = cache_map.get(&key) {
+                // Cache hit — just update LRU timestamp.
+                timestamps[cache_slot] = clock;
+                active_indices[slot_idx] = cache_slot;
+            } else {
+                // Cache miss — evict LRU slot.
+                let cache_slot = self.find_lru_slot();
+                // Remove old entry from cache_map.
+                cache_map.retain(|_, &mut v| v != cache_slot);
+                // Insert new entry.
+                cache_map.insert(key, cache_slot);
+                timestamps[cache_slot] = clock;
+                active_indices[slot_idx] = cache_slot;
+                misses.push(MissInfo {
+                    slot_idx,
+                    expert_idx,
+                    cache_slot,
+                });
+            }
+        }
+
+        // If all hits, nothing to load — early return.
+        if misses.is_empty() {
+            return;
+        }
+
+        // Pre-fetch GPU buffer pointers for missed slots (direct path).
+        let gpu_ptrs: Vec<Option<[SendPtr; 3]>> = misses
             .iter()
-            .enumerate()
-            .map(|(slot_idx, _)| {
-                let slot = &self.slots[active][slot_idx];
+            .map(|m| {
+                let slot = &self.cache[m.cache_slot];
                 match (
                     backend.tensor_mut_ptr(&slot.gate_proj),
                     backend.tensor_mut_ptr(&slot.up_proj),
@@ -364,29 +461,18 @@ impl<B: GpuCore> ExpertStreamer<B> {
             .collect();
         let direct = gpu_ptrs.first().is_some_and(|p| p.is_some());
 
-        // Phase 1 + Phase 2 (fused per-thread): parallel pread + GPU upload.
-        //
-        // Each thread reads one expert (gate+up + down).  pread() is thread-safe
-        // (no shared file position), and File is Sync so &File is Send.
-        // std::thread::scope ensures all threads join before we return.
-        //
-        // For pre-quantized models, reads are 3.2x smaller (Q4 vs bf16) — the
-        // main performance win of pre-quantization.
+        // Phase 1 + Phase 2 (fused per-thread): parallel pread + GPU upload
+        // for cache misses only.
         std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(selected.len());
+            let mut handles = Vec::with_capacity(misses.len());
 
-            let iter = read_bufs
-                .iter_mut()
-                .zip(selected.iter())
-                .zip(gpu_ptrs.iter());
-
-            for ((slot_bufs, &(expert_idx, _)), &ptrs) in iter {
-                let loc = &self.index.layers[layer_idx][expert_idx];
+            let buf_iter = read_bufs.iter_mut();
+            for ((miss_idx, miss), slot_bufs) in misses.iter().enumerate().zip(buf_iter) {
+                let loc = &self.index.layers[layer_idx][miss.expert_idx];
                 let shard_files = &self.index.shard_files;
+                let ptrs = gpu_ptrs[miss_idx];
 
                 handles.push(s.spawn(move || {
-                    // Phase 1: pread from disk into CPU staging buffer.
-                    // Gate + up: single pread if contiguous (fused format), else two.
                     let gate_up = slot_bufs.gate_up.as_mut_slice();
                     if loc.gate_up_contiguous() {
                         let total = loc.gate_bytes + loc.up_bytes;
@@ -408,17 +494,13 @@ impl<B: GpuCore> ExpertStreamer<B> {
                         );
                     }
 
-                    // Down projection (always a separate read).
                     pread_exact(
                         &shard_files[loc.shard_down],
                         &mut slot_bufs.down.as_mut_slice()[..loc.down_bytes],
                         loc.down_offset,
                     );
 
-                    // Phase 2 (direct): memcpy from staging buffer to GPU buffer.
-                    // On Metal/CPU, buffer.contents() is CPU-writable unified memory.
-                    // Each thread writes to its own expert's GPU buffers (disjoint),
-                    // so no synchronization needed between threads.
+                    // Phase 2 (direct): memcpy for unified memory backends.
                     if let Some([g, u, d]) = ptrs {
                         let gate_up = slot_bufs.gate_up.as_slice();
                         unsafe {
@@ -447,15 +529,12 @@ impl<B: GpuCore> ExpertStreamer<B> {
             }
         });
 
-        // Fallback Phase 2 (async DMA): for backends without direct CPU→GPU writes.
-        // CUDA enqueues HtoD transfers on a dedicated transfer stream, then waits
-        // via event synchronisation.  With pinned staging buffers, all K×3 transfers
-        // run asynchronously on the DMA engine.
+        // Fallback Phase 2 (async DMA): CUDA path for cache misses.
         if !direct {
-            for (slot_idx, &(expert_idx, _)) in selected.iter().enumerate() {
-                let loc = &self.index.layers[layer_idx][expert_idx];
-                let slot = &self.slots[self.active.get()][slot_idx];
-                let bufs = &read_bufs[slot_idx];
+            for (miss_idx, miss) in misses.iter().enumerate() {
+                let loc = &self.index.layers[layer_idx][miss.expert_idx];
+                let slot = &self.cache[miss.cache_slot];
+                let bufs = &read_bufs[miss_idx];
                 let gate_up = bufs.gate_up.as_slice();
 
                 backend.copy_to_tensor_async(&slot.gate_proj, &gate_up[..loc.gate_bytes]);
@@ -467,91 +546,6 @@ impl<B: GpuCore> ExpertStreamer<B> {
             }
             backend.sync_transfers();
         }
-    }
-
-    /// Load experts into the inactive buffer set using async GPU transfers.
-    ///
-    /// Phase 1: parallel pread from SSD (identical to load_experts).
-    /// Phase 2: async GPU upload via copy_to_tensor_async into the INACTIVE slots.
-    ///
-    /// After calling this, the caller must call `sync_and_swap()` before
-    /// computing on the newly loaded data.  On Metal, this behaves identically
-    /// to load_experts() + swap because copy_to_tensor_async defaults to sync.
-    pub fn load_experts_async(
-        &self,
-        backend: &B,
-        layer_idx: usize,
-        selected: &[(usize, f32)],
-    ) {
-        let read_bufs = unsafe { &mut *self.read_bufs.get() };
-
-        // Phase 1: Parallel pread from disk into per-slot CPU buffers.
-        std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(selected.len());
-
-            for (slot_bufs, &(expert_idx, _)) in read_bufs.iter_mut().zip(selected.iter()) {
-                let loc = &self.index.layers[layer_idx][expert_idx];
-                let shard_files = &self.index.shard_files;
-
-                handles.push(s.spawn(move || {
-                    let gate_up = slot_bufs.gate_up.as_mut_slice();
-                    if loc.gate_up_contiguous() {
-                        let total = loc.gate_bytes + loc.up_bytes;
-                        pread_exact(
-                            &shard_files[loc.shard_gate_up],
-                            &mut gate_up[..total],
-                            loc.gate_offset,
-                        );
-                    } else {
-                        pread_exact(
-                            &shard_files[loc.shard_gate_up],
-                            &mut gate_up[..loc.gate_bytes],
-                            loc.gate_offset,
-                        );
-                        pread_exact(
-                            &shard_files[loc.shard_gate_up],
-                            &mut gate_up[loc.gate_bytes..loc.gate_bytes + loc.up_bytes],
-                            loc.up_offset,
-                        );
-                    }
-
-                    pread_exact(
-                        &shard_files[loc.shard_down],
-                        &mut slot_bufs.down.as_mut_slice()[..loc.down_bytes],
-                        loc.down_offset,
-                    );
-                }));
-            }
-
-            for h in handles {
-                h.join().unwrap();
-            }
-        });
-
-        // Phase 2: Async GPU upload into INACTIVE slots.
-        let inactive = 1 - self.active.get();
-        for (slot_idx, &(expert_idx, _)) in selected.iter().enumerate() {
-            let loc = &self.index.layers[layer_idx][expert_idx];
-            let slot = &self.slots[inactive][slot_idx];
-            let bufs = &read_bufs[slot_idx];
-            let gate_up = bufs.gate_up.as_slice();
-
-            backend.copy_to_tensor_async(&slot.gate_proj, &gate_up[..loc.gate_bytes]);
-            backend.copy_to_tensor_async(
-                &slot.up_proj,
-                &gate_up[loc.gate_bytes..loc.gate_bytes + loc.up_bytes],
-            );
-            backend.copy_to_tensor_async(&slot.down_proj, &bufs.down.as_slice()[..loc.down_bytes]);
-        }
-    }
-
-    /// Wait for async transfers to complete, then swap active/inactive.
-    ///
-    /// After this returns, `active_slots()` points to the newly uploaded data.
-    /// On Metal, `sync_transfers()` is a no-op (uploads were already synchronous).
-    pub fn sync_and_swap(&self, backend: &B) {
-        backend.sync_transfers();
-        self.active.set(1 - self.active.get());
     }
 }
 

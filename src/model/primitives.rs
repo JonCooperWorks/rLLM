@@ -573,7 +573,7 @@ pub(crate) fn moe_expert_dispatch_streamed<B: GpuMatmul + GpuElementwise + GpuMo
     backend.fill_zero(moe_output, hidden_size);
 
     for (slot_idx, &(_expert_idx, routing_weight)) in selected.iter().enumerate() {
-        let slot = &streamer.active_slots()[slot_idx];
+        let slot = streamer.active_slot(slot_idx);
 
         // Fused gate+up+SwiGLU (same as non-streamed path).
         backend.fused_gate_up_swiglu(

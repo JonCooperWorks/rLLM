@@ -102,11 +102,6 @@ fn load_and_run_single_gpu(
         let k = config.num_experts_per_tok;
         let streamer = model::expert_stream::ExpertStreamer::new(&backend, index, k);
         model.expert_streamer = Some(streamer);
-        eprintln!(
-            "expert streaming: {} slots, {} MB per expert load",
-            k,
-            config.moe_intermediate_size * config.hidden_size * 2 * 3 / 1024 / 1024,
-        );
     }
 
     // Dynamic KV cache sizing based on remaining GPU memory.
