@@ -375,8 +375,8 @@ rLLM can run MoE models that far exceed GPU memory by streaming expert weights f
 
 | System | Expert offload tier | Backends | Status |
 |---|---|---|---|
-| **rLLM** | NVMe/SSD streaming | Metal + CUDA | Production |
-| [flash-moe](https://github.com/danveloper/flash-moe) | NVMe/SSD streaming | Metal only | Production |
+| **rLLM** | NVMe/SSD streaming | Metal + CUDA | Educational |
+| [flash-moe](https://github.com/danveloper/flash-moe) | NVMe/SSD streaming | Metal only | Educational |
 | vLLM | CPU memory offload | CUDA only | Production |
 | llama.cpp | CPU-side expert compute | CPU (no GPU streaming) | Production |
 | HOBBIT (llama.cpp fork) | Mixed-precision CPU offload | CUDA only | Research |
