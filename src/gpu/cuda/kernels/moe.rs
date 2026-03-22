@@ -1,12 +1,17 @@
 // ---------------------------------------------------------------------------
-// CUDA impl: GpuMoe — fused MoE kernels.
+// CUDA impl: GpuMoe — fused MoE kernels for expert streaming.
 //
-// Trait contract: gpu/ops/moe.rs
-// CUDA shader:    cuda/shaders/moe.cu
+// These kernels run the expert FFN compute after weights arrive on GPU via
+// the expert streaming pipeline (pread from NVMe → pinned host memory →
+// async DMA to device via dedicated CUDA transfer stream).
 //
 // Fused gate+up+SwiGLU halves the number of dispatches per expert by
 // computing both dot products and applying the activation in a single kernel.
 // The combine+residual kernel replaces k scale_add + 1 add with one pass.
+//
+// Trait contract:    gpu/ops/moe.rs
+// CUDA shader:       cuda/shaders/moe.cu
+// Expert streamer:   model/expert_stream.rs
 // ---------------------------------------------------------------------------
 
 use cudarc::driver::{DeviceRepr, PushKernelArg};

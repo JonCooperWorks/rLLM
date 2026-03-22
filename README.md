@@ -181,7 +181,7 @@ Q4 is slower than bf16 for decode on H100 — unlike Apple Silicon where Q4 is a
 - **Q4 quantization** — offline 4-bit block quantization via `rllm quantize` (~3.2x memory reduction)
 - **bf16 inference** — native half-precision compute
 - **Mixture of Experts** — top-k expert routing with per-token dispatch (Mixtral, Qwen3 MoE, GPT-OSS)
-- **SSD expert streaming** — run MoE models larger than GPU memory by streaming experts from NVMe on demand (`--stream-experts`); fused gate+up+SwiGLU kernel reduces per-expert dispatches
+- **SSD expert streaming** — run MoE models larger than GPU memory by streaming experts from NVMe on demand (`--stream-experts`) on both Metal and CUDA; LRU expert cache skips NVMe reads and PCIe transfers on cache hits; fused gate+up+SwiGLU kernel reduces per-expert dispatches. Streaming approach inspired by [flash-moe](https://github.com/danveloper/flash-moe)
 - **MXFP4 dequantization** — microscaling FP4 (E2M1 + E8M0 scales) weight loading for GPT-OSS
 - **API server** — OpenAI and Anthropic compatible HTTP endpoints with SSE streaming
 - **Chat templates** — Llama 3, ChatML (Qwen/GPT-OSS), Mistral/Mixtral, Phi, and Gemma instruct formats
@@ -359,6 +359,33 @@ src/
 | Batching | Continuous batching (N sequences share the GPU) | ~Nx |
 | Expert streaming | SSD pread on demand, fused gate+up+SwiGLU kernel | runs models that don't fit in VRAM |
 | Tensor parallelism | NCCL all-reduce across GPUs (`--tp N`) | ~Nx bandwidth |
+
+## Expert Streaming
+
+rLLM can run MoE models that far exceed GPU memory by streaming expert weights from NVMe on demand. The 397B-parameter Qwen3.5 (751 GB on disk, 213 GB as Q4) runs on a 64 GB MacBook or a 48 GB RTX 4090 using ~20 GB of GPU memory.
+
+**How it works:** During loading, expert weight tensors are *not* uploaded to GPU. Instead, their file offsets are recorded in an index. At inference time, after the router selects K experts per token, their weights are `pread()`'d from disk in parallel and copied into a fixed pool of GPU buffer slots that act as an LRU cache. Cache hits skip both NVMe reads and PCIe transfers entirely. Fused gate+up+SwiGLU kernels halve the number of GPU dispatches per expert.
+
+**Both backends:** Expert streaming works on Metal (Apple Silicon unified memory, direct `memcpy` into GPU buffers) and CUDA (discrete GPU, async DMA via dedicated transfer stream with pinned host memory). As far as we're aware, rLLM is the only engine with NVMe-based expert streaming on both CUDA and Metal from a single codebase.
+
+**Approach credit:** The pread-based streaming architecture and the insight that the OS page cache outperforms custom LRU caching (~71% natural hit rate) come from [flash-moe](https://github.com/danveloper/flash-moe), an Objective-C/Metal engine built for running Qwen3.5-397B on Apple Silicon. rLLM extends this approach to CUDA with async DMA, adds a GPU-side LRU expert cache for discrete GPUs where PCIe transfer cost is significant, and supports pre-quantized Q4 experts (3.5x less NVMe I/O).
+
+<details>
+<summary><b>Landscape comparison</b></summary>
+
+| System | Expert offload tier | Backends | Status |
+|---|---|---|---|
+| **rLLM** | NVMe/SSD streaming | Metal + CUDA | Production |
+| [flash-moe](https://github.com/danveloper/flash-moe) | NVMe/SSD streaming | Metal only | Production |
+| vLLM | CPU memory offload | CUDA only | Production |
+| llama.cpp | CPU-side expert compute | CPU (no GPU streaming) | Production |
+| HOBBIT (llama.cpp fork) | Mixed-precision CPU offload | CUDA only | Research |
+| FlashMoE (paper) | SSD streaming + ML cache | CUDA only | Research |
+| SGLang / TensorRT-LLM | No expert offloading | CUDA only | — |
+
+Mainline llama.cpp sends activations to CPU for expert computation (not weight streaming). vLLM caches a hot subset of experts on GPU with the rest in CPU memory. Neither streams expert weights directly from NVMe/SSD to GPU.
+
+</details>
 
 ## Scripts
 

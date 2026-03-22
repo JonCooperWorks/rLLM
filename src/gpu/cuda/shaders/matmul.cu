@@ -79,10 +79,12 @@ extern "C" __global__ void matvec_bf16(
 // ---------------------------------------------------------------------------
 // matvec_q4 — SIMD-cooperative matvec with inline Q4 dequantisation.
 //
-// Q4 block layout (20 bytes per 32 weights):
-//   bytes  0-3:  f32 scale
-//   bytes  4-19: 16 packed nibble bytes (2 weights per byte)
+// Q4 block layout (18 bytes per 32 weights):
+//   bytes  0-1:  bf16 scale
+//   bytes  2-17: 16 packed nibble bytes (2 weights per byte)
 //   Dequant: weight = (nibble - 8) * scale
+//   bf16 scale (vs f32) saves 10% I/O per block — critical for NVMe-bound
+//   expert streaming where bandwidth is the bottleneck.
 //
 // Two access patterns selected by blocks_per_row:
 //
