@@ -52,6 +52,7 @@ use axum::response::{IntoResponse, Json, Response};
 
 use super::{InferenceEvent, ServerState, StopReason, WorkerRequest};
 use crate::model::chat::Message;
+use crate::model::thinking;
 use crate::model::tools::{self, ToolDefinition};
 
 // ---------------------------------------------------------------------------
@@ -87,6 +88,38 @@ pub(crate) struct MessagesRequest {
     /// Tool definitions (Anthropic format: name, description, input_schema).
     #[serde(default)]
     pub tools: Option<Vec<AnthropicToolDef>>,
+    /// Extended thinking configuration.
+    /// Anthropic uses `{"type": "enabled", "budget_tokens": N}` but we accept
+    /// a simplified form: `{"enabled": true}` or just `true` for convenience.
+    #[serde(default)]
+    pub thinking: Option<ThinkingConfig>,
+}
+
+/// Anthropic thinking configuration.
+///
+/// Anthropic's API uses `{"type": "enabled", "budget_tokens": N}`.  We also
+/// accept a boolean for simplicity (e.g. `"thinking": true`).
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum ThinkingConfig {
+    /// Full Anthropic format: `{"type": "enabled", "budget_tokens": 1024}`.
+    Structured {
+        #[serde(rename = "type")]
+        type_: String,
+        #[allow(dead_code)]
+        budget_tokens: Option<usize>,
+    },
+    /// Simplified boolean: `true` or `false`.
+    Bool(bool),
+}
+
+impl ThinkingConfig {
+    fn is_enabled(&self) -> bool {
+        match self {
+            ThinkingConfig::Structured { type_, .. } => type_ == "enabled",
+            ThinkingConfig::Bool(b) => *b,
+        }
+    }
 }
 
 fn default_max_tokens() -> usize {
@@ -112,6 +145,8 @@ struct MessagesResponse {
 #[derive(serde::Serialize)]
 #[serde(tag = "type")]
 enum ContentBlock {
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String },
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "tool_use")]
@@ -172,6 +207,7 @@ pub(crate) async fn messages(
     Json(req): Json<MessagesRequest>,
 ) -> Result<Response, StatusCode> {
     let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+    let thinking_requested = req.thinking.as_ref().map(|t| t.is_enabled());
 
     // Build message list: prepend system prompt if provided.
     let mut messages = Vec::new();
@@ -194,10 +230,10 @@ pub(crate) async fn messages(
     }
     messages.extend(req.messages);
 
-    // Tokenize on the async handler thread (CPU-only, doesn't block GPU).
+    // Tokenize with thinking control.
     let prompt_tokens = state
         .tokenizer
-        .encode_messages(&messages, state.arch)
+        .encode_messages_with_thinking(&messages, state.arch, thinking_requested)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let (response_tx, response_rx) = tokio::sync::mpsc::channel(64);
@@ -208,6 +244,7 @@ pub(crate) async fn messages(
         temperature: req.temperature.unwrap_or(1.0),
         top_p: req.top_p.unwrap_or(0.9),
         response_tx,
+        thinking: thinking_requested,
     };
 
     state.request_tx.try_send(worker_req).map_err(|e| match e {
@@ -215,18 +252,28 @@ pub(crate) async fn messages(
         std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
     })?;
 
-    if req.stream && !has_tools {
+    // When thinking is enabled, we must collect all tokens to parse blocks.
+    let needs_blocking = has_tools || thinking_requested.is_some_and(|t| t);
+    if req.stream && !needs_blocking {
         Ok(messages_stream(state, response_rx).await)
     } else {
-        Ok(messages_blocking(state, response_rx, has_tools).await)
+        Ok(messages_blocking(
+            state,
+            response_rx,
+            has_tools,
+            thinking_requested.unwrap_or(false),
+        )
+        .await)
     }
 }
 
-/// Non-streaming: collect all tokens, return complete JSON response.
+/// Non-streaming: collect all tokens, parse thinking blocks and tool calls,
+/// return complete JSON response.
 async fn messages_blocking(
     state: Arc<ServerState>,
     mut response_rx: tokio::sync::mpsc::Receiver<InferenceEvent>,
     check_tools: bool,
+    check_thinking: bool,
 ) -> Response {
     let mut text = String::new();
     let mut input_tokens = 0usize;
@@ -251,6 +298,15 @@ async fn messages_blocking(
         }
     }
 
+    // Parse thinking blocks first (they wrap the entire output including
+    // any tool calls), then check for tool calls in the remaining content.
+    let mut thinking_text = None;
+    if check_thinking {
+        let result = thinking::parse_thinking(state.arch, &text);
+        thinking_text = result.thinking;
+        text = result.content;
+    }
+
     // Check for tool calls in the generated text.
     let (content_text, tool_calls) = if check_tools {
         let (cleaned, calls) = tools::parse_tool_calls(state.arch, &text);
@@ -265,6 +321,13 @@ async fn messages_blocking(
 
     // Build content blocks.
     let mut content = Vec::new();
+
+    // Add thinking block first (Anthropic puts it before the text block).
+    if let Some(ref thinking) = thinking_text {
+        content.push(ContentBlock::Thinking {
+            thinking: thinking.clone(),
+        });
+    }
 
     // Add text block if there's content.
     if !content_text.is_empty() {
@@ -564,5 +627,76 @@ mod tests {
             converted[0].function.description.as_deref(),
             Some("A test tool")
         );
+    }
+
+    // -- Thinking tests --
+
+    #[test]
+    fn test_thinking_config_structured() {
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 1024}
+        }"#;
+        let req: MessagesRequest = serde_json::from_str(json).unwrap();
+        assert!(req.thinking.as_ref().unwrap().is_enabled());
+    }
+
+    #[test]
+    fn test_thinking_config_bool() {
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Hi"}],
+            "thinking": true
+        }"#;
+        let req: MessagesRequest = serde_json::from_str(json).unwrap();
+        assert!(req.thinking.as_ref().unwrap().is_enabled());
+    }
+
+    #[test]
+    fn test_thinking_config_disabled() {
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Hi"}],
+            "thinking": {"type": "disabled"}
+        }"#;
+        let req: MessagesRequest = serde_json::from_str(json).unwrap();
+        assert!(!req.thinking.as_ref().unwrap().is_enabled());
+    }
+
+    #[test]
+    fn test_thinking_config_defaults_to_none() {
+        let json = r#"{"messages": [{"role": "user", "content": "Hi"}]}"#;
+        let req: MessagesRequest = serde_json::from_str(json).unwrap();
+        assert!(req.thinking.is_none());
+    }
+
+    #[test]
+    fn test_messages_response_with_thinking() {
+        let response = MessagesResponse {
+            id: "msg_think1".into(),
+            type_: "message",
+            role: "assistant",
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "Let me reason about this.".into(),
+                },
+                ContentBlock::Text {
+                    text: "The answer is 4.".into(),
+                },
+            ],
+            model: "test-model".into(),
+            stop_reason: Some("end_turn".into()),
+            usage: AnthropicUsage {
+                input_tokens: 10,
+                output_tokens: 50,
+            },
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["content"].as_array().unwrap().len(), 2);
+        assert_eq!(json["content"][0]["type"], "thinking");
+        assert_eq!(
+            json["content"][0]["thinking"],
+            "Let me reason about this."
+        );
+        assert_eq!(json["content"][1]["type"], "text");
+        assert_eq!(json["content"][1]["text"], "The answer is 4.");
     }
 }

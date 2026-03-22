@@ -64,6 +64,7 @@ pub(crate) mod primitives;
 pub(crate) mod profile;
 pub(crate) mod registry;
 pub(crate) mod sampler;
+pub(crate) mod thinking;
 pub(crate) mod tokenizer;
 pub(crate) mod tools;
 

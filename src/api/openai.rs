@@ -47,6 +47,7 @@ use axum::response::{IntoResponse, Json, Response};
 
 use super::{InferenceEvent, ServerState, StopReason, WorkerRequest};
 use crate::model::chat::Message;
+use crate::model::thinking;
 use crate::model::tools::{self, ToolDefinition};
 
 // ---------------------------------------------------------------------------
@@ -72,6 +73,11 @@ pub(crate) struct ChatCompletionRequest {
     /// Controls tool calling behaviour: "auto" (default), "none", or "required".
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+    /// Enable extended thinking (chain-of-thought reasoning).
+    /// When true, models that support it will produce reasoning before responding.
+    /// The reasoning is returned in the `reasoning_content` field of the response.
+    #[serde(default)]
+    pub thinking: Option<bool>,
 }
 
 #[derive(serde::Deserialize)]
@@ -130,6 +136,11 @@ struct ChatResponseMessage {
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<tools::ToolCall>>,
+    /// Extended thinking / chain-of-thought reasoning.
+    /// Only present when the model produced a `<think>` block and the client
+    /// enabled thinking.  Matches OpenAI's `reasoning_content` convention.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -212,6 +223,7 @@ pub(crate) async fn chat_completions(
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, StatusCode> {
     let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+    let thinking_requested = req.thinking;
 
     // If tool_choice is "none", strip tools so the model won't be prompted.
     let tools_disabled = req
@@ -228,9 +240,10 @@ pub(crate) async fn chat_completions(
     };
 
     // Tokenize on the async handler thread (CPU-only, doesn't block GPU).
+    // Use thinking-aware encoding if thinking was requested.
     let prompt_tokens = state
         .tokenizer
-        .encode_messages(&messages, state.arch)
+        .encode_messages_with_thinking(&messages, state.arch, thinking_requested)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let (response_tx, response_rx) = tokio::sync::mpsc::channel(64);
@@ -241,6 +254,7 @@ pub(crate) async fn chat_completions(
         temperature: req.temperature,
         top_p: req.top_p,
         response_tx,
+        thinking: thinking_requested,
     };
 
     state.request_tx.try_send(worker_req).map_err(|e| match e {
@@ -248,21 +262,29 @@ pub(crate) async fn chat_completions(
         std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
     })?;
 
-    // For non-streaming with tools, we need to collect all text to detect
-    // tool calls.  For streaming without tools, we can stream directly.
-    // For streaming WITH tools, we also collect first then emit.
-    if req.stream && !has_tools {
+    // When thinking is enabled, we must collect all tokens to parse
+    // the thinking block — same as tool calling.
+    let needs_blocking = has_tools || thinking_requested.is_some_and(|t| t);
+    if req.stream && !needs_blocking {
         Ok(chat_completions_stream(state, response_rx).await)
     } else {
-        Ok(chat_completions_blocking(state, response_rx, has_tools && !tools_disabled).await)
+        Ok(chat_completions_blocking(
+            state,
+            response_rx,
+            has_tools && !tools_disabled,
+            thinking_requested.unwrap_or(false),
+        )
+        .await)
     }
 }
 
-/// Non-streaming: collect all tokens, detect tool calls, return complete JSON response.
+/// Non-streaming: collect all tokens, detect thinking blocks and tool calls,
+/// return complete JSON response.
 async fn chat_completions_blocking(
     state: Arc<ServerState>,
     mut response_rx: tokio::sync::mpsc::Receiver<InferenceEvent>,
     check_tools: bool,
+    check_thinking: bool,
 ) -> Response {
     let mut text = String::new();
     let mut prompt_tokens = 0usize;
@@ -285,6 +307,15 @@ async fn chat_completions_blocking(
                 return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e);
             }
         }
+    }
+
+    // Parse thinking blocks first (they wrap the entire output including
+    // any tool calls), then check for tool calls in the remaining content.
+    let mut reasoning_content = None;
+    if check_thinking {
+        let result = thinking::parse_thinking(state.arch, &text);
+        reasoning_content = result.thinking;
+        text = result.content;
     }
 
     // Check for tool calls in the generated text.
@@ -323,6 +354,7 @@ async fn chat_completions_blocking(
                 role: "assistant",
                 content,
                 tool_calls,
+                reasoning_content,
             },
             finish_reason: Some(finish_reason_str(finish_reason).to_string()),
         }],
@@ -420,6 +452,7 @@ pub(crate) async fn completions(
         temperature: req.temperature,
         top_p: req.top_p,
         response_tx,
+        thinking: None,
     };
 
     state.request_tx.try_send(worker_req).map_err(|e| match e {
@@ -691,6 +724,7 @@ mod tests {
                     role: "assistant",
                     content: Some("Hello!".into()),
                     tool_calls: None,
+                    reasoning_content: None,
                 },
                 finish_reason: Some("stop".into()),
             }],
@@ -705,8 +739,11 @@ mod tests {
         assert_eq!(json["choices"][0]["message"]["content"], "Hello!");
         assert_eq!(json["choices"][0]["finish_reason"], "stop");
         assert_eq!(json["usage"]["total_tokens"], 15);
-        // tool_calls should be absent (not null) when None.
+        // tool_calls and reasoning_content should be absent (not null) when None.
         assert!(json["choices"][0]["message"].get("tool_calls").is_none());
+        assert!(json["choices"][0]["message"]
+            .get("reasoning_content")
+            .is_none());
     }
 
     #[test]
@@ -729,6 +766,7 @@ mod tests {
                             arguments: "{\"city\":\"SF\"}".into(),
                         },
                     }]),
+                    reasoning_content: None,
                 },
                 finish_reason: Some("tool_calls".into()),
             }],
@@ -847,5 +885,58 @@ mod tests {
         assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
         assert!(parsed["choices"][0]["delta"].get("content").is_none());
         assert!(parsed["choices"][0]["delta"].as_object().unwrap().is_empty());
+    }
+
+    // -- Thinking tests --
+
+    #[test]
+    fn test_chat_request_with_thinking() {
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Solve 2+2"}],
+            "thinking": true
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.thinking, Some(true));
+    }
+
+    #[test]
+    fn test_chat_request_thinking_defaults_to_none() {
+        let json = r#"{"messages": [{"role": "user", "content": "Hi"}]}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.thinking, None);
+    }
+
+    #[test]
+    fn test_chat_response_with_reasoning_content() {
+        let response = ChatCompletionResponse {
+            id: "chatcmpl-think1".into(),
+            object: "chat.completion",
+            created: 1234567890,
+            model: "test-model".into(),
+            choices: vec![ChatChoice {
+                index: 0,
+                message: ChatResponseMessage {
+                    role: "assistant",
+                    content: Some("The answer is 4.".into()),
+                    tool_calls: None,
+                    reasoning_content: Some("2+2=4 because addition.".into()),
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens: 50,
+                total_tokens: 60,
+            },
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            json["choices"][0]["message"]["reasoning_content"],
+            "2+2=4 because addition."
+        );
+        assert_eq!(
+            json["choices"][0]["message"]["content"],
+            "The answer is 4."
+        );
     }
 }

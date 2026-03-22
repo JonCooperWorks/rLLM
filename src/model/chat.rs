@@ -56,6 +56,7 @@
 // ===========================================================================
 
 use super::config::ModelArch;
+use super::thinking;
 use super::tools::{self, ToolCall};
 
 /// A single message in a chat conversation.
@@ -96,19 +97,48 @@ where
 /// template produces gibberish — the model literally doesn't understand the
 /// role boundaries if the special tokens are wrong.
 pub(crate) fn format_chat(arch: ModelArch, messages: &[Message]) -> String {
-    match arch {
+    format_chat_with_thinking(arch, messages, None)
+}
+
+/// Format messages with optional thinking control.
+///
+/// When `thinking` is Some(true), a thinking prompt tag is appended after
+/// the generation prompt so the model begins reasoning.  When Some(false),
+/// a suppression tag is appended to prevent thinking.  When None, no
+/// thinking control is applied (the model decides on its own).
+///
+/// See `thinking.rs` for the architecture-specific tags.
+pub(crate) fn format_chat_with_thinking(
+    arch: ModelArch,
+    messages: &[Message],
+    thinking_enabled: Option<bool>,
+) -> String {
+    let mut out = match arch {
         ModelArch::Llama => format_llama3(messages),
-        // Mistral and Mixtral use [INST]/[/INST] markers with system prepended to first user message.
         ModelArch::Mistral | ModelArch::Mixtral => format_mistral(messages),
-        // Qwen 2.5, Qwen 3 MoE, Qwen 3.5, and GPT-OSS all use ChatML format.
         ModelArch::Qwen2 | ModelArch::Qwen3Moe | ModelArch::Qwen3_5 | ModelArch::GptOss => {
             format_chatml(messages)
         }
-        // Phi uses a ChatML-like format but with <|im_sep|> between role and content.
         ModelArch::Phi => format_phi(messages),
-        // Gemma 3 uses <start_of_turn>/<end_of_turn> markers.
         ModelArch::Gemma3 => format_gemma3(messages),
+    };
+
+    // Append thinking control tag after the generation prompt.
+    match thinking_enabled {
+        Some(true) => {
+            if let Some(tag) = thinking::thinking_prompt_tag(arch, true) {
+                out.push_str(tag);
+            }
+        }
+        Some(false) => {
+            if let Some(tag) = thinking::thinking_suppress_tag(arch) {
+                out.push_str(tag);
+            }
+        }
+        None => {}
     }
+
+    out
 }
 
 /// Format chat messages into the Llama 3 instruct template string.
@@ -462,5 +492,42 @@ mod tests {
         // Should just produce the generation prompt
         let llama = format_chat(ModelArch::Llama, &messages);
         assert_eq!(llama, "<|start_header_id|>assistant<|end_header_id|>\n\n");
+    }
+
+    // -- Thinking control tests --
+
+    #[test]
+    fn test_thinking_enabled_qwen3_5() {
+        let messages = vec![msg("user", "Solve 2+2")];
+        let result = format_chat_with_thinking(ModelArch::Qwen3_5, &messages, Some(true));
+        // Should end with the generation prompt + <think> tag
+        assert!(result.ends_with("<|im_start|>assistant\n<think>\n"));
+    }
+
+    #[test]
+    fn test_thinking_disabled_qwen3_5() {
+        let messages = vec![msg("user", "Solve 2+2")];
+        let result = format_chat_with_thinking(ModelArch::Qwen3_5, &messages, Some(false));
+        // When disabled, no thinking tag is added — same as format_chat.
+        let without = format_chat(ModelArch::Qwen3_5, &messages);
+        assert_eq!(result, without);
+    }
+
+    #[test]
+    fn test_thinking_none_no_tag() {
+        let messages = vec![msg("user", "Hello")];
+        let with_none = format_chat_with_thinking(ModelArch::Qwen3_5, &messages, None);
+        let without = format_chat(ModelArch::Qwen3_5, &messages);
+        // None should produce identical output to format_chat
+        assert_eq!(with_none, without);
+    }
+
+    #[test]
+    fn test_thinking_unsupported_arch_no_tag() {
+        let messages = vec![msg("user", "Hello")];
+        let result = format_chat_with_thinking(ModelArch::Llama, &messages, Some(true));
+        // Llama doesn't support thinking — should be same as without
+        let without = format_chat(ModelArch::Llama, &messages);
+        assert_eq!(result, without);
     }
 }

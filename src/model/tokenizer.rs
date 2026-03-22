@@ -187,13 +187,28 @@ impl Tokenizer {
     /// Encode pre-structured chat messages into token IDs.
     ///
     /// Used by the API server where messages arrive already structured
-    /// (system/user/assistant roles from the HTTP request).
+    /// (system/user/assistant roles from the HTTP request).  Delegates to
+    /// `encode_messages_with_thinking()` with no thinking control.
     pub fn encode_messages(
         &self,
         messages: &[chat::Message],
         arch: ModelArch,
     ) -> anyhow::Result<Vec<u32>> {
-        let formatted = chat::format_chat(arch, messages);
+        self.encode_messages_with_thinking(messages, arch, None)
+    }
+
+    /// Encode chat messages with optional thinking control.
+    ///
+    /// Like `encode_messages()` but passes a thinking flag to the chat
+    /// template so the model knows whether to produce reasoning output.
+    /// See `chat::format_chat_with_thinking()` for details.
+    pub fn encode_messages_with_thinking(
+        &self,
+        messages: &[chat::Message],
+        arch: ModelArch,
+        thinking: Option<bool>,
+    ) -> anyhow::Result<Vec<u32>> {
+        let formatted = chat::format_chat_with_thinking(arch, messages, thinking);
         self.encode_chat(&formatted)
     }
 
@@ -217,6 +232,25 @@ impl Tokenizer {
     /// Used to stop the generation loop.
     pub fn is_eos(&self, token_id: u32) -> bool {
         self.eos_token_ids.contains(&token_id)
+    }
+
+    /// Check if a token ID is a thinking start marker (`<think>`).
+    ///
+    /// Models like Qwen 3.5 emit `<think>` as a special token (ID 248068)
+    /// that gets stripped by `decode(skip_special_tokens=true)`.  The worker
+    /// loop uses this to inject the literal `<think>` text back into the
+    /// decoded output so the text-level thinking parser can find it.
+    pub fn is_think_start(&self, token_id: u32) -> bool {
+        // Qwen 3 / 3.5: <think> = 248068
+        token_id == 248068
+    }
+
+    /// Check if a token ID is a thinking end marker (`</think>`).
+    ///
+    /// See `is_think_start()` for context.  `</think>` = 248069 in Qwen 3.5.
+    pub fn is_think_end(&self, token_id: u32) -> bool {
+        // Qwen 3 / 3.5: </think> = 248069
+        token_id == 248069
     }
 
     /// Decode tokens incrementally, simulating the streaming API path.

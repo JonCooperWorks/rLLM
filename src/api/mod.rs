@@ -73,6 +73,9 @@ pub(crate) struct WorkerRequest {
     pub top_p: f32,
     /// Per-request channel to send token events back to the handler.
     pub response_tx: tokio::sync::mpsc::Sender<InferenceEvent>,
+    /// Whether thinking (extended reasoning) was requested.
+    /// Some(true) = enabled, Some(false) = explicitly disabled, None = not specified.
+    pub thinking: Option<bool>,
 }
 
 /// Events sent from the inference worker back to an HTTP handler.
@@ -376,6 +379,18 @@ struct RequestContext {
     created_at: Instant,
     /// When the first token was generated (None until the first token event).
     first_token_at: Option<Instant>,
+    /// Whether thinking was requested for this sequence.
+    /// Used to inject literal `<think>`/`</think>` markers when the model
+    /// generates these as special tokens (which `decode(skip_special=true)`
+    /// would otherwise strip).
+    thinking: bool,
+    /// Suffix to inject before the next decode.
+    ///
+    /// When we see a `<think>` or `</think>` special token, we can't just
+    /// append the marker text — we need to inject it at the right position
+    /// in the incremental decode buffer.  This field accumulates markers
+    /// that were seen since the last decode.
+    inject_marker: Option<&'static str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -404,6 +419,7 @@ fn run_worker_loop(
         // 1. Drain all pending requests (non-blocking).
         while let Ok(req) = request_rx.try_recv() {
             let prompt_token_count = req.prompt_tokens.len();
+            let thinking = req.thinking.unwrap_or(false);
             let seq_id = engine.add_request(
                 req.prompt_tokens,
                 req.max_tokens,
@@ -420,6 +436,8 @@ fn run_worker_loop(
                     prev_text_len: 0,
                     created_at: Instant::now(),
                     first_token_at: None,
+                    thinking,
+                    inject_marker: None,
                 },
             );
         }
@@ -429,6 +447,7 @@ fn run_worker_loop(
             match request_rx.recv() {
                 Ok(req) => {
                     let prompt_token_count = req.prompt_tokens.len();
+                    let thinking = req.thinking.unwrap_or(false);
                     let seq_id = engine.add_request(
                         req.prompt_tokens,
                         req.max_tokens,
@@ -445,6 +464,8 @@ fn run_worker_loop(
                             prev_text_len: 0,
                             created_at: Instant::now(),
                             first_token_at: None,
+                            thinking,
+                            inject_marker: None,
                         },
                     );
                 }
@@ -468,16 +489,49 @@ fn run_worker_loop(
 
         // 4. Stream tokens to response channels.
         let mut to_abort: Vec<SeqId> = Vec::new();
+        let tokenizer = engine.tokenizer();
 
         for &(seq_id, token_id) in &step_output.tokens {
             if let Some(ctx) = registry.get_mut(&seq_id) {
+                // Detect thinking special tokens.  Models like Qwen 3.5 emit
+                // <think> (248068) and </think> (248069) as special tokens that
+                // `decode(skip_special=true)` strips.  We record a pending
+                // marker so we can inject the literal text after decoding.
+                if ctx.thinking && tokenizer.is_think_start(token_id) {
+                    // Flush any pending marker first, then store the new one.
+                    if let Some(prev) = ctx.inject_marker.take() {
+                        let _ = ctx
+                            .response_tx
+                            .blocking_send(InferenceEvent::Token { text: prev.to_string() });
+                    }
+                    ctx.inject_marker = Some("<think>");
+                    ctx.generated_count += 1;
+                    if ctx.first_token_at.is_none() {
+                        ctx.first_token_at = Some(Instant::now());
+                    }
+                    continue;
+                }
+                if ctx.thinking && tokenizer.is_think_end(token_id) {
+                    if let Some(prev) = ctx.inject_marker.take() {
+                        let _ = ctx
+                            .response_tx
+                            .blocking_send(InferenceEvent::Token { text: prev.to_string() });
+                    }
+                    ctx.inject_marker = Some("</think>");
+                    ctx.generated_count += 1;
+                    continue;
+                }
+
                 ctx.token_ids.push(token_id);
-                let full_text = engine
-                    .tokenizer()
-                    .decode(&ctx.token_ids)
-                    .unwrap_or_default();
-                let text = full_text[ctx.prev_text_len..].to_string();
+                let full_text = tokenizer.decode(&ctx.token_ids).unwrap_or_default();
+                let mut text = full_text[ctx.prev_text_len..].to_string();
                 ctx.prev_text_len = full_text.len();
+
+                // Prepend any pending thinking marker to the decoded text.
+                if let Some(marker) = ctx.inject_marker.take() {
+                    text = format!("{marker}{text}");
+                }
+
                 ctx.generated_count += 1;
                 if ctx.first_token_at.is_none() {
                     ctx.first_token_at = Some(Instant::now());
@@ -494,7 +548,15 @@ fn run_worker_loop(
 
         // 5. Handle finished sequences.
         for finished in &step_output.finished {
-            if let Some(ctx) = registry.remove(&finished.id) {
+            if let Some(mut ctx) = registry.remove(&finished.id) {
+                // Flush any pending thinking marker (e.g. </think> was the
+                // last token before EOS).
+                if let Some(marker) = ctx.inject_marker.take() {
+                    let _ = ctx
+                        .response_tx
+                        .blocking_send(InferenceEvent::Token { text: marker.to_string() });
+                }
+
                 let stop_reason = match finished.reason {
                     engine::FinishReason::Eos => StopReason::EndOfSequence,
                     engine::FinishReason::MaxTokens => StopReason::MaxTokens,
