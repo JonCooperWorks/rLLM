@@ -2268,7 +2268,7 @@ fn build_expert_index_from_safetensors(
     let num_experts = config.num_experts;
     let num_layers = config.num_hidden_layers;
 
-    // Re-open shard files (need file handles for pread, not mmaps).
+    // Load safetensors headers to compute tensor file offsets.
     let (mmaps, weight_map) = load_safetensors_files(model_dir)?;
 
     // Compute data_start for each shard (8 + header_len).
@@ -2289,7 +2289,7 @@ fn build_expert_index_from_safetensors(
     // Determine the layer prefix pattern.
     let prefix_base = format!("{}layers.", config.weight_prefix);
 
-    // Open file handles for pread.
+    // Open file handles for pread (kept alive in ExpertIndex).
     let shard_paths = get_shard_paths(model_dir)?;
     let shard_files: Vec<std::fs::File> = shard_paths
         .iter()

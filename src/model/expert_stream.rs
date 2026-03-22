@@ -20,12 +20,24 @@
 //   4. The forward pass runs using these temporary buffers, then they're
 //      reused for the next layer.
 //
+// Performance architecture (flash-moe pattern):
+//   - **Parallel pread**: K experts are read concurrently using std::thread::scope.
+//     Each thread reads one expert's weights independently.  pread() is thread-safe
+//     (no shared file position) so multiple threads can read from the same file.
+//   - **Fused gate+up read**: For Qwen3.5's fused format, gate and up projections
+//     are contiguous on disk.  Instead of 2 pread() calls (gate, up), we do 1
+//     pread() for the combined gate_up block — halving NVMe command overhead.
+//   - **OS page cache**: No custom LRU.  Flash-moe tested custom caching and found
+//     it 38% slower than trusting the OS page cache (~71% hit rate naturally).
+//   - **No pipeline overlap**: Apple Silicon's unified memory controller means GPU
+//     compute and NVMe DMA can't truly overlap — serial I/O→compute is optimal.
+//
 // Why pread and not mmap?
-//   The safetensors files ARE mmap'd during loading, but upload_tensor()
-//   copies into a new Metal buffer.  For streaming we reuse fixed GPU
-//   buffers via copy_to_tensor() to avoid allocation overhead per expert.
-//   pread() gives us precise control over which bytes to read, and the OS
-//   page cache handles caching transparently (~71% hit rate per flash-moe).
+//   mmap'ing 751GB of shard files (94 × ~8GB for 397B) causes excessive memory
+//   pressure.  Each page fault triggers a 16KB kernel I/O operation, while pread()
+//   issues 8-16MB reads that the kernel can satisfy with large sequential I/O.
+//   For large MoE models, targeted pread gives the kernel better I/O scheduling
+//   information than random page faults across hundreds of GB of virtual mappings.
 //
 // Inspired by flash-moe (github.com/danveloper/flash-moe).
 //
@@ -69,6 +81,17 @@ pub(crate) struct ExpertLocation {
     pub down_bytes: usize,
 }
 
+impl ExpertLocation {
+    /// Whether gate and up projections are contiguous on disk.
+    ///
+    /// True for Qwen3.5's fused gate_up_proj format, where gate and up are
+    /// stacked along dim 0 within a single tensor.  When contiguous, we can
+    /// read both in a single pread() instead of two — halving NVMe commands.
+    fn gate_up_contiguous(&self) -> bool {
+        self.up_offset == self.gate_offset + self.gate_bytes as u64
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ExpertIndex — full model expert location map.
 //
@@ -89,11 +112,32 @@ pub(crate) struct ExpertIndex {
 }
 
 // ---------------------------------------------------------------------------
+// SlotReadBufs — per-slot CPU buffers for parallel pread.
+//
+// Each expert slot gets its own read buffers so that K threads can pread()
+// concurrently without contention.  The gate_up buffer holds both gate and
+// up projections contiguously (matching the fused on-disk layout) so that
+// Qwen3.5's fused format can be loaded with a single pread.
+// ---------------------------------------------------------------------------
+
+struct SlotReadBufs {
+    /// Combined gate+up buffer.  For fused format, read in one pread().
+    /// Layout: [gate_bytes | up_bytes] — gate first, then up.
+    gate_up: Vec<u8>,
+    /// Down projection buffer.
+    down: Vec<u8>,
+}
+
+// ---------------------------------------------------------------------------
 // ExpertStreamer — manages GPU buffer slots and loads experts on demand.
 //
 // The streamer holds K pre-allocated GPU buffer slots (one per active
 // expert).  When the router selects experts, load_experts() reads their
 // weights from disk and copies them into the buffer slots.
+//
+// Performance: parallel pread across K experts, fused gate+up reads for
+// models with contiguous gate/up layout (Qwen3.5).  For K=10 on 397B,
+// this saturates NVMe queue depth instead of issuing 30 serial reads.
 // ---------------------------------------------------------------------------
 
 pub(crate) struct ExpertStreamer<B: GpuCore> {
@@ -101,13 +145,13 @@ pub(crate) struct ExpertStreamer<B: GpuCore> {
     pub index: ExpertIndex,
     /// K buffer slots for active experts.  Reused every layer.
     pub slots: Vec<ExpertSlot<B>>,
-    /// CPU-side read buffers for pread → quantize → GPU upload.
-    /// One per slot to enable future parallel I/O.
+    /// Per-slot CPU read buffers for parallel pread → GPU upload.
     ///
     /// UnsafeCell because load_experts() needs to write to these buffers
     /// through &self (matching the GPU tensor interior mutability pattern —
-    /// inference is single-threaded within a model).
-    read_bufs: UnsafeCell<Vec<Vec<u8>>>,
+    /// inference is single-threaded within a model).  Each slot's buffers
+    /// are accessed by exactly one thread during parallel pread.
+    read_bufs: UnsafeCell<Vec<SlotReadBufs>>,
 }
 
 /// One expert's worth of GPU-resident weight buffers.
@@ -142,11 +186,17 @@ impl<B: GpuCore> ExpertStreamer<B> {
             });
         }
 
-        // CPU read buffers: sized for the largest expert tensor (bf16, pre-quantize).
-        let max_expert_bytes = moe_inter * hidden * 2; // gate or up (bf16)
+        // CPU read buffers: per-slot gate_up + down for parallel pread.
+        let gate_up_bytes = moe_inter * hidden * 2 * 2; // gate + up combined (bf16)
         let down_bytes = hidden * moe_inter * 2;
-        let buf_size = max_expert_bytes.max(down_bytes);
-        let read_bufs = UnsafeCell::new((0..k).map(|_| vec![0u8; buf_size]).collect());
+        let read_bufs = UnsafeCell::new(
+            (0..k)
+                .map(|_| SlotReadBufs {
+                    gate_up: vec![0u8; gate_up_bytes],
+                    down: vec![0u8; down_bytes],
+                })
+                .collect(),
+        );
 
         ExpertStreamer {
             index,
@@ -157,12 +207,14 @@ impl<B: GpuCore> ExpertStreamer<B> {
 
     /// Load selected experts from disk into GPU buffer slots.
     ///
-    /// `selected` contains (expert_idx, routing_weight) pairs from the router.
-    /// After this call, `self.slots[i]` contains the weights for `selected[i]`.
+    /// Two-phase approach:
+    ///   Phase 1: Parallel pread — K threads read experts concurrently from SSD.
+    ///            For fused formats (Qwen3.5), gate+up are read in a single pread.
+    ///   Phase 2: Serial GPU upload — copy data into Metal buffers (not thread-safe).
     ///
     /// Safety: takes &self (not &mut) because inference is single-threaded and
-    /// GPU tensor writes already use interior mutability.  The UnsafeCell on
-    /// read_bufs allows writing to CPU scratch buffers through &self.
+    /// GPU tensor writes already use interior mutability.  During parallel pread,
+    /// each thread accesses only its own slot's buffers — no cross-slot access.
     pub fn load_experts(
         &self,
         backend: &B,
@@ -173,51 +225,96 @@ impl<B: GpuCore> ExpertStreamer<B> {
         let moe_inter = self.index.moe_inter;
         let quantize = self.index.quantize;
 
-        // Safety: single-threaded inference — no concurrent access to read_bufs.
+        // Safety: single-threaded inference — no concurrent access to read_bufs
+        // from other model code.  Within this function, each thread gets exclusive
+        // access to exactly one slot's buffers via iter_mut().
         let read_bufs = unsafe { &mut *self.read_bufs.get() };
 
-        for (slot_idx, &(expert_idx, _weight)) in selected.iter().enumerate() {
+        // Phase 1: Parallel pread from disk into per-slot CPU buffers.
+        //
+        // Each thread reads one expert (gate+up + down).  pread() is thread-safe
+        // (no shared file position), and File is Sync so &File is Send.
+        // std::thread::scope ensures all threads join before we proceed to GPU upload.
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(selected.len());
+
+            for (slot_bufs, &(expert_idx, _)) in read_bufs.iter_mut().zip(selected.iter()) {
+                let loc = &self.index.layers[layer_idx][expert_idx];
+                let shard_files = &self.index.shard_files;
+
+                handles.push(s.spawn(move || {
+                    // Gate + up: single pread if contiguous (fused format), else two.
+                    if loc.gate_up_contiguous() {
+                        let total = loc.gate_bytes + loc.up_bytes;
+                        pread_exact(
+                            &shard_files[loc.shard_gate_up],
+                            &mut slot_bufs.gate_up[..total],
+                            loc.gate_offset,
+                        );
+                    } else {
+                        pread_exact(
+                            &shard_files[loc.shard_gate_up],
+                            &mut slot_bufs.gate_up[..loc.gate_bytes],
+                            loc.gate_offset,
+                        );
+                        pread_exact(
+                            &shard_files[loc.shard_gate_up],
+                            &mut slot_bufs.gate_up[loc.gate_bytes..loc.gate_bytes + loc.up_bytes],
+                            loc.up_offset,
+                        );
+                    }
+
+                    // Down projection (always a separate read).
+                    pread_exact(
+                        &shard_files[loc.shard_down],
+                        &mut slot_bufs.down[..loc.down_bytes],
+                        loc.down_offset,
+                    );
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
+
+        // Phase 2: GPU upload (serial — Metal command encoding isn't thread-safe).
+        //
+        // Optionally Q4-quantize on CPU before uploading.  The gate_up buffer
+        // holds [gate | up] contiguously, so we slice at gate_bytes to split.
+        for (slot_idx, &(expert_idx, _)) in selected.iter().enumerate() {
             let loc = &self.index.layers[layer_idx][expert_idx];
             let slot = &self.slots[slot_idx];
-            let buf = &mut read_bufs[slot_idx];
+            let bufs = &read_bufs[slot_idx];
 
-            // Read gate projection.
-            pread_exact(
-                &self.index.shard_files[loc.shard_gate_up],
-                &mut buf[..loc.gate_bytes],
-                loc.gate_offset,
-            );
             if quantize {
-                let q4 = quantize_bf16_to_q4(&buf[..loc.gate_bytes], moe_inter, hidden);
-                backend.copy_to_tensor(&slot.gate_proj, &q4);
-            } else {
-                backend.copy_to_tensor(&slot.gate_proj, &buf[..loc.gate_bytes]);
-            }
+                let q4_gate = quantize_bf16_to_q4(
+                    &bufs.gate_up[..loc.gate_bytes],
+                    moe_inter,
+                    hidden,
+                );
+                backend.copy_to_tensor(&slot.gate_proj, &q4_gate);
 
-            // Read up projection.
-            pread_exact(
-                &self.index.shard_files[loc.shard_gate_up],
-                &mut buf[..loc.up_bytes],
-                loc.up_offset,
-            );
-            if quantize {
-                let q4 = quantize_bf16_to_q4(&buf[..loc.up_bytes], moe_inter, hidden);
-                backend.copy_to_tensor(&slot.up_proj, &q4);
-            } else {
-                backend.copy_to_tensor(&slot.up_proj, &buf[..loc.up_bytes]);
-            }
+                let q4_up = quantize_bf16_to_q4(
+                    &bufs.gate_up[loc.gate_bytes..loc.gate_bytes + loc.up_bytes],
+                    moe_inter,
+                    hidden,
+                );
+                backend.copy_to_tensor(&slot.up_proj, &q4_up);
 
-            // Read down projection.
-            pread_exact(
-                &self.index.shard_files[loc.shard_down],
-                &mut buf[..loc.down_bytes],
-                loc.down_offset,
-            );
-            if quantize {
-                let q4 = quantize_bf16_to_q4(&buf[..loc.down_bytes], hidden, moe_inter);
-                backend.copy_to_tensor(&slot.down_proj, &q4);
+                let q4_down = quantize_bf16_to_q4(
+                    &bufs.down[..loc.down_bytes],
+                    hidden,
+                    moe_inter,
+                );
+                backend.copy_to_tensor(&slot.down_proj, &q4_down);
             } else {
-                backend.copy_to_tensor(&slot.down_proj, &buf[..loc.down_bytes]);
+                backend.copy_to_tensor(&slot.gate_proj, &bufs.gate_up[..loc.gate_bytes]);
+                backend.copy_to_tensor(
+                    &slot.up_proj,
+                    &bufs.gate_up[loc.gate_bytes..loc.gate_bytes + loc.up_bytes],
+                );
+                backend.copy_to_tensor(&slot.down_proj, &bufs.down[..loc.down_bytes]);
             }
         }
     }
@@ -258,8 +355,6 @@ pub(crate) fn safetensors_data_start(mmap: &[u8]) -> u64 {
 /// Each expert is a contiguous slice along dim 0, so expert j's data starts
 /// at `tensor_file_offset + j * expert_stride_bytes`.
 pub(crate) fn build_fused_expert_index(
-    // Per-layer tensor info: (shard_idx_gate_up, gate_up_data_ptr, shard_idx_down, down_data_ptr)
-    // where data_ptr is the pointer to the tensor's data within its mmap.
     layer_info: Vec<FusedLayerInfo>,
     shard_files: Vec<File>,
     hidden: usize,

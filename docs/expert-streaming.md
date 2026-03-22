@@ -218,8 +218,12 @@ Per-layer time breakdown (Qwen3.5-35b-a3b, bf16):
 - **Expert I/O**: ~6 ms (8 × 6 MB from SSD)
 - Expert compute: ~0.5 ms
 
-Expert I/O dominates.  Future optimisations:
-1. **Parallel pread** — 4 threads reading experts concurrently (rayon)
+Expert I/O dominates.  Implemented optimisations:
+1. **Parallel pread** — K threads reading experts concurrently (std::thread::scope)
+2. **Fused gate+up read** — single pread for contiguous gate+up (Qwen3.5 fused format)
+
+Future optimisations:
+1. **Q4 pre-quantized streaming** — 3.2x less I/O volume per expert
 2. **Pipeline overlap** — start next layer's attention while experts still loading
 3. **Expert caching** — keep recently-used experts in CPU RAM instead of re-reading
 
@@ -260,6 +264,8 @@ Dense models ignore the flag.
 The SSD streaming architecture is inspired by
 [flash-moe](https://github.com/danveloper/flash-moe), which runs Qwen3.5-397B
 at 4.4 tok/s on a 48GB MacBook using parallel `pread()`, double-buffered expert
-slots, and a pipelined GPU command buffer architecture.  rLLM's implementation
-takes a simpler approach (sequential pread, single buffer set) as a starting
-point, with parallel I/O and pipeline overlap as planned future optimisations.
+slots, and a pipelined GPU command buffer architecture.  rLLM uses parallel
+pread with fused gate+up reads (0.28 tok/s on 397B bf16, M4 Max 64 GB).
+We tested mmap-based streaming but found it slower for large shard files
+(751 GB across 94 files) — page fault overhead (16 KB granularity) exceeds
+the cost of targeted 8-16 MB pread calls.
