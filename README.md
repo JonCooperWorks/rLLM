@@ -72,8 +72,9 @@ Measured via `rllm run --chat`, single run, 128 max tokens.
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
 | Qwen3.5 122B-A10B ⚡ | ~122B (~10B active) | 1.2 tok/s | 4.0 tok/s | 8,800 ms | 3,500 ms |
+| Qwen3.5 397B-A17B ⚡ | ~397B (~17B active) | 0.5 tok/s | 1.9 tok/s | 11,200 ms | 3,500 ms |
 
-⚡ = SSD expert streaming (`--stream-experts`) with GPU-side LRU expert cache (64 slots, ~324 MB Q4 / ~1.1 GB bf16).  Expert weights stream from NVMe on demand — the 122B model (256 experts/layer, ~230 GB bf16, ~67 GB Q4) runs on a 48 GB GPU.  Cache hits skip both NVMe reads and PCIe transfers entirely.  Q4 is 3.3x faster than bf16 — pre-quantized experts reduce NVMe I/O 3.2x per expert load.  Async DMA via dedicated CUDA transfer stream with pinned host memory.
+⚡ = SSD expert streaming (`--stream-experts`) with GPU-side LRU expert cache (64 slots, ~432 MB Q4 / ~1.5 GB bf16).  Expert weights stream from NVMe on demand — the 122B model (256 experts/layer, ~230 GB bf16, ~67 GB Q4) runs on a 48 GB GPU.  Cache hits skip both NVMe reads and PCIe transfers entirely.  Q4 is 3.3-3.8x faster than bf16 — pre-quantized experts reduce NVMe I/O 3.5x per expert load.  The 397B model (512 experts/layer, ~751 GB bf16, ~214 GB Q4) also runs via expert streaming.  Async DMA via dedicated CUDA transfer stream with pinned host memory.
 
 </details>
 

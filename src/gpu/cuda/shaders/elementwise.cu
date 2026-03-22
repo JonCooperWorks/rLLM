@@ -173,9 +173,9 @@ extern "C" __global__ void top_k_softmax(
     unsigned int n = params.num_experts;
     unsigned int k = params.k;
 
-    // Convert bf16 logits to f32 (max 256 experts).
-    float vals[256];
-    for (unsigned int i = 0; i < n && i < 256; i++) {
+    // Convert bf16 logits to f32 (max 1024 experts).
+    float vals[1024];
+    for (unsigned int i = 0; i < n && i < 1024; i++) {
         vals[i] = __bfloat162float(logits[i]);
     }
 
