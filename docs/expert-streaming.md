@@ -236,9 +236,9 @@ Future optimisations:
 rllm run --model models/qwen3.5-35b-a3b \
   --prompt "Hello" --stream-experts
 
-# Stream experts with Q4 quantization
-rllm run --model models/qwen3.5-35b-a3b \
-  --prompt "Hello" --stream-experts --quantize
+# Stream experts from a pre-quantized Q4 model
+rllm run --model models/qwen3.5-35b-a3b-q4 \
+  --prompt "Hello" --stream-experts
 ```
 
 The `--stream-experts` flag works with any MoE model (Qwen3.5, Qwen3-MoE, Mixtral).

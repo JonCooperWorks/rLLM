@@ -765,9 +765,9 @@ impl ModelConfig {
 
     /// Estimate total GPU memory for model weights in bytes.
     ///
-    /// Matches the loading logic in loader.rs: projection weights are quantised
-    /// when `quantize` is true, everything else (embeddings, norms, biases,
-    /// router gates) stays BF16.
+    /// When `quantize` is true (pre-quantized model), projection weights use
+    /// Q4 sizes; everything else (embeddings, norms, biases, router gates)
+    /// stays BF16.
     ///
     /// The `quantized_proj_bytes` closure returns the byte count for a quantised
     /// [m, k] projection weight.  Callers pass `|m, k| backend.quantized_weight_bytes(m, k)`

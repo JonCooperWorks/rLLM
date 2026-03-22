@@ -26,10 +26,6 @@ pub(crate) struct RunArgs {
     #[arg(long, default_value = "128")]
     max_tokens: usize,
 
-    /// Quantise weights to Q4 on load (reduces memory ~3.2x, speeds up matmul).
-    #[arg(long)]
-    quantize: bool,
-
     /// Stream MoE expert weights from SSD instead of loading all into GPU memory.
     /// Enables running large MoE models (e.g. 397B) that don't fit in VRAM.
     #[arg(long)]
@@ -104,7 +100,6 @@ pub(crate) fn exec(mut args: RunArgs) -> anyhow::Result<()> {
 
     engine::loader::load_and_run_ext(
         &args.model,
-        args.quantize,
         args.stream_experts,
         args.tp,
         1, // single sequence

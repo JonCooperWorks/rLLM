@@ -50,8 +50,9 @@ The config provides all dimension info: `num_hidden_layers`, `hidden_size`,
    - `has_tied_embeddings` — Llama 3.2 1B shares embed/lm_head weights
    - `has_qk_norm` — Qwen 3 MoE normalizes Q and K
 3. Helper functions: `load_attention_weights()`, `load_ffn_weights()`, `load_layer_norms()`
-4. **Q4 on-load**: when `--quantize` is set, weights pass through
-   `backend.quantize_upload()` instead of plain upload
+4. **Q4 weights**: pre-quantized Q4 models (produced by `rllm quantize`) are
+   loaded directly — the loader detects the Q4 format and uses the appropriate
+   upload path
 
 Novel weight formats get dedicated helpers (e.g., `load_mxfp4_experts()` for
 GPT-OSS's MXFP4 expert weights).

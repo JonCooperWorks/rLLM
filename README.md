@@ -59,7 +59,7 @@ Measured via `rllm run --chat`, single run.
 
 ⚡ = SSD expert streaming (`--stream-experts`).  Expert weights are read from NVMe on demand instead of loading all to GPU — the 397B model (751 GB on disk, 237 GB Q4) runs on a 64 GB machine using ~20 GB GPU memory.  Pre-quantized Q4 streaming reduces I/O volume 3.2x vs bf16, achieving 1.8 tok/s on 397B and 15 tok/s on 27B with parallel pread across K expert threads.
 
-Q4 quantization (`--quantize`) gives ~1.3-3.5x faster decode by reducing memory bandwidth. Mixtral requires Q4 (bf16 would need ~87 GB). Q4 is strongly recommended for models over ~8B params. Large models (Gemma 3 27B, Phi-4, Qwen3/3.5 MoE) run in bf16 but are slow because the weights consume most of the 64 GB unified memory. Dynamic KV cache sizing automatically adjusts block count based on available GPU memory.
+Q4 quantization (`rllm quantize`) gives ~1.3-3.5x faster decode by reducing memory bandwidth. Mixtral requires Q4 (bf16 would need ~87 GB). Q4 is strongly recommended for models over ~8B params. Large models (Gemma 3 27B, Phi-4, Qwen3/3.5 MoE) run in bf16 but are slow because the weights consume most of the 64 GB unified memory. Dynamic KV cache sizing automatically adjusts block count based on available GPU memory.
 
 </details>
 
@@ -163,7 +163,7 @@ Q4 is slower than bf16 for decode on H100 — unlike Apple Silicon where Q4 is a
 - **Batched prefill** — GEMM-based prompt processing (3-10x faster than token-by-token)
 - **Paged KV cache** — on-demand block allocation, shared across sequences
 - **Continuous batching** — concurrent multi-sequence inference via engine/scheduler
-- **Q4 quantization** — 4-bit block quantization on load (~3.2x memory reduction)
+- **Q4 quantization** — offline 4-bit block quantization via `rllm quantize` (~3.2x memory reduction)
 - **bf16 inference** — native half-precision compute
 - **Mixture of Experts** — top-k expert routing with per-token dispatch (Mixtral, Qwen3 MoE, GPT-OSS)
 - **SSD expert streaming** — run MoE models larger than GPU memory by streaming experts from NVMe on demand (`--stream-experts`); fused gate+up+SwiGLU kernel reduces per-expert dispatches
@@ -180,8 +180,11 @@ Q4 is slower than bf16 for decode on H100 — unlike Apple Silicon where Q4 is a
 # Text completion
 cargo run --release -- run --model models/llama-3.2-1b --prompt "The meaning of life is" --max-tokens 128
 
-# With Q4 quantization
-cargo run --release -- run --model models/llama-3.2-1b --prompt "The meaning of life is" --max-tokens 128 --quantize
+# Pre-quantize a model to Q4 (one-time, saves to models/llama-3.2-1b-q4/)
+cargo run --release -- quantize --model models/llama-3.2-1b
+
+# Run with Q4 quantized model
+cargo run --release -- run --model models/llama-3.2-1b-q4 --prompt "The meaning of life is" --max-tokens 128
 
 # Chat mode (auto-detects template per architecture)
 cargo run --release -- run --model models/llama-3.2-3b-instruct --prompt "Write a fibonacci function" --chat --temperature 0
@@ -204,7 +207,7 @@ Start an OpenAI/Anthropic-compatible server:
 cargo run --release -- serve --model models/llama-3.2-1b-instruct --port 8080 --dangerous-no-tls
 
 # Multi-GPU: shard a 70B model across 2 GPUs
-cargo run --release -- serve --model models/llama-3.1-70b-instruct --quantize --tp 2 --port 8080 --dangerous-no-tls
+cargo run --release -- serve --model models/llama-3.1-70b-instruct --tp 2 --port 8080 --dangerous-no-tls
 ```
 
 Works as a drop-in backend for any tool that speaks the OpenAI or Anthropic API — just point it at `http://localhost:8080`. With `--tp 2`, the model is sharded across GPUs via NCCL with continuous batching — multiple concurrent requests are interleaved just like the single-GPU path.
@@ -217,7 +220,6 @@ Works as a drop-in backend for any tool that speaks the OpenAI or Anthropic API 
 | `--model` | *(required)* | Path to model directory |
 | `--port` | `8080` | Port to listen on |
 | `--host` | `127.0.0.1` | Host to bind to (use `0.0.0.0` for all interfaces) |
-| `--quantize` | off | Quantize weights to Q4 on load |
 | `--cert` / `--private-key` | — | TLS certificate and key (PEM) |
 | `--letsencrypt` | off | Automatic TLS via Let's Encrypt (requires `--domain`) |
 | `--domain` | — | Domain name for Let's Encrypt |
@@ -314,7 +316,7 @@ src/
 ├── model/
 │   ├── mod.rs           — Transformer forward pass (single-token + batched prefill)
 │   ├── config.rs        — HuggingFace config.json parsing, ModelArch detection
-│   ├── loader.rs        — Safetensors loading, Q4 on-load quantization
+│   ├── loader.rs        — Safetensors loading, pre-quantized Q4 detection
 │   ├── tokenizer.rs     — BPE tokenizer with per-model special tokens
 │   ├── chat.rs          — Chat template formatter
 │   ├── kv_cache.rs      — Paged KV cache (block pool + per-sequence state)

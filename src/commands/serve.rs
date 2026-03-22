@@ -25,10 +25,6 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
 
-    /// Quantise weights to Q4 on load.
-    #[arg(long)]
-    pub quantize: bool,
-
     /// Stream MoE expert weights from SSD instead of loading all into GPU memory.
     /// Enables serving large MoE models (e.g. 397B) that don't fit in VRAM.
     #[arg(long)]

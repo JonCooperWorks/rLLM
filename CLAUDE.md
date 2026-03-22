@@ -54,7 +54,7 @@ gpt_oss.rs     — GPT Open Source
 ```
 
 Config parsing: `src/model/config.rs` (`ModelArch` enum).
-Weight loading: `src/model/loader.rs` (safetensors, single + multi-shard, Q4 on-load).
+Weight loading: `src/model/loader.rs` (safetensors, single + multi-shard, pre-quantized Q4 auto-detection).
 Expert streaming: `src/model/expert_stream.rs` (SSD-backed on-demand expert loading for large MoE models).
 
 ### Inference Engine (`src/engine/`)

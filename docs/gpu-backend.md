@@ -156,8 +156,8 @@ Pure Rust reference implementation used for testing:
 
 ## Q4 Quantization
 
-rLLM supports 4-bit symmetric quantization, applied on-load when `--quantize`
-is passed:
+rLLM supports 4-bit symmetric quantization.  Models are pre-quantized using
+`rllm quantize` and stored as Q4 weight files on disk:
 
 | Property | Value |
 |----------|-------|

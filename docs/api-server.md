@@ -165,7 +165,6 @@ Options:
   --model <PATH>       Path to model directory
   --host <HOST>        Bind address (default: 0.0.0.0)
   --port <PORT>        Bind port (default: 8080)
-  --quantize           Enable Q4 quantization
   --tp <N>             Tensor parallelism (number of GPUs)
   --tls-cert <PATH>    TLS certificate file
   --tls-key <PATH>     TLS private key file

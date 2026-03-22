@@ -27,10 +27,6 @@ pub(crate) struct BatchArgs {
     #[arg(long, default_value = "128")]
     max_tokens: usize,
 
-    /// Quantise weights to Q4 on load (reduces memory ~3.2x, speeds up matmul).
-    #[arg(long)]
-    quantize: bool,
-
     /// Sampling temperature.  T=0 → greedy (deterministic), T=1 → natural,
     /// T>1 → more random.  Default 1.0.
     #[arg(long, default_value = "1.0")]
@@ -84,7 +80,6 @@ pub(crate) fn exec(args: BatchArgs) -> anyhow::Result<()> {
 
     engine::loader::load_and_run(
         &args.model,
-        args.quantize,
         args.tp,
         max_active,
         |_tok, arch| {

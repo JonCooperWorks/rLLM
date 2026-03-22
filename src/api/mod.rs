@@ -211,9 +211,7 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     eprintln!("  ----------------------------------------");
     // Detect pre-quantized models by checking safetensors metadata.
     let is_prequantized = crate::model::loader::is_prequantized_model(&args.model);
-    if args.quantize {
-        eprintln!("  mode      : Q4 (on-load quantize)");
-    } else if is_prequantized {
+    if is_prequantized {
         eprintln!("  mode      : Q4 (pre-quantized)");
     } else {
         eprintln!("  mode      : bf16");
@@ -244,7 +242,7 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         request_tx,
         tokenizer,
         arch,
-    } = spawn_worker(args.model.clone(), args.quantize, args.stream_experts, tp)?;
+    } = spawn_worker(args.model.clone(), args.stream_experts, tp)?;
 
     // ------------------------------------------------------------------
     // 3. Start HTTP server.
@@ -322,7 +320,6 @@ struct WorkerHandle {
 /// construction, providing callbacks for the ready signal and the worker loop.
 fn spawn_worker(
     model_dir: std::path::PathBuf,
-    quantize: bool,
     stream_experts: bool,
     tp: usize,
 ) -> anyhow::Result<WorkerHandle> {
@@ -336,7 +333,6 @@ fn spawn_worker(
 
         let result = engine::loader::load_and_run_ext(
             &model_dir,
-            quantize,
             stream_experts,
             tp,
             max_active,

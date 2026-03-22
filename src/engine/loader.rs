@@ -46,19 +46,17 @@ use super::InferenceEngine;
 /// - `run` is called with the engine — this is the caller's inference loop.
 pub(crate) fn load_and_run(
     model_dir: &Path,
-    quantize: bool,
     tp: usize,
     max_active: usize,
     on_ready: impl FnOnce(&Tokenizer, ModelArch),
     run: impl FnOnce(&mut dyn InferenceEngine) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    load_and_run_ext(model_dir, quantize, false, tp, max_active, on_ready, run)
+    load_and_run_ext(model_dir, false, tp, max_active, on_ready, run)
 }
 
 /// Extended version with expert streaming support.
 pub(crate) fn load_and_run_ext(
     model_dir: &Path,
-    quantize: bool,
     stream_experts: bool,
     tp: usize,
     max_active: usize,
@@ -66,16 +64,15 @@ pub(crate) fn load_and_run_ext(
     run: impl FnOnce(&mut dyn InferenceEngine) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     if tp > 1 {
-        load_and_run_multi_gpu(model_dir, quantize, tp, max_active, on_ready, run)
+        load_and_run_multi_gpu(model_dir, tp, max_active, on_ready, run)
     } else {
-        load_and_run_single_gpu(model_dir, quantize, stream_experts, max_active, on_ready, run)
+        load_and_run_single_gpu(model_dir, stream_experts, max_active, on_ready, run)
     }
 }
 
 /// Single-GPU path: one backend, one model, one KV pool.
 fn load_and_run_single_gpu(
     model_dir: &Path,
-    quantize: bool,
     stream_experts: bool,
     max_active: usize,
     on_ready: impl FnOnce(&Tokenizer, ModelArch),
@@ -93,14 +90,10 @@ fn load_and_run_single_gpu(
         tokenizer,
         weights,
         expert_index,
-    } = loader::load_model(&backend, model_dir, quantize, stream_experts)?;
+        is_quantized,
+    } = loader::load_model(&backend, model_dir, stream_experts)?;
     let load_secs = t_load.elapsed().as_secs_f64();
-
-    if quantize {
-        eprintln!("loaded + quantized in {:.2}s", load_secs);
-    } else {
-        eprintln!("loaded in {:.2}s", load_secs);
-    }
+    eprintln!("loaded in {:.2}s", load_secs);
 
     let mut model = model::Model::new(config.clone(), weights, &backend)?;
 
@@ -119,11 +112,11 @@ fn load_and_run_single_gpu(
     // Dynamic KV cache sizing based on remaining GPU memory.
     let gpu_budget = backend.recommended_max_memory();
     let qpb = |m, k| backend.quantized_weight_bytes(m, k);
-    let num_blocks = config.recommended_kv_blocks(gpu_budget, quantize, &qpb);
+    let num_blocks = config.recommended_kv_blocks(gpu_budget, is_quantized, &qpb);
     let kv_dim = config.num_key_value_heads * config.head_dim;
     let kv_pool = kv_cache::KvPool::new(&backend, num_blocks, kv_dim, config.num_kv_layers());
 
-    let weight_mb = config.estimate_weight_bytes(quantize, &qpb) as f64 / (1024.0 * 1024.0);
+    let weight_mb = config.estimate_weight_bytes(is_quantized, &qpb) as f64 / (1024.0 * 1024.0);
     let kv_mb = kv_pool.total_memory_bytes() as f64 / (1024.0 * 1024.0);
     let max_tokens = kv_pool.max_tokens();
     eprintln!(
@@ -147,7 +140,6 @@ fn load_and_run_single_gpu(
 #[cfg(feature = "cuda")]
 fn load_and_run_multi_gpu(
     model_dir: &Path,
-    quantize: bool,
     tp: usize,
     max_active: usize,
     on_ready: impl FnOnce(&Tokenizer, ModelArch),
@@ -168,14 +160,10 @@ fn load_and_run_multi_gpu(
 
     let t_load = Instant::now();
     let num_blocks = 256;
-    let multi = MultiGpuInference::new(model_dir, config.clone(), quantize, tp, num_blocks)?;
+    let is_prequantized = loader::is_prequantized_model(model_dir);
+    let multi = MultiGpuInference::new(model_dir, config.clone(), is_prequantized, tp, num_blocks)?;
     let load_secs = t_load.elapsed().as_secs_f64();
-
-    if quantize {
-        eprintln!("loaded + quantized in {:.2}s", load_secs);
-    } else {
-        eprintln!("loaded in {:.2}s", load_secs);
-    }
+    eprintln!("loaded in {:.2}s", load_secs);
     eprintln!(
         "multi-GPU inference ready ({} ranks, max {} concurrent sequences)",
         tp, max_active,
@@ -192,7 +180,6 @@ fn load_and_run_multi_gpu(
 #[cfg(not(feature = "cuda"))]
 fn load_and_run_multi_gpu(
     _model_dir: &Path,
-    _quantize: bool,
     _tp: usize,
     _max_active: usize,
     _on_ready: impl FnOnce(&Tokenizer, ModelArch),

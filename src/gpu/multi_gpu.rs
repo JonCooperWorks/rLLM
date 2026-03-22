@@ -55,7 +55,7 @@ pub(crate) mod tp {
         pub fn new(
             model_dir: &Path,
             config: ModelConfig,
-            quantize: bool,
+            is_prequantized: bool,
             world_size: usize,
             num_blocks: usize,
         ) -> anyhow::Result<Self> {
@@ -76,12 +76,12 @@ pub(crate) mod tp {
 
                 // Load sharded weights.
                 let weights =
-                    loader::load_weights(&*backend, model_dir, &config, quantize, Some(&plan))?;
+                    loader::load_weights(&*backend, model_dir, &config, Some(&plan))?;
 
                 if rank == 0 {
                     eprintln!(
                         "weights loaded{} (rank 0/{})",
-                        if quantize { " (Q4)" } else { "" },
+                        if is_prequantized { " (Q4)" } else { "" },
                         world_size,
                     );
                 }

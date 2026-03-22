@@ -11,7 +11,6 @@
 #   --medium   small + medium-tier models (default)
 #   --big      only 70B+ models
 #   --all      all tiers
-#   --quantize only run Q4 for each model (compact Q4-only table)
 #   --q4-only  skip bf16 runs (useful for models that don't fit in VRAM)
 #   --bf16-only skip Q4 runs
 #   --runs N   number of runs per config (default: 1)
@@ -28,7 +27,6 @@ DEST="models"
 RUNS=1
 SKIP_BF16=false
 SKIP_Q4=false
-QUANTIZE_ONLY=false
 TP=1
 MAX_TOKENS="${RLLM_BENCH_TOKENS:-128}"
 PROMPT="${RLLM_BENCH_PROMPT:-The meaning of life is}"
@@ -39,7 +37,6 @@ for arg in "$@"; do
     --medium)    TIER="medium" ;;
     --big)       TIER="big" ;;
     --all)       TIER="all" ;;
-    --quantize)  SKIP_BF16=true; QUANTIZE_ONLY=true ;;
     --q4-only)   SKIP_BF16=true ;;
     --bf16-only) SKIP_Q4=true ;;
     --tp)        shift_next=tp ;;
@@ -128,14 +125,10 @@ esac
 # Outputs: gen_tps prefill_tps ttft_ms
 run_one() {
   local model_dir="$1"
-  local quantize_flag="${2:-}"
   local tmpfile
   tmpfile=$(mktemp)
 
   local cmd=("$RLLM" run --model "$model_dir" --prompt "$PROMPT" --max-tokens "$MAX_TOKENS" --temperature 0 --tp "$TP")
-  if [[ -n "$quantize_flag" ]]; then
-    cmd+=(--quantize)
-  fi
 
   # Run inference, capture stderr (metrics) to tmpfile, discard stdout (tokens)
   if ! "${cmd[@]}" >/dev/null 2>"$tmpfile"; then
@@ -235,12 +228,13 @@ for i in "${!MODELS[@]}"; do
     BF16_TTFT[$i]="—"
   fi
 
-  # Q4 run
-  if [[ "$SKIP_Q4" == "false" ]]; then
+  # Q4 run (uses pre-quantized model directory: ${model_dir}-q4)
+  q4_model_dir="${model_dir}-q4"
+  if [[ "$SKIP_Q4" == "false" ]] && [[ -d "$q4_model_dir" ]]; then
     echo -n "  Q4:   "
     local_tps=0 local_ttft=0
     for _ in $(seq "$RUNS"); do
-      result=$(run_one "$model_dir" "--quantize")
+      result=$(run_one "$q4_model_dir")
       tps=$(echo "$result" | awk '{print $1}')
       ttft=$(echo "$result" | awk '{print $3}')
       if [[ "$tps" == "FAIL" ]]; then
@@ -259,6 +253,10 @@ for i in "${!MODELS[@]}"; do
       Q4_TTFT[$i]=$(echo "scale=0; $local_ttft / $RUNS" | bc)
       echo "${Q4_TPS[$i]} tok/s, TTFT ${Q4_TTFT[$i]} ms"
     fi
+  elif [[ "$SKIP_Q4" == "false" ]] && [[ ! -d "$q4_model_dir" ]]; then
+    echo "  Q4:   SKIP (no pre-quantized dir ${q4_model_dir})"
+    Q4_TPS[$i]="—"
+    Q4_TTFT[$i]="—"
   else
     Q4_TPS[$i]="—"
     Q4_TTFT[$i]="—"
@@ -284,13 +282,8 @@ fmt_ttft() {
   fi
 }
 
-if [[ "$QUANTIZE_ONLY" == "true" ]]; then
-  echo "| Model | Q4 tok/s | TTFT |"
-  echo "|---|---|---|"
-else
-  echo "| Model | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |"
-  echo "|---|---|---|---|---|"
-fi
+echo "| Model | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |"
+echo "|---|---|---|---|---|"
 
 for i in "${!MODELS[@]}"; do
   model="${MODELS[$i]}"
@@ -308,11 +301,7 @@ for i in "${!MODELS[@]}"; do
   bf16_ttft=$(fmt_ttft "$bf16_ttft")
   q4_ttft=$(fmt_ttft "$q4_ttft")
 
-  if [[ "$QUANTIZE_ONLY" == "true" ]]; then
-    echo "| $model | $q4 | $q4_ttft |"
-  else
-    echo "| $model | $bf16 | $q4 | $bf16_ttft | $q4_ttft |"
-  fi
+  echo "| $model | $bf16 | $q4 | $bf16_ttft | $q4_ttft |"
 done
 
 echo ""

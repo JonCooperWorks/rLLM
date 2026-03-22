@@ -57,11 +57,11 @@
 //   `lm_head.weight` tensor.  Qwen 2.5 always has `tie_word_embeddings=false`.
 //   The final output projection reuses the embedding table when tied.
 //
-// Q4 quantisation (on-load):
-//   When `quantize=true`, linear projection weights are converted from bf16 to
-//   block-wise 4-bit quantisation during loading.  This reduces memory ~3.2×
-//   and speeds up matmul by reducing memory bandwidth.  Norm weights and the
-//   embedding table stay in bf16.
+// Q4 quantisation (pre-quantized):
+//   Models pre-quantized via `rllm quantize` have their linear projection
+//   weights stored as Q4 in the safetensors files.  The loader auto-detects
+//   this from the "rllm-q4" metadata and uploads Q4 bytes directly.
+//   Norm weights and the embedding table stay in bf16.
 //
 // Architecture-specific loading:
 //   Each architecture has quirks in its weight format (QKV bias, fused
@@ -585,25 +585,22 @@ struct NormLoaded<B: GpuCore> {
 
 /// Load all model weights from safetensors file(s) into GPU memory.
 ///
-/// When `quantize` is true, linear projection weights (Q/K/V/O/gate/up/down)
-/// are quantised from bf16 to Q4 on the CPU during loading.  This reduces
-/// memory ~3.2x and speeds up matmul ~1.5-2x.  Norm weights and the embedding
-/// table stay in bf16 (they're small and used for lookup/norm, not matmul).
+/// Pre-quantized models (produced by `rllm quantize`) are auto-detected
+/// from safetensors metadata and uploaded as Q4.  All other weights are
+/// loaded as bf16.
 pub(crate) fn load_weights<B: GpuCore>(
     backend: &B,
     model_dir: &Path,
     config: &ModelConfig,
-    quantize: bool,
     sharding: Option<&crate::gpu::parallel::ShardingPlan>,
 ) -> anyhow::Result<ModelWeights<B>> {
-    load_weights_inner(backend, model_dir, config, quantize, sharding, false)
+    load_weights_inner(backend, model_dir, config, sharding, false)
 }
 
 fn load_weights_inner<B: GpuCore>(
     backend: &B,
     model_dir: &Path,
     config: &ModelConfig,
-    quantize: bool,
     sharding: Option<&crate::gpu::parallel::ShardingPlan>,
     skip_experts: bool,
 ) -> anyhow::Result<ModelWeights<B>> {
@@ -707,11 +704,10 @@ fn load_weights_inner<B: GpuCore>(
             &hints,
             i,
             is_deltanet_layer,
-            quantize,
             sharding,
         )?;
         let ffn = load_ffn_weights(
-            &store, backend, &prefix, config, &hints, i, quantize, sharding,
+            &store, backend, &prefix, config, &hints, i, sharding,
             skip_experts,
         )?;
 
@@ -848,7 +844,6 @@ fn load_attention_weights<B: GpuCore>(
     hints: &LoaderHints,
     layer_idx: usize,
     is_deltanet_layer: bool,
-    quantize: bool,
     sharding: Option<&crate::gpu::parallel::ShardingPlan>,
 ) -> anyhow::Result<AttentionLoaded<B>> {
     let hidden = config.hidden_size;
@@ -934,13 +929,13 @@ fn load_attention_weights<B: GpuCore>(
         attn_z_proj,
     ) = if is_deltanet_layer {
         load_deltanet_attention(
-            store, backend, prefix, config, layer_idx, quantize, sharding,
+            store, backend, prefix, config, layer_idx, sharding,
         )?
     } else if hints.has_fused_qkv {
-        load_fused_qkv_attention(store, backend, prefix, hidden, q_dim, kv_dim, quantize)?
+        load_fused_qkv_attention(store, backend, prefix, hidden, q_dim, kv_dim)?
     } else {
         load_standard_attention(
-            store, backend, prefix, config, hidden, q_dim, kv_dim, quantize, sharding,
+            store, backend, prefix, config, hidden, q_dim, kv_dim, sharding,
         )?
     };
 
@@ -1006,7 +1001,6 @@ fn load_deltanet_attention<B: GpuCore>(
     prefix: &str,
     config: &ModelConfig,
     layer_idx: usize,
-    quantize: bool,
     sharding: Option<&crate::gpu::parallel::ShardingPlan>,
 ) -> anyhow::Result<(
     B::Tensor,
@@ -1071,22 +1065,21 @@ fn load_deltanet_attention<B: GpuCore>(
                 let v_start = (2 * qk_dim + rank * v_rows_per_rank) * row_bytes;
                 shard_data.extend_from_slice(&data[v_start..v_start + v_rows_per_rank * row_bytes]);
 
-                upload_raw_maybe_quantized(backend, &shard_data, &[shard_rows, hidden], quantize)
+                upload_raw_bf16(backend, &shard_data, &[shard_rows, hidden])
             } else {
-                upload_maybe_quantized(store, backend, &qkv_name, &[fused_dim, hidden], quantize)?
+                upload_tensor(store, backend, &qkv_name, &[fused_dim, hidden])?
             }
         } else {
-            upload_maybe_quantized(store, backend, &qkv_name, &[fused_dim, hidden], quantize)?
+            upload_tensor(store, backend, &qkv_name, &[fused_dim, hidden])?
         }
     } else {
-        upload_maybe_quantized(store, backend, &qkv_name, &[fused_dim, hidden], quantize)?
+        upload_tensor(store, backend, &qkv_name, &[fused_dim, hidden])?
     };
     let a = upload_sharded(
         store,
         backend,
         &format!("{prefix}.linear_attn.in_proj_a.weight"),
         &[config.linear_num_value_heads, hidden],
-        quantize,
         sharding,
     )?;
     let b = upload_sharded(
@@ -1094,7 +1087,6 @@ fn load_deltanet_attention<B: GpuCore>(
         backend,
         &format!("{prefix}.linear_attn.in_proj_b.weight"),
         &[config.linear_num_value_heads, hidden],
-        quantize,
         sharding,
     )?;
     let z = upload_sharded(
@@ -1102,7 +1094,6 @@ fn load_deltanet_attention<B: GpuCore>(
         backend,
         &format!("{prefix}.linear_attn.in_proj_z.weight"),
         &[v_dim, hidden],
-        quantize,
         sharding,
     )?;
     // Conv1D: depthwise, shape [channels, 1, kernel_size] in safetensors.
@@ -1157,7 +1148,6 @@ fn load_deltanet_attention<B: GpuCore>(
         backend,
         &format!("{prefix}.linear_attn.out_proj.weight"),
         &[hidden, v_dim],
-        quantize,
         sharding,
     )?;
 
@@ -1280,7 +1270,6 @@ fn load_fused_qkv_attention<B: GpuCore>(
     hidden: usize,
     q_dim: usize,
     kv_dim: usize,
-    quantize: bool,
 ) -> anyhow::Result<(
     B::Tensor,
     B::Tensor,
@@ -1314,15 +1303,14 @@ fn load_fused_qkv_attention<B: GpuCore>(
     let k_raw = &raw[q_bytes..q_bytes + kv_bytes];
     let v_raw = &raw[q_bytes + kv_bytes..q_bytes + 2 * kv_bytes];
 
-    let qp = upload_raw_maybe_quantized(backend, q_raw, &[q_dim, hidden], quantize);
-    let kp = upload_raw_maybe_quantized(backend, k_raw, &[kv_dim, hidden], quantize);
-    let vp = upload_raw_maybe_quantized(backend, v_raw, &[kv_dim, hidden], quantize);
-    let op = upload_maybe_quantized(
+    let qp = upload_raw_bf16(backend, q_raw, &[q_dim, hidden]);
+    let kp = upload_raw_bf16(backend, k_raw, &[kv_dim, hidden]);
+    let vp = upload_raw_bf16(backend, v_raw, &[kv_dim, hidden]);
+    let op = upload_tensor(
         store,
         backend,
         &format!("{prefix}.self_attn.o_proj.weight"),
         &[hidden, q_dim],
-        quantize,
     )?;
     Ok((
         qp, kp, vp, op, None, None, None, None, None, None, None, None, None, None,
@@ -1343,7 +1331,6 @@ fn load_standard_attention<B: GpuCore>(
     hidden: usize,
     q_dim: usize,
     kv_dim: usize,
-    quantize: bool,
     sharding: Option<&crate::gpu::parallel::ShardingPlan>,
 ) -> anyhow::Result<(
     B::Tensor,
@@ -1421,10 +1408,8 @@ fn load_standard_attention<B: GpuCore>(
             let z_tensor = backend.upload_tensor(&z_raw, &[shard_q_dim, hidden], crate::gpu::TensorDtype::Q4);
             (q_tensor, Some(z_tensor))
         } else {
-            let q_tensor =
-                upload_raw_maybe_quantized(backend, &q_raw, &[shard_q_dim, hidden], quantize);
-            let z_tensor =
-                upload_raw_maybe_quantized(backend, &z_raw, &[shard_q_dim, hidden], quantize);
+            let q_tensor = upload_raw_bf16(backend, &q_raw, &[shard_q_dim, hidden]);
+            let z_tensor = upload_raw_bf16(backend, &z_raw, &[shard_q_dim, hidden]);
             (q_tensor, Some(z_tensor))
         }
     } else {
@@ -1433,7 +1418,6 @@ fn load_standard_attention<B: GpuCore>(
             backend,
             &format!("{prefix}.self_attn.q_proj.weight"),
             &[q_dim, hidden],
-            quantize,
             sharding,
         )?;
         (qp, None)
@@ -1443,7 +1427,6 @@ fn load_standard_attention<B: GpuCore>(
         backend,
         &format!("{prefix}.self_attn.k_proj.weight"),
         &[kv_dim, hidden],
-        quantize,
         sharding,
     )?;
     let vp = upload_sharded(
@@ -1451,7 +1434,6 @@ fn load_standard_attention<B: GpuCore>(
         backend,
         &format!("{prefix}.self_attn.v_proj.weight"),
         &[kv_dim, hidden],
-        quantize,
         sharding,
     )?;
     let op = upload_sharded(
@@ -1459,7 +1441,6 @@ fn load_standard_attention<B: GpuCore>(
         backend,
         &format!("{prefix}.self_attn.o_proj.weight"),
         &[hidden, q_dim],
-        quantize,
         sharding,
     )?;
     Ok((
@@ -1481,7 +1462,6 @@ fn load_ffn_weights<B: GpuCore>(
     config: &ModelConfig,
     hints: &LoaderHints,
     layer_idx: usize,
-    quantize: bool,
     sharding: Option<&crate::gpu::parallel::ShardingPlan>,
     skip_experts: bool,
 ) -> anyhow::Result<FfnLoaded<B>> {
@@ -1490,7 +1470,7 @@ fn load_ffn_weights<B: GpuCore>(
 
     if config.is_moe() {
         load_moe_ffn_weights(
-            store, backend, prefix, config, hints, layer_idx, quantize, sharding,
+            store, backend, prefix, config, hints, layer_idx, sharding,
             skip_experts,
         )
     } else if hints.has_fused_qkv {
@@ -1523,14 +1503,13 @@ fn load_ffn_weights<B: GpuCore>(
         let gate_raw = &raw[..half];
         let up_raw = &raw[half..2 * half];
 
-        let gate = upload_raw_maybe_quantized(backend, gate_raw, &[inter, hidden], quantize);
-        let up = upload_raw_maybe_quantized(backend, up_raw, &[inter, hidden], quantize);
-        let down = upload_maybe_quantized(
+        let gate = upload_raw_bf16(backend, gate_raw, &[inter, hidden]);
+        let up = upload_raw_bf16(backend, up_raw, &[inter, hidden]);
+        let down = upload_tensor(
             store,
             backend,
             &format!("{prefix}.mlp.down_proj.weight"),
             &[hidden, inter],
-            quantize,
         )?;
         Ok(FfnLoaded {
             gate_proj: gate,
@@ -1551,7 +1530,6 @@ fn load_ffn_weights<B: GpuCore>(
             backend,
             &format!("{prefix}.mlp.gate_proj.weight"),
             &[inter, hidden],
-            quantize,
             sharding,
         )?;
         let up = upload_sharded(
@@ -1559,7 +1537,6 @@ fn load_ffn_weights<B: GpuCore>(
             backend,
             &format!("{prefix}.mlp.up_proj.weight"),
             &[inter, hidden],
-            quantize,
             sharding,
         )?;
         let down = upload_sharded(
@@ -1567,7 +1544,6 @@ fn load_ffn_weights<B: GpuCore>(
             backend,
             &format!("{prefix}.mlp.down_proj.weight"),
             &[hidden, inter],
-            quantize,
             sharding,
         )?;
         Ok(FfnLoaded {
@@ -1598,7 +1574,6 @@ fn load_moe_ffn_weights<B: GpuCore>(
     config: &ModelConfig,
     hints: &LoaderHints,
     layer_idx: usize,
-    quantize: bool,
     sharding: Option<&crate::gpu::parallel::ShardingPlan>,
     skip_experts: bool,
 ) -> anyhow::Result<FfnLoaded<B>> {
@@ -1664,7 +1639,6 @@ fn load_moe_ffn_weights<B: GpuCore>(
             hidden,
             moe_inter,
             num_experts,
-            quantize,
         )?
     } else if is_fused {
         load_fused_experts(
@@ -1674,7 +1648,6 @@ fn load_moe_ffn_weights<B: GpuCore>(
             hidden,
             moe_inter,
             num_experts,
-            quantize,
         )?
     } else {
         // Per-expert format: separate tensors per expert.
@@ -1712,7 +1685,6 @@ fn load_moe_ffn_weights<B: GpuCore>(
                     backend,
                     &gate_name,
                     &[moe_inter, hidden],
-                    quantize,
                     sharding,
                 )?,
                 up_proj: upload_sharded(
@@ -1720,7 +1692,6 @@ fn load_moe_ffn_weights<B: GpuCore>(
                     backend,
                     &up_name,
                     &[moe_inter, hidden],
-                    quantize,
                     sharding,
                 )?,
                 down_proj: upload_sharded(
@@ -1728,7 +1699,6 @@ fn load_moe_ffn_weights<B: GpuCore>(
                     backend,
                     &down_name,
                     &[hidden, moe_inter],
-                    quantize,
                     sharding,
                 )?,
                 gate_bias: None,
@@ -1757,26 +1727,23 @@ fn load_moe_ffn_weights<B: GpuCore>(
     // Load shared expert weights if present.
     let shared_inter = config.shared_expert_intermediate_size;
     let (se_gate_proj, se_up_proj, se_down_proj, se_gate) = if config.has_shared_expert() {
-        let gp = upload_maybe_quantized(
+        let gp = upload_tensor(
             store,
             backend,
             &format!("{prefix}.mlp.shared_expert.gate_proj.weight"),
             &[shared_inter, hidden],
-            quantize,
         )?;
-        let up = upload_maybe_quantized(
+        let up = upload_tensor(
             store,
             backend,
             &format!("{prefix}.mlp.shared_expert.up_proj.weight"),
             &[shared_inter, hidden],
-            quantize,
         )?;
-        let dp = upload_maybe_quantized(
+        let dp = upload_tensor(
             store,
             backend,
             &format!("{prefix}.mlp.shared_expert.down_proj.weight"),
             &[hidden, shared_inter],
-            quantize,
         )?;
         let sg = upload_tensor(
             store,
@@ -1825,7 +1792,6 @@ fn load_mxfp4_experts<B: GpuCore>(
     hidden: usize,
     moe_inter: usize,
     num_experts: usize,
-    quantize: bool,
 ) -> anyhow::Result<Vec<ExpertWeights<B>>> {
     let block_size = 32usize; // MXFP4 standard block size
 
@@ -1903,8 +1869,8 @@ fn load_mxfp4_experts<B: GpuCore>(
             up_raw[r * row_bytes..(r + 1) * row_bytes]
                 .copy_from_slice(&gu_bf16[odd_start..odd_start + row_bytes]);
         }
-        let gate_t = upload_raw_maybe_quantized(backend, &gate_raw, &[moe_inter, hidden], quantize);
-        let up_t = upload_raw_maybe_quantized(backend, &up_raw, &[moe_inter, hidden], quantize);
+        let gate_t = upload_raw_bf16(backend, &gate_raw, &[moe_inter, hidden]);
+        let up_t = upload_raw_bf16(backend, &up_raw, &[moe_inter, hidden]);
 
         // Dequant down: on-disk [hidden, moe_inter] → our convention [hidden, moe_inter] = [out, in].
         let d_b_off = j * down_blocks_per_expert;
@@ -1916,8 +1882,7 @@ fn load_mxfp4_experts<B: GpuCore>(
             moe_inter,
             block_size,
         );
-        let down_t =
-            upload_raw_maybe_quantized(backend, &down_bf16, &[hidden, moe_inter], quantize);
+        let down_t = upload_raw_bf16(backend, &down_bf16, &[hidden, moe_inter]);
 
         // Expert biases — de-interleave fused gate_up_bias into separate gate and up.
         //
@@ -1971,7 +1936,6 @@ fn load_fused_experts<B: GpuCore>(
     hidden: usize,
     moe_inter: usize,
     num_experts: usize,
-    quantize: bool,
 ) -> anyhow::Result<Vec<ExpertWeights<B>>> {
     let fused_name = format!("{prefix}.mlp.experts.gate_up_proj");
     let gate_up_view = store.tensor(&fused_name)?;
@@ -2029,9 +1993,9 @@ fn load_fused_experts<B: GpuCore>(
             )
         } else {
             (
-                upload_raw_maybe_quantized(backend, gate_raw, &[moe_inter, hidden], quantize),
-                upload_raw_maybe_quantized(backend, up_raw, &[moe_inter, hidden], quantize),
-                upload_raw_maybe_quantized(backend, down_raw, &[hidden, moe_inter], quantize),
+                upload_raw_bf16(backend, gate_raw, &[moe_inter, hidden]),
+                upload_raw_bf16(backend, up_raw, &[moe_inter, hidden]),
+                upload_raw_bf16(backend, down_raw, &[hidden, moe_inter]),
             )
         };
 
@@ -2124,56 +2088,16 @@ fn upload_norm_residual<B: GpuCore>(
     Ok(backend.upload_tensor(bytemuck::cast_slice(&bf16_out), shape, TensorDtype::BF16))
 }
 
-/// Upload a tensor, optionally quantising via the backend's quantisation format.
+/// Upload raw bf16 bytes as a tensor.
 ///
-/// When `quantize` is true, delegates to `backend.quantize_upload()` which
-/// each backend can override to use its own format (e.g. Q4 for Metal,
-/// INT4 for CUDA).
-///
-/// Pre-quantized tensors (in the store's Q4 map) are uploaded directly —
-/// the `quantize` flag is ignored since they're already Q4.
-fn upload_maybe_quantized<B: GpuCore>(
-    store: &TensorStore,
-    backend: &B,
-    name: &str,
-    expected_shape: &[usize],
-    quantize: bool,
-) -> anyhow::Result<B::Tensor> {
-    // Pre-quantized: upload_tensor handles Q4 map lookup.
-    if store.q4_shape(name).is_some() {
-        return upload_tensor(store, backend, name, expected_shape);
-    }
-
-    if !quantize {
-        return upload_tensor(store, backend, name, expected_shape);
-    }
-
-    let view = store.tensor(name)?;
-
-    let shape = view.shape();
-    anyhow::ensure!(
-        shape == expected_shape,
-        "tensor '{name}' shape mismatch: expected {expected_shape:?}, got {shape:?}"
-    );
-
-    Ok(backend.quantize_upload(view.data(), shape))
-}
-
-/// Upload raw bf16 bytes, optionally quantising via the backend's format.
-///
-/// Like `upload_maybe_quantized` but for pre-sliced byte buffers (e.g. when
-/// splitting a fused QKV or MoE expert weight from a larger tensor).
-fn upload_raw_maybe_quantized<B: GpuCore>(
+/// Used for pre-sliced byte buffers (e.g. when splitting a fused QKV or
+/// MoE expert weight from a larger tensor).
+fn upload_raw_bf16<B: GpuCore>(
     backend: &B,
     bf16_data: &[u8],
     shape: &[usize],
-    quantize: bool,
 ) -> B::Tensor {
-    if quantize {
-        backend.quantize_upload(bf16_data, shape)
-    } else {
-        backend.upload_tensor(bf16_data, shape, TensorDtype::BF16)
-    }
+    backend.upload_tensor(bf16_data, shape, TensorDtype::BF16)
 }
 
 /// Upload a weight tensor with optional sharding.
@@ -2186,7 +2110,6 @@ fn upload_sharded<B: GpuCore>(
     backend: &B,
     name: &str,
     expected_shape: &[usize],
-    quantize: bool,
     sharding: Option<&crate::gpu::parallel::ShardingPlan>,
 ) -> anyhow::Result<B::Tensor> {
     use crate::gpu::parallel::{SplitDimension, slice_tensor_data};
@@ -2217,18 +2140,12 @@ fn upload_sharded<B: GpuCore>(
                     bpe,
                 );
 
-                // Upload the sliced data (optionally quantized).
-                return Ok(upload_raw_maybe_quantized(
-                    backend,
-                    &sliced,
-                    &shard_shape,
-                    quantize,
-                ));
+                return Ok(upload_raw_bf16(backend, &sliced, &shard_shape));
             }
         }
     }
     // Fallback: no sharding or Replicated — use regular upload.
-    upload_maybe_quantized(store, backend, name, expected_shape, quantize)
+    upload_tensor(store, backend, name, expected_shape)
 }
 
 // ---------------------------------------------------------------------------
@@ -2249,6 +2166,8 @@ pub(crate) struct LoadedModel<B: GpuCore> {
     pub weights: ModelWeights<B>,
     /// Expert index for SSD streaming (None when all experts are GPU-resident).
     pub expert_index: Option<super::expert_stream::ExpertIndex>,
+    /// Whether the model weights are Q4 (pre-quantized).
+    pub is_quantized: bool,
 }
 
 /// Load config, tokenizer, and weights from a model directory.
@@ -2259,7 +2178,6 @@ pub(crate) struct LoadedModel<B: GpuCore> {
 pub(crate) fn load_model<B: GpuCore>(
     backend: &B,
     model_dir: &Path,
-    quantize: bool,
     stream_experts: bool,
 ) -> anyhow::Result<LoadedModel<B>> {
     let config = ModelConfig::from_file(&model_dir.join("config.json"))?;
@@ -2272,12 +2190,13 @@ pub(crate) fn load_model<B: GpuCore>(
     let tokenizer = Tokenizer::from_file(&model_dir.join("tokenizer.json"), arch)?;
     eprintln!("tokenizer loaded");
 
+    let is_quantized = is_prequantized_model(model_dir);
     let (weights, expert_index) = load_weights_maybe_streamed(
-        backend, model_dir, &config, quantize, stream_experts, None,
+        backend, model_dir, &config, stream_experts, None,
     )?;
     eprintln!(
         "weights loaded{}{}",
-        if quantize { " (Q4 quantised)" } else { "" },
+        if is_quantized { " (Q4 pre-quantized)" } else { "" },
         if expert_index.is_some() { " (experts streaming from SSD)" } else { "" },
     );
 
@@ -2287,6 +2206,7 @@ pub(crate) fn load_model<B: GpuCore>(
         tokenizer,
         weights,
         expert_index,
+        is_quantized,
     })
 }
 
@@ -2299,22 +2219,21 @@ fn load_weights_maybe_streamed<B: GpuCore>(
     backend: &B,
     model_dir: &Path,
     config: &ModelConfig,
-    quantize: bool,
     stream_experts: bool,
     sharding: Option<&crate::gpu::parallel::ShardingPlan>,
 ) -> anyhow::Result<(ModelWeights<B>, Option<super::expert_stream::ExpertIndex>)> {
     if !stream_experts || !config.is_moe() {
-        let weights = load_weights(backend, model_dir, config, quantize, sharding)?;
+        let weights = load_weights(backend, model_dir, config, sharding)?;
         return Ok((weights, None));
     }
 
     // Build expert index from safetensors headers (computes file offsets).
     let expert_index = build_expert_index_from_safetensors(
-        model_dir, config, quantize,
+        model_dir, config,
     )?;
 
     // Load weights with skip_experts=true to avoid uploading expert data to GPU.
-    let weights = load_weights_inner(backend, model_dir, config, quantize, sharding, true)?;
+    let weights = load_weights_inner(backend, model_dir, config, sharding, true)?;
 
     Ok((weights, Some(expert_index)))
 }
@@ -2330,7 +2249,6 @@ fn load_weights_maybe_streamed<B: GpuCore>(
 fn build_expert_index_from_safetensors(
     model_dir: &Path,
     config: &ModelConfig,
-    quantize: bool,
 ) -> anyhow::Result<super::expert_stream::ExpertIndex> {
     use super::expert_stream::{FusedLayerInfo, PerExpertInfo, safetensors_data_start};
 
@@ -2419,7 +2337,7 @@ fn build_expert_index_from_safetensors(
         eprintln!("  built expert index: {} layers × {} experts (fused format)", num_layers, num_experts);
 
         Ok(super::expert_stream::build_fused_expert_index(
-            layer_info, shard_files, hidden, moe_inter, num_experts, quantize, prequantized,
+            layer_info, shard_files, hidden, moe_inter, num_experts, prequantized,
         ))
     } else {
         // Per-expert format (Qwen3-MoE, Mixtral): experts.{j}.gate_proj etc.
@@ -2480,7 +2398,7 @@ fn build_expert_index_from_safetensors(
         eprintln!("  built expert index: {} layers × {} experts (per-expert format)", num_layers, num_experts);
 
         Ok(super::expert_stream::build_per_expert_index(
-            layer_info, shard_files, hidden, moe_inter, quantize, prequantized,
+            layer_info, shard_files, hidden, moe_inter, prequantized,
         ))
     }
 }
