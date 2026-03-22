@@ -136,5 +136,6 @@ rllm serve  — HTTP API server
 
 ## Q4 Quantization Format
 
-Block size 32 weights, 20 bytes per block: 4-byte f32 scale + 16 bytes packed nibbles.
+Block size 32 weights, 18 bytes per block: 2-byte bf16 scale + 16 bytes packed nibbles.
 Symmetric: `scale = max(abs) / 7`, `q = clamp(round(v / scale), -8, 7)`, stored as `q + 8`.
+bf16 scale (vs f32) saves 10% I/O per block — critical for NVMe-bound expert streaming.

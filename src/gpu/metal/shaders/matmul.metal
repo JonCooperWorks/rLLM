@@ -128,9 +128,9 @@ kernel void matvec_bf16(
 //   there's exactly one tile with zero overhead.  For larger K, the kernel
 //   processes multiple tiles, with one barrier per tile boundary.
 //
-// Block layout (20 bytes per block of 32 weights):
-//   bytes  0-3:  f32 scale factor
-//   bytes  4-19: 16 bytes of packed nibbles (2 weights per byte)
+// Block layout (18 bytes per block of 32 weights):
+//   bytes  0-1:  bf16 scale factor
+//   bytes  2-17: 16 bytes of packed nibbles (2 weights per byte)
 //
 // Packing: byte[i] = (q[2i] & 0xF) | (q[2i+1] << 4)
 // Dequant: weight = (nibble - 8) * scale
