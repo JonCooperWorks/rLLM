@@ -1,0 +1,1 @@
+ curl -LsSf https://hf.co/cli/install.sh | bash
