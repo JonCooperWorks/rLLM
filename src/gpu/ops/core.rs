@@ -143,6 +143,22 @@ pub(crate) trait GpuCore: Send + Sync {
         None
     }
 
+    /// Allocate a pinned (page-locked) host buffer for async DMA.
+    ///
+    /// Returns `Some(PinnedBuf)` on backends with discrete memory (CUDA)
+    /// where pinned buffers enable true async transfers via `cuMemAllocHost`.
+    /// Returns `None` on unified memory backends (Metal, CPU) where pinned
+    /// buffers aren't needed.
+    ///
+    /// Pinned allocation is expensive (~1ms per call), so callers should
+    /// allocate once at init and reuse.
+    ///
+    /// Used by: model/expert_stream.rs (staging buffers for parallel pread)
+    /// CUDA impl: gpu/cuda/kernels/core.rs
+    fn alloc_pinned_buf(&self, _byte_count: usize) -> Option<super::super::PinnedBuf> {
+        None
+    }
+
     /// Estimate the byte count of a 2D weight [m, k] after quantisation.
     ///
     /// Used by config.rs to predict GPU memory usage before loading weights.

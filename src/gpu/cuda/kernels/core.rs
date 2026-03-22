@@ -181,4 +181,63 @@ impl GpuCore for CudaBackend {
     // GPU-side quantization was considered but doubles peak VRAM during loading
     // (holds bf16 temp + Q4 output simultaneously), which causes OOM on models
     // that nearly fill device memory.  CPU quantize + upload-Q4 only is safer.
+
+    fn alloc_pinned_buf(&self, byte_count: usize) -> Option<crate::gpu::PinnedBuf> {
+        self.ctx
+            .bind_to_thread()
+            .expect("CUDA bind_to_thread failed");
+
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let result =
+            unsafe { cudarc::driver::sys::cuMemAllocHost_v2(&mut ptr, byte_count) };
+        if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        Some(crate::gpu::PinnedBuf {
+            ptr: ptr as *mut u8,
+            len: byte_count,
+            _ctx: self.ctx.clone(),
+        })
+    }
+
+    fn copy_to_tensor_async(&self, tensor: &CudaTensor, src: &[u8]) {
+        let byte_count = tensor.byte_count();
+        assert!(
+            src.len() <= byte_count,
+            "copy_to_tensor_async: src too large ({} > {})",
+            src.len(),
+            byte_count
+        );
+        // Bind context for multi-GPU safety (same pattern as copy_to_tensor).
+        self.ctx
+            .bind_to_thread()
+            .expect("CUDA bind_to_thread failed");
+
+        // Enqueue HtoD on the dedicated transfer stream (not the compute stream).
+        // For true async behavior, `src` must point to pinned (page-locked) memory.
+        // Unpinned memory silently falls back to synchronous — still correct, just
+        // slower.  Expert streaming allocates pinned buffers via alloc_pinned_buf().
+        let (dptr, _sync) = tensor.buf.device_ptr(&self.transfer_stream);
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async(
+                dptr,
+                src,
+                self.transfer_stream.cu_stream(),
+            )
+        }
+        .expect("CUDA async memcpy_htod on transfer stream failed");
+    }
+
+    fn sync_transfers(&self) {
+        // Record event on transfer stream — marks when all prior transfers complete.
+        // Then make compute stream wait on that event.  Both operations are GPU-side
+        // only — the CPU returns immediately.  The compute stream will stall only if
+        // it reaches this wait point before the DMA engine finishes.
+        self.transfer_event
+            .record(&self.transfer_stream)
+            .expect("CUDA event record failed");
+        self.stream
+            .wait(&self.transfer_event)
+            .expect("CUDA stream wait failed");
+    }
 }

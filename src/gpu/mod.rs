@@ -217,6 +217,65 @@ pub(crate) fn quantize_bf16_to_q4(bf16_data: &[u8], m: usize, k: usize) -> Vec<u
 }
 
 // ---------------------------------------------------------------------------
+// PinnedBuf — page-locked host memory for async DMA transfers.
+//
+// On CUDA, allocated via cuMemAllocHost — the physical pages are pinned
+// so the DMA engine can transfer directly without staging through a
+// bounce buffer.  This is required for true async HtoD transfers:
+// unpinned memory silently falls back to synchronous copies.
+//
+// On Metal/CPU, pinned buffers are never allocated (alloc_pinned_buf
+// returns None) because unified memory doesn't need them.
+//
+// Used by: model/expert_stream.rs (staging buffers for parallel pread)
+// Allocated by: gpu/cuda/kernels/core.rs (GpuCore::alloc_pinned_buf)
+// ---------------------------------------------------------------------------
+
+pub(crate) struct PinnedBuf {
+    ptr: *mut u8,
+    len: usize,
+    /// Prevent CUDA context destruction before cuMemFreeHost.
+    #[cfg(feature = "cuda")]
+    _ctx: std::sync::Arc<cudarc::driver::CudaContext>,
+}
+
+// Safety: the buffer is a raw allocation with no interior references.
+// Ownership semantics are like Vec<u8> — the holder has exclusive access.
+unsafe impl Send for PinnedBuf {}
+unsafe impl Sync for PinnedBuf {}
+
+impl PinnedBuf {
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for PinnedBuf {
+    fn drop(&mut self) {
+        #[cfg(feature = "cuda")]
+        unsafe {
+            cudarc::driver::sys::cuMemFreeHost(self.ptr as *mut std::ffi::c_void);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Factory function.
 // ---------------------------------------------------------------------------
 

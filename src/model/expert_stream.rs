@@ -72,7 +72,7 @@ use std::cell::{Cell, UnsafeCell};
 use std::fs::File;
 use std::sync::Arc;
 
-use crate::gpu::{GpuCore, TensorDtype};
+use crate::gpu::{GpuCore, PinnedBuf, TensorDtype};
 
 /// Wrapper to send raw pointers across thread boundaries.
 ///
@@ -154,14 +154,45 @@ pub(crate) struct ExpertIndex {
 // concurrently without contention.  The gate_up buffer holds both gate and
 // up projections contiguously (matching the fused on-disk layout) so that
 // Qwen3.5's fused format can be loaded with a single pread.
+//
+// On CUDA, buffers are pinned (page-locked) via cuMemAllocHost — required
+// for true async HtoD transfers.  On Metal/CPU, regular heap buffers are
+// used since unified memory doesn't need pinning.
 // ---------------------------------------------------------------------------
+
+/// A staging buffer that may be pinned (for async DMA) or heap-allocated.
+///
+/// Pinned memory (CUDA): allocated via cuMemAllocHost, enables true async
+/// transfers via cuMemcpyHtoDAsync on a dedicated transfer stream.
+/// Heap memory (Metal/CPU): regular Vec<u8>, used when pinned isn't needed
+/// (unified memory) or unavailable (alloc_pinned_buf returns None).
+enum ReadBuf {
+    Heap(Vec<u8>),
+    Pinned(PinnedBuf),
+}
+
+impl ReadBuf {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            ReadBuf::Heap(v) => v.as_slice(),
+            ReadBuf::Pinned(p) => p.as_slice(),
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            ReadBuf::Heap(v) => v.as_mut_slice(),
+            ReadBuf::Pinned(p) => p.as_mut_slice(),
+        }
+    }
+}
 
 struct SlotReadBufs {
     /// Combined gate+up buffer.  For fused format, read in one pread().
     /// Layout: [gate_bytes | up_bytes] — gate first, then up.
-    gate_up: Vec<u8>,
+    gate_up: ReadBuf,
     /// Down projection buffer.
-    down: Vec<u8>,
+    down: ReadBuf,
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +228,15 @@ pub(crate) struct ExpertStreamer<B: GpuCore> {
     read_bufs: UnsafeCell<Vec<SlotReadBufs>>,
 }
 
+/// Safety: ExpertStreamer uses interior mutability (Cell, UnsafeCell) for
+/// single-threaded inference — each model instance is accessed by exactly
+/// one thread at a time.  The multi-GPU dispatch in multi_gpu.rs assigns
+/// one RankState per thread; each rank's ExpertStreamer is never shared
+/// across threads concurrently.  This impl is required because CudaBackend
+/// is used with thread::scope in multi_gpu.rs, which requires Sync on
+/// captured references even though each thread touches a disjoint rank.
+unsafe impl<B: GpuCore> Sync for ExpertStreamer<B> {}
+
 /// One expert's worth of GPU-resident weight buffers.
 pub(crate) struct ExpertSlot<B: GpuCore> {
     pub gate_proj: B::Tensor,
@@ -229,11 +269,19 @@ impl<B: GpuCore> ExpertStreamer<B> {
                 hidden * moe_inter * 2,
             )
         };
+        // Try pinned (page-locked) allocation for CUDA async DMA.
+        // Falls back to heap allocation on Metal/CPU or if pinned alloc fails.
+        let alloc_buf = |byte_count: usize| -> ReadBuf {
+            match backend.alloc_pinned_buf(byte_count) {
+                Some(buf) => ReadBuf::Pinned(buf),
+                None => ReadBuf::Heap(vec![0u8; byte_count]),
+            }
+        };
         let read_bufs = UnsafeCell::new(
             (0..k)
                 .map(|_| SlotReadBufs {
-                    gate_up: vec![0u8; gate_up_bytes],
-                    down: vec![0u8; down_bytes],
+                    gate_up: alloc_buf(gate_up_bytes),
+                    down: alloc_buf(down_bytes),
                 })
                 .collect(),
         );
@@ -339,22 +387,23 @@ impl<B: GpuCore> ExpertStreamer<B> {
                 handles.push(s.spawn(move || {
                     // Phase 1: pread from disk into CPU staging buffer.
                     // Gate + up: single pread if contiguous (fused format), else two.
+                    let gate_up = slot_bufs.gate_up.as_mut_slice();
                     if loc.gate_up_contiguous() {
                         let total = loc.gate_bytes + loc.up_bytes;
                         pread_exact(
                             &shard_files[loc.shard_gate_up],
-                            &mut slot_bufs.gate_up[..total],
+                            &mut gate_up[..total],
                             loc.gate_offset,
                         );
                     } else {
                         pread_exact(
                             &shard_files[loc.shard_gate_up],
-                            &mut slot_bufs.gate_up[..loc.gate_bytes],
+                            &mut gate_up[..loc.gate_bytes],
                             loc.gate_offset,
                         );
                         pread_exact(
                             &shard_files[loc.shard_gate_up],
-                            &mut slot_bufs.gate_up[loc.gate_bytes..loc.gate_bytes + loc.up_bytes],
+                            &mut gate_up[loc.gate_bytes..loc.gate_bytes + loc.up_bytes],
                             loc.up_offset,
                         );
                     }
@@ -362,7 +411,7 @@ impl<B: GpuCore> ExpertStreamer<B> {
                     // Down projection (always a separate read).
                     pread_exact(
                         &shard_files[loc.shard_down],
-                        &mut slot_bufs.down[..loc.down_bytes],
+                        &mut slot_bufs.down.as_mut_slice()[..loc.down_bytes],
                         loc.down_offset,
                     );
 
@@ -371,19 +420,20 @@ impl<B: GpuCore> ExpertStreamer<B> {
                     // Each thread writes to its own expert's GPU buffers (disjoint),
                     // so no synchronization needed between threads.
                     if let Some([g, u, d]) = ptrs {
+                        let gate_up = slot_bufs.gate_up.as_slice();
                         unsafe {
                             std::ptr::copy_nonoverlapping(
-                                slot_bufs.gate_up.as_ptr(),
+                                gate_up.as_ptr(),
                                 g.0,
                                 loc.gate_bytes,
                             );
                             std::ptr::copy_nonoverlapping(
-                                slot_bufs.gate_up.as_ptr().add(loc.gate_bytes),
+                                gate_up.as_ptr().add(loc.gate_bytes),
                                 u.0,
                                 loc.up_bytes,
                             );
                             std::ptr::copy_nonoverlapping(
-                                slot_bufs.down.as_ptr(),
+                                slot_bufs.down.as_slice().as_ptr(),
                                 d.0,
                                 loc.down_bytes,
                             );
@@ -397,21 +447,25 @@ impl<B: GpuCore> ExpertStreamer<B> {
             }
         });
 
-        // Fallback Phase 2 (serial): for backends without direct CPU→GPU writes.
-        // CUDA uses copy_to_tensor which enqueues a DMA transfer on the GPU stream.
+        // Fallback Phase 2 (async DMA): for backends without direct CPU→GPU writes.
+        // CUDA enqueues HtoD transfers on a dedicated transfer stream, then waits
+        // via event synchronisation.  With pinned staging buffers, all K×3 transfers
+        // run asynchronously on the DMA engine.
         if !direct {
             for (slot_idx, &(expert_idx, _)) in selected.iter().enumerate() {
                 let loc = &self.index.layers[layer_idx][expert_idx];
                 let slot = &self.slots[self.active.get()][slot_idx];
                 let bufs = &read_bufs[slot_idx];
+                let gate_up = bufs.gate_up.as_slice();
 
-                backend.copy_to_tensor(&slot.gate_proj, &bufs.gate_up[..loc.gate_bytes]);
-                backend.copy_to_tensor(
+                backend.copy_to_tensor_async(&slot.gate_proj, &gate_up[..loc.gate_bytes]);
+                backend.copy_to_tensor_async(
                     &slot.up_proj,
-                    &bufs.gate_up[loc.gate_bytes..loc.gate_bytes + loc.up_bytes],
+                    &gate_up[loc.gate_bytes..loc.gate_bytes + loc.up_bytes],
                 );
-                backend.copy_to_tensor(&slot.down_proj, &bufs.down[..loc.down_bytes]);
+                backend.copy_to_tensor_async(&slot.down_proj, &bufs.down.as_slice()[..loc.down_bytes]);
             }
+            backend.sync_transfers();
         }
     }
 
@@ -440,29 +494,30 @@ impl<B: GpuCore> ExpertStreamer<B> {
                 let shard_files = &self.index.shard_files;
 
                 handles.push(s.spawn(move || {
+                    let gate_up = slot_bufs.gate_up.as_mut_slice();
                     if loc.gate_up_contiguous() {
                         let total = loc.gate_bytes + loc.up_bytes;
                         pread_exact(
                             &shard_files[loc.shard_gate_up],
-                            &mut slot_bufs.gate_up[..total],
+                            &mut gate_up[..total],
                             loc.gate_offset,
                         );
                     } else {
                         pread_exact(
                             &shard_files[loc.shard_gate_up],
-                            &mut slot_bufs.gate_up[..loc.gate_bytes],
+                            &mut gate_up[..loc.gate_bytes],
                             loc.gate_offset,
                         );
                         pread_exact(
                             &shard_files[loc.shard_gate_up],
-                            &mut slot_bufs.gate_up[loc.gate_bytes..loc.gate_bytes + loc.up_bytes],
+                            &mut gate_up[loc.gate_bytes..loc.gate_bytes + loc.up_bytes],
                             loc.up_offset,
                         );
                     }
 
                     pread_exact(
                         &shard_files[loc.shard_down],
-                        &mut slot_bufs.down[..loc.down_bytes],
+                        &mut slot_bufs.down.as_mut_slice()[..loc.down_bytes],
                         loc.down_offset,
                     );
                 }));
@@ -479,13 +534,14 @@ impl<B: GpuCore> ExpertStreamer<B> {
             let loc = &self.index.layers[layer_idx][expert_idx];
             let slot = &self.slots[inactive][slot_idx];
             let bufs = &read_bufs[slot_idx];
+            let gate_up = bufs.gate_up.as_slice();
 
-            backend.copy_to_tensor_async(&slot.gate_proj, &bufs.gate_up[..loc.gate_bytes]);
+            backend.copy_to_tensor_async(&slot.gate_proj, &gate_up[..loc.gate_bytes]);
             backend.copy_to_tensor_async(
                 &slot.up_proj,
-                &bufs.gate_up[loc.gate_bytes..loc.gate_bytes + loc.up_bytes],
+                &gate_up[loc.gate_bytes..loc.gate_bytes + loc.up_bytes],
             );
-            backend.copy_to_tensor_async(&slot.down_proj, &bufs.down[..loc.down_bytes]);
+            backend.copy_to_tensor_async(&slot.down_proj, &bufs.down.as_slice()[..loc.down_bytes]);
         }
     }
 

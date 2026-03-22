@@ -64,6 +64,19 @@ Q4 quantization (`rllm quantize`) gives ~1.3-3.5x faster decode by reducing memo
 </details>
 
 <details>
+<summary><b>NVIDIA GeForce RTX 4090 48 GB</b> — 1.01 TB/s GDDR6X bandwidth</summary>
+
+Measured via `rllm run --chat`, single run, 128 max tokens.
+
+| Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
+|---|---|---|---|---|---|
+| Qwen3.5 122B-A10B ⚡ | ~122B (~10B active) | 1.1 tok/s | 3.3 tok/s | 19,300 ms | 7,100 ms |
+
+⚡ = SSD expert streaming (`--stream-experts`). Expert weights stream from NVMe on demand — the 122B model (256 experts/layer, ~230 GB bf16, ~67 GB Q4) runs with ~18 MB GPU memory for expert buffers (8 pinned streaming slots). Q4 is 3x faster than bf16 — pre-quantized experts reduce NVMe I/O 3.2x per expert load, which dominates at this scale. Async DMA via dedicated CUDA transfer stream with pinned host memory enables overlap between NVMe reads and GPU compute.
+
+</details>
+
+<details>
 <summary><b>NVIDIA RTX PRO 6000 Blackwell</b> — 96 GB GDDR7, 1.53 TB/s bandwidth</summary>
 
 Measured via `rllm run --chat`, 3 runs averaged, 128 max tokens.

@@ -56,7 +56,9 @@
 use std::sync::Arc;
 
 use anyhow::anyhow;
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig};
+use cudarc::driver::{
+    CudaContext, CudaEvent, CudaFunction, CudaModule, CudaStream, LaunchConfig,
+};
 
 // ---------------------------------------------------------------------------
 // Embedded shader sources.
@@ -69,6 +71,7 @@ const CUDA_SOURCE_ATTENTION: &str = include_str!("shaders/attention.cu");
 const CUDA_SOURCE_ELEMENTWISE: &str = include_str!("shaders/elementwise.cu");
 const CUDA_SOURCE_EMBED: &str = include_str!("shaders/embed.cu");
 const CUDA_SOURCE_DELTANET: &str = include_str!("shaders/deltanet.cu");
+const CUDA_SOURCE_MOE: &str = include_str!("shaders/moe.cu");
 
 // ---------------------------------------------------------------------------
 // CudaBackend — holds the CUDA device context, stream, and all compiled
@@ -84,6 +87,14 @@ pub(crate) struct CudaBackend {
     pub(crate) ctx: Arc<CudaContext>,
     pub(crate) stream: Arc<CudaStream>,
     pub(crate) name: String,
+
+    // Dedicated transfer stream for async HtoD copies (expert streaming).
+    //
+    // Separate from the compute stream so DMA and kernel execution overlap.
+    // sync_transfers() records an event here, then makes the compute stream
+    // wait — GPU-side only, CPU doesn't block.
+    pub(crate) transfer_stream: Arc<CudaStream>,
+    pub(crate) transfer_event: cudarc::driver::CudaEvent,
 
     // Multi-GPU tensor parallelism fields.
     pub(crate) rank: usize,
@@ -136,6 +147,11 @@ pub(crate) struct CudaBackend {
     pub(crate) fn_mul_elem: CudaFunction,
     pub(crate) fn_deltanet_step: CudaFunction,
 
+    // Fused MoE kernels (gate+up+SwiGLU, combine+residual).
+    pub(crate) fn_fused_gate_up_swiglu_bf16: CudaFunction,
+    pub(crate) fn_fused_gate_up_swiglu_q4: CudaFunction,
+    pub(crate) fn_moe_combine_residual: CudaFunction,
+
     // GPT-OSS kernels.
     pub(crate) fn_silu_mul_clamp: CudaFunction,
     pub(crate) fn_rope_yarn: CudaFunction,
@@ -159,6 +175,20 @@ impl CudaBackend {
         let ctx = CudaContext::new(device_id)
             .map_err(|e| anyhow!("failed to create CUDA context on device {device_id}: {e}"))?;
         let stream = ctx.default_stream();
+
+        // Dedicated transfer stream for async HtoD copies (expert streaming).
+        // new_stream() creates a CU_STREAM_NON_BLOCKING stream — prevents
+        // implicit synchronisation with the default stream so transfers and
+        // compute can run concurrently.
+        let transfer_stream = ctx
+            .new_stream()
+            .map_err(|e| anyhow!("failed to create CUDA transfer stream: {e}"))?;
+
+        // Event for transfer→compute synchronisation.
+        // CU_EVENT_DISABLE_TIMING (default): we don't need timing, saves overhead.
+        let transfer_event = ctx
+            .new_event(None)
+            .map_err(|e| anyhow!("failed to create CUDA transfer event: {e}"))?;
 
         // Query device name via the CudaContext API.
         let name = ctx.name().unwrap_or_else(|_| "NVIDIA GPU".to_string());
@@ -191,6 +221,7 @@ impl CudaBackend {
         let ptx_elementwise = compile(CUDA_SOURCE_ELEMENTWISE)?;
         let ptx_embed = compile(CUDA_SOURCE_EMBED)?;
         let ptx_deltanet = compile(CUDA_SOURCE_DELTANET)?;
+        let ptx_moe = compile(CUDA_SOURCE_MOE)?;
 
         // Load modules and extract function handles.
         let load = |ptx: cudarc::nvrtc::Ptx| -> anyhow::Result<Arc<CudaModule>> {
@@ -206,6 +237,7 @@ impl CudaBackend {
         let mod_elementwise = load(ptx_elementwise)?;
         let mod_embed = load(ptx_embed)?;
         let mod_deltanet = load(ptx_deltanet)?;
+        let mod_moe = load(ptx_moe)?;
 
         let func = |module: &Arc<CudaModule>, name: &str| -> anyhow::Result<CudaFunction> {
             module
@@ -216,6 +248,8 @@ impl CudaBackend {
         Ok(Self {
             ctx,
             stream,
+            transfer_stream,
+            transfer_event,
             name,
             rank,
             world_size,
@@ -276,6 +310,11 @@ impl CudaBackend {
             fn_mul_elem: func(&mod_deltanet, "mul_elementwise")?,
             fn_deltanet_step: func(&mod_deltanet, "deltanet_step")?,
 
+            // Fused MoE
+            fn_fused_gate_up_swiglu_bf16: func(&mod_moe, "fused_gate_up_swiglu_bf16")?,
+            fn_fused_gate_up_swiglu_q4: func(&mod_moe, "fused_gate_up_swiglu_q4")?,
+            fn_moe_combine_residual: func(&mod_moe, "moe_combine_residual")?,
+
             // GPT-OSS kernels.
             fn_silu_mul_clamp: func(&mod_elementwise, "silu_mul_clamp")?,
             fn_rope_yarn: func(&mod_rope, "rotary_embedding_yarn")?,
@@ -320,3 +359,4 @@ impl CudaBackend {
         total as u64
     }
 }
+

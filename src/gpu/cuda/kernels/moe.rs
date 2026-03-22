@@ -1,46 +1,99 @@
 // ---------------------------------------------------------------------------
-// CUDA impl: GpuMoe — fused MoE kernels (stub).
+// CUDA impl: GpuMoe — fused MoE kernels.
 //
 // Trait contract: gpu/ops/moe.rs
+// CUDA shader:    cuda/shaders/moe.cu
 //
-// The fused kernels are currently Metal-only.  The CUDA backend falls back
-// to calling the separate matmul + silu_mul + scale_add operations via the
-// unfused path in `moe_expert_dispatch`.  These stubs exist to satisfy the
-// trait bound; they should not be called directly.
+// Fused gate+up+SwiGLU halves the number of dispatches per expert by
+// computing both dot products and applying the activation in a single kernel.
+// The combine+residual kernel replaces k scale_add + 1 add with one pass.
 // ---------------------------------------------------------------------------
+
+use cudarc::driver::{DeviceRepr, PushKernelArg};
 
 use super::super::backend::CudaBackend;
 use super::super::tensor::CudaTensor;
+use crate::gpu::TensorDtype;
 use crate::gpu::ops::GpuMoe;
+
+// Must match the CUDA shader's FusedGateUpParams.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FusedGateUpParams {
+    m: u32,
+    k: u32,
+}
+unsafe impl DeviceRepr for FusedGateUpParams {}
+
+// Must match the CUDA shader's MoeCombineParams.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MoeCombineParams {
+    hidden_size: u32,
+    k: u32,
+    weights: [f32; 32],
+}
+unsafe impl DeviceRepr for MoeCombineParams {}
 
 impl GpuMoe for CudaBackend {
     fn fused_gate_up_swiglu(
         &self,
-        _w_gate: &CudaTensor,
-        _w_up: &CudaTensor,
-        _input: &CudaTensor,
-        _output: &CudaTensor,
-        _m: u32,
-        _k: u32,
+        w_gate: &CudaTensor,
+        w_up: &CudaTensor,
+        input: &CudaTensor,
+        output: &CudaTensor,
+        m: u32,
+        k: u32,
     ) {
-        panic!(
-            "CUDA fused_gate_up_swiglu not yet implemented; \
-             use separate matmul + silu_mul calls via moe_expert_dispatch"
-        );
+        let params = FusedGateUpParams { m, k };
+        // Dispatch Q4 or bf16 variant based on weight dtype (same as matmul).
+        let func = match w_gate.dtype {
+            TensorDtype::Q4 => &self.fn_fused_gate_up_swiglu_q4,
+            _ => &self.fn_fused_gate_up_swiglu_bf16,
+        };
+        // M rows × 32 threads per row = M*32 total threads.
+        let cfg = CudaBackend::cfg_1d(m * 32, 256);
+        unsafe {
+            self.stream
+                .launch_builder(func)
+                .arg(&params)
+                .arg(&w_gate.buf)
+                .arg(&w_up.buf)
+                .arg(&input.buf)
+                .arg(&output.buf)
+                .launch(cfg)
+        }
+        .expect("fused_gate_up_swiglu launch failed");
     }
 
     fn moe_combine_residual(
         &self,
-        _residual: &CudaTensor,
-        _expert_outputs: &CudaTensor,
-        _weights: &[f32],
-        _output: &CudaTensor,
-        _hidden_size: u32,
-        _k: u32,
+        residual: &CudaTensor,
+        expert_outputs: &CudaTensor,
+        weights: &[f32],
+        output: &CudaTensor,
+        hidden_size: u32,
+        k: u32,
     ) {
-        panic!(
-            "CUDA moe_combine_residual not yet implemented; \
-             use separate scale_add + add calls via moe_expert_dispatch"
-        );
+        let mut weight_arr = [0.0f32; 32];
+        for (i, &w) in weights.iter().enumerate().take(32) {
+            weight_arr[i] = w;
+        }
+        let params = MoeCombineParams {
+            hidden_size,
+            k,
+            weights: weight_arr,
+        };
+        let cfg = CudaBackend::cfg_1d(hidden_size, 256);
+        unsafe {
+            self.stream
+                .launch_builder(&self.fn_moe_combine_residual)
+                .arg(&params)
+                .arg(&residual.buf)
+                .arg(&expert_outputs.buf)
+                .arg(&output.buf)
+                .launch(cfg)
+        }
+        .expect("moe_combine_residual launch failed");
     }
 }

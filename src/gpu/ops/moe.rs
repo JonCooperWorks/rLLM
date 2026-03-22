@@ -26,7 +26,7 @@
 //
 // Metal shaders: shaders/moe.metal
 // Metal impl:    gpu/metal/kernels/moe.rs
-// CUDA impl:     cuda/kernels/moe.rs (stub — not yet implemented)
+// CUDA impl:     cuda/kernels/moe.rs
 // CPU impl:      cpu/mod.rs (reference implementation for testing)
 // ---------------------------------------------------------------------------
 
