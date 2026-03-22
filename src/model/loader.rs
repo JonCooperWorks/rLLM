@@ -1944,29 +1944,42 @@ fn load_fused_experts<B: GpuCore>(
 ) -> anyhow::Result<Vec<ExpertWeights<B>>> {
     let fused_name = format!("{prefix}.mlp.experts.gate_up_proj");
     let gate_up_view = store.tensor(&fused_name)?;
-    anyhow::ensure!(
-        gate_up_view.shape() == [num_experts, moe_inter * 2, hidden],
-        "fused gate_up_proj shape mismatch: expected [{}, {}, {}], got {:?}",
-        num_experts,
-        moe_inter * 2,
-        hidden,
-        gate_up_view.shape()
-    );
-    let down_view = store.tensor(&format!("{prefix}.mlp.experts.down_proj"))?;
-    anyhow::ensure!(
-        down_view.shape() == [num_experts, hidden, moe_inter],
-        "fused down_proj shape mismatch: expected [{}, {}, {}], got {:?}",
-        num_experts,
-        hidden,
-        moe_inter,
-        down_view.shape()
-    );
+    let down_name = format!("{prefix}.mlp.experts.down_proj");
+    let down_view = store.tensor(&down_name)?;
+
+    // Pre-quantized Q4 tensors are stored as 1D U8 — use q4_map for logical shape.
+    // Q4 is per-row so we can split experts using Q4 byte strides.
+    let is_q4 = store.q4_shape(&fused_name).is_some();
+
+    if !is_q4 {
+        anyhow::ensure!(
+            gate_up_view.shape() == [num_experts, moe_inter * 2, hidden],
+            "fused gate_up_proj shape mismatch: expected [{}, {}, {}], got {:?}",
+            num_experts, moe_inter * 2, hidden, gate_up_view.shape()
+        );
+        anyhow::ensure!(
+            down_view.shape() == [num_experts, hidden, moe_inter],
+            "fused down_proj shape mismatch: expected [{}, {}, {}], got {:?}",
+            num_experts, hidden, moe_inter, down_view.shape()
+        );
+    }
 
     let gate_up_data = gate_up_view.data();
     let down_data = down_view.data();
-    let gate_up_expert_bytes = moe_inter * 2 * hidden * 2; // bf16
-    let gate_bytes = moe_inter * hidden * 2;
-    let down_expert_bytes = hidden * moe_inter * 2;
+
+    let (gate_up_expert_bytes, gate_bytes, down_expert_bytes) = if is_q4 {
+        (
+            crate::gpu::q4_byte_count(moe_inter * 2, hidden),
+            crate::gpu::q4_byte_count(moe_inter, hidden),
+            crate::gpu::q4_byte_count(hidden, moe_inter),
+        )
+    } else {
+        (
+            moe_inter * 2 * hidden * 2, // bf16
+            moe_inter * hidden * 2,
+            hidden * moe_inter * 2,
+        )
+    };
 
     let mut experts = Vec::with_capacity(num_experts);
     for j in 0..num_experts {
@@ -1976,9 +1989,20 @@ fn load_fused_experts<B: GpuCore>(
         let d_offset = j * down_expert_bytes;
         let down_raw = &down_data[d_offset..d_offset + down_expert_bytes];
 
-        let gate_t = upload_raw_maybe_quantized(backend, gate_raw, &[moe_inter, hidden], quantize);
-        let up_t = upload_raw_maybe_quantized(backend, up_raw, &[moe_inter, hidden], quantize);
-        let down_t = upload_raw_maybe_quantized(backend, down_raw, &[hidden, moe_inter], quantize);
+        let (gate_t, up_t, down_t) = if is_q4 {
+            // Already Q4 — upload directly.
+            (
+                backend.upload_tensor(gate_raw, &[moe_inter, hidden], crate::gpu::TensorDtype::Q4),
+                backend.upload_tensor(up_raw, &[moe_inter, hidden], crate::gpu::TensorDtype::Q4),
+                backend.upload_tensor(down_raw, &[hidden, moe_inter], crate::gpu::TensorDtype::Q4),
+            )
+        } else {
+            (
+                upload_raw_maybe_quantized(backend, gate_raw, &[moe_inter, hidden], quantize),
+                upload_raw_maybe_quantized(backend, up_raw, &[moe_inter, hidden], quantize),
+                upload_raw_maybe_quantized(backend, down_raw, &[hidden, moe_inter], quantize),
+            )
+        };
 
         experts.push(ExpertWeights {
             gate_proj: gate_t,
