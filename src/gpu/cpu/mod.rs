@@ -1409,9 +1409,9 @@ mod tests {
     #[test]
     fn test_core_q4_alloc() {
         let b = CpuBackend;
-        // 2 rows, 32 elements each = 2 blocks = 40 bytes
+        // 2 blocks of 32 elements = 2 × 18 bytes (bf16 scale + 16 packed nibbles)
         let t = b.alloc_tensor(&[64], TensorDtype::Q4);
-        assert_eq!(b.tensor_byte_count(&t), 40);
+        assert_eq!(b.tensor_byte_count(&t), 36);
     }
 
     // -----------------------------------------------------------------------
