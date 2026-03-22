@@ -52,10 +52,12 @@ Measured via `rllm run --chat`, single run.
 | Qwen3.5 35B-A3B | 35.1B (3.3B active) | 5 tok/s | 16 tok/s | 44,600 ms | 2,000 ms |
 | GPT-OSS 20B | 20.0B (3.6B active) | 6 tok/s | 34 tok/s | 4,800 ms | 425 ms |
 | Mixtral 8x7B Instruct | 46.7B (12.9B active) | — | 12 tok/s | — | 5,400 ms |
+| Qwen3.5 9B | ~9B | 19 tok/s | — | 1,400 ms | — |
 | Qwen3.5 35B-A3B ⚡ | 35.1B (3.3B active) | **3.0 tok/s** | 0.5 tok/s | 2,600 ms | 10,600 ms |
-| Qwen3.5 397B-A17B ⚡ | 397B (17B active) | **1.56 tok/s** | 0.28 tok/s | 640 ms | 3,500 ms |
+| Qwen3.5 27B ⚡ | ~27B | **1.7 tok/s** | **15 tok/s** | 52,800 ms | 2,000 ms |
+| Qwen3.5 397B-A17B ⚡ | 397B (17B active) | **0.3 tok/s** | **1.8 tok/s** | 48,200 ms | 16,000 ms |
 
-⚡ = SSD expert streaming (`--stream-experts`).  Expert weights are read from NVMe on demand instead of loading all to GPU — the 397B model (751 GB on disk, 237 GB Q4) runs on a 64 GB machine using ~20 GB GPU memory.  Pre-quantized Q4 streaming (`rllm quantize` first) reduces I/O volume 3.2x vs bf16, achieving 1.56 tok/s with parallel pread across K expert threads.
+⚡ = SSD expert streaming (`--stream-experts`).  Expert weights are read from NVMe on demand instead of loading all to GPU — the 397B model (751 GB on disk, 237 GB Q4) runs on a 64 GB machine using ~20 GB GPU memory.  Pre-quantized Q4 streaming reduces I/O volume 3.2x vs bf16, achieving 1.8 tok/s on 397B and 15 tok/s on 27B with parallel pread across K expert threads.
 
 Q4 quantization (`--quantize`) gives ~1.3-3.5x faster decode by reducing memory bandwidth. Mixtral requires Q4 (bf16 would need ~87 GB). Q4 is strongly recommended for models over ~8B params. Large models (Gemma 3 27B, Phi-4, Qwen3/3.5 MoE) run in bf16 but are slow because the weights consume most of the 64 GB unified memory. Dynamic KV cache sizing automatically adjusts block count based on available GPU memory.
 
