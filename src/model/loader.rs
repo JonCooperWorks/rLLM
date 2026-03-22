@@ -1370,7 +1370,7 @@ fn load_standard_attention<B: GpuCore>(
         // just with a different bytes_per_row stride.
         let is_q4 = store.q4_shape(&q_proj_name).is_some();
         let row_bytes = if is_q4 {
-            (hidden / 32) * 20 // Q4: blocks_per_row * 20 bytes
+            (hidden / 32) * 18 // Q4: blocks_per_row * 18 bytes
         } else {
             anyhow::ensure!(
                 view.shape() == [fused_q_dim, hidden],

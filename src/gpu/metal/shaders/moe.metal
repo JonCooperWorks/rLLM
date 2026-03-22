@@ -115,11 +115,12 @@ kernel void fused_gate_up_swiglu_bf16(
 
 kernel void fused_gate_up_swiglu_q4(
     constant FusedGateUpParams& params [[buffer(0)]],
-    device const uchar* W_gate_q4      [[buffer(1)]],  // [M * blocks_per_row * 20]
-    device const uchar* W_up_q4        [[buffer(2)]],  // [M * blocks_per_row * 20]
+    device const uchar* W_gate_q4      [[buffer(1)]],  // [M * blocks_per_row * 18]
+    device const uchar* W_up_q4        [[buffer(2)]],  // [M * blocks_per_row * 18]
     device const bfloat* x             [[buffer(3)]],   // [K]
     device bfloat* output              [[buffer(4)]],   // [M]
-    uint gid                           [[thread_position_in_grid]]
+    uint gid                           [[thread_position_in_grid]],
+    uint lid                           [[thread_position_in_threadgroup]]
 ) {
     const uint M = params.M;
     const uint K = params.K;
@@ -127,75 +128,89 @@ kernel void fused_gate_up_swiglu_q4(
     uint row = gid / 32;
     uint lane = gid % 32;
 
-    if (row >= M) return;
-
     const uint blocks_per_row = K / 32;
-    const uint bytes_per_block = 20;
+    const uint bytes_per_block = 18;
 
-    device const uchar* gate_row = W_gate_q4 + row * blocks_per_row * bytes_per_block;
-    device const uchar* up_row   = W_up_q4   + row * blocks_per_row * bytes_per_block;
+    // Shared memory cache for x — same tiled approach as matvec_q4.
+    // Gate and up projections share x, so caching gives a double benefit:
+    // x loaded once from device memory, used for both dot products.
+    threadgroup float x_shared[4096];
 
     float acc_gate = 0.0f;
     float acc_up   = 0.0f;
 
-    for (uint block_idx = lane; block_idx < blocks_per_row; block_idx += 32) {
-        // Gate block.
-        device const uchar* g_ptr = gate_row + block_idx * bytes_per_block;
-        float g_scale = *((device const float*)g_ptr);
-        device const uchar* g_data = g_ptr + 4;
+    for (uint tile = 0; tile < K; tile += 4096) {
+        uint tile_len = min((uint)4096, K - tile);
 
-        // Up block.
-        device const uchar* u_ptr = up_row + block_idx * bytes_per_block;
-        float u_scale = *((device const float*)u_ptr);
-        device const uchar* u_data = u_ptr + 4;
-
-        uint x_base = block_idx * 32;
-
-        // FMA-optimised dequant for both gate and up, sharing x reads.
-        for (uint i = 0; i < 16; i += 4) {
-            uchar gb0 = g_data[i], gb1 = g_data[i+1], gb2 = g_data[i+2], gb3 = g_data[i+3];
-            uchar ub0 = u_data[i], ub1 = u_data[i+1], ub2 = u_data[i+2], ub3 = u_data[i+3];
-
-            // Read x values once, shared between gate and up.
-            float x0 = float(x[x_base + i*2]);
-            float x1 = float(x[x_base + i*2 + 1]);
-            float x2 = float(x[x_base + i*2 + 2]);
-            float x3 = float(x[x_base + i*2 + 3]);
-            float x4 = float(x[x_base + i*2 + 4]);
-            float x5 = float(x[x_base + i*2 + 5]);
-            float x6 = float(x[x_base + i*2 + 6]);
-            float x7 = float(x[x_base + i*2 + 7]);
-
-            // Gate: fma(nibble, scale*x, -8*scale*x).
-            float gsx0 = g_scale * x0, gsx1 = g_scale * x1;
-            float gsx2 = g_scale * x2, gsx3 = g_scale * x3;
-            float gsx4 = g_scale * x4, gsx5 = g_scale * x5;
-            float gsx6 = g_scale * x6, gsx7 = g_scale * x7;
-
-            acc_gate = fma(float(gb0 & 0xF), gsx0, fma(-8.0f, gsx0, acc_gate));
-            acc_gate = fma(float(gb0 >> 4),  gsx1, fma(-8.0f, gsx1, acc_gate));
-            acc_gate = fma(float(gb1 & 0xF), gsx2, fma(-8.0f, gsx2, acc_gate));
-            acc_gate = fma(float(gb1 >> 4),  gsx3, fma(-8.0f, gsx3, acc_gate));
-            acc_gate = fma(float(gb2 & 0xF), gsx4, fma(-8.0f, gsx4, acc_gate));
-            acc_gate = fma(float(gb2 >> 4),  gsx5, fma(-8.0f, gsx5, acc_gate));
-            acc_gate = fma(float(gb3 & 0xF), gsx6, fma(-8.0f, gsx6, acc_gate));
-            acc_gate = fma(float(gb3 >> 4),  gsx7, fma(-8.0f, gsx7, acc_gate));
-
-            // Up: same pattern, same x values, different weights.
-            float usx0 = u_scale * x0, usx1 = u_scale * x1;
-            float usx2 = u_scale * x2, usx3 = u_scale * x3;
-            float usx4 = u_scale * x4, usx5 = u_scale * x5;
-            float usx6 = u_scale * x6, usx7 = u_scale * x7;
-
-            acc_up = fma(float(ub0 & 0xF), usx0, fma(-8.0f, usx0, acc_up));
-            acc_up = fma(float(ub0 >> 4),  usx1, fma(-8.0f, usx1, acc_up));
-            acc_up = fma(float(ub1 & 0xF), usx2, fma(-8.0f, usx2, acc_up));
-            acc_up = fma(float(ub1 >> 4),  usx3, fma(-8.0f, usx3, acc_up));
-            acc_up = fma(float(ub2 & 0xF), usx4, fma(-8.0f, usx4, acc_up));
-            acc_up = fma(float(ub2 >> 4),  usx5, fma(-8.0f, usx5, acc_up));
-            acc_up = fma(float(ub3 & 0xF), usx6, fma(-8.0f, usx6, acc_up));
-            acc_up = fma(float(ub3 >> 4),  usx7, fma(-8.0f, usx7, acc_up));
+        for (uint i = lid; i < tile_len; i += 256) {
+            x_shared[i] = float(x[tile + i]);
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (row < M) {
+            device const uchar* gate_row = W_gate_q4 + row * blocks_per_row * bytes_per_block;
+            device const uchar* up_row   = W_up_q4   + row * blocks_per_row * bytes_per_block;
+
+            uint block_start = tile / 32;
+            uint block_end   = (tile + tile_len) / 32;
+
+            for (uint block_idx = block_start + lane; block_idx < block_end; block_idx += 32) {
+                device const uchar* g_ptr = gate_row + block_idx * bytes_per_block;
+                float g_scale = float(*((device const half*)g_ptr));
+                device const uchar* g_data = g_ptr + 2;
+
+                device const uchar* u_ptr = up_row + block_idx * bytes_per_block;
+                float u_scale = float(*((device const half*)u_ptr));
+                device const uchar* u_data = u_ptr + 2;
+
+                uint x_local = (block_idx * 32) - tile;
+
+                // FMA-optimised dequant for both gate and up, sharing cached x.
+                for (uint i = 0; i < 16; i += 4) {
+                    uchar gb0 = g_data[i], gb1 = g_data[i+1], gb2 = g_data[i+2], gb3 = g_data[i+3];
+                    uchar ub0 = u_data[i], ub1 = u_data[i+1], ub2 = u_data[i+2], ub3 = u_data[i+3];
+
+                    float x0 = x_shared[x_local + i*2];
+                    float x1 = x_shared[x_local + i*2 + 1];
+                    float x2 = x_shared[x_local + i*2 + 2];
+                    float x3 = x_shared[x_local + i*2 + 3];
+                    float x4 = x_shared[x_local + i*2 + 4];
+                    float x5 = x_shared[x_local + i*2 + 5];
+                    float x6 = x_shared[x_local + i*2 + 6];
+                    float x7 = x_shared[x_local + i*2 + 7];
+
+                    float gsx0 = g_scale * x0, gsx1 = g_scale * x1;
+                    float gsx2 = g_scale * x2, gsx3 = g_scale * x3;
+                    float gsx4 = g_scale * x4, gsx5 = g_scale * x5;
+                    float gsx6 = g_scale * x6, gsx7 = g_scale * x7;
+
+                    acc_gate = fma(float(gb0 & 0xF), gsx0, fma(-8.0f, gsx0, acc_gate));
+                    acc_gate = fma(float(gb0 >> 4),  gsx1, fma(-8.0f, gsx1, acc_gate));
+                    acc_gate = fma(float(gb1 & 0xF), gsx2, fma(-8.0f, gsx2, acc_gate));
+                    acc_gate = fma(float(gb1 >> 4),  gsx3, fma(-8.0f, gsx3, acc_gate));
+                    acc_gate = fma(float(gb2 & 0xF), gsx4, fma(-8.0f, gsx4, acc_gate));
+                    acc_gate = fma(float(gb2 >> 4),  gsx5, fma(-8.0f, gsx5, acc_gate));
+                    acc_gate = fma(float(gb3 & 0xF), gsx6, fma(-8.0f, gsx6, acc_gate));
+                    acc_gate = fma(float(gb3 >> 4),  gsx7, fma(-8.0f, gsx7, acc_gate));
+
+                    float usx0 = u_scale * x0, usx1 = u_scale * x1;
+                    float usx2 = u_scale * x2, usx3 = u_scale * x3;
+                    float usx4 = u_scale * x4, usx5 = u_scale * x5;
+                    float usx6 = u_scale * x6, usx7 = u_scale * x7;
+
+                    acc_up = fma(float(ub0 & 0xF), usx0, fma(-8.0f, usx0, acc_up));
+                    acc_up = fma(float(ub0 >> 4),  usx1, fma(-8.0f, usx1, acc_up));
+                    acc_up = fma(float(ub1 & 0xF), usx2, fma(-8.0f, usx2, acc_up));
+                    acc_up = fma(float(ub1 >> 4),  usx3, fma(-8.0f, usx3, acc_up));
+                    acc_up = fma(float(ub2 & 0xF), usx4, fma(-8.0f, usx4, acc_up));
+                    acc_up = fma(float(ub2 >> 4),  usx5, fma(-8.0f, usx5, acc_up));
+                    acc_up = fma(float(ub3 & 0xF), usx6, fma(-8.0f, usx6, acc_up));
+                    acc_up = fma(float(ub3 >> 4),  usx7, fma(-8.0f, usx7, acc_up));
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     acc_gate = simd_sum(acc_gate);

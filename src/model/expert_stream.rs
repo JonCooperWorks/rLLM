@@ -21,16 +21,29 @@
 //      reused for the next layer.
 //
 // Performance architecture (flash-moe pattern):
-//   - **Parallel pread**: K experts are read concurrently using std::thread::scope.
-//     Each thread reads one expert's weights independently.  pread() is thread-safe
-//     (no shared file position) so multiple threads can read from the same file.
-//   - **Fused gate+up read**: For Qwen3.5's fused format, gate and up projections
-//     are contiguous on disk.  Instead of 2 pread() calls (gate, up), we do 1
-//     pread() for the combined gate_up block — halving NVMe command overhead.
-//   - **OS page cache**: No custom LRU.  Flash-moe tested custom caching and found
-//     it 38% slower than trusting the OS page cache (~71% hit rate naturally).
-//   - **No pipeline overlap**: Apple Silicon's unified memory controller means GPU
-//     compute and NVMe DMA can't truly overlap — serial I/O→compute is optimal.
+//   - **Parallel pread + upload**: K experts are loaded concurrently using
+//     std::thread::scope.  Each thread reads one expert's weights via pread()
+//     and immediately copies them into the GPU buffer — both phases (disk I/O
+//     and GPU upload) run in parallel across experts.  On unified memory
+//     backends (Metal), the GPU upload is a direct memcpy to buffer.contents()
+//     which is safe to do from multiple threads (no Metal API calls involved).
+//   - **Fused gate+up read**: For Qwen3.5's fused format, gate and up
+//     projections are contiguous on disk.  Instead of 2 pread() calls, we do
+//     1 pread() for the combined block — halving NVMe command overhead.
+//   - **OS page cache**: No custom LRU.  Flash-moe tested custom caching and
+//     found it 38% slower than trusting the OS page cache (~71% hit rate
+//     naturally).
+//   - **No pipeline overlap**: Apple Silicon's unified memory controller means
+//     GPU compute and NVMe DMA can't truly overlap — serial I/O→compute is
+//     optimal.
+//
+// Why parallel Phase 2?
+//   The original code serialized GPU uploads because "Metal command encoding
+//   isn't thread-safe."  But copy_to_tensor on Metal is just ptr::copy to
+//   buffer.contents() — a plain memory write with no Metal API calls.
+//   Writing to different Metal buffer contents pointers from different threads
+//   is safe (disjoint memory regions).  By merging Phase 2 into each pread
+//   thread, we parallelise both I/O and memcpy across K experts.
 //
 // Double-buffering (CUDA preparation):
 //   Two sets of K GPU buffer slots are allocated (active + inactive).
@@ -57,8 +70,19 @@
 
 use std::cell::{Cell, UnsafeCell};
 use std::fs::File;
+use std::sync::Arc;
 
 use crate::gpu::{GpuCore, TensorDtype};
+
+/// Wrapper to send raw pointers across thread boundaries.
+///
+/// Safety: the pointed-to memory must outlive the thread and each thread
+/// must write to disjoint regions.  Both are guaranteed by ExpertStreamer:
+/// GPU buffer slots are pre-allocated and each thread targets a different slot.
+#[derive(Clone, Copy)]
+struct SendPtr(*mut u8);
+unsafe impl Send for SendPtr {}
+unsafe impl Sync for SendPtr {}
 
 // ---------------------------------------------------------------------------
 // ExpertLocation — where one expert's weights live on disk.
@@ -105,13 +129,16 @@ impl ExpertLocation {
 //
 // Built during loading when --stream-experts is set.  Records where every
 // expert's weights live on disk without loading any expert data.
+//
+// shard_files is Arc-wrapped so it can be shared with scoped threads without
+// lifetime issues (File is Sync, so &File can be sent to other threads).
 // ---------------------------------------------------------------------------
 
 pub(crate) struct ExpertIndex {
     /// Per-layer expert locations: layers[layer_idx][expert_idx].
     pub layers: Vec<Vec<ExpertLocation>>,
     /// Open file handles for each shard (kept alive for pread).
-    pub shard_files: Vec<File>,
+    pub shard_files: Arc<Vec<File>>,
     /// Expert dimensions.
     pub hidden: usize,
     pub moe_inter: usize,
@@ -145,8 +172,9 @@ struct SlotReadBufs {
 // weights from disk and copies them into the buffer slots.
 //
 // Performance: parallel pread across K experts, fused gate+up reads for
-// models with contiguous gate/up layout (Qwen3.5).  For K=10 on 397B,
-// this saturates NVMe queue depth instead of issuing 30 serial reads.
+// models with contiguous gate/up layout (Qwen3.5).  On unified memory
+// backends (Metal), the GPU upload is merged into the same parallel pass
+// as the pread — each thread does pread→memcpy without a serial Phase 2.
 // ---------------------------------------------------------------------------
 
 pub(crate) struct ExpertStreamer<B: GpuCore> {
@@ -241,10 +269,15 @@ impl<B: GpuCore> ExpertStreamer<B> {
 
     /// Load selected experts from disk into GPU buffer slots.
     ///
-    /// Two-phase approach:
-    ///   Phase 1: Parallel pread — K threads read experts concurrently from SSD.
-    ///            For fused formats (Qwen3.5), gate+up are read in a single pread.
-    ///   Phase 2: Serial GPU upload — copy data into Metal buffers (not thread-safe).
+    /// Fully parallel approach: each of K threads handles one expert end-to-end:
+    ///   1. pread expert weights from SSD (fused gate+up where possible)
+    ///   2. copy data into GPU buffer (memcpy to unified memory, or via trait)
+    ///
+    /// On unified memory backends (Metal/CPU), both phases run in the same
+    /// thread — the GPU upload is just a memcpy to buffer.contents(), which
+    /// is safe from multiple threads writing to disjoint buffers.  On CUDA
+    /// (where tensor_mut_ptr returns None), Phase 2 falls back to serial
+    /// copy_to_tensor after all threads join.
     ///
     /// Safety: takes &self (not &mut) because inference is single-threaded and
     /// GPU tensor writes already use interior mutability.  During parallel pread,
@@ -259,23 +292,52 @@ impl<B: GpuCore> ExpertStreamer<B> {
         // from other model code.  Within this function, each thread gets exclusive
         // access to exactly one slot's buffers via iter_mut().
         let read_bufs = unsafe { &mut *self.read_bufs.get() };
+        let active = self.active.get();
 
-        // Phase 1: Parallel pread from disk into per-slot CPU buffers.
+        // Pre-fetch GPU buffer pointers before spawning threads.
+        // On Metal/CPU: Some([gate_ptr, up_ptr, down_ptr]) — direct memcpy target.
+        // On CUDA: None — must use copy_to_tensor after threads join.
+        let gpu_ptrs: Vec<Option<[SendPtr; 3]>> = selected
+            .iter()
+            .enumerate()
+            .map(|(slot_idx, _)| {
+                let slot = &self.slots[active][slot_idx];
+                match (
+                    backend.tensor_mut_ptr(&slot.gate_proj),
+                    backend.tensor_mut_ptr(&slot.up_proj),
+                    backend.tensor_mut_ptr(&slot.down_proj),
+                ) {
+                    (Some(g), Some(u), Some(d)) => {
+                        Some([SendPtr(g), SendPtr(u), SendPtr(d)])
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        let direct = gpu_ptrs.first().is_some_and(|p| p.is_some());
+
+        // Phase 1 + Phase 2 (fused per-thread): parallel pread + GPU upload.
         //
         // Each thread reads one expert (gate+up + down).  pread() is thread-safe
         // (no shared file position), and File is Sync so &File is Send.
-        // std::thread::scope ensures all threads join before we proceed to GPU upload.
+        // std::thread::scope ensures all threads join before we return.
         //
         // For pre-quantized models, reads are 3.2x smaller (Q4 vs bf16) — the
         // main performance win of pre-quantization.
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(selected.len());
 
-            for (slot_bufs, &(expert_idx, _)) in read_bufs.iter_mut().zip(selected.iter()) {
+            let iter = read_bufs
+                .iter_mut()
+                .zip(selected.iter())
+                .zip(gpu_ptrs.iter());
+
+            for ((slot_bufs, &(expert_idx, _)), &ptrs) in iter {
                 let loc = &self.index.layers[layer_idx][expert_idx];
                 let shard_files = &self.index.shard_files;
 
                 handles.push(s.spawn(move || {
+                    // Phase 1: pread from disk into CPU staging buffer.
                     // Gate + up: single pread if contiguous (fused format), else two.
                     if loc.gate_up_contiguous() {
                         let total = loc.gate_bytes + loc.up_bytes;
@@ -303,6 +365,30 @@ impl<B: GpuCore> ExpertStreamer<B> {
                         &mut slot_bufs.down[..loc.down_bytes],
                         loc.down_offset,
                     );
+
+                    // Phase 2 (direct): memcpy from staging buffer to GPU buffer.
+                    // On Metal/CPU, buffer.contents() is CPU-writable unified memory.
+                    // Each thread writes to its own expert's GPU buffers (disjoint),
+                    // so no synchronization needed between threads.
+                    if let Some([g, u, d]) = ptrs {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                slot_bufs.gate_up.as_ptr(),
+                                g.0,
+                                loc.gate_bytes,
+                            );
+                            std::ptr::copy_nonoverlapping(
+                                slot_bufs.gate_up.as_ptr().add(loc.gate_bytes),
+                                u.0,
+                                loc.up_bytes,
+                            );
+                            std::ptr::copy_nonoverlapping(
+                                slot_bufs.down.as_ptr(),
+                                d.0,
+                                loc.down_bytes,
+                            );
+                        }
+                    }
                 }));
             }
 
@@ -311,22 +397,21 @@ impl<B: GpuCore> ExpertStreamer<B> {
             }
         });
 
-        // Phase 2: GPU upload (serial — Metal command encoding isn't thread-safe).
-        //
-        // Two modes:
-        //   prequantized: data is already Q4 on disk → pread Q4 → copy_to_tensor (fastest)
-        //   bf16:         data is bf16 on disk → pread bf16 → copy_to_tensor
-        for (slot_idx, &(expert_idx, _)) in selected.iter().enumerate() {
-            let loc = &self.index.layers[layer_idx][expert_idx];
-            let slot = &self.slots[self.active.get()][slot_idx];
-            let bufs = &read_bufs[slot_idx];
+        // Fallback Phase 2 (serial): for backends without direct CPU→GPU writes.
+        // CUDA uses copy_to_tensor which enqueues a DMA transfer on the GPU stream.
+        if !direct {
+            for (slot_idx, &(expert_idx, _)) in selected.iter().enumerate() {
+                let loc = &self.index.layers[layer_idx][expert_idx];
+                let slot = &self.slots[self.active.get()][slot_idx];
+                let bufs = &read_bufs[slot_idx];
 
-            backend.copy_to_tensor(&slot.gate_proj, &bufs.gate_up[..loc.gate_bytes]);
-            backend.copy_to_tensor(
-                &slot.up_proj,
-                &bufs.gate_up[loc.gate_bytes..loc.gate_bytes + loc.up_bytes],
-            );
-            backend.copy_to_tensor(&slot.down_proj, &bufs.down[..loc.down_bytes]);
+                backend.copy_to_tensor(&slot.gate_proj, &bufs.gate_up[..loc.gate_bytes]);
+                backend.copy_to_tensor(
+                    &slot.up_proj,
+                    &bufs.gate_up[loc.gate_bytes..loc.gate_bytes + loc.up_bytes],
+                );
+                backend.copy_to_tensor(&slot.down_proj, &bufs.down[..loc.down_bytes]);
+            }
         }
     }
 
@@ -498,7 +583,7 @@ pub(crate) fn build_fused_expert_index(
 
     ExpertIndex {
         layers,
-        shard_files,
+        shard_files: Arc::new(shard_files),
         hidden,
         moe_inter,
         prequantized,
@@ -548,7 +633,7 @@ pub(crate) fn build_per_expert_index(
 
     ExpertIndex {
         layers,
-        shard_files,
+        shard_files: Arc::new(shard_files),
         hidden,
         moe_inter,
         prequantized,

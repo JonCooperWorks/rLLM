@@ -83,6 +83,10 @@ impl GpuCore for MetalBackend {
         }
     }
 
+    fn tensor_mut_ptr(&self, tensor: &MetalTensor) -> Option<*mut u8> {
+        Some(tensor.buffer.contents() as *mut u8)
+    }
+
     fn copy_to_tensor(&self, tensor: &MetalTensor, src: &[u8]) {
         let byte_count = tensor.byte_count();
         assert!(

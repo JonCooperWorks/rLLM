@@ -107,7 +107,8 @@ kernel void matvec_bf16(
 }
 
 // ===========================================================================
-// Matrix-vector multiply kernel (Q4) — SIMD-cooperative with inline dequant.
+// Matrix-vector multiply kernel (Q4) — SIMD-cooperative with inline dequant
+// and shared memory input caching (flash-moe pattern).
 //
 // LEARNING OVERVIEW
 //
@@ -115,6 +116,17 @@ kernel void matvec_bf16(
 // stored in block-wise 4-bit quantisation.  This halves memory bandwidth
 // compared to bf16 (20 bytes per 32 weights vs 64 bytes), giving ~2x speedup
 // for memory-bound matmuls.
+//
+// Shared memory x caching (from flash-moe):
+//   All 256 threads (8 SIMD groups = 8 output rows) cooperatively load the
+//   input vector x into threadgroup shared memory.  This means x is read from
+//   device memory ONCE per 8 rows instead of once per row — an 8x reduction
+//   in x memory traffic.  For expert matmuls [1024, 4096], this reduces total
+//   device bandwidth from ~10.5 MB to ~4.5 MB per matmul (2.3x).
+//
+//   The x vector is loaded in tiles of 4096 elements (16KB).  For K <= 4096,
+//   there's exactly one tile with zero overhead.  For larger K, the kernel
+//   processes multiple tiles, with one barrier per tile boundary.
 //
 // Block layout (20 bytes per block of 32 weights):
 //   bytes  0-3:  f32 scale factor
@@ -127,90 +139,113 @@ kernel void matvec_bf16(
 // Dispatch: same as bf16 — grid_size = M × 32, threadgroup_size = 256.
 // ===========================================================================
 
+// Shared memory tile size for input vector caching.  4096 floats = 16KB,
+// well within Apple Silicon's 32KB threadgroup memory limit.  Covers
+// K <= 4096 in a single tile (all expert matmuls for 397B).  Larger K
+// is handled by iterating over multiple tiles.
+#define X_TILE_Q4 4096
+
 kernel void matvec_q4(
     constant MatvecParams& params [[buffer(0)]],
-    // buffer(1): packed Q4 weight data [M * blocks_per_row * 20 bytes].
+    // buffer(1): packed Q4 weight data [M * blocks_per_row * 18 bytes].
     device const uchar* W_q4     [[buffer(1)]],
     // buffer(2): input vector x [K] in bfloat16.
     device const bfloat* x       [[buffer(2)]],
     // buffer(3): output vector y [M] in bfloat16.
     device bfloat* y             [[buffer(3)]],
-    uint gid                     [[thread_position_in_grid]]
+    uint gid                     [[thread_position_in_grid]],
+    uint lid                     [[thread_position_in_threadgroup]]
 ) {
     const uint M = params.M;
     const uint K = params.K;
 
     uint row = gid / 32;
     uint lane = gid % 32;
-    if (row >= M) return;
 
     const uint blocks_per_row = K / 32;
-    const uint bytes_per_block = 20;  // 4 (scale) + 16 (packed nibbles)
-
-    // Pointer to this row's Q4 data.
-    device const uchar* row_data = W_q4 + row * blocks_per_row * bytes_per_block;
+    const uint bytes_per_block = 18;  // 2 (bf16 scale) + 16 (packed nibbles)
 
     // -----------------------------------------------------------------------
-    // Each lane processes blocks in a strided pattern (lane, lane+32, ...).
-    // Within each block, dequantise all 32 weights and dot with x.
+    // Shared memory cache for input vector x.
     //
-    // For K=2048: blocks_per_row=64, each lane handles 2 blocks = 64 weights.
-    // For K=8192: blocks_per_row=256, each lane handles 8 blocks = 256 weights.
+    // All 256 threads cooperatively load x from device memory (bf16) into
+    // shared memory (f32).  The bf16→f32 conversion happens during the load,
+    // so the inner loop reads f32 from shared memory — no per-element
+    // conversion overhead in the hot path.
     //
-    // Learning note: Q4 is memory-bandwidth bound.  Reading 20 bytes per 32
-    // weights (vs 64 bytes for bf16) is 3.2x less data, but dequantisation
-    // adds compute.  Net effect: ~1.5-2x faster because we're memory-bound.
+    // 8 SIMD groups (= 8 output rows) share this cached x, reducing device
+    // memory x traffic 8x compared to each row reading x independently.
+    //
+    // For K > X_TILE_Q4, we tile: load a chunk of x, process blocks in that
+    // range, barrier, load the next chunk.  For expert matmuls (K=1024-4096),
+    // there's exactly one tile — zero tiling overhead.
     // -----------------------------------------------------------------------
+    threadgroup float x_shared[X_TILE_Q4];
+
     float acc = 0.0f;
 
-    for (uint block_idx = lane; block_idx < blocks_per_row; block_idx += 32) {
-        device const uchar* block_ptr = row_data + block_idx * bytes_per_block;
+    for (uint tile = 0; tile < K; tile += X_TILE_Q4) {
+        uint tile_len = min((uint)X_TILE_Q4, K - tile);
 
-        // Read scale (first 4 bytes, always 4-byte aligned since 20%4==0).
-        float scale = *((device const float*)block_ptr);
-        device const uchar* data = block_ptr + 4;
-
-        // Base index in x vector for this block's 32 weights.
-        uint x_base = block_idx * 32;
-
-        // Unpack 16 bytes → 32 nibbles → 32 dequantised weights.
-        // 4x unrolled: process 4 bytes (8 weights) per iteration.
-        //
-        // FMA optimisation (from flash-moe): precompute scale*x per element,
-        // then use fma(nibble, sx, -8*sx) instead of (nibble-8)*scale*x.
-        // This lets the GPU issue a single fused multiply-add per nibble
-        // instead of a subtract + two multiplies.  The -8*sx bias term is
-        // hoisted out of the nibble extraction path.
-        for (uint i = 0; i < 16; i += 4) {
-            uchar b0 = data[i];
-            uchar b1 = data[i + 1];
-            uchar b2 = data[i + 2];
-            uchar b3 = data[i + 3];
-
-            // Precompute scale*x and bias (-8*scale*x) for each element.
-            float sx0 = scale * float(x[x_base + i * 2]);
-            float sx1 = scale * float(x[x_base + i * 2 + 1]);
-            float sx2 = scale * float(x[x_base + i * 2 + 2]);
-            float sx3 = scale * float(x[x_base + i * 2 + 3]);
-            float sx4 = scale * float(x[x_base + i * 2 + 4]);
-            float sx5 = scale * float(x[x_base + i * 2 + 5]);
-            float sx6 = scale * float(x[x_base + i * 2 + 6]);
-            float sx7 = scale * float(x[x_base + i * 2 + 7]);
-
-            // fma(nibble, scale*x, -8*scale*x) = (nibble - 8) * scale * x
-            acc = fma(float(b0 & 0xF), sx0, fma(-8.0f, sx0, acc));
-            acc = fma(float(b0 >> 4),  sx1, fma(-8.0f, sx1, acc));
-            acc = fma(float(b1 & 0xF), sx2, fma(-8.0f, sx2, acc));
-            acc = fma(float(b1 >> 4),  sx3, fma(-8.0f, sx3, acc));
-            acc = fma(float(b2 & 0xF), sx4, fma(-8.0f, sx4, acc));
-            acc = fma(float(b2 >> 4),  sx5, fma(-8.0f, sx5, acc));
-            acc = fma(float(b3 & 0xF), sx6, fma(-8.0f, sx6, acc));
-            acc = fma(float(b3 >> 4),  sx7, fma(-8.0f, sx7, acc));
+        // Cooperative load: 256 threads load tile_len bf16→f32 values.
+        // ALL threads participate (even out-of-bounds rows) to ensure the
+        // barrier is reached by every thread in the threadgroup.
+        for (uint i = lid; i < tile_len; i += 256) {
+            x_shared[i] = float(x[tile + i]);
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Process Q4 blocks whose x indices fall within this tile.
+        // Each block covers 32 consecutive x elements.  Blocks are assigned
+        // to lanes in a strided pattern for coalesced weight reads.
+        if (row < M) {
+            device const uchar* row_data = W_q4 + row * blocks_per_row * bytes_per_block;
+            uint block_start = tile / 32;
+            uint block_end   = (tile + tile_len) / 32;
+
+            for (uint block_idx = block_start + lane; block_idx < block_end; block_idx += 32) {
+                device const uchar* block_ptr = row_data + block_idx * bytes_per_block;
+
+                float scale = float(*((device const half*)block_ptr));
+                device const uchar* data = block_ptr + 2;
+
+                // x index relative to tile start.
+                uint x_local = (block_idx * 32) - tile;
+
+                // FMA-optimised dequant (from flash-moe): precompute scale*x,
+                // then fma(nibble, sx, -8*sx) = (nibble - 8) * scale * x.
+                for (uint i = 0; i < 16; i += 4) {
+                    uchar b0 = data[i];
+                    uchar b1 = data[i + 1];
+                    uchar b2 = data[i + 2];
+                    uchar b3 = data[i + 3];
+
+                    float sx0 = scale * x_shared[x_local + i * 2];
+                    float sx1 = scale * x_shared[x_local + i * 2 + 1];
+                    float sx2 = scale * x_shared[x_local + i * 2 + 2];
+                    float sx3 = scale * x_shared[x_local + i * 2 + 3];
+                    float sx4 = scale * x_shared[x_local + i * 2 + 4];
+                    float sx5 = scale * x_shared[x_local + i * 2 + 5];
+                    float sx6 = scale * x_shared[x_local + i * 2 + 6];
+                    float sx7 = scale * x_shared[x_local + i * 2 + 7];
+
+                    acc = fma(float(b0 & 0xF), sx0, fma(-8.0f, sx0, acc));
+                    acc = fma(float(b0 >> 4),  sx1, fma(-8.0f, sx1, acc));
+                    acc = fma(float(b1 & 0xF), sx2, fma(-8.0f, sx2, acc));
+                    acc = fma(float(b1 >> 4),  sx3, fma(-8.0f, sx3, acc));
+                    acc = fma(float(b2 & 0xF), sx4, fma(-8.0f, sx4, acc));
+                    acc = fma(float(b2 >> 4),  sx5, fma(-8.0f, sx5, acc));
+                    acc = fma(float(b3 & 0xF), sx6, fma(-8.0f, sx6, acc));
+                    acc = fma(float(b3 >> 4),  sx7, fma(-8.0f, sx7, acc));
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     acc = simd_sum(acc);
-    if (lane == 0) {
+    if (lane == 0 && row < M) {
         y[row] = bfloat(acc);
     }
 }
@@ -322,7 +357,7 @@ kernel void gemm_bf16(
 
 kernel void gemm_q4(
     constant GemmParams& params  [[buffer(0)]],
-    device const uchar* W_q4     [[buffer(1)]],  // [M * blocks_per_row * 20 bytes]
+    device const uchar* W_q4     [[buffer(1)]],  // [M * blocks_per_row * 18 bytes]
     device const bfloat* X       [[buffer(2)]],  // [batch_size, K]
     device bfloat* Y             [[buffer(3)]],  // [batch_size, M]
     uint gid                     [[thread_position_in_grid]]

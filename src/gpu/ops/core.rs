@@ -127,6 +127,22 @@ pub(crate) trait GpuCore: Send + Sync {
         // Default: transfers are synchronous, nothing to wait for.
     }
 
+    /// Get a mutable byte pointer to tensor data for direct CPU writes.
+    ///
+    /// Returns `Some` for backends with CPU-accessible unified memory (Metal,
+    /// CPU) where the GPU buffer can be written directly by the host.
+    /// Returns `None` for backends requiring explicit DMA transfers (CUDA
+    /// with device-private memory).
+    ///
+    /// Used by expert streaming to pread() directly into GPU buffer contents,
+    /// eliminating the intermediate CPU buffer + memcpy overhead.
+    ///
+    /// Safety: the returned pointer is valid for `tensor_byte_count()` bytes.
+    /// Caller must ensure no GPU work is reading the tensor concurrently.
+    fn tensor_mut_ptr(&self, _tensor: &Self::Tensor) -> Option<*mut u8> {
+        None
+    }
+
     /// Estimate the byte count of a 2D weight [m, k] after quantisation.
     ///
     /// Used by config.rs to predict GPU memory usage before loading weights.

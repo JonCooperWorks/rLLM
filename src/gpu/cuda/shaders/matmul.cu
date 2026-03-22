@@ -114,7 +114,7 @@ extern "C" __global__ void matvec_q4(
     if (row >= M) return;
 
     const unsigned int blocks_per_row = K / 32;
-    const unsigned int bytes_per_block = 20;
+    const unsigned int bytes_per_block = 18;
     const unsigned char* row_data = W_q4 + row * blocks_per_row * bytes_per_block;
 
     float acc = 0.0f;
@@ -123,8 +123,8 @@ extern "C" __global__ void matvec_q4(
         // Per-lane pattern: each lane processes its own blocks.
         for (unsigned int block_idx = lane; block_idx < blocks_per_row; block_idx += 32) {
             const unsigned char* block_ptr = row_data + block_idx * bytes_per_block;
-            float scale = *((const float*)block_ptr);
-            const unsigned char* data = block_ptr + 4;
+            float scale = __bfloat162float(*((const __nv_bfloat16*)block_ptr));
+            const unsigned char* data = block_ptr + 2;
             unsigned int x_base = block_idx * 32;
 
             for (unsigned int i = 0; i < 16; i += 4) {
@@ -152,30 +152,30 @@ extern "C" __global__ void matvec_q4(
         for (; base + 3 < blocks_per_row; base += 4) {
             float my_scale = 0.0f;
             if (lane < 4) {
-                my_scale = *((const float*)(row_data + (base + lane) * bytes_per_block));
+                my_scale = __bfloat162float(*((const __nv_bfloat16*)(row_data + (base + lane) * bytes_per_block)));
             }
 
             {
                 float scale = __shfl_sync(0xffffffff, my_scale, 0);
-                unsigned char packed = row_data[(base + 0) * bytes_per_block + 4 + byte_in_block];
+                unsigned char packed = row_data[(base + 0) * bytes_per_block + 2 + byte_in_block];
                 int nib = nibble_hi ? (packed >> 4) : (packed & 0xF);
                 acc += (float)(nib - 8) * scale * __bfloat162float(x[(base + 0) * 32 + lane]);
             }
             {
                 float scale = __shfl_sync(0xffffffff, my_scale, 1);
-                unsigned char packed = row_data[(base + 1) * bytes_per_block + 4 + byte_in_block];
+                unsigned char packed = row_data[(base + 1) * bytes_per_block + 2 + byte_in_block];
                 int nib = nibble_hi ? (packed >> 4) : (packed & 0xF);
                 acc += (float)(nib - 8) * scale * __bfloat162float(x[(base + 1) * 32 + lane]);
             }
             {
                 float scale = __shfl_sync(0xffffffff, my_scale, 2);
-                unsigned char packed = row_data[(base + 2) * bytes_per_block + 4 + byte_in_block];
+                unsigned char packed = row_data[(base + 2) * bytes_per_block + 2 + byte_in_block];
                 int nib = nibble_hi ? (packed >> 4) : (packed & 0xF);
                 acc += (float)(nib - 8) * scale * __bfloat162float(x[(base + 2) * 32 + lane]);
             }
             {
                 float scale = __shfl_sync(0xffffffff, my_scale, 3);
-                unsigned char packed = row_data[(base + 3) * bytes_per_block + 4 + byte_in_block];
+                unsigned char packed = row_data[(base + 3) * bytes_per_block + 2 + byte_in_block];
                 int nib = nibble_hi ? (packed >> 4) : (packed & 0xF);
                 acc += (float)(nib - 8) * scale * __bfloat162float(x[(base + 3) * 32 + lane]);
             }
@@ -184,10 +184,10 @@ extern "C" __global__ void matvec_q4(
         for (; base < blocks_per_row; base++) {
             float scale_val = 0.0f;
             if (lane == 0) {
-                scale_val = *((const float*)(row_data + base * bytes_per_block));
+                scale_val = __bfloat162float(*((const __nv_bfloat16*)(row_data + base * bytes_per_block)));
             }
             float scale = __shfl_sync(0xffffffff, scale_val, 0);
-            unsigned char packed = row_data[base * bytes_per_block + 4 + byte_in_block];
+            unsigned char packed = row_data[base * bytes_per_block + 2 + byte_in_block];
             int nib = nibble_hi ? (packed >> 4) : (packed & 0xF);
             acc += (float)(nib - 8) * scale * __bfloat162float(x[base * 32 + lane]);
         }
@@ -269,7 +269,7 @@ extern "C" __global__ void gemm_q4(
     if (batch >= params.batch_size) return;
 
     const unsigned int blocks_per_row = K / 32;
-    const unsigned int bytes_per_block = 20;
+    const unsigned int bytes_per_block = 18;
     const unsigned char* row_data = W_q4 + row * blocks_per_row * bytes_per_block;
     const __nv_bfloat16* x_vec = X + batch * K;
 
@@ -278,8 +278,8 @@ extern "C" __global__ void gemm_q4(
     if (blocks_per_row <= 64) {
         for (unsigned int block_idx = lane; block_idx < blocks_per_row; block_idx += 32) {
             const unsigned char* block_ptr = row_data + block_idx * bytes_per_block;
-            float scale = *((const float*)block_ptr);
-            const unsigned char* data = block_ptr + 4;
+            float scale = __bfloat162float(*((const __nv_bfloat16*)block_ptr));
+            const unsigned char* data = block_ptr + 2;
             unsigned int x_base = block_idx * 32;
 
             for (unsigned int i = 0; i < 16; i += 4) {
@@ -306,30 +306,30 @@ extern "C" __global__ void gemm_q4(
         for (; base + 3 < blocks_per_row; base += 4) {
             float my_scale = 0.0f;
             if (lane < 4) {
-                my_scale = *((const float*)(row_data + (base + lane) * bytes_per_block));
+                my_scale = __bfloat162float(*((const __nv_bfloat16*)(row_data + (base + lane) * bytes_per_block)));
             }
 
             {
                 float scale = __shfl_sync(0xffffffff, my_scale, 0);
-                unsigned char packed = row_data[(base + 0) * bytes_per_block + 4 + byte_in_block];
+                unsigned char packed = row_data[(base + 0) * bytes_per_block + 2 + byte_in_block];
                 int nib = nibble_hi ? (packed >> 4) : (packed & 0xF);
                 acc += (float)(nib - 8) * scale * __bfloat162float(x_vec[(base + 0) * 32 + lane]);
             }
             {
                 float scale = __shfl_sync(0xffffffff, my_scale, 1);
-                unsigned char packed = row_data[(base + 1) * bytes_per_block + 4 + byte_in_block];
+                unsigned char packed = row_data[(base + 1) * bytes_per_block + 2 + byte_in_block];
                 int nib = nibble_hi ? (packed >> 4) : (packed & 0xF);
                 acc += (float)(nib - 8) * scale * __bfloat162float(x_vec[(base + 1) * 32 + lane]);
             }
             {
                 float scale = __shfl_sync(0xffffffff, my_scale, 2);
-                unsigned char packed = row_data[(base + 2) * bytes_per_block + 4 + byte_in_block];
+                unsigned char packed = row_data[(base + 2) * bytes_per_block + 2 + byte_in_block];
                 int nib = nibble_hi ? (packed >> 4) : (packed & 0xF);
                 acc += (float)(nib - 8) * scale * __bfloat162float(x_vec[(base + 2) * 32 + lane]);
             }
             {
                 float scale = __shfl_sync(0xffffffff, my_scale, 3);
-                unsigned char packed = row_data[(base + 3) * bytes_per_block + 4 + byte_in_block];
+                unsigned char packed = row_data[(base + 3) * bytes_per_block + 2 + byte_in_block];
                 int nib = nibble_hi ? (packed >> 4) : (packed & 0xF);
                 acc += (float)(nib - 8) * scale * __bfloat162float(x_vec[(base + 3) * 32 + lane]);
             }
@@ -338,10 +338,10 @@ extern "C" __global__ void gemm_q4(
         for (; base < blocks_per_row; base++) {
             float scale_val = 0.0f;
             if (lane == 0) {
-                scale_val = *((const float*)(row_data + base * bytes_per_block));
+                scale_val = __bfloat162float(*((const __nv_bfloat16*)(row_data + base * bytes_per_block)));
             }
             float scale = __shfl_sync(0xffffffff, scale_val, 0);
-            unsigned char packed = row_data[base * bytes_per_block + 4 + byte_in_block];
+            unsigned char packed = row_data[base * bytes_per_block + 2 + byte_in_block];
             int nib = nibble_hi ? (packed >> 4) : (packed & 0xF);
             acc += (float)(nib - 8) * scale * __bfloat162float(x_vec[base * 32 + lane]);
         }

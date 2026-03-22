@@ -116,7 +116,7 @@ pub(crate) enum TensorDtype {
     BF16,
     F32,
     /// Block-wise 4-bit quantization: 32 weights per block, each block is
-    /// 20 bytes (4-byte f32 scale + 16 bytes of packed nibbles).
+    /// 18 bytes (2-byte bf16 scale + 16 bytes of packed nibbles).
     Q4,
 }
 
@@ -134,7 +134,7 @@ impl TensorDtype {
 /// Compute total byte count for a Q4 weight tensor [m, k].
 pub(crate) fn q4_byte_count(m: usize, k: usize) -> usize {
     let blocks_per_row = k / 32;
-    m * blocks_per_row * 20
+    m * blocks_per_row * 18
 }
 
 // ---------------------------------------------------------------------------
@@ -152,9 +152,9 @@ pub(crate) fn q4_byte_count(m: usize, k: usize) -> usize {
 ///     q_i = clamp(round(w_i / scale), -8, 7)  (4-bit signed, range [-8, 7])
 ///     stored as unsigned: u_i = q_i + 8  (range [0, 15], fits in 4 bits)
 ///
-///   Output per block (20 bytes):
-///     [0..4]:   f32 scale (little-endian)
-///     [4..20]:  16 bytes, 2 packed nibbles each
+///   Output per block (18 bytes):
+///     [0..2]:   bf16 scale (little-endian)
+///     [2..18]:  16 bytes, 2 packed nibbles each
 ///               byte[i] = u[2i] | (u[2i+1] << 4)
 pub(crate) fn quantize_bf16_to_q4(bf16_data: &[u8], m: usize, k: usize) -> Vec<u8> {
     use half::bf16;
@@ -182,7 +182,7 @@ pub(crate) fn quantize_bf16_to_q4(bf16_data: &[u8], m: usize, k: usize) -> Vec<u
     for row in 0..m {
         for block in 0..blocks_per_row {
             let src_offset = row * k + block * 32;
-            let dst_offset = (row * blocks_per_row + block) * 20;
+            let dst_offset = (row * blocks_per_row + block) * 18;
 
             // Find max absolute value in the block for scale computation.
             let mut max_abs: f32 = 0.0;
@@ -195,8 +195,10 @@ pub(crate) fn quantize_bf16_to_q4(bf16_data: &[u8], m: usize, k: usize) -> Vec<u
             let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 7.0 };
             let inv_scale = 1.0 / scale;
 
-            // Write scale.
-            out[dst_offset..dst_offset + 4].copy_from_slice(&scale.to_le_bytes());
+            // Write scale as bf16 (2 bytes instead of 4).
+            // bf16 truncation: just take upper 16 bits of f32.
+            let scale_bf16 = (scale.to_bits() >> 16) as u16;
+            out[dst_offset..dst_offset + 2].copy_from_slice(&scale_bf16.to_le_bytes());
 
             // Quantise and pack pairs of weights into bytes.
             for i in 0..16 {
@@ -206,7 +208,7 @@ pub(crate) fn quantize_bf16_to_q4(bf16_data: &[u8], m: usize, k: usize) -> Vec<u
                 let q0 = ((v0 * inv_scale).round() as i32).clamp(-8, 7) + 8;
                 let q1 = ((v1 * inv_scale).round() as i32).clamp(-8, 7) + 8;
 
-                out[dst_offset + 4 + i] = (q0 as u8) | ((q1 as u8) << 4);
+                out[dst_offset + 2 + i] = (q0 as u8) | ((q1 as u8) << 4);
             }
         }
     }
@@ -292,25 +294,25 @@ mod tests {
 
     #[test]
     fn test_q4_byte_count_single_block() {
-        // 1 row, 32 elements = 1 block = 20 bytes
-        assert_eq!(q4_byte_count(1, 32), 20);
+        // 1 row, 32 elements = 1 block = 18 bytes
+        assert_eq!(q4_byte_count(1, 32), 18);
     }
 
     #[test]
     fn test_q4_byte_count_multiple_blocks() {
-        // 1 row, 64 elements = 2 blocks = 40 bytes
-        assert_eq!(q4_byte_count(1, 64), 40);
+        // 1 row, 64 elements = 2 blocks = 36 bytes
+        assert_eq!(q4_byte_count(1, 64), 36);
     }
 
     #[test]
     fn test_q4_byte_count_multiple_rows() {
-        // 4 rows, 64 elements each = 4 * 2 blocks * 20 = 160
-        assert_eq!(q4_byte_count(4, 64), 160);
+        // 4 rows, 64 elements each = 4 * 2 blocks * 18 = 144
+        assert_eq!(q4_byte_count(4, 64), 144);
     }
 
     #[test]
     fn test_q4_byte_count_large() {
-        // 2048 rows, 2048 cols = 2048 * 64 * 20 = 2621440
-        assert_eq!(q4_byte_count(2048, 2048), 2048 * (2048 / 32) * 20);
+        // 2048 rows, 2048 cols = 2048 * 64 * 18 = 2359296
+        assert_eq!(q4_byte_count(2048, 2048), 2048 * (2048 / 32) * 18);
     }
 }

@@ -75,6 +75,12 @@ fn write_f32(tensor: &CpuTensor, values: &[f32]) {
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
 }
 
+/// Read a Q4 block's bf16 scale factor and convert to f32.
+fn read_q4_scale(data: &[u8], block_offset: usize) -> f32 {
+    let bf16_bits = u16::from_le_bytes([data[block_offset], data[block_offset + 1]]);
+    f32::from_bits((bf16_bits as u32) << 16)
+}
+
 /// Write raw bytes at an offset into a tensor.
 fn write_bytes_at(tensor: &CpuTensor, offset: usize, src: &[u8]) {
     let dst = unsafe { (tensor.data.as_ptr() as *mut u8).add(offset) };
@@ -101,7 +107,7 @@ impl GpuCore for CpuBackend {
         let byte_count = match dtype {
             TensorDtype::Q4 => {
                 let total_elements: usize = shape.iter().product();
-                (total_elements / 32) * 20
+                (total_elements / 32) * 18
             }
             other => {
                 let total_elements: usize = shape.iter().product();
@@ -125,6 +131,10 @@ impl GpuCore for CpuBackend {
 
     fn copy_to_host(&self, tensor: &CpuTensor, dst: &mut [u8]) {
         dst[..tensor.data.len()].copy_from_slice(&tensor.data);
+    }
+
+    fn tensor_mut_ptr(&self, tensor: &CpuTensor) -> Option<*mut u8> {
+        Some(tensor.data.as_ptr() as *mut u8)
     }
 
     fn copy_to_tensor(&self, tensor: &CpuTensor, src: &[u8]) {
@@ -456,14 +466,12 @@ impl GpuMatmul for CpuBackend {
                 let mut result = vec![0.0f32; mm];
 
                 for row in 0..mm {
-                    let row_offset = row * blocks_per_row * 20;
+                    let row_offset = row * blocks_per_row * 18;
                     let mut acc = 0.0f32;
                     for block in 0..blocks_per_row {
-                        let block_offset = row_offset + block * 20;
-                        let scale: f32 = bytemuck::cast_slice::<u8, f32>(
-                            &weight.data[block_offset..block_offset + 4],
-                        )[0];
-                        let nibbles = &weight.data[block_offset + 4..block_offset + 20];
+                        let block_offset = row_offset + block * 18;
+                        let scale: f32 = read_q4_scale(&weight.data, block_offset);
+                        let nibbles = &weight.data[block_offset + 2..block_offset + 18];
                         for i in 0..16 {
                             let byte = nibbles[i];
                             let lo = (byte & 0x0F) as i8 - 8;
@@ -522,10 +530,10 @@ impl GpuMatmul for CpuBackend {
 
                     let mut row_result = vec![0.0f32; mm];
                     for row in 0..mm {
-                        let row_offset = row * blocks_per_row * 20;
+                        let row_offset = row * blocks_per_row * 18;
                         let mut acc = 0.0f32;
                         for block in 0..blocks_per_row {
-                            let block_offset = row_offset + block * 20;
+                            let block_offset = row_offset + block * 18;
                             let scale: f32 = bytemuck::cast_slice::<u8, f32>(
                                 &weight.data[block_offset..block_offset + 4],
                             )[0];
@@ -1256,21 +1264,19 @@ impl GpuMoe for CpuBackend {
             TensorDtype::Q4 => {
                 let blocks_per_row = kk / 32;
                 for row in 0..mm {
-                    let row_offset = row * blocks_per_row * 20;
+                    let row_offset = row * blocks_per_row * 18;
                     let mut acc_gate = 0.0f32;
                     let mut acc_up = 0.0f32;
 
                     for block in 0..blocks_per_row {
-                        let g_off = row_offset + block * 20;
-                        let g_scale: f32 =
-                            bytemuck::cast_slice::<u8, f32>(&w_gate.data[g_off..g_off + 4])[0];
-                        let u_off = row_offset + block * 20;
-                        let u_scale: f32 =
-                            bytemuck::cast_slice::<u8, f32>(&w_up.data[u_off..u_off + 4])[0];
+                        let g_off = row_offset + block * 18;
+                        let g_scale: f32 = read_q4_scale(&w_gate.data, g_off);
+                        let u_off = row_offset + block * 18;
+                        let u_scale: f32 = read_q4_scale(&w_up.data, u_off);
 
                         for i in 0..16 {
-                            let gb = w_gate.data[g_off + 4 + i];
-                            let ub = w_up.data[u_off + 4 + i];
+                            let gb = w_gate.data[g_off + 2 + i];
+                            let ub = w_up.data[u_off + 2 + i];
                             let x_idx = block * 32 + i * 2;
 
                             let glo = (gb & 0xF) as i32 - 8;
@@ -1702,15 +1708,15 @@ mod tests {
     #[test]
     fn test_matmul_q4() {
         let b = CpuBackend;
-        // Create a Q4 weight with 1 row of 32 elements (1 block = 20 bytes)
+        // Create a Q4 weight with 1 row of 32 elements (1 block = 18 bytes)
         // Scale = 1.0, all quantized values = 1 (stored as 1+8 = 9)
-        let mut block = vec![0u8; 20];
-        // Write scale as f32
-        let scale_bytes = 1.0f32.to_le_bytes();
-        block[0..4].copy_from_slice(&scale_bytes);
+        let mut block = vec![0u8; 18];
+        // Write scale as bf16
+        let scale_bf16 = (1.0f32.to_bits() >> 16) as u16;
+        block[0..2].copy_from_slice(&scale_bf16.to_le_bytes());
         // Pack nibbles: each byte has (lo, hi), value 9 means dequant = 9-8 = 1
         // 0x99 = lo=9, hi=9
-        for i in 4..20 {
+        for i in 2..18 {
             block[i] = 0x99;
         }
         let weight = b.upload_tensor(&block, &[32], TensorDtype::Q4);
