@@ -53,7 +53,7 @@ Measured via `rllm run --chat`, single run.
 | GPT-OSS 20B | 20.0B (3.6B active) | 6 tok/s | 34 tok/s | 4,800 ms | 425 ms |
 | Mixtral 8x7B Instruct | 46.7B (12.9B active) | — | 12 tok/s | — | 5,400 ms |
 | Qwen3.5 9B | ~9B | 19 tok/s | — | 1,400 ms | — |
-| Qwen3.5 35B-A3B ⚡ | 35.1B (3.3B active) | **3.0 tok/s** | 0.5 tok/s | 2,600 ms | 10,600 ms |
+| Qwen3.5 35B-A3B ⚡ | 35.1B (3.3B active) | **3.0 tok/s** | - | 2,600 ms | 10,600 ms |
 | Qwen3.5 27B ⚡ | ~27B | **1.7 tok/s** | **15 tok/s** | 52,800 ms | 2,000 ms |
 | Qwen3.5 397B-A17B ⚡ | 397B (17B active) | **0.3 tok/s** | **1.8 tok/s** | 48,200 ms | 16,000 ms |
 
