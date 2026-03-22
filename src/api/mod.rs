@@ -209,8 +209,12 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     eprintln!();
     eprintln!("  rllm — loading {}", model_name);
     eprintln!("  ----------------------------------------");
+    // Detect pre-quantized models by checking safetensors metadata.
+    let is_prequantized = crate::model::loader::is_prequantized_model(&args.model);
     if args.quantize {
-        eprintln!("  mode      : Q4 quantized");
+        eprintln!("  mode      : Q4 (on-load quantize)");
+    } else if is_prequantized {
+        eprintln!("  mode      : Q4 (pre-quantized)");
     } else {
         eprintln!("  mode      : bf16");
     }

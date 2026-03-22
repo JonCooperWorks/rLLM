@@ -128,6 +128,37 @@ impl<'a> TensorStore<'a> {
     }
 }
 
+/// Quick check if a model directory contains pre-quantized (rllm-q4) safetensors.
+/// Only reads the first shard's metadata header — no full mmap needed.
+pub(crate) fn is_prequantized_model(model_dir: &Path) -> bool {
+    let first_shard = if model_dir.join("model.safetensors").exists() {
+        model_dir.join("model.safetensors")
+    } else {
+        model_dir.join("model-00001-of-00001.safetensors") // try first shard
+    };
+    // Find the actual first shard from index if simple names don't exist.
+    let path = if first_shard.exists() {
+        first_shard
+    } else if let Ok(idx_str) = std::fs::read_to_string(model_dir.join("model.safetensors.index.json")) {
+        if let Ok(idx) = serde_json::from_str::<serde_json::Value>(&idx_str) {
+            if let Some(wm) = idx["weight_map"].as_object() {
+                if let Some(first_file) = wm.values().next().and_then(|v| v.as_str()) {
+                    model_dir.join(first_file)
+                } else { return false; }
+            } else { return false; }
+        } else { return false; }
+    } else { return false; };
+
+    let Ok(file) = std::fs::File::open(&path) else { return false };
+    let Ok(mmap) = (unsafe { Mmap::map(&file) }) else { return false };
+    if let Ok((_, metadata)) = SafeTensors::read_metadata(mmap.as_ref()) {
+        if let Some(meta) = metadata.metadata() {
+            return meta.get("quantization").map(|v| v.as_str()) == Some("rllm-q4");
+        }
+    }
+    false
+}
+
 /// Load safetensors files from a model directory.
 ///
 /// Returns the mmaps (kept alive for the SafeTensors references) and a weight
