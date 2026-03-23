@@ -1,6 +1,17 @@
 # rLLM
 
-A learning project for understanding GPU programming and LLM inference from the ground up. Built from scratch in Rust with no frameworks or GGML — just raw GPU compute. The codebase is heavily annotated as an educational exercise, explaining *why* things work the way they do, not just *what* they do.
+Rust LLM inference engine that runs 397B-parameter MoE models on a single 48 GB GPU via NVMe expert streaming. 12 model architectures, two GPU backends (Metal + CUDA), continuous batching, paged KV cache, and an OpenAI/Anthropic-compatible API server — built from scratch in Rust with no frameworks or GGML.
+
+### Highlights
+
+- **Expert streaming on Metal and CUDA** — stream hundreds of GB of expert weights from NVMe on demand, with GPU-side LRU caching and async DMA
+- **12 architectures** — Llama 3.x, Qwen 2.5/3/3.5, Mistral, Mixtral, Gemma 3, Phi-4, DeepSeek-R1-Distill, GPT-OSS
+- **bf16 and Q4 quantization** — 18-byte block format with bf16 scales; Q4 expert streaming cuts NVMe I/O 3.5×
+- **Multi-GPU tensor parallelism** via NCCL for distributed inference
+- **Continuous batching with paged KV cache** — dynamic block allocation across concurrent sequences
+- **Hand-written Metal and CUDA shaders** — SIMD-cooperative matmul, WMMA tensor-core GEMM, fused attention, DeltaNet linear attention
+
+Every file includes architectural rationale explaining *why* things work the way they do, not just *what* they do — designed to be read and understood, not just executed.
 
 ## Backends
 
