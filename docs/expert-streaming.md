@@ -358,15 +358,25 @@ to the streamed or resident path accordingly:
 | **Total GPU** | **~7-10 GB** | **~3-6 GB** |
 | Without streaming | 67 GB (doesn't fit) | ~22 GB |
 
-### Qwen3.5-397B (512 experts, K=10)
+### Qwen3.5-122B-A10B (256 experts, K=10)
 
-| Component | bf16 |
-|-----------|------|
-| Non-expert weights | ~20 GB |
-| 64-slot LRU cache | ~1.5 GB |
-| KV cache | ~2 GB |
-| **Total GPU** | **~22 GB** |
-| Without streaming | 720+ GB (impossible) |
+| Component | bf16 | Q4 |
+|-----------|------|-----|
+| Non-expert weights | ~15 GB | ~5 GB |
+| 64-slot LRU cache | ~1.5 GB | ~432 MB |
+| KV cache | ~1 GB | ~1 GB |
+| **Total GPU** | **~17 GB** | **~6-7 GB** |
+| Without streaming | ~230 GB (doesn't fit) | ~67 GB |
+
+### Qwen3.5-397B-A17B (512 experts, K=10)
+
+| Component | bf16 |Q4 |
+|-----------|------|-----|
+| Non-expert weights | ~20 GB | ~7 GB |
+| 64-slot LRU cache | ~1.5 GB | ~432 MB |
+| KV cache | ~2 GB | ~2 GB |
+| **Total GPU** | **~22 GB** | **~9 GB** |
+| Without streaming | 720+ GB (impossible) | ~214 GB |
 
 ---
 
