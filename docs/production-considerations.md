@@ -13,23 +13,20 @@ rLLM is a single-model inference server.  In production you'd run many
 instances, each serving one model on one or more GPUs.  A gateway sits in
 front and handles everything that isn't inference:
 
-```
-                    ┌─────────────┐
-    client ────────►│   Gateway   │
-                    │             │
-                    │  • auth     │
-                    │  • billing  │
-                    │  • routing  │
-                    │  • rate lim │
-                    └──┬──┬──┬───┘
-                       │  │  │
-            ┌──────────┘  │  └──────────┐
-            ▼             ▼             ▼
-     ┌────────────┐ ┌────────────┐ ┌────────────┐
-     │ rLLM       │ │ rLLM       │ │ rLLM       │
-     │ Llama 70B  │ │ Qwen 32B   │ │ Gemma 27B  │
-     │ 4×H100     │ │ 1×A100     │ │ 1×L40      │
-     └────────────┘ └────────────┘ └────────────┘
+```mermaid
+graph TD
+    Client([Client]) --> Gateway
+
+    subgraph Gateway[Gateway]
+        Auth[Auth]
+        Billing[Billing]
+        Routing[Routing]
+        RateLimit[Rate Limiting]
+    end
+
+    Gateway --> A["rLLM<br/>Llama 70B<br/>4×H100"]
+    Gateway --> B["rLLM<br/>Qwen 32B<br/>1×A100"]
+    Gateway --> C["rLLM<br/>Gemma 27B<br/>1×L40"]
 ```
 
 **Auth.**  Validate API keys, check model access, reject bad requests before
@@ -56,6 +53,14 @@ matrix once per token.  Decoding one sequence at a time wastes compute.
 read, N tokens of output.  A 70B on 4×H100s decodes at ~40ms for one user;
 with batching, the same latency serves 32–128 concurrent sequences.
 
+```mermaid
+xychart-beta
+    title "Throughput vs Batch Size (70B model, 4×H100)"
+    x-axis "Batch Size" [1, 4, 8, 16, 32, 64, 128]
+    y-axis "Tokens/sec" 0 --> 3500
+    bar [25, 100, 200, 400, 800, 1600, 3200]
+```
+
 Prefill is compute-bound and parallelizes naturally.  Decode is where
 batching matters — and where the economics live.
 
@@ -66,6 +71,14 @@ batching matters — and where the economics live.
 Quantization compresses weights — rLLM's Q4 packs 32 weights into 18 bytes
 (vs 64 at bf16), cutting memory bandwidth ~4× and directly increasing decode
 throughput ~4× (since decode is bandwidth-bound).
+
+```mermaid
+xychart-beta
+    title "Memory per Block (32 weights)"
+    x-axis "Precision" [bf16, Q8, Q4]
+    y-axis "Bytes" 0 --> 70
+    bar [64, 34, 18]
+```
 
 **"Small" models are often quantized large ones.**  A 70B at Q4 fits in the
 same memory as a 20B at bf16 and often performs comparably.
@@ -85,6 +98,22 @@ Not every model has to fit in GPU memory.  rLLM already streams MoE experts
 from NVMe on demand (`src/model/expert_stream.rs`) — Qwen3.5-35b has 256
 experts (~60GB), but only 8 are active per token, so expert memory drops from
 60GB to ~15MB of buffer slots.
+
+```mermaid
+graph LR
+    subgraph NVMe["NVMe (256 experts, ~60GB)"]
+        E1[Expert 1]
+        E2[Expert 2]
+        E3["..."]
+        EN[Expert 256]
+    end
+
+    Router["Router<br/>selects K=8"] --> |pread| Buf["GPU Buffer Slots<br/>~15MB"]
+    E1 -.-> Router
+    EN -.-> Router
+    Buf --> FWD[Forward Pass]
+    FWD --> |reuse| Buf
+```
 
 The same idea generalizes to dense models.  A 70B at Q4 is ~35GB.  A machine
 with 24GB of VRAM can run it by streaming layers from disk — load a few
@@ -108,18 +137,39 @@ to users: undercut competitors.
 
 **Tiers are a mix of hardware, quantization, residency, and priority.**
 
-| Configuration | Latency | Cost | Tier |
-|---------------|---------|------|------|
-| Full model in VRAM, latest GPU (H100/B200) | Lowest | Highest | Pro |
-| Full model in VRAM, older GPU (A100/L40) | Low | Medium | Standard |
-| Quantized model in VRAM, older GPU | Low | Lower | Standard / Free |
-| Model streamed from disk, minimal VRAM | High | Lowest | Free |
+```mermaid
+quadrantChart
+    title Tier Strategy — Latency vs Cost
+    x-axis "Lower Cost" --> "Higher Cost"
+    y-axis "Higher Latency" --> "Lower Latency"
+    quadrant-1 "Pro"
+    quadrant-2 "Standard"
+    quadrant-3 "Free"
+    quadrant-4 "Overprovisioned"
+    "VRAM resident, H100/B200": [0.85, 0.9]
+    "VRAM resident, A100/L40": [0.55, 0.75]
+    "Quantized, older GPU": [0.35, 0.7]
+    "Disk-streamed, minimal VRAM": [0.15, 0.15]
+```
 
 Same model, same API, different hardware behind it.  Pro users get dedicated
 GPU pools with low batch sizes and aggressive latency SLOs.  Free users get
 overflow pools on older hardware, high batch sizes, disk-streamed models, and
 lower queue priority.  The GPU does the same work — the difference is queue
 position and how much of the model lives in VRAM.
+
+```mermaid
+graph TD
+    Req([API Request]) --> GW{Gateway<br/>checks user tier}
+
+    GW -->|Pro| Pro["Dedicated H100 pool<br/>Low batch size<br/>Full VRAM residency"]
+    GW -->|Standard| Std["Shared A100/L40 pool<br/>Medium batch size<br/>Quantized weights"]
+    GW -->|Free| Free["Overflow pool<br/>High batch size<br/>Disk-streamed layers<br/>Queue deprioritized"]
+
+    Pro --> Resp([Response])
+    Std --> Resp
+    Free --> Resp
+```
 
 **Smaller models are genuinely cheap.**  A 7B fits on a consumer GPU; a 70B
 needs 4×H100s.  10–50× cost difference.  The large-model premium pays for the
@@ -131,6 +181,16 @@ fleet.
 
 The question: "which models, at which precisions, on which hardware, pass the
 quality bar?"
+
+```mermaid
+graph LR
+    Drop["New model drop"] --> Matrix["Test matrix<br/>precision × hardware"]
+    Matrix --> Eval["Run evals<br/>accuracy, latency,<br/>throughput"]
+    Eval --> Report["Ship / Hold<br/>decision"]
+    Report -->|passes| Deploy[Deploy to tier]
+    Report -->|fails| Tune["Try lower precision<br/>or different hardware"]
+    Tune --> Matrix
+```
 
 **What providers likely have.**  CI/CD for models — spin up servers for each
 model + quantization + hardware combo, run evals (accuracy, latency
