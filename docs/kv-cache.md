@@ -30,26 +30,35 @@ to virtual memory page tables.
 ## Architecture
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│  KvPool<B>  (shared across all sequences)                  │
-│                                                            │
-│  k_pool: Vec<Tensor>   ─── one tensor per layer            │
-│    shape: [num_blocks * BLOCK_SIZE, kv_dim]                │
-│                                                            │
-│  v_pool: Vec<Tensor>   ─── one tensor per layer            │
-│    shape: [num_blocks * BLOCK_SIZE, kv_dim]                │
-│                                                            │
-│  free_blocks: Vec<u32> ─── LIFO stack of available blocks  │
-└────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  KvPool<B>  (shared across all sequences)                       │
+│                                                                 │
+│  k_pool: Vec<Tensor>      ─── one tensor per layer              │
+│    shape: [num_blocks * BLOCK_SIZE, kv_dim]                     │
+│                                                                 │
+│  v_pool: Vec<Tensor>      ─── one tensor per layer              │
+│    shape: [num_blocks * BLOCK_SIZE, kv_dim]                     │
+│                                                                 │
+│  free_blocks: Vec<u32>    ─── LIFO stack of available blocks    │
+│  generations: Vec<u32>    ─── per-slot generation counter       │
+└─────────────────────────────────────────────────────────────────┘
 
-┌────────────────────────────────────────────────────────────┐
-│  SeqKvState<B>  (per sequence)                             │
-│                                                            │
-│  block_table_cpu: Vec<u32>  ─── logical → physical mapping │
-│  block_table_gpu: Tensor    ─── GPU copy (synced on dirty) │
-│  seq_len: usize             ─── current sequence length    │
-│  dirty: bool                ─── needs GPU re-sync?         │
-└────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  BlockHandle  (replaces raw u32 block indices)                  │
+│                                                                 │
+│  index: u32       ─── physical block index (GPU kernel uses)    │
+│  generation: u32  ─── must match pool's generation for slot     │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│  SeqKvState<B>  (per sequence)                                  │
+│                                                                 │
+│  block_table_cpu: Vec<BlockHandle> ─── logical → physical map   │
+│  block_table_gpu: Tensor           ─── GPU copy (raw u32 only)  │
+│  seq_len: usize                    ─── current sequence length  │
+│  dirty: bool                       ─── needs GPU re-sync?       │
+│  shared_prefix_blocks: usize       ─── prefix cache block count │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Constants
@@ -92,15 +101,20 @@ For a 32-layer model with 1024 kv_dim and 2048 blocks:
 When a sequence needs more KV slots (during prefill or decode):
 
 1. `ensure_slots(count)` checks if the current last block has room
-2. If not, `allocate_block()` pops from `free_blocks` and appends to `block_table_cpu`
-3. Sets `dirty = true` so the GPU copy is re-synced before the next kernel
+2. If not, `alloc_block()` pops from `free_blocks` and returns a `BlockHandle`
+   with the slot's current generation
+3. The handle is appended to `block_table_cpu`
+4. Sets `dirty = true` so the GPU copy is re-synced before the next kernel
 
 ### Deallocation
 
 When a sequence finishes:
 
-1. `free_blocks()` pushes all the sequence's physical block indices back onto `free_blocks`
-2. The blocks are immediately available for new sequences
+1. `free_sequence()` iterates the sequence's owned block handles (skipping
+   shared prefix blocks)
+2. Each `free_block(handle)` validates the handle's generation against the pool,
+   increments the generation, and pushes the index back onto `free_blocks`
+3. Any stale handle (wrong generation) panics immediately
 
 ---
 
@@ -132,9 +146,10 @@ transfers:
 
 1. `block_table_cpu` is the source of truth (modified during allocation)
 2. `dirty` flag is set whenever `block_table_cpu` changes
-3. Before a kernel that reads the block table, `sync_if_dirty()` copies
-   the CPU table to `block_table_gpu`
-4. If not dirty, the GPU copy is reused — no transfer
+3. Before a kernel that reads the block table, `sync_block_table_validated()`
+   validates all handle generations, extracts raw `u32` indices, and uploads
+   to `block_table_gpu`
+4. If not dirty, the GPU copy is reused — no transfer or validation
 
 This matters because decode adds at most one block per step, but the
 attention kernel reads the block table every step.
@@ -163,6 +178,52 @@ During prefill and decode, new K/V vectors are written to the cache:
 - `GpuAttention::kv_cache_write()` — writes K and V for new tokens
 - Uses `seq_len` to determine the write position within the block table
 - After writing, `seq_len` is incremented
+
+---
+
+## Generational Indices
+
+Block indices are capabilities — a `u32` that grants access to a region of the
+KV pool.  If a block is freed and reallocated, any leftover reference silently
+reads another sequence's KV data.  Rust's ownership model can't prevent this
+because the pool is one long-lived buffer and block indices are just offsets.
+
+`BlockHandle` pairs each index with a generation counter:
+
+```rust
+struct BlockHandle {
+    index: u32,       // physical block index (what the GPU kernel uses)
+    generation: u32,  // must match pool's current generation for this slot
+}
+```
+
+The pool tracks a generation per slot.  Freeing increments it.  Any operation
+on a stale handle panics:
+
+```
+alloc block 7   → BlockHandle { index: 7, generation: 0 }
+free  block 7   → pool.generations[7] becomes 1, index 7 back on free list
+alloc block 7   → BlockHandle { index: 7, generation: 1 }
+free  old handle → generation 0 ≠ 1 → PANIC: "stale BlockHandle"
+```
+
+### Validation points
+
+| Where | What | When |
+|-------|------|------|
+| `free_block(handle)` | Generation check | Every block free (sequence finish, cache eviction) |
+| `sync_block_table_validated()` | All handles in block table | Before every GPU upload (prefill, decode) |
+
+The validated sync is the last checkpoint before stale indices reach the GPU
+attention kernel.  It catches the exact bug class that motivated this design:
+prefix cache blocks freed while still referenced, then reallocated to a
+different sequence.
+
+### Cost
+
+One `u32` comparison per block on free and sync.  No runtime cost on the GPU —
+`sync_block_table_inner` extracts raw `handle.index` values for the kernel.
+Generations live only on the CPU side.
 
 ---
 

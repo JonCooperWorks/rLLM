@@ -100,9 +100,13 @@ pub(crate) trait Dispatch {
 
     /// Look up a cached prefix for the given prompt tokens.
     ///
-    /// Returns `(block_indices, token_count)` for the longest matching prefix,
-    /// or None if no match found.
-    fn prefix_cache_lookup(&mut self, _prompt_tokens: &[u32]) -> Option<(Vec<u32>, usize)> {
+    /// Returns `(block_handles, token_count)` for the longest matching prefix,
+    /// or None if no match found.  The handles carry generation counters for
+    /// stale-reference detection.
+    fn prefix_cache_lookup(
+        &mut self,
+        _prompt_tokens: &[u32],
+    ) -> Option<(Vec<crate::model::kv_cache::BlockHandle>, usize)> {
         None
     }
 
@@ -116,12 +120,13 @@ pub(crate) trait Dispatch {
 
     /// Link a sequence's KV state to a cached prefix.
     ///
-    /// Copies the prefix's physical block indices into the sequence's block
-    /// table and advances seq_len past the already-computed positions.
+    /// Copies the prefix's block handles into the sequence's block table
+    /// and advances seq_len past the already-computed positions.  Handles
+    /// carry generation counters for stale-reference detection.
     fn link_prefix(
         &self,
         _state: &mut Self::SeqState,
-        _prefix_blocks: &[u32],
+        _prefix_handles: &[crate::model::kv_cache::BlockHandle],
         _prefix_token_count: usize,
         _prefix_tokens: Vec<u32>,
     ) {

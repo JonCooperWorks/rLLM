@@ -190,6 +190,10 @@ Prompt caching is correct because:
    `tokens == stored_tokens` check to prevent hash collision corruption
 4. **Block alignment** — only full blocks are shared; partial blocks are never
    cached, avoiding position-mismatch bugs
+5. **Generational indices** — `BlockHandle` pairs each block index with a
+   generation counter.  If a bug causes shared blocks to be freed while the
+   cache still references them, `sync_block_table_validated` panics before
+   stale indices reach the GPU.  See [KV Cache — Generational Indices](kv-cache.md#generational-indices)
 
 ---
 

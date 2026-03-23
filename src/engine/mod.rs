@@ -58,7 +58,7 @@ use std::collections::{HashMap, VecDeque};
 
 use self::dispatch::Dispatch;
 use crate::gpu::GpuBackend;
-use crate::model::kv_cache::{self, KvPool, PrefixCache, SeqKvState, BLOCK_SIZE};
+use crate::model::kv_cache::{self, BlockHandle, KvPool, PrefixCache, SeqKvState, BLOCK_SIZE};
 use crate::model::tokenizer::Tokenizer;
 use crate::model::{self, Model, PrefillBuffers};
 
@@ -584,7 +584,7 @@ impl<'a, B: GpuBackend> Dispatch for SingleGpuDispatch<'a, B> {
         token_count: usize,
     ) -> anyhow::Result<()> {
         state.ensure_slots(&mut self.kv_pool, token_count)?;
-        state.sync_block_table(self.backend);
+        state.sync_block_table_validated(self.backend, &self.kv_pool);
         Ok(())
     }
 
@@ -603,7 +603,7 @@ impl<'a, B: GpuBackend> Dispatch for SingleGpuDispatch<'a, B> {
 
     fn prepare_decode(&mut self, state: &mut SeqKvState<B>) -> anyhow::Result<()> {
         state.ensure_slot(&mut self.kv_pool)?;
-        state.sync_block_table(self.backend);
+        state.sync_block_table_validated(self.backend, &self.kv_pool);
         Ok(())
     }
 
@@ -624,18 +624,18 @@ impl<'a, B: GpuBackend> Dispatch for SingleGpuDispatch<'a, B> {
         crate::model::sampler::sample(self.backend, self.model.logits(), temperature, top_p, rng)
     }
 
-    fn prefix_cache_lookup(&mut self, prompt_tokens: &[u32]) -> Option<(Vec<u32>, usize)> {
+    fn prefix_cache_lookup(&mut self, prompt_tokens: &[u32]) -> Option<(Vec<BlockHandle>, usize)> {
         self.prefix_cache.lookup(prompt_tokens)
     }
 
     fn link_prefix(
         &self,
         state: &mut SeqKvState<B>,
-        prefix_blocks: &[u32],
+        prefix_handles: &[BlockHandle],
         prefix_token_count: usize,
         prefix_tokens: Vec<u32>,
     ) {
-        state.link_prefix(prefix_blocks, prefix_token_count, prefix_tokens);
+        state.link_prefix(prefix_handles, prefix_token_count, prefix_tokens);
     }
 
     fn prefix_cache_register(&mut self, tokens: &[u32], state: &mut SeqKvState<B>) {
@@ -1470,7 +1470,7 @@ mod tests {
             Ok(0)
         }
 
-        fn prefix_cache_lookup(&mut self, prompt_tokens: &[u32]) -> Option<(Vec<u32>, usize)> {
+        fn prefix_cache_lookup(&mut self, prompt_tokens: &[u32]) -> Option<(Vec<BlockHandle>, usize)> {
             self.prefix_cache.lookup(prompt_tokens)
         }
 
@@ -1491,11 +1491,11 @@ mod tests {
         fn link_prefix(
             &self,
             state: &mut Self::SeqState,
-            prefix_blocks: &[u32],
+            prefix_handles: &[BlockHandle],
             prefix_token_count: usize,
             prefix_tokens: Vec<u32>,
         ) {
-            state.link_prefix(prefix_blocks, prefix_token_count, prefix_tokens);
+            state.link_prefix(prefix_handles, prefix_token_count, prefix_tokens);
         }
     }
 
@@ -1620,14 +1620,15 @@ mod tests {
         let evict2: Vec<u32> = vec![201; BLOCK_SIZE];
         let evict3: Vec<u32> = vec![202; BLOCK_SIZE];
         let evict4: Vec<u32> = vec![203; BLOCK_SIZE];
-        dispatch.prefix_cache.insert(evict1.clone(), vec![99]);
+        let bh = |i, g| BlockHandle { index: i, generation: g };
+        dispatch.prefix_cache.insert(evict1.clone(), vec![bh(99, 0)]);
         dispatch.prefix_cache.release(&evict1);
-        dispatch.prefix_cache.insert(evict2.clone(), vec![98]);
+        dispatch.prefix_cache.insert(evict2.clone(), vec![bh(98, 0)]);
         dispatch.prefix_cache.release(&evict2);
-        dispatch.prefix_cache.insert(evict3.clone(), vec![97]);
+        dispatch.prefix_cache.insert(evict3.clone(), vec![bh(97, 0)]);
         dispatch.prefix_cache.release(&evict3);
         // This insert should evict our original prefix (oldest, ref_count=0).
-        let evicted = dispatch.prefix_cache.insert(evict4.clone(), vec![96]);
+        let evicted = dispatch.prefix_cache.insert(evict4.clone(), vec![bh(96, 0)]);
         assert!(evicted.is_some(), "original prefix should be evictable (ref_count=0)");
     }
 

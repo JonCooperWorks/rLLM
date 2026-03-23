@@ -16,19 +16,32 @@
 // Memory layout:
 //   The physical KV pool is a single large GPU buffer per layer per K/V:
 //     pool shape: [num_blocks * BLOCK_SIZE, kv_dim]
-//   A block table (per sequence) maps logical block indices to physical ones:
-//     block_table[logical_block] = physical_block_index
+//   A block table (per sequence) maps logical blocks to physical ones via
+//   BlockHandle (index + generation):
+//     block_table[logical_block] = BlockHandle { index, generation }
 //
 //   To find position `pos`:
 //     logical_block = pos / BLOCK_SIZE
 //     offset_in_block = pos % BLOCK_SIZE
-//     physical_block = block_table[logical_block]
+//     physical_block = block_table[logical_block].index
 //     data_index = (physical_block * BLOCK_SIZE + offset_in_block) * kv_dim
 //
 // Block size: 16 tokens.
 //   Each block stores 16 positions of KV data.  For Llama 3.2 1B (kv_dim=512,
 //   bf16), one block is 16 * 512 * 2 = 16 KB per layer per K/V.  This aligns
 //   well with Metal's memory access patterns and flash attention tile sizes.
+//
+// Generational indices:
+//   Block indices are capabilities into a long-lived GPU buffer.  A raw u32
+//   index that outlives its allocation silently reads wrong data.  BlockHandle
+//   pairs each index with a generation counter; the pool tracks generations
+//   per slot and increments on free.  Stale handles panic on use — turning
+//   silent corruption into a loud crash.  The GPU never sees generations;
+//   sync_block_table extracts raw indices for the attention kernel.
+//
+// Prefix caching:
+//   PrefixCache shares KV blocks across sequences with identical prefixes.
+//   See the PrefixCache section below and docs/prompt-caching.md.
 // ===========================================================================
 
 use std::collections::HashMap;
@@ -37,6 +50,40 @@ use crate::gpu::{GpuCore, TensorDtype};
 
 /// Number of token positions stored per KV cache block.
 pub(crate) const BLOCK_SIZE: usize = 16;
+
+// ===========================================================================
+// Generational block handles — runtime detection of stale block references.
+//
+// A raw u32 block index is a capability: it grants access to a region of the
+// KV pool.  If a block is freed and reallocated, any old reference to it
+// silently reads/writes the wrong data.  Rust's ownership model can't prevent
+// this because the pool is one long-lived buffer and block indices are just
+// offsets into it.
+//
+// BlockHandle pairs each index with a generation counter.  The pool tracks
+// the current generation per slot.  Freeing a block increments its generation.
+// Any operation on a stale handle (wrong generation) panics immediately,
+// turning silent data corruption into a loud crash with a clear message.
+//
+// The GPU never sees generations — sync_block_table extracts raw indices
+// for the attention kernel.  Generation validation happens on the CPU side
+// before upload.
+// ===========================================================================
+
+/// A block index paired with its allocation generation.
+///
+/// The generation counter detects stale references: if a block is freed and
+/// reallocated, handles from the previous allocation have the wrong generation
+/// and will panic on use.  This catches the class of bugs where block indices
+/// outlive their intended lifetime (e.g. the prefix cache UAF bug).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BlockHandle {
+    /// Physical block index in the KV pool (the value the GPU kernel uses).
+    pub index: u32,
+    /// Generation counter — must match the pool's current generation for this
+    /// slot.  Mismatches indicate a stale (use-after-free) reference.
+    pub generation: u32,
+}
 
 /// Maximum number of logical blocks per sequence (supports up to
 /// MAX_BLOCKS_PER_SEQ * BLOCK_SIZE = 8192 * 16 = 131072 tokens = 128K context).
@@ -57,6 +104,11 @@ pub(crate) fn blocks_needed_for(token_count: usize) -> usize {
 /// The pool owns the physical GPU memory for all K and V caches across all
 /// layers.  Individual sequences get assigned physical blocks from this pool
 /// via their block tables.
+///
+/// Each block slot has a generation counter.  Allocating returns a `BlockHandle`
+/// with the current generation; freeing increments the generation.  Any attempt
+/// to use a handle with a stale generation panics, catching use-after-free bugs
+/// at runtime instead of silently corrupting KV data.
 #[allow(dead_code)]
 pub(crate) struct KvPool<B: GpuCore> {
     /// Physical K cache pool: one buffer per layer.
@@ -67,6 +119,9 @@ pub(crate) struct KvPool<B: GpuCore> {
 
     /// Free list of physical block indices (LIFO stack for locality).
     free_blocks: Vec<u32>,
+    /// Generation counter per physical block slot.  Incremented on each free.
+    /// A BlockHandle is valid only if its generation matches the current one.
+    generations: Vec<u32>,
     /// Total number of physical blocks in the pool.
     num_physical_blocks: usize,
     /// KV dimension (num_kv_heads * head_dim).
@@ -82,13 +137,14 @@ pub(crate) struct KvPool<B: GpuCore> {
 /// when the attention kernel needs it.
 ///
 /// When prefix caching is active, the first N blocks may be shared with
-/// other sequences.  `shared_prefix_len` tracks how many leading blocks
+/// other sequences.  `shared_prefix_blocks` tracks how many leading blocks
 /// are borrowed from the PrefixCache (these must NOT be freed when the
-/// sequence finishes — they belong to the cache).
+/// sequence finishes — they belong to the cache).  The handles carry
+/// generation counters, so stale references panic on sync or free.
 pub(crate) struct SeqKvState<B: GpuCore> {
-    /// Logical block index -> physical block index.
+    /// Logical block index -> physical block handle (index + generation).
     /// Length = ceil(seq_len / BLOCK_SIZE), grows as the sequence gets longer.
-    block_table_cpu: Vec<u32>,
+    block_table_cpu: Vec<BlockHandle>,
     /// GPU-resident copy of the block table, uploaded when modified.
     /// Shape: [MAX_BLOCKS_PER_SEQ] u32 (padded with zeros for unused slots).
     pub block_table_gpu: B::Tensor,
@@ -128,14 +184,16 @@ pub(crate) struct SeqKvState<B: GpuCore> {
 // cache exceeds its capacity.
 // ===========================================================================
 
-/// A cached prefix: the token sequence, block indices, and reference count.
+/// A cached prefix: the token sequence, block handles, and reference count.
 pub(crate) struct CachedPrefix {
     /// The token IDs that produced this prefix's KV data.
     /// Stored for collision checking — the hash is not sufficient alone.
     pub tokens: Vec<u32>,
-    /// Physical block indices containing this prefix's KV data.
+    /// Block handles containing this prefix's KV data.
+    /// Handles carry generation counters — if any generation is stale when
+    /// a new sequence links to this prefix, sync_block_table will panic.
     /// These blocks are NOT on the free list while the entry exists.
-    pub block_indices: Vec<u32>,
+    pub block_handles: Vec<BlockHandle>,
     /// Number of token positions filled in these blocks.
     /// Always equals `tokens.len()`.
     pub token_count: usize,
@@ -185,12 +243,14 @@ impl PrefixCache {
         h
     }
 
-    /// Look up a prefix.  Returns the cached block indices and token count
+    /// Look up a prefix.  Returns the cached block handles and token count
     /// if found, and increments the ref count.
     ///
     /// The caller provides the full prompt tokens; this method checks all
     /// prefixes that are a prefix of the prompt (longest match wins).
-    pub fn lookup(&mut self, prompt_tokens: &[u32]) -> Option<(Vec<u32>, usize)> {
+    /// The returned handles carry generation counters — if the blocks were
+    /// freed (bug), sync_block_table_validated will catch it.
+    pub fn lookup(&mut self, prompt_tokens: &[u32]) -> Option<(Vec<BlockHandle>, usize)> {
         // Try progressively shorter block-aligned prefixes.
         // Start from the longest block-aligned prefix of the prompt.
         let max_prefix_blocks = prompt_tokens.len() / BLOCK_SIZE;
@@ -205,7 +265,7 @@ impl PrefixCache {
                     self.clock += 1;
                     entry.last_used = self.clock;
                     self.hits += 1;
-                    return Some((entry.block_indices.clone(), entry.token_count));
+                    return Some((entry.block_handles.clone(), entry.token_count));
                 }
             }
         }
@@ -216,23 +276,23 @@ impl PrefixCache {
     /// Register a new prefix after prefill completes.
     ///
     /// `tokens` is the prefix token sequence (should be block-aligned).
-    /// `block_indices` are the physical blocks holding the KV data.
+    /// `block_handles` are the handles to physical blocks holding the KV data.
     /// The entry starts with ref_count = 1 (the sequence that just prefilled).
     ///
     /// If the cache is full, evicts the LRU entry with ref_count == 0.
-    /// Returns the evicted blocks (if any) so the caller can free them.
+    /// Returns the evicted block handles (if any) so the caller can free them.
     pub fn insert(
         &mut self,
         tokens: Vec<u32>,
-        block_indices: Vec<u32>,
-    ) -> Option<Vec<u32>> {
+        block_handles: Vec<BlockHandle>,
+    ) -> Option<Vec<BlockHandle>> {
         let hash = Self::hash_tokens(&tokens);
         if self.entries.contains_key(&hash) {
             return None; // Already cached (race between concurrent prefills).
         }
 
         // Evict if at capacity.
-        let evicted_blocks = if self.entries.len() >= self.max_entries {
+        let evicted = if self.entries.len() >= self.max_entries {
             self.evict_lru()
         } else {
             None
@@ -244,14 +304,14 @@ impl PrefixCache {
             hash,
             CachedPrefix {
                 tokens,
-                block_indices,
+                block_handles,
                 token_count,
                 ref_count: 1,
                 last_used: self.clock,
             },
         );
 
-        evicted_blocks
+        evicted
     }
 
     /// Decrement the ref count for a prefix matching `tokens`.
@@ -268,8 +328,8 @@ impl PrefixCache {
     }
 
     /// Evict the least recently used entry with ref_count == 0.
-    /// Returns the freed block indices, or None if nothing is evictable.
-    fn evict_lru(&mut self) -> Option<Vec<u32>> {
+    /// Returns the freed block handles, or None if nothing is evictable.
+    fn evict_lru(&mut self) -> Option<Vec<BlockHandle>> {
         let victim = self
             .entries
             .iter()
@@ -279,7 +339,7 @@ impl PrefixCache {
 
         if let Some(hash) = victim {
             let entry = self.entries.remove(&hash).unwrap();
-            Some(entry.block_indices)
+            Some(entry.block_handles)
         } else {
             None
         }
@@ -293,7 +353,7 @@ impl PrefixCache {
 
     /// Total blocks held by the cache (not on the free list).
     pub fn blocks_held(&self) -> usize {
-        self.entries.values().map(|e| e.block_indices.len()).sum()
+        self.entries.values().map(|e| e.block_handles.len()).sum()
     }
 
     /// Hit rate as a fraction (0.0 to 1.0).
@@ -325,11 +385,14 @@ impl<B: GpuCore> KvPool<B> {
 
         // Initialise free list with all block indices (in reverse so pop gives 0, 1, 2, ...).
         let free_blocks: Vec<u32> = (0..num_blocks as u32).rev().collect();
+        // All blocks start at generation 0.
+        let generations = vec![0u32; num_blocks];
 
         Self {
             k_pool,
             v_pool,
             free_blocks,
+            generations,
             num_physical_blocks: num_blocks,
             kv_dim,
             num_layers,
@@ -375,13 +438,33 @@ impl<B: GpuCore> KvPool<B> {
     }
 
     /// Allocate one physical block from the free list.  Returns None if OOM.
-    pub fn alloc_block(&mut self) -> Option<u32> {
-        self.free_blocks.pop()
+    ///
+    /// The returned `BlockHandle` carries the current generation for this slot.
+    /// The handle is valid until the block is freed (which increments the
+    /// generation, invalidating any stale copies).
+    pub fn alloc_block(&mut self) -> Option<BlockHandle> {
+        self.free_blocks.pop().map(|index| BlockHandle {
+            index,
+            generation: self.generations[index as usize],
+        })
     }
 
     /// Return a physical block to the free list.
-    pub fn free_block(&mut self, block_idx: u32) {
-        self.free_blocks.push(block_idx);
+    ///
+    /// Panics if the handle's generation doesn't match the pool's current
+    /// generation for this slot — this means the block was already freed
+    /// (double-free) or the handle is from a previous allocation cycle.
+    pub fn free_block(&mut self, handle: BlockHandle) {
+        let slot = handle.index as usize;
+        assert_eq!(
+            handle.generation, self.generations[slot],
+            "stale BlockHandle: block {} has generation {} but handle has generation {} \
+             (block was freed and possibly reallocated since this handle was created)",
+            handle.index, self.generations[slot], handle.generation,
+        );
+        // Increment generation so any remaining handles to this slot become stale.
+        self.generations[slot] += 1;
+        self.free_blocks.push(handle.index);
     }
 
     /// Create a new empty sequence state.
@@ -406,21 +489,41 @@ impl<B: GpuCore> KvPool<B> {
     /// Prefix-aware: only frees blocks that this sequence owns (allocated
     /// after the shared prefix).  Shared prefix blocks are managed by the
     /// PrefixCache and freed only on eviction.
+    ///
+    /// Each block's generation is validated — a stale handle panics.
     pub fn free_sequence(&mut self, seq: &SeqKvState<B>) {
         // Skip the first `shared_prefix_blocks` — those belong to the cache.
-        for &block_idx in &seq.block_table_cpu[seq.shared_prefix_blocks..] {
-            self.free_block(block_idx);
+        for &handle in &seq.block_table_cpu[seq.shared_prefix_blocks..] {
+            self.free_block(handle);
         }
     }
 
-    /// Return evicted prefix blocks to the free list.
+    /// Return evicted prefix block handles to the free list.
     ///
     /// Called when PrefixCache evicts an entry — its blocks were held out
     /// of the free list while cached, and now need to be returned.
-    pub fn free_blocks(&mut self, blocks: &[u32]) {
-        for &block_idx in blocks {
-            self.free_block(block_idx);
+    /// Generation is validated on each handle.
+    pub fn free_blocks(&mut self, handles: &[BlockHandle]) {
+        for &handle in handles {
+            self.free_block(handle);
         }
+    }
+
+    /// Validate that a block handle's generation matches the pool's current
+    /// generation for that slot.  Panics on mismatch.
+    ///
+    /// Used by sync_block_table before uploading indices to the GPU — this
+    /// is the last line of defense before stale indices reach the attention
+    /// kernel.
+    pub fn validate_handle(&self, handle: BlockHandle) {
+        let slot = handle.index as usize;
+        assert_eq!(
+            handle.generation, self.generations[slot],
+            "stale BlockHandle in block table: block {} has generation {} but handle has \
+             generation {} — this block was freed and reallocated, the KV data is from \
+             a different sequence",
+            handle.index, self.generations[slot], handle.generation,
+        );
     }
 
     /// Number of layers.
@@ -442,27 +545,50 @@ impl<B: GpuCore> SeqKvState<B> {
     pub fn ensure_slot(&mut self, pool: &mut KvPool<B>) -> anyhow::Result<()> {
         let needed_blocks = (self.seq_len + BLOCK_SIZE) / BLOCK_SIZE; // ceil((seq_len+1)/BLOCK_SIZE)
         if needed_blocks > self.block_table_cpu.len() {
-            // Need a new block.
-            let block_idx = pool
+            let handle = pool
                 .alloc_block()
                 .ok_or_else(|| anyhow::anyhow!("KV cache out of memory: no free blocks"))?;
-            self.block_table_cpu.push(block_idx);
+            self.block_table_cpu.push(handle);
             self.dirty = true;
         }
         Ok(())
     }
 
     /// Upload the block table to GPU if it has been modified since last upload.
+    ///
+    /// Extracts raw u32 indices from BlockHandles for the GPU kernel.
+    /// Validates each handle's generation against the pool before upload —
+    /// this is the last checkpoint before stale indices reach the attention
+    /// kernel.  Pass `pool = None` to skip validation (e.g. in tests without
+    /// a real pool).
+    pub fn sync_block_table_validated(&mut self, backend: &B, pool: &KvPool<B>) {
+        if !self.dirty {
+            return;
+        }
+        // Validate all handles before uploading to GPU.
+        for handle in &self.block_table_cpu {
+            pool.validate_handle(*handle);
+        }
+        self.sync_block_table_inner(backend);
+    }
+
+    /// Upload the block table to GPU without generation validation.
+    ///
+    /// Used when no pool reference is available (e.g. multi-GPU paths where
+    /// each rank has its own pool).
     pub fn sync_block_table(&mut self, backend: &B) {
         if !self.dirty {
             return;
         }
-        // Build padded u32 array.
+        self.sync_block_table_inner(backend);
+    }
+
+    /// Inner implementation: build padded u32 array and upload.
+    fn sync_block_table_inner(&mut self, backend: &B) {
         let mut table = vec![0u32; MAX_BLOCKS_PER_SEQ];
-        for (i, &block_idx) in self.block_table_cpu.iter().enumerate() {
-            table[i] = block_idx;
+        for (i, handle) in self.block_table_cpu.iter().enumerate() {
+            table[i] = handle.index;
         }
-        // Upload via copy_to_tensor (works on unified memory and discrete GPUs).
         let bytes: &[u8] = bytemuck::cast_slice(&table);
         backend.copy_to_tensor(&self.block_table_gpu, bytes);
         self.dirty = false;
@@ -497,10 +623,10 @@ impl<B: GpuCore> SeqKvState<B> {
         let new_len = self.seq_len + count;
         let needed_blocks = (new_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
         while self.block_table_cpu.len() < needed_blocks {
-            let block_idx = pool
+            let handle = pool
                 .alloc_block()
                 .ok_or_else(|| anyhow::anyhow!("KV cache out of memory: no free blocks"))?;
-            self.block_table_cpu.push(block_idx);
+            self.block_table_cpu.push(handle);
             self.dirty = true;
         }
         Ok(())
@@ -508,19 +634,20 @@ impl<B: GpuCore> SeqKvState<B> {
 
     /// Link this sequence to a cached prefix.
     ///
-    /// Copies the prefix's physical block indices into this sequence's block
-    /// table and advances seq_len to skip the already-computed positions.
-    /// The blocks are NOT allocated from the free list — they're borrowed
-    /// from the PrefixCache.
+    /// Copies the prefix's block handles into this sequence's block table and
+    /// advances seq_len to skip the already-computed positions.  The blocks
+    /// are NOT allocated from the free list — they're borrowed from the
+    /// PrefixCache.  The handles carry generation counters, so if the prefix
+    /// blocks were freed (bug), sync_block_table_validated will catch it.
     pub fn link_prefix(
         &mut self,
-        prefix_blocks: &[u32],
+        prefix_handles: &[BlockHandle],
         prefix_token_count: usize,
         prefix_tokens: Vec<u32>,
     ) {
-        self.block_table_cpu = prefix_blocks.to_vec();
+        self.block_table_cpu = prefix_handles.to_vec();
         self.seq_len = prefix_token_count;
-        self.shared_prefix_blocks = prefix_blocks.len();
+        self.shared_prefix_blocks = prefix_handles.len();
         self.shared_prefix_tokens = Some(prefix_tokens);
         self.dirty = true;
     }
@@ -542,9 +669,9 @@ impl<B: GpuCore> SeqKvState<B> {
 
     /// Read-only access to the CPU block table.
     ///
-    /// Used by the prefix cache to record which physical blocks hold a
+    /// Used by the prefix cache to record which block handles hold a
     /// prefix's KV data after prefill completes.
-    pub fn block_table_cpu_slice(&self) -> &[u32] {
+    pub fn block_table_cpu_slice(&self) -> &[BlockHandle] {
         &self.block_table_cpu
     }
 
@@ -577,23 +704,30 @@ mod tests {
         assert_eq!(pool.v_pool.len(), 2);
     }
 
+    /// Helper to create a BlockHandle for test assertions.
+    fn bh(index: u32, generation: u32) -> BlockHandle {
+        BlockHandle { index, generation }
+    }
+
     #[test]
     fn test_alloc_and_free_block() {
         let (_b, mut pool) = make_pool(4);
         let b0 = pool.alloc_block().unwrap();
-        assert_eq!(b0, 0); // LIFO: reversed, so first pop = 0
+        assert_eq!(b0.index, 0); // LIFO: reversed, so first pop = 0
+        assert_eq!(b0.generation, 0);
         assert_eq!(pool.free_block_count(), 3);
 
         let b1 = pool.alloc_block().unwrap();
-        assert_eq!(b1, 1);
+        assert_eq!(b1.index, 1);
         assert_eq!(pool.free_block_count(), 2);
 
         pool.free_block(b0);
         assert_eq!(pool.free_block_count(), 3);
 
-        // Re-allocate should get b0 back (LIFO)
+        // Re-allocate should get index 0 back (LIFO), but generation is now 1.
         let b_realloc = pool.alloc_block().unwrap();
-        assert_eq!(b_realloc, b0);
+        assert_eq!(b_realloc.index, b0.index);
+        assert_eq!(b_realloc.generation, 1); // incremented by free
     }
 
     #[test]
@@ -602,6 +736,25 @@ mod tests {
         assert!(pool.alloc_block().is_some());
         assert!(pool.alloc_block().is_some());
         assert!(pool.alloc_block().is_none()); // exhausted
+    }
+
+    #[test]
+    #[should_panic(expected = "stale BlockHandle")]
+    fn test_double_free_panics() {
+        let (_b, mut pool) = make_pool(4);
+        let handle = pool.alloc_block().unwrap();
+        pool.free_block(handle);
+        pool.free_block(handle); // stale: generation was incremented
+    }
+
+    #[test]
+    #[should_panic(expected = "stale BlockHandle")]
+    fn test_stale_handle_after_realloc_panics() {
+        let (_b, mut pool) = make_pool(4);
+        let old_handle = pool.alloc_block().unwrap();
+        pool.free_block(old_handle);
+        let _new_handle = pool.alloc_block().unwrap(); // same index, new generation
+        pool.free_block(old_handle); // stale: generation mismatch
     }
 
     #[test]
@@ -719,14 +872,14 @@ mod tests {
         assert_eq!(cache.hits, 0);
 
         // Insert a prefix (block-aligned: 32 tokens = 2 blocks).
-        let blocks = vec![10, 20];
-        cache.insert(prompt.clone(), blocks.clone());
+        let handles = vec![bh(10, 0), bh(20, 0)];
+        cache.insert(prompt.clone(), handles.clone());
 
         // Second lookup: hit.
         let result = cache.lookup(&prompt);
         assert!(result.is_some());
-        let (found_blocks, token_count) = result.unwrap();
-        assert_eq!(found_blocks, vec![10, 20]);
+        let (found_handles, token_count) = result.unwrap();
+        assert_eq!(found_handles, vec![bh(10, 0), bh(20, 0)]);
         assert_eq!(token_count, 32);
         assert_eq!(cache.hits, 1);
     }
@@ -737,14 +890,14 @@ mod tests {
 
         // Cache a 32-token prefix (2 blocks).
         let prefix: Vec<u32> = (0..32).collect();
-        cache.insert(prefix.clone(), vec![10, 20]);
+        cache.insert(prefix.clone(), vec![bh(10, 0), bh(20, 0)]);
 
         // Look up with a longer prompt that starts with the same 32 tokens.
-        let mut long_prompt: Vec<u32> = (0..48).collect(); // 3 blocks
+        let long_prompt: Vec<u32> = (0..48).collect(); // 3 blocks
         let result = cache.lookup(&long_prompt);
         assert!(result.is_some());
-        let (blocks, count) = result.unwrap();
-        assert_eq!(blocks, vec![10, 20]);
+        let (handles, count) = result.unwrap();
+        assert_eq!(handles, vec![bh(10, 0), bh(20, 0)]);
         assert_eq!(count, 32);
     }
 
@@ -754,7 +907,7 @@ mod tests {
         let prefix: Vec<u32> = (0..16).collect(); // 1 block
 
         // Insert with initial ref_count = 1.
-        cache.insert(prefix.clone(), vec![5]);
+        cache.insert(prefix.clone(), vec![bh(5, 0)]);
 
         // Two more lookups → ref_count = 3.
         cache.lookup(&prefix);
@@ -774,18 +927,16 @@ mod tests {
         // Insert two entries.
         let p1: Vec<u32> = vec![1; BLOCK_SIZE];
         let p2: Vec<u32> = vec![2; BLOCK_SIZE];
-        cache.insert(p1.clone(), vec![10]);
-        // Release p1's ref so it's evictable.
+        cache.insert(p1.clone(), vec![bh(10, 0)]);
         cache.release(&p1);
 
-        cache.insert(p2.clone(), vec![20]);
-        // Release p2's ref so it's evictable.
+        cache.insert(p2.clone(), vec![bh(20, 0)]);
         cache.release(&p2);
 
         // Insert a third — should evict p1 (oldest, ref_count=0).
         let p3: Vec<u32> = vec![3; BLOCK_SIZE];
-        let evicted = cache.insert(p3.clone(), vec![30]);
-        assert_eq!(evicted, Some(vec![10])); // p1's blocks freed
+        let evicted = cache.insert(p3.clone(), vec![bh(30, 0)]);
+        assert_eq!(evicted, Some(vec![bh(10, 0)])); // p1's handles freed
 
         // p1 should be gone, p2 and p3 remain.
         assert_eq!(cache.len(), 2);
@@ -798,11 +949,11 @@ mod tests {
 
         // Insert and keep ref (ref_count = 1 from insert).
         let p1: Vec<u32> = vec![1; BLOCK_SIZE];
-        cache.insert(p1.clone(), vec![10]);
+        cache.insert(p1.clone(), vec![bh(10, 0)]);
 
         // Try to insert another — can't evict p1 (ref_count > 0).
         let p2: Vec<u32> = vec![2; BLOCK_SIZE];
-        let evicted = cache.insert(p2.clone(), vec![20]);
+        let evicted = cache.insert(p2.clone(), vec![bh(20, 0)]);
         assert_eq!(evicted, None); // Nothing evictable.
 
         // Both entries now exist (over capacity, but can't evict).
@@ -814,9 +965,10 @@ mod tests {
         let (b, mut pool) = make_pool(8);
         let mut seq = pool.new_sequence(&b);
 
-        // Simulate linking 2 prefix blocks (blocks 0, 1) then allocating 1 own block.
-        let prefix_blocks = vec![0, 1];
-        seq.link_prefix(&prefix_blocks, 32, vec![0; 32]);
+        // Simulate linking 2 prefix blocks then allocating 1 own block.
+        // Use handles with generation 0 (matching pool's initial state).
+        let prefix_handles = vec![bh(0, 0), bh(1, 0)];
+        seq.link_prefix(&prefix_handles, 32, vec![0; 32]);
 
         // Allocate one more block for the suffix.
         seq.ensure_slots(&mut pool, 16).unwrap();
@@ -835,7 +987,7 @@ mod tests {
         assert_eq!(cache.hit_rate(), 0.0);
 
         let prefix: Vec<u32> = (0..16).collect();
-        cache.insert(prefix.clone(), vec![5]);
+        cache.insert(prefix.clone(), vec![bh(5, 0)]);
 
         // 1 miss (short prompt), then 2 hits
         let short: Vec<u32> = vec![99; 5]; // too short for any block-aligned match
@@ -845,5 +997,28 @@ mod tests {
 
         // 2 hits / (2 hits + 1 miss) = 2/3
         assert!((cache.hit_rate() - 2.0 / 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_validated_sync_catches_stale_handle() {
+        let (b, mut pool) = make_pool(4);
+        let mut seq = pool.new_sequence(&b);
+
+        // Allocate a block, then free it externally (simulating the bug).
+        seq.ensure_slot(&mut pool).unwrap();
+        let stale_handle = seq.block_table_cpu[0];
+
+        // Free the block through the pool (incrementing its generation).
+        pool.free_block(stale_handle);
+
+        // Re-allocate (same index, new generation).
+        let _new_handle = pool.alloc_block().unwrap();
+
+        // The seq still holds the old handle.  Validated sync should catch it.
+        seq.dirty = true;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            seq.sync_block_table_validated(&b, &pool);
+        }));
+        assert!(result.is_err(), "should panic on stale handle");
     }
 }
