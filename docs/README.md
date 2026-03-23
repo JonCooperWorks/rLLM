@@ -15,3 +15,4 @@ big picture, then drill into subsystem docs as needed.
 | [API Server](api-server.md) | HTTP server with OpenAI and Anthropic endpoint compatibility using a worker-thread architecture |
 | [Tool Calling](tool-calling.md) | Tool/function calling with per-architecture prompt formatting, output parsing, and both OpenAI and Anthropic API surfaces |
 | [Expert Streaming](expert-streaming.md) | SSD-backed MoE inference — stream expert weights from NVMe on demand for models that don't fit in GPU memory |
+| [Production Considerations](production-considerations.md) | Learning notes on how LLM inference might work at scale — gateway architecture, batching, hardware tiers, quantization as a product lever |
