@@ -298,6 +298,7 @@ async fn chat_completions_blocking(
                 stop_reason: sr,
                 prompt_tokens: pt,
                 completion_tokens: ct,
+                cached_tokens: _cached,
             } => {
                 prompt_tokens = pt;
                 completion_tokens = ct;
@@ -484,6 +485,7 @@ async fn completions_blocking(
                 stop_reason,
                 prompt_tokens: pt,
                 completion_tokens: ct,
+                cached_tokens: _cached,
             } => {
                 prompt_tokens = pt;
                 completion_tokens = ct;

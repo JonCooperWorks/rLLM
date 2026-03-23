@@ -92,6 +92,41 @@ pub(crate) trait Dispatch {
     -> anyhow::Result<u32>;
 
     // -----------------------------------------------------------------------
+    // Prefix caching — reusing KV blocks across requests with shared prefixes.
+    //
+    // Default implementations are no-ops (caching disabled).  SingleGpuDispatch
+    // provides the real implementation.
+    // -----------------------------------------------------------------------
+
+    /// Look up a cached prefix for the given prompt tokens.
+    ///
+    /// Returns `(block_indices, token_count)` for the longest matching prefix,
+    /// or None if no match found.
+    fn prefix_cache_lookup(&mut self, _prompt_tokens: &[u32]) -> Option<(Vec<u32>, usize)> {
+        None
+    }
+
+    /// Register a new prefix after prefill completes.
+    ///
+    /// `tokens` are the full prompt tokens; the implementation extracts the
+    /// block-aligned prefix and records the block table entries.
+    fn prefix_cache_register(&mut self, _tokens: &[u32], _state: &Self::SeqState) {}
+
+    /// Link a sequence's KV state to a cached prefix.
+    ///
+    /// Copies the prefix's physical block indices into the sequence's block
+    /// table and advances seq_len past the already-computed positions.
+    fn link_prefix(
+        &self,
+        _state: &mut Self::SeqState,
+        _prefix_blocks: &[u32],
+        _prefix_token_count: usize,
+        _prefix_tokens: Vec<u32>,
+    ) {
+    }
+
+
+    // -----------------------------------------------------------------------
     // Batched decode — processing N decoding sequences in one forward pass.
     //
     // These methods turn N separate mat-vec decode passes into one GEMM pass.

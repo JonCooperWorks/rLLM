@@ -122,6 +122,109 @@ transformer blocks, run them, evict, load the next batch.  Latency goes up
 
 ---
 
+## Prompt Caching
+
+Most API traffic shares a common prefix.  System prompts, tool definitions,
+and few-shot examples appear identically at the start of every request for a
+given integration.  Prompt caching exploits this: compute the KV once, share
+the physical blocks across all subsequent requests.
+
+### The mechanism
+
+rLLM's paged KV cache already uses block-table indirection — each sequence has
+a block table mapping logical blocks to physical blocks in a shared pool.
+Prompt caching extends this with a `PrefixCache` that maps token-sequence
+hashes to physical block indices:
+
+```
+Request 1 (first with this system prompt):
+  prefill all 1024 tokens → writes blocks [0..63]
+  register blocks [0..63] in PrefixCache, key = hash(tokens[0..1024])
+
+Request 2 (same system prompt + different user message):
+  lookup hash(tokens[0..1024]) → hit, blocks [0..63]
+  copy [0..63] into new seq's block table, set seq_len = 1024
+  prefill only the 50 suffix tokens → writes blocks [64..67]
+```
+
+The attention kernel sees a contiguous 1074-position sequence.  It doesn't
+know that blocks 0–63 were computed by a different request.  The block table
+abstraction makes sharing transparent.
+
+```mermaid
+graph LR
+    subgraph Pool["Physical KV Block Pool"]
+        B0["Block 0<br/>(shared)"]
+        B1["Block 1<br/>(shared)"]
+        BN["..."]
+        B63["Block 63<br/>(shared)"]
+        B64["Block 64<br/>(Seq 2 own)"]
+        B65["Block 65<br/>(Seq 3 own)"]
+    end
+
+    subgraph Seq2["Sequence 2"]
+        BT2["Block Table:<br/>0,1,...,63,64"]
+    end
+
+    subgraph Seq3["Sequence 3"]
+        BT3["Block Table:<br/>0,1,...,63,65"]
+    end
+
+    BT2 --> B0
+    BT2 --> B64
+    BT3 --> B0
+    BT3 --> B65
+```
+
+Reference counting ensures shared blocks survive until all users are done.
+Eviction is LRU among entries with zero active references.
+
+### The economics
+
+Prompt caching saves **prefill compute** — the most expensive per-request
+cost.  Prefill is compute-bound (GEMM through every transformer layer for
+every prompt token).  For a 70B model on 4×H100, prefilling 1000 tokens takes
+~200ms.  Cache that prefix and subsequent requests skip it entirely.
+
+The numbers:
+
+| Metric | Without cache | With cache (90% hit) |
+|--------|--------------|---------------------|
+| Prefill per request | 1000 tokens | 100 tokens (suffix only) |
+| TTFT (time to first token) | ~200 ms | ~20 ms |
+| Prefill compute/request | ~200 TFLOP | ~20 TFLOP |
+| Max prefills/sec (compute-limited) | ~5 | ~50 |
+
+**Prefill throughput scales inversely with prefix length.**  A 4000-token
+system prompt (common for tool-calling agents) takes ~800ms to prefill.  Cache
+it and TTFT drops to the user-message prefill time — typically 10–50ms.
+
+**Memory trade-off.**  Cached blocks consume VRAM that could hold more
+concurrent sequences.  A 1000-token prefix at kv_dim=1024, bf16, 32 layers
+costs `63 blocks × 16 × 1024 × 2 × 2 × 32 = ~128 MB`.  On a 80GB H100, that's
+0.16% of VRAM for a cache entry that might serve thousands of requests.
+
+**The pricing angle.**  Anthropic charges cached input tokens at a 90%
+discount (10% of base price).  This works because the provider's marginal cost
+for a cached token is near zero — the KV already exists in GPU memory.  The
+discount incentivises users to structure prompts for cacheability (stable
+system prompt first, variable content last), which improves GPU utilisation
+for the provider.
+
+```mermaid
+xychart-beta
+    title "Effective Cost per Request (1000-token prefix)"
+    x-axis "Cache Hit Rate" [0%, 25%, 50%, 75%, 90%, 100%]
+    y-axis "Relative Prefill Cost" 0 --> 100
+    bar [100, 77, 55, 32, 14, 5]
+```
+
+At 90% hit rate, prefill cost per request drops to ~14% of the uncached
+baseline.  The remaining cost is the suffix prefill (always required) plus
+the decode phase (unaffected by caching).
+
+---
+
 ## Economics and Tier Differentiation
 
 Unit economics: how many tokens per GPU-hour, and what do you charge per
@@ -135,7 +238,12 @@ the same hour — 64× lower cost per token.
 at nearly the same quality.  Charge the same price: 4× margin.  Pass savings
 to users: undercut competitors.
 
-**Tiers are a mix of hardware, quantization, residency, and priority.**
+**Prompt caching is throughput multiplication.**  The GPU cycles saved on
+prefill are available for more decode batches.  A workload that's 60% prefill-bound
+(long system prompts, short responses) can nearly double effective throughput
+with a hot cache — same hardware, same price, 2× the requests served.
+
+**Tiers are a mix of hardware, quantization, residency, caching, and priority.**
 
 ```mermaid
 quadrantChart
@@ -162,7 +270,7 @@ position and how much of the model lives in VRAM.
 graph TD
     Req([API Request]) --> GW{Gateway<br/>checks user tier}
 
-    GW -->|Pro| Pro["Dedicated H100 pool<br/>Low batch size<br/>Full VRAM residency"]
+    GW -->|Pro| Pro["Dedicated H100 pool<br/>Low batch size<br/>Full VRAM residency<br/>Hot prefix cache"]
     GW -->|Standard| Std["Shared A100/L40 pool<br/>Medium batch size<br/>Quantized weights"]
     GW -->|Free| Free["Overflow pool<br/>High batch size<br/>Disk-streamed layers<br/>Queue deprioritized"]
 
@@ -174,6 +282,11 @@ graph TD
 **Smaller models are genuinely cheap.**  A 7B fits on a consumer GPU; a 70B
 needs 4×H100s.  10–50× cost difference.  The large-model premium pays for the
 fleet.
+
+**Prefix-cache affinity routing.**  The gateway can route requests to the
+server instance that already has the system prompt cached, avoiding cold
+prefills.  Hash the system prompt, use it as a routing key.  This turns prompt
+caching from a per-instance optimisation into a fleet-wide one.
 
 ---
 

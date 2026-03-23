@@ -58,7 +58,7 @@ use std::collections::{HashMap, VecDeque};
 
 use self::dispatch::Dispatch;
 use crate::gpu::GpuBackend;
-use crate::model::kv_cache::{self, KvPool, SeqKvState};
+use crate::model::kv_cache::{self, KvPool, PrefixCache, SeqKvState, BLOCK_SIZE};
 use crate::model::tokenizer::Tokenizer;
 use crate::model::{self, Model, PrefillBuffers};
 
@@ -112,6 +112,8 @@ pub(crate) struct FinishedSequence {
     pub tokens: Vec<u32>,
     pub text: String,
     pub reason: FinishReason,
+    /// Number of prompt tokens served from the prefix cache (0 if no hit).
+    pub cached_tokens: usize,
 }
 
 /// Output from a single engine step.
@@ -163,6 +165,8 @@ pub(crate) struct Sequence<S> {
     pub top_p: f32,
     /// Whether this sequence has finished (EOS or max_tokens reached).
     pub finished: bool,
+    /// Number of prompt tokens served from the prefix cache.
+    pub cached_tokens: usize,
 }
 
 /// Manages the waiting queue and active set for continuous batching.
@@ -223,6 +227,7 @@ impl<S> Scheduler<S> {
                 temperature: req.temperature,
                 top_p: req.top_p,
                 finished: false,
+                cached_tokens: 0,
             };
             self.active.insert(id, seq);
             admitted.push(id);
@@ -300,6 +305,10 @@ pub(crate) fn run_step<D: Dispatch>(
     // 2. Batched prefill: drain all pending tokens for each prefilling sequence.
     //    Each sequence's prompt is processed via GEMM (mat-mat).  Long prompts
     //    are chunked to fit within the prefill buffer allocation (max_chunk).
+    //
+    //    Prefix caching: before running prefill, check if the prompt's prefix
+    //    is already cached.  If so, link the cached blocks and only prefill
+    //    the suffix.  After prefill, register the prefix for future reuse.
     let prefilling_ids: Vec<SeqId> = scheduler
         .active
         .iter()
@@ -313,14 +322,55 @@ pub(crate) fn run_step<D: Dispatch>(
         let seq = scheduler.active.get_mut(&id).unwrap();
         let tokens: Vec<u32> = seq.pending_prefill.drain(..).collect();
 
-        // Chunk the prompt if it exceeds the prefill buffer size.
-        // Each chunk gets its own prepare → forward → finish cycle so that
-        // seq_state.seq_len advances between chunks (positions stay correct).
-        for chunk in tokens.chunks(max_chunk) {
-            let chunk_size = chunk.len();
-            dispatch.prepare_prefill(&mut seq.kv_state, chunk_size)?;
-            dispatch.forward_prefill(chunk, &seq.kv_state)?;
-            D::finish_prefill(&mut seq.kv_state, chunk_size);
+        // --- Prefix cache lookup ---
+        // Check if a prefix of this prompt is already cached.  If so,
+        // link the cached blocks (skip prefill for those tokens) and
+        // only run the model on the remaining suffix.
+        let cached_prefix_len = if let Some((prefix_blocks, prefix_token_count)) =
+            dispatch.prefix_cache_lookup(&tokens)
+        {
+            let prefix_len = prefix_token_count;
+            let prefix_block_count = prefix_blocks.len();
+
+            // Block-aligned prefix tokens for cache release on free.
+            let prefix_tokens = tokens[..prefix_len].to_vec();
+
+            dispatch.link_prefix(
+                &mut seq.kv_state,
+                &prefix_blocks,
+                prefix_token_count,
+                prefix_tokens,
+            );
+            seq.cached_tokens = prefix_len;
+
+            eprintln!(
+                "  seq {:>3}  |  prefix cache hit: {} tokens ({} blocks), prefilling {} suffix tokens",
+                id, prefix_len, prefix_block_count, tokens.len() - prefix_len,
+            );
+
+            prefix_len
+        } else {
+            0
+        };
+
+        let suffix_tokens = &tokens[cached_prefix_len..];
+
+        // Chunk the suffix (or full prompt) and run prefill.
+        if !suffix_tokens.is_empty() {
+            for chunk in suffix_tokens.chunks(max_chunk) {
+                let chunk_size = chunk.len();
+                dispatch.prepare_prefill(&mut seq.kv_state, chunk_size)?;
+                dispatch.forward_prefill(chunk, &seq.kv_state)?;
+                D::finish_prefill(&mut seq.kv_state, chunk_size);
+            }
+        }
+
+        // --- Prefix cache registration ---
+        // After prefill, register the block-aligned prefix for future reuse.
+        // Only register if we didn't already use a cached prefix (avoid
+        // re-registering a subset of an existing entry).
+        if cached_prefix_len == 0 {
+            dispatch.prefix_cache_register(&tokens, &seq.kv_state);
         }
 
         sample_and_finish(dispatch, seq, id, tokenizer, &mut step_tokens, &mut rng)?;
@@ -420,6 +470,7 @@ pub(crate) fn run_step<D: Dispatch>(
             tokens: seq.generated_tokens,
             text,
             reason,
+            cached_tokens: seq.cached_tokens,
         });
     }
 
@@ -473,6 +524,8 @@ pub(crate) struct SingleGpuDispatch<'a, B: GpuBackend> {
     /// small (32 seqs × 128K vocab × 2 bytes = ~8 MB).
     logits_batch: B::Tensor,
     backend: &'a B,
+    /// Prefix cache for sharing KV blocks across sequences with identical prefixes.
+    pub prefix_cache: PrefixCache,
 }
 
 impl<'a, B: GpuBackend> SingleGpuDispatch<'a, B> {
@@ -487,12 +540,17 @@ impl<'a, B: GpuBackend> SingleGpuDispatch<'a, B> {
             &[max_active, model.config().vocab_size],
             crate::gpu::TensorDtype::BF16,
         );
+        // Default prefix cache: 64 entries.  Each entry holds a system prompt
+        // or common prefix — 64 is generous for typical API server workloads
+        // where a handful of system prompts dominate.
+        let prefix_cache = PrefixCache::new(64);
         Self {
             model,
             kv_pool,
             prefill_bufs,
             logits_batch,
             backend,
+            prefix_cache,
         }
     }
 }
@@ -505,6 +563,10 @@ impl<'a, B: GpuBackend> Dispatch for SingleGpuDispatch<'a, B> {
     }
 
     fn free_seq_state(&mut self, state: &SeqKvState<B>) {
+        // Release prefix cache ref count if this sequence used a cached prefix.
+        if let Some(prefix_tokens) = state.shared_prefix_tokens() {
+            self.prefix_cache.release(prefix_tokens);
+        }
         self.kv_pool.free_sequence(state);
     }
 
@@ -560,6 +622,38 @@ impl<'a, B: GpuBackend> Dispatch for SingleGpuDispatch<'a, B> {
         rng: &mut impl rand::Rng,
     ) -> anyhow::Result<u32> {
         crate::model::sampler::sample(self.backend, self.model.logits(), temperature, top_p, rng)
+    }
+
+    fn prefix_cache_lookup(&mut self, prompt_tokens: &[u32]) -> Option<(Vec<u32>, usize)> {
+        self.prefix_cache.lookup(prompt_tokens)
+    }
+
+    fn link_prefix(
+        &self,
+        state: &mut SeqKvState<B>,
+        prefix_blocks: &[u32],
+        prefix_token_count: usize,
+        prefix_tokens: Vec<u32>,
+    ) {
+        state.link_prefix(prefix_blocks, prefix_token_count, prefix_tokens);
+    }
+
+    fn prefix_cache_register(&mut self, tokens: &[u32], state: &SeqKvState<B>) {
+        // Only cache block-aligned prefixes (partial blocks can't be shared
+        // because the next sequence might write different tokens into the
+        // remaining slots).
+        let prefix_blocks = tokens.len() / BLOCK_SIZE;
+        if prefix_blocks == 0 {
+            return;
+        }
+        let prefix_len = prefix_blocks * BLOCK_SIZE;
+        let prefix_tokens = tokens[..prefix_len].to_vec();
+        let block_indices = state.block_table_cpu_slice()[..prefix_blocks].to_vec();
+
+        if let Some(evicted) = self.prefix_cache.insert(prefix_tokens, block_indices) {
+            // Return evicted blocks to the free list.
+            self.kv_pool.free_blocks(&evicted);
+        }
     }
 
     fn supports_batched_decode(&self) -> bool {

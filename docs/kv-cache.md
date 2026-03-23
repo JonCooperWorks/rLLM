@@ -173,12 +173,13 @@ During prefill and decode, new K/V vectors are written to the cache:
 | Allocation | Paged blocks | Paged blocks (PagedAttention) | Contiguous buffer |
 | Block size | 16 tokens | Configurable (default 16) | N/A (no blocks) |
 | Preemption | No | Yes (evict + re-prefill) | No |
-| Prefix caching | No | Yes (share prefix blocks) | K-shift for RoPE |
+| Prefix caching | Yes (hash + ref count) | Yes (share prefix blocks) | K-shift for RoPE |
 | Defragmentation | No (LIFO reuse) | Yes (copy-on-write) | Recently added |
 
-rLLM's paging is simpler than vLLM's — no preemption, no prefix sharing,
-no copy-on-write.  This keeps the implementation straightforward while still
-avoiding the memory waste of contiguous allocation.
+rLLM's paging is simpler than vLLM's — no preemption, no copy-on-write.
+Prefix caching shares KV blocks across sequences with identical prefixes
+via `PrefixCache` (hash lookup + reference counting + LRU eviction).
+See [Prompt Caching](prompt-caching.md) for details.
 
 ---
 
