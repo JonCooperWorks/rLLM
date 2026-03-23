@@ -287,6 +287,7 @@ async fn messages_blocking(
                 stop_reason: sr,
                 prompt_tokens,
                 completion_tokens,
+                cached_tokens: _cached,
             } => {
                 input_tokens = prompt_tokens;
                 output_tokens = completion_tokens;

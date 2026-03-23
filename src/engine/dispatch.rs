@@ -92,6 +92,48 @@ pub(crate) trait Dispatch {
     -> anyhow::Result<u32>;
 
     // -----------------------------------------------------------------------
+    // Prefix caching — reusing KV blocks across requests with shared prefixes.
+    //
+    // Default implementations are no-ops (caching disabled).  SingleGpuDispatch
+    // provides the real implementation.
+    // -----------------------------------------------------------------------
+
+    /// Look up a cached prefix for the given prompt tokens.
+    ///
+    /// Returns `(block_handles, token_count)` for the longest matching prefix,
+    /// or None if no match found.  The handles carry generation counters for
+    /// stale-reference detection.
+    fn prefix_cache_lookup(
+        &mut self,
+        _prompt_tokens: &[u32],
+    ) -> Option<(Vec<crate::model::kv_cache::BlockHandle>, usize)> {
+        None
+    }
+
+    /// Register a new prefix after prefill completes.
+    ///
+    /// `tokens` are the full prompt tokens; the implementation extracts the
+    /// block-aligned prefix and records the block table entries.
+    /// `state` is mutable so the implementation can mark the prefix blocks
+    /// as shared (preventing them from being freed when this sequence finishes).
+    fn prefix_cache_register(&mut self, _tokens: &[u32], _state: &mut Self::SeqState) {}
+
+    /// Link a sequence's KV state to a cached prefix.
+    ///
+    /// Copies the prefix's block handles into the sequence's block table
+    /// and advances seq_len past the already-computed positions.  Handles
+    /// carry generation counters for stale-reference detection.
+    fn link_prefix(
+        &self,
+        _state: &mut Self::SeqState,
+        _prefix_handles: &[crate::model::kv_cache::BlockHandle],
+        _prefix_token_count: usize,
+        _prefix_tokens: Vec<u32>,
+    ) {
+    }
+
+
+    // -----------------------------------------------------------------------
     // Batched decode — processing N decoding sequences in one forward pass.
     //
     // These methods turn N separate mat-vec decode passes into one GEMM pass.

@@ -9,6 +9,7 @@ Rust LLM inference engine that runs 397B-parameter MoE models on a MacBook via N
 - **bf16 and Q4 quantization** — 18-byte block format with bf16 scales; Q4 expert streaming cuts NVMe I/O 3.5×
 - **Multi-GPU tensor parallelism** via NCCL for distributed inference
 - **Continuous batching with paged KV cache** — dynamic block allocation across concurrent sequences
+- **Prompt prefix caching** — repeated system prompts skip prefill entirely; shared KV blocks across sequences with generational safety
 - **Hand-written Metal and CUDA shaders** — SIMD-cooperative matmul, WMMA tensor-core GEMM, fused attention, DeltaNet linear attention
 
 Every file includes architectural rationale explaining *why* things work the way they do, not just *what* they do — designed to be read and understood, not just executed.
@@ -184,6 +185,29 @@ Q4 is slower than bf16 for decode on H100 — unlike Apple Silicon where Q4 is a
 
 </details>
 
+### Prompt Prefix Caching
+
+When multiple requests share the same system prompt, the KV cache from the first prefill is reused — subsequent requests skip prefill for the shared portion entirely. This is the common case for API servers where every request includes the same system prompt.
+
+This reduces **time to first token (TTFT)** but does not affect **decode throughput (tok/s)** — once decoding begins, each token still requires the same forward pass through all layers regardless of how the KV cache was populated.
+
+<details open>
+<summary><b>Apple M4 Max</b> — 16-core CPU, 40-core GPU, 64 GB unified, 546 GB/s</summary>
+
+| Model | Params | Quant | TTFT (cold) | TTFT (cached) | Speedup | Decode |
+|---|---|---|---|---|---|---|
+| Qwen3.5 9B | ~9B | bf16 | 5,427 ms | 616 ms | **8.81x** | 25.3 tok/s |
+| Qwen3.5 122B-A10B ⚡ | 122B (10B active) | Q4 | 3,665 ms | 1,089 ms | **3.37x** | 13.6 tok/s |
+| Qwen3.5 122B-A10B ⚡ | 122B (10B active) | bf16 | 27,176 ms | 13,644 ms | **1.99x** | 1.3 tok/s |
+| Qwen3.5 397B-A17B ⚡ | 397B (17B active) | Q4 | 5,676 ms | 1,817 ms | **3.12x** | 7.9 tok/s |
+| Qwen3.5 397B-A17B ⚡ | 397B (17B active) | bf16 | 60,462 ms | 29,501 ms | **2.05x** | 0.3 tok/s |
+
+⚡ = SSD expert streaming (`--stream-experts`).
+
+</details>
+
+Measured via `rllm bench` — 8 requests sharing the same system prompt (~32 cached prefix tokens). First request is a cache miss (full prefill), subsequent 7 are cache hits (suffix-only prefill). "TTFT (cached)" is the average across cache-hit requests. Prompt prefix caching works on both Metal and CUDA with no configuration — it's always on.
+
 ## Features
 
 - **Multi-architecture** — Llama 3, Qwen 2.5, Mistral, Mixtral 8x7B, Qwen3 MoE, Qwen3.5, Phi-4, Gemma 3, DeepSeek-R1-Distill, and GPT-OSS from the same codebase
@@ -191,6 +215,7 @@ Q4 is slower than bf16 for decode on H100 — unlike Apple Silicon where Q4 is a
 - **Multi-GPU tensor parallelism** — split models across GPUs via NCCL (`--tp 2`); currently supported for Llama, Mistral, and Gemma
 - **Batched prefill** — GEMM-based prompt processing (3-10x faster than token-by-token)
 - **Paged KV cache** — on-demand block allocation, shared across sequences
+- **Prompt prefix caching** — when multiple requests share the same system prompt (or any common prefix), the KV cache blocks from the first prefill are reused — subsequent requests skip prefill for the shared portion entirely, reducing TTFT to near-zero for the cached prefix. Uses block-aligned matching with LRU eviction and reference counting. Generational block handles prevent use-after-free if cached blocks are evicted while in use
 - **Continuous batching** — concurrent multi-sequence inference via engine/scheduler
 - **Q4 quantization** — offline 4-bit block quantization via `rllm quantize` (~3.2x memory reduction)
 - **bf16 inference** — native half-precision compute
@@ -348,7 +373,7 @@ src/
 │   ├── loader.rs        — Safetensors loading, pre-quantized Q4 detection
 │   ├── tokenizer.rs     — BPE tokenizer with per-model special tokens
 │   ├── chat.rs          — Chat template formatter
-│   ├── kv_cache.rs      — Paged KV cache (block pool + per-sequence state)
+│   ├── kv_cache.rs      — Paged KV cache (block pool + per-sequence state + prefix cache)
 │   ├── expert_stream.rs — SSD expert streaming (pread-based on-demand loading)
 │   └── sampler.rs       — Temperature + top-p sampling
 ├── engine/              — Continuous batching loop + FCFS scheduler
@@ -369,6 +394,7 @@ src/
 | Weights | Q4 quantization (3.2x less memory bandwidth) | ~1.5x |
 | Prefill | Batched GEMM (load weights once, compute B times) | 3-10x |
 | KV cache | Paged allocation (on-demand blocks, no waste) | — |
+| Prefix caching | Shared KV blocks across sequences with same system prompt | TTFT → ~0 for cached prefix |
 | Attention | Fused single-pass softmax+V, head_dim-specialised pipelines | 1.3-2.8x |
 | Batching | Continuous batching (N sequences share the GPU) | ~Nx |
 | Expert streaming | SSD pread on demand, fused gate+up+SwiGLU kernel | runs models that don't fit in VRAM |

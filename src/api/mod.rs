@@ -87,6 +87,8 @@ pub(crate) enum InferenceEvent {
         stop_reason: StopReason,
         prompt_tokens: usize,
         completion_tokens: usize,
+        /// Number of prompt tokens served from the prefix cache.
+        cached_tokens: usize,
     },
     /// An error occurred during inference.
     Error(String),
@@ -375,6 +377,8 @@ struct RequestContext {
     token_ids: Vec<u32>,
     /// Number of characters already sent to the client.
     prev_text_len: usize,
+    /// Number of prompt tokens served from the prefix cache (0 if miss).
+    cached_tokens: usize,
     /// When this request was submitted to the worker (for TTFT / tok/s logging).
     created_at: Instant,
     /// When the first token was generated (None until the first token event).
@@ -432,6 +436,7 @@ fn run_worker_loop(
                     response_tx: req.response_tx,
                     prompt_token_count,
                     generated_count: 0,
+                    cached_tokens: 0,
                     token_ids: Vec::new(),
                     prev_text_len: 0,
                     created_at: Instant::now(),
@@ -460,6 +465,7 @@ fn run_worker_loop(
                             response_tx: req.response_tx,
                             prompt_token_count,
                             generated_count: 0,
+                            cached_tokens: 0,
                             token_ids: Vec::new(),
                             prev_text_len: 0,
                             created_at: Instant::now(),
@@ -549,6 +555,8 @@ fn run_worker_loop(
         // 5. Handle finished sequences.
         for finished in &step_output.finished {
             if let Some(mut ctx) = registry.remove(&finished.id) {
+                // Propagate cached_tokens count from engine.
+                ctx.cached_tokens = finished.cached_tokens;
                 // Flush any pending thinking marker (e.g. </think> was the
                 // last token before EOS).
                 if let Some(marker) = ctx.inject_marker.take() {
@@ -583,10 +591,16 @@ fn run_worker_loop(
                     StopReason::MaxTokens => "max_tokens",
                     StopReason::ToolCalls => "tool_calls",
                 };
+                let cache_label = if ctx.cached_tokens > 0 {
+                    format!(" ({} cached)", ctx.cached_tokens)
+                } else {
+                    String::new()
+                };
                 eprintln!(
-                    "  seq {:>3}  |  {} prompt + {} gen  |  TTFT {:.0} ms  |  {:.1} tok/s  |  {:.2}s  |  {}",
+                    "  seq {:>3}  |  {} prompt{} + {} gen  |  TTFT {:.0} ms  |  {:.1} tok/s  |  {:.2}s  |  {}",
                     finished.id,
                     ctx.prompt_token_count,
+                    cache_label,
                     ctx.generated_count,
                     ttft_ms.unwrap_or(0.0),
                     tok_per_sec,
@@ -598,6 +612,7 @@ fn run_worker_loop(
                     stop_reason,
                     prompt_tokens: ctx.prompt_token_count,
                     completion_tokens: ctx.generated_count,
+                    cached_tokens: ctx.cached_tokens,
                 });
             }
         }

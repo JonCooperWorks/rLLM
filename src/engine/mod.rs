@@ -58,7 +58,7 @@ use std::collections::{HashMap, VecDeque};
 
 use self::dispatch::Dispatch;
 use crate::gpu::GpuBackend;
-use crate::model::kv_cache::{self, KvPool, SeqKvState};
+use crate::model::kv_cache::{self, BlockHandle, KvPool, PrefixCache, SeqKvState, BLOCK_SIZE};
 use crate::model::tokenizer::Tokenizer;
 use crate::model::{self, Model, PrefillBuffers};
 
@@ -112,6 +112,8 @@ pub(crate) struct FinishedSequence {
     pub tokens: Vec<u32>,
     pub text: String,
     pub reason: FinishReason,
+    /// Number of prompt tokens served from the prefix cache (0 if no hit).
+    pub cached_tokens: usize,
 }
 
 /// Output from a single engine step.
@@ -163,6 +165,8 @@ pub(crate) struct Sequence<S> {
     pub top_p: f32,
     /// Whether this sequence has finished (EOS or max_tokens reached).
     pub finished: bool,
+    /// Number of prompt tokens served from the prefix cache.
+    pub cached_tokens: usize,
 }
 
 /// Manages the waiting queue and active set for continuous batching.
@@ -223,6 +227,7 @@ impl<S> Scheduler<S> {
                 temperature: req.temperature,
                 top_p: req.top_p,
                 finished: false,
+                cached_tokens: 0,
             };
             self.active.insert(id, seq);
             admitted.push(id);
@@ -300,6 +305,10 @@ pub(crate) fn run_step<D: Dispatch>(
     // 2. Batched prefill: drain all pending tokens for each prefilling sequence.
     //    Each sequence's prompt is processed via GEMM (mat-mat).  Long prompts
     //    are chunked to fit within the prefill buffer allocation (max_chunk).
+    //
+    //    Prefix caching: before running prefill, check if the prompt's prefix
+    //    is already cached.  If so, link the cached blocks and only prefill
+    //    the suffix.  After prefill, register the prefix for future reuse.
     let prefilling_ids: Vec<SeqId> = scheduler
         .active
         .iter()
@@ -313,14 +322,55 @@ pub(crate) fn run_step<D: Dispatch>(
         let seq = scheduler.active.get_mut(&id).unwrap();
         let tokens: Vec<u32> = seq.pending_prefill.drain(..).collect();
 
-        // Chunk the prompt if it exceeds the prefill buffer size.
-        // Each chunk gets its own prepare → forward → finish cycle so that
-        // seq_state.seq_len advances between chunks (positions stay correct).
-        for chunk in tokens.chunks(max_chunk) {
-            let chunk_size = chunk.len();
-            dispatch.prepare_prefill(&mut seq.kv_state, chunk_size)?;
-            dispatch.forward_prefill(chunk, &seq.kv_state)?;
-            D::finish_prefill(&mut seq.kv_state, chunk_size);
+        // --- Prefix cache lookup ---
+        // Check if a prefix of this prompt is already cached.  If so,
+        // link the cached blocks (skip prefill for those tokens) and
+        // only run the model on the remaining suffix.
+        let cached_prefix_len = if let Some((prefix_blocks, prefix_token_count)) =
+            dispatch.prefix_cache_lookup(&tokens)
+        {
+            let prefix_len = prefix_token_count;
+            let prefix_block_count = prefix_blocks.len();
+
+            // Block-aligned prefix tokens for cache release on free.
+            let prefix_tokens = tokens[..prefix_len].to_vec();
+
+            dispatch.link_prefix(
+                &mut seq.kv_state,
+                &prefix_blocks,
+                prefix_token_count,
+                prefix_tokens,
+            );
+            seq.cached_tokens = prefix_len;
+
+            eprintln!(
+                "  seq {:>3}  |  prefix cache hit: {} tokens ({} blocks), prefilling {} suffix tokens",
+                id, prefix_len, prefix_block_count, tokens.len() - prefix_len,
+            );
+
+            prefix_len
+        } else {
+            0
+        };
+
+        let suffix_tokens = &tokens[cached_prefix_len..];
+
+        // Chunk the suffix (or full prompt) and run prefill.
+        if !suffix_tokens.is_empty() {
+            for chunk in suffix_tokens.chunks(max_chunk) {
+                let chunk_size = chunk.len();
+                dispatch.prepare_prefill(&mut seq.kv_state, chunk_size)?;
+                dispatch.forward_prefill(chunk, &seq.kv_state)?;
+                D::finish_prefill(&mut seq.kv_state, chunk_size);
+            }
+        }
+
+        // --- Prefix cache registration ---
+        // After prefill, register the block-aligned prefix for future reuse.
+        // Only register if we didn't already use a cached prefix (avoid
+        // re-registering a subset of an existing entry).
+        if cached_prefix_len == 0 {
+            dispatch.prefix_cache_register(&tokens, &mut seq.kv_state);
         }
 
         sample_and_finish(dispatch, seq, id, tokenizer, &mut step_tokens, &mut rng)?;
@@ -420,6 +470,7 @@ pub(crate) fn run_step<D: Dispatch>(
             tokens: seq.generated_tokens,
             text,
             reason,
+            cached_tokens: seq.cached_tokens,
         });
     }
 
@@ -473,6 +524,8 @@ pub(crate) struct SingleGpuDispatch<'a, B: GpuBackend> {
     /// small (32 seqs × 128K vocab × 2 bytes = ~8 MB).
     logits_batch: B::Tensor,
     backend: &'a B,
+    /// Prefix cache for sharing KV blocks across sequences with identical prefixes.
+    pub prefix_cache: PrefixCache,
 }
 
 impl<'a, B: GpuBackend> SingleGpuDispatch<'a, B> {
@@ -487,12 +540,17 @@ impl<'a, B: GpuBackend> SingleGpuDispatch<'a, B> {
             &[max_active, model.config().vocab_size],
             crate::gpu::TensorDtype::BF16,
         );
+        // Default prefix cache: 64 entries.  Each entry holds a system prompt
+        // or common prefix — 64 is generous for typical API server workloads
+        // where a handful of system prompts dominate.
+        let prefix_cache = PrefixCache::new(64);
         Self {
             model,
             kv_pool,
             prefill_bufs,
             logits_batch,
             backend,
+            prefix_cache,
         }
     }
 }
@@ -505,6 +563,10 @@ impl<'a, B: GpuBackend> Dispatch for SingleGpuDispatch<'a, B> {
     }
 
     fn free_seq_state(&mut self, state: &SeqKvState<B>) {
+        // Release prefix cache ref count if this sequence used a cached prefix.
+        if let Some(prefix_tokens) = state.shared_prefix_tokens() {
+            self.prefix_cache.release(prefix_tokens);
+        }
         self.kv_pool.free_sequence(state);
     }
 
@@ -522,7 +584,7 @@ impl<'a, B: GpuBackend> Dispatch for SingleGpuDispatch<'a, B> {
         token_count: usize,
     ) -> anyhow::Result<()> {
         state.ensure_slots(&mut self.kv_pool, token_count)?;
-        state.sync_block_table(self.backend);
+        state.sync_block_table_validated(self.backend, &self.kv_pool);
         Ok(())
     }
 
@@ -541,7 +603,7 @@ impl<'a, B: GpuBackend> Dispatch for SingleGpuDispatch<'a, B> {
 
     fn prepare_decode(&mut self, state: &mut SeqKvState<B>) -> anyhow::Result<()> {
         state.ensure_slot(&mut self.kv_pool)?;
-        state.sync_block_table(self.backend);
+        state.sync_block_table_validated(self.backend, &self.kv_pool);
         Ok(())
     }
 
@@ -560,6 +622,42 @@ impl<'a, B: GpuBackend> Dispatch for SingleGpuDispatch<'a, B> {
         rng: &mut impl rand::Rng,
     ) -> anyhow::Result<u32> {
         crate::model::sampler::sample(self.backend, self.model.logits(), temperature, top_p, rng)
+    }
+
+    fn prefix_cache_lookup(&mut self, prompt_tokens: &[u32]) -> Option<(Vec<BlockHandle>, usize)> {
+        self.prefix_cache.lookup(prompt_tokens)
+    }
+
+    fn link_prefix(
+        &self,
+        state: &mut SeqKvState<B>,
+        prefix_handles: &[BlockHandle],
+        prefix_token_count: usize,
+        prefix_tokens: Vec<u32>,
+    ) {
+        state.link_prefix(prefix_handles, prefix_token_count, prefix_tokens);
+    }
+
+    fn prefix_cache_register(&mut self, tokens: &[u32], state: &mut SeqKvState<B>) {
+        // Only cache block-aligned prefixes (partial blocks can't be shared
+        // because the next sequence might write different tokens into the
+        // remaining slots).
+        let prefix_blocks = tokens.len() / BLOCK_SIZE;
+        if prefix_blocks == 0 {
+            return;
+        }
+        let prefix_len = prefix_blocks * BLOCK_SIZE;
+        let prefix_tokens = tokens[..prefix_len].to_vec();
+        let block_indices = state.block_table_cpu_slice()[..prefix_blocks].to_vec();
+
+        if let Some(evicted) = self.prefix_cache.insert(prefix_tokens.clone(), block_indices) {
+            // Return evicted blocks to the free list.
+            self.kv_pool.free_blocks(&evicted);
+        }
+
+        // Mark the prefix blocks as shared on this sequence so free_sequence()
+        // won't return them to the pool — they now belong to the cache.
+        state.mark_prefix_shared(prefix_blocks, prefix_tokens);
     }
 
     fn supports_batched_decode(&self) -> bool {
@@ -1272,5 +1370,325 @@ mod tests {
         assert_eq!(out.finished.len(), 1);
         assert_eq!(out.finished[0].tokens, vec![101]);
         assert!(!scheduler.has_work());
+    }
+
+    // -----------------------------------------------------------------------
+    // Prefix caching integration tests — verify run_step with a real KvPool
+    // and PrefixCache, exercising the full lookup → link → suffix-prefill →
+    // register → reuse flow.
+    // -----------------------------------------------------------------------
+
+    /// Dispatch backed by a real CpuBackend KvPool + PrefixCache.
+    ///
+    /// Forward passes are no-ops, but block allocation, prefix caching, and
+    /// block freeing are all real.  This tests the full lifecycle from the
+    /// engine's perspective.
+    struct CachingTestDispatch {
+        pool: KvPool<CpuBackend>,
+        backend: CpuBackend,
+        prefix_cache: PrefixCache,
+        /// Tokens passed to forward_prefill (accumulated across calls).
+        /// Used to verify that cache hits skip prefix tokens.
+        prefilled_tokens: std::cell::RefCell<Vec<Vec<u32>>>,
+    }
+
+    impl CachingTestDispatch {
+        fn new(num_blocks: usize, cache_entries: usize) -> Self {
+            let backend = CpuBackend;
+            let pool = KvPool::new(&backend, num_blocks, 4, 1);
+            Self {
+                pool,
+                backend,
+                prefix_cache: PrefixCache::new(cache_entries),
+                prefilled_tokens: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Dispatch for CachingTestDispatch {
+        type SeqState = SeqKvState<CpuBackend>;
+
+        fn new_seq_state(&self) -> Self::SeqState {
+            self.pool.new_sequence(&self.backend)
+        }
+
+        fn free_seq_state(&mut self, state: &Self::SeqState) {
+            if let Some(prefix_tokens) = state.shared_prefix_tokens() {
+                self.prefix_cache.release(prefix_tokens);
+            }
+            self.pool.free_sequence(state);
+        }
+
+        fn free_block_count(&self) -> usize {
+            self.pool.free_block_count()
+        }
+
+        fn seq_len(state: &Self::SeqState) -> usize {
+            state.seq_len
+        }
+
+        fn prepare_prefill(
+            &mut self,
+            state: &mut Self::SeqState,
+            token_count: usize,
+        ) -> anyhow::Result<()> {
+            state.ensure_slots(&mut self.pool, token_count)?;
+            state.sync_block_table(&self.backend);
+            Ok(())
+        }
+
+        fn forward_prefill(&self, tokens: &[u32], _state: &Self::SeqState) -> anyhow::Result<()> {
+            // Record what was actually prefilled (for cache-hit verification).
+            self.prefilled_tokens.borrow_mut().push(tokens.to_vec());
+            Ok(())
+        }
+
+        fn finish_prefill(state: &mut Self::SeqState, token_count: usize) {
+            state.advance_by(token_count);
+        }
+
+        fn prepare_decode(&mut self, state: &mut Self::SeqState) -> anyhow::Result<()> {
+            state.ensure_slot(&mut self.pool)?;
+            state.sync_block_table(&self.backend);
+            Ok(())
+        }
+
+        fn forward_decode(&self, _token: u32, _state: &Self::SeqState) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn finish_decode(state: &mut Self::SeqState) {
+            state.advance();
+        }
+
+        fn sample(
+            &self,
+            _temperature: f32,
+            _top_p: f32,
+            _rng: &mut impl rand::Rng,
+        ) -> anyhow::Result<u32> {
+            Ok(0)
+        }
+
+        fn prefix_cache_lookup(&mut self, prompt_tokens: &[u32]) -> Option<(Vec<BlockHandle>, usize)> {
+            self.prefix_cache.lookup(prompt_tokens)
+        }
+
+        fn prefix_cache_register(&mut self, tokens: &[u32], state: &mut Self::SeqState) {
+            let prefix_blocks = tokens.len() / BLOCK_SIZE;
+            if prefix_blocks == 0 {
+                return;
+            }
+            let prefix_len = prefix_blocks * BLOCK_SIZE;
+            let prefix_tokens = tokens[..prefix_len].to_vec();
+            let block_indices = state.block_table_cpu_slice()[..prefix_blocks].to_vec();
+            if let Some(evicted) = self.prefix_cache.insert(prefix_tokens.clone(), block_indices) {
+                self.pool.free_blocks(&evicted);
+            }
+            state.mark_prefix_shared(prefix_blocks, prefix_tokens);
+        }
+
+        fn link_prefix(
+            &self,
+            state: &mut Self::SeqState,
+            prefix_handles: &[BlockHandle],
+            prefix_token_count: usize,
+            prefix_tokens: Vec<u32>,
+        ) {
+            state.link_prefix(prefix_handles, prefix_token_count, prefix_tokens);
+        }
+    }
+
+    #[test]
+    fn test_prefix_cache_miss_registers_then_hit_skips_prefill() {
+        // Two sequences with the same 32-token prefix + different suffixes.
+        // First sequence: 40 tokens (not block-aligned: 2.5 blocks).
+        //   → Registers 32-token block-aligned prefix (2 full blocks).
+        // Second sequence: same 32-token prefix + different suffix.
+        //   → Cache hit: 32 tokens skipped, only suffix prefilled.
+        let mut dispatch = CachingTestDispatch::new(20, 4);
+        let mut scheduler: Scheduler<SeqKvState<CpuBackend>> = Scheduler::new(4);
+        let tokenizer = make_tokenizer(vec![999]);
+
+        // Sequence 1: 40 tokens (2 full blocks + 8 extra in partial block).
+        let prompt1: Vec<u32> = (0..40).collect();
+        scheduler.add_request(SequenceRequest {
+            prompt_tokens: prompt1.clone(),
+            max_gen_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+        });
+
+        let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
+        assert_eq!(out.finished.len(), 1);
+        assert_eq!(out.finished[0].cached_tokens, 0); // miss
+
+        // Verify full prompt was prefilled.
+        let prefilled = dispatch.prefilled_tokens.borrow().clone();
+        assert_eq!(prefilled.len(), 1);
+        assert_eq!(prefilled[0].len(), 40);
+
+        // Cache should now have the 32-token block-aligned prefix (2 blocks).
+        assert_eq!(dispatch.prefix_cache.len(), 1);
+
+        // Sequence 2: same 32-token prefix + different 8-token suffix.
+        dispatch.prefilled_tokens.borrow_mut().clear();
+        let mut prompt2: Vec<u32> = (0..32).collect(); // same prefix
+        prompt2.extend(100..108); // different suffix (8 tokens)
+        scheduler.add_request(SequenceRequest {
+            prompt_tokens: prompt2.clone(),
+            max_gen_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+        });
+
+        let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
+        assert_eq!(out.finished.len(), 1);
+        assert_eq!(out.finished[0].cached_tokens, 32); // hit: 32 tokens cached
+
+        // Verify only the 8-token suffix was prefilled (not the full 40).
+        let prefilled = dispatch.prefilled_tokens.borrow().clone();
+        assert_eq!(prefilled.len(), 1);
+        assert_eq!(prefilled[0].len(), 8);
+        assert_eq!(prefilled[0], (100..108).collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn test_prefix_cache_blocks_freed_correctly_after_both_sequences_finish() {
+        // Two sequences share a prefix.  After both finish, the shared blocks
+        // should remain held by the cache (not double-freed).
+        //
+        // Prompt: 40 tokens = 2 full blocks (cached) + 8 in partial block (not cached).
+        let mut dispatch = CachingTestDispatch::new(20, 4);
+        let mut scheduler: Scheduler<SeqKvState<CpuBackend>> = Scheduler::new(4);
+        let tokenizer = make_tokenizer(vec![999]);
+
+        let prompt: Vec<u32> = (0..40).collect(); // 2 full blocks + 8 extra
+        let blocks_before = dispatch.pool.free_block_count();
+
+        // Sequence 1: prefill, register 32-token prefix, generate 1 token, finish.
+        scheduler.add_request(SequenceRequest {
+            prompt_tokens: prompt.clone(),
+            max_gen_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+        });
+        let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
+        assert_eq!(out.finished.len(), 1);
+        let blocks_after_seq1 = dispatch.pool.free_block_count();
+        // 3 blocks allocated for 40 tokens (ceil(40/16) = 3).
+        // 2 prefix blocks held by cache.
+        // 1 suffix block (partial, positions 32-39) freed on finish.
+        // Plus 1 decode block allocated then freed (sample needs pos 40).
+        // Net: 2 blocks held by cache.
+        assert_eq!(
+            blocks_before - blocks_after_seq1,
+            2, // 2 prefix blocks held by cache
+            "prefix blocks should be held by cache"
+        );
+
+        // Sequence 2: same first 32 tokens + different suffix, cache hit.
+        let mut prompt2: Vec<u32> = (0..32).collect();
+        prompt2.extend(500..508); // different 8-token suffix
+        scheduler.add_request(SequenceRequest {
+            prompt_tokens: prompt2.clone(),
+            max_gen_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+        });
+        let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
+        assert_eq!(out.finished.len(), 1);
+        assert_eq!(out.finished[0].cached_tokens, 32);
+
+        let blocks_after_seq2 = dispatch.pool.free_block_count();
+        // Seq2 used cached prefix (no new prefix blocks).
+        // Allocated 0 suffix blocks (8 tokens fit in the last partial area
+        // of block 1, which is shared — wait, no.  Suffix tokens need their
+        // own block.  seq_len=32 after link, ensure_slots(8) needs
+        // ceil((32+8)/16) = 3 blocks total.  Already have 2 from prefix,
+        // so allocates 1 new block.  That 1 block is freed on finish.
+        // Cache still holds 2.
+        assert_eq!(
+            blocks_before - blocks_after_seq2,
+            2,
+            "prefix blocks still held by cache after both sequences finish"
+        );
+
+        // Verify cache ref count is 0 now (both sequences released).
+        // Insert enough entries to trigger eviction of our prefix.
+        let evict1: Vec<u32> = vec![200; BLOCK_SIZE];
+        let evict2: Vec<u32> = vec![201; BLOCK_SIZE];
+        let evict3: Vec<u32> = vec![202; BLOCK_SIZE];
+        let evict4: Vec<u32> = vec![203; BLOCK_SIZE];
+        let bh = |i, g| BlockHandle { index: i, generation: g };
+        dispatch.prefix_cache.insert(evict1.clone(), vec![bh(99, 0)]);
+        dispatch.prefix_cache.release(&evict1);
+        dispatch.prefix_cache.insert(evict2.clone(), vec![bh(98, 0)]);
+        dispatch.prefix_cache.release(&evict2);
+        dispatch.prefix_cache.insert(evict3.clone(), vec![bh(97, 0)]);
+        dispatch.prefix_cache.release(&evict3);
+        // This insert should evict our original prefix (oldest, ref_count=0).
+        let evicted = dispatch.prefix_cache.insert(evict4.clone(), vec![bh(96, 0)]);
+        assert!(evicted.is_some(), "original prefix should be evictable (ref_count=0)");
+    }
+
+    #[test]
+    fn test_prefix_cache_short_prompt_no_cache() {
+        // Prompts shorter than BLOCK_SIZE should not be cached (can't be block-aligned).
+        let mut dispatch = CachingTestDispatch::new(10, 4);
+        let mut scheduler: Scheduler<SeqKvState<CpuBackend>> = Scheduler::new(4);
+        let tokenizer = make_tokenizer(vec![999]);
+
+        scheduler.add_request(SequenceRequest {
+            prompt_tokens: vec![1, 2, 3],
+            max_gen_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+        });
+
+        run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
+        assert_eq!(dispatch.prefix_cache.len(), 0);
+    }
+
+    #[test]
+    fn test_prefix_cache_seq_len_correct_after_link() {
+        // After a cache hit, seq_len should equal prefix_len, and suffix prefill
+        // should advance it further.
+        let mut dispatch = CachingTestDispatch::new(30, 4);
+        let mut scheduler: Scheduler<SeqKvState<CpuBackend>> = Scheduler::new(4);
+        let tokenizer = make_tokenizer(vec![999]);
+
+        // Seq 1: 40 tokens (2 full blocks cached + 8 in partial).
+        let prompt1: Vec<u32> = (0..40).collect();
+        scheduler.add_request(SequenceRequest {
+            prompt_tokens: prompt1.clone(),
+            max_gen_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+        });
+        run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
+
+        // Seq 2: same 32-token prefix + 24-token different suffix = 56 tokens.
+        let mut prompt2: Vec<u32> = (0..32).collect();
+        prompt2.extend(1000..1024);
+        scheduler.add_request(SequenceRequest {
+            prompt_tokens: prompt2.clone(),
+            max_gen_tokens: 2,
+            temperature: 0.0,
+            top_p: 1.0,
+        });
+
+        // Step: admit + cache hit (32 tokens) + prefill suffix (24 tokens)
+        //       + sample first token + decode + sample second → finish (max_tokens=2).
+        let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
+        assert_eq!(out.finished.len(), 1);
+        assert_eq!(out.finished[0].cached_tokens, 32);
+
+        // Verify the suffix was prefilled correctly (24 tokens, not the full 56).
+        let prefilled = dispatch.prefilled_tokens.borrow();
+        // Last prefill call should be the 24-token suffix.
+        let last = prefilled.last().unwrap();
+        assert_eq!(last.len(), 24);
+        assert_eq!(*last, (1000..1024).collect::<Vec<u32>>());
     }
 }

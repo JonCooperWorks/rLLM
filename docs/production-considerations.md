@@ -122,6 +122,210 @@ transformer blocks, run them, evict, load the next batch.  Latency goes up
 
 ---
 
+## Prompt Caching
+
+Most API traffic shares a common prefix.  System prompts, tool definitions,
+and few-shot examples appear identically at the start of every request for a
+given integration.  Prompt caching exploits this: compute the KV once, share
+the physical blocks across all subsequent requests.
+
+### The mechanism
+
+rLLM's paged KV cache already uses block-table indirection — each sequence has
+a block table mapping logical blocks to physical blocks in a shared pool.
+Prompt caching extends this with a `PrefixCache` that maps token-sequence
+hashes to physical block indices:
+
+```
+Request 1 (first with this system prompt):
+  prefill all 1024 tokens → writes blocks [0..63]
+  register blocks [0..63] in PrefixCache, key = hash(tokens[0..1024])
+
+Request 2 (same system prompt + different user message):
+  lookup hash(tokens[0..1024]) → hit, blocks [0..63]
+  copy [0..63] into new seq's block table, set seq_len = 1024
+  prefill only the 50 suffix tokens → writes blocks [64..67]
+```
+
+The attention kernel sees a contiguous 1074-position sequence.  It doesn't
+know that blocks 0–63 were computed by a different request.  The block table
+abstraction makes sharing transparent.
+
+```mermaid
+graph LR
+    subgraph Pool["Physical KV Block Pool"]
+        B0["Block 0<br/>(shared)"]
+        B1["Block 1<br/>(shared)"]
+        BN["..."]
+        B63["Block 63<br/>(shared)"]
+        B64["Block 64<br/>(Seq 2 own)"]
+        B65["Block 65<br/>(Seq 3 own)"]
+    end
+
+    subgraph Seq2["Sequence 2"]
+        BT2["Block Table:<br/>0,1,...,63,64"]
+    end
+
+    subgraph Seq3["Sequence 3"]
+        BT3["Block Table:<br/>0,1,...,63,65"]
+    end
+
+    BT2 --> B0
+    BT2 --> B64
+    BT3 --> B0
+    BT3 --> B65
+```
+
+Reference counting ensures shared blocks survive until all users are done.
+Eviction is LRU among entries with zero active references.
+
+### The economics
+
+Prompt caching saves **prefill compute** — the most expensive per-request
+cost.  Prefill is compute-bound (GEMM through every transformer layer for
+every prompt token).  For a 70B model on 4×H100, prefilling 1000 tokens takes
+~200ms.  Cache that prefix and subsequent requests skip it entirely.
+
+The numbers:
+
+| Metric | Without cache | With cache (90% hit) |
+|--------|--------------|---------------------|
+| Prefill per request | 1000 tokens | 100 tokens (suffix only) |
+| TTFT (time to first token) | ~200 ms | ~20 ms |
+| Prefill compute/request | ~200 TFLOP | ~20 TFLOP |
+| Max prefills/sec (compute-limited) | ~5 | ~50 |
+
+**Prefill throughput scales inversely with prefix length.**  A 4000-token
+system prompt (common for tool-calling agents) takes ~800ms to prefill.  Cache
+it and TTFT drops to the user-message prefill time — typically 10–50ms.
+
+**Memory trade-off.**  Cached blocks consume VRAM that could hold more
+concurrent sequences.  A 1000-token prefix at kv_dim=1024, bf16, 32 layers
+costs `63 blocks × 16 × 1024 × 2 × 2 × 32 = ~128 MB`.  On a 80GB H100, that's
+0.16% of VRAM for a cache entry that might serve thousands of requests.
+
+**The pricing angle.**  Anthropic charges cached input tokens at a 90%
+discount (10% of base price).  This works because the provider's marginal cost
+for a cached token is near zero — the KV already exists in GPU memory.  The
+discount incentivises users to structure prompts for cacheability (stable
+system prompt first, variable content last), which improves GPU utilisation
+for the provider.
+
+```mermaid
+xychart-beta
+    title "Effective Cost per Request (1000-token prefix)"
+    x-axis "Cache Hit Rate" [0%, 25%, 50%, 75%, 90%, 100%]
+    y-axis "Relative Prefill Cost" 0 --> 100
+    bar [100, 77, 55, 32, 14, 5]
+```
+
+At 90% hit rate, prefill cost per request drops to ~14% of the uncached
+baseline.  The remaining cost is the suffix prefill (always required) plus
+the decode phase (unaffected by caching).
+
+**What caching does NOT improve.**  Decode throughput (tok/s) is unchanged —
+each generated token still requires a full forward pass through all layers,
+reading the entire KV cache.  Caching is purely a TTFT and prefill-compute
+optimisation.
+
+---
+
+## Prefix-Cache Routing
+
+The prefix cache is **local to each engine instance** — an in-process hash map
+with no cross-server coordination.  A request only hits a cached prefix if it
+lands on the server that computed it.  This makes load-balancer routing the
+single biggest lever for cache hit rate.
+
+### Routing strategies
+
+```mermaid
+graph TD
+    Req([Request]) --> LB{Load Balancer}
+
+    LB -->|Round-robin| RR["Even load<br/>Low hit rate<br/>Each server builds<br/>its own partial cache"]
+    LB -->|Hash system prompt| HP["High hit rate<br/>Uneven if prompts<br/>are unbalanced"]
+    LB -->|First-party pool| FP["Dedicated servers<br/>One prompt, always hot"]
+
+    style FP fill:#d4edda
+    style HP fill:#fff3cd
+    style RR fill:#f8d7da
+```
+
+**Round-robin** — Even load, but every server independently caches the same
+prefixes.  N servers means N× the VRAM spent on duplicate cache entries and N×
+the cold prefills.  Fine for low-volume or heterogeneous traffic where no prefix
+dominates.
+
+**Hash on system prompt** — Hash the system prompt content (or a stable prefix
+of it) and use it as the routing key.  All requests with the same system prompt
+land on the same server(s).  High cache hit rate, and naturally groups traffic
+by integration rather than by user.  The risk is hot spots if one prompt
+dominates — mitigate with consistent hashing across a small pool per prompt.
+
+**Dedicated first-party pools** — The highest-leverage pattern.  First-party
+clients (mobile app, web app, internal tools) all share a single system prompt
+that you control.  Route them to a dedicated server pool where that prefix is
+always hot.  The prefix never competes with other entries for cache slots and
+never gets evicted.
+
+### The first-party / API split
+
+In practice, traffic splits into two categories with very different caching
+profiles:
+
+```
+First-party clients          API customers
+─────────────────           ──────────────
+You control the prompt       They control the prompt
+One system prompt            One per customer (mostly stable)
+100% cache hit rate          High hit rate with affinity routing
+Dedicated server pool        Shared pool, hash-routed
+```
+
+**First-party clients** are the easy case.  You wrote the system prompt, it
+never changes mid-session, and every request from every user starts with the
+exact same tokens.  A dedicated pool of 2–4 servers with sticky routing gives
+near-100% cache hit rate.  The system prompt's KV blocks are computed once at
+first request and stay resident indefinitely.
+
+**API customers** converge on the same pattern organically.  Each customer
+typically has one or a few system prompts (one per app they've built).  Route
+by API key or by hash of the system prompt and each customer's prefix stays
+warm on their assigned servers.  The pricing incentive reinforces this:
+charging cached input tokens at a discount (e.g., Anthropic's 90% discount)
+nudges API users toward stable, cacheable system prompts — which improves
+GPU utilisation for the provider.  A virtuous cycle.
+
+### Why this works economically
+
+System prompts are simultaneously:
+- **The longest part** of the input (hundreds to thousands of tokens of
+  instructions, tool schemas, few-shot examples)
+- **The most repetitive** (identical across every request from the same client)
+- **The most expensive to compute** (prefill is compute-bound, cost scales
+  with prompt length)
+
+Caching the thing that is longest, most repetitive, and most expensive to
+compute gives the biggest return.  A 4000-token system prompt at ~800ms
+prefill, cached at 90% hit rate, saves ~720ms of GPU compute per request.
+At 100 req/s that's 72 seconds of GPU time saved per second of wall time —
+the equivalent of adding 72 GPUs worth of prefill capacity for free.
+
+### Capacity planning
+
+The default cache holds 64 prefixes per instance.  In the first-party pool
+pattern, you only need one slot.  In the API pattern, 64 slots covers your
+top 64 API customers by traffic — which likely accounts for 95%+ of requests
+(API traffic follows a power law).
+
+The real constraint is VRAM.  Each cached prefix holds KV blocks that can't
+be used for active sequences.  A 1000-token prefix costs ~128MB at typical
+dimensions.  64 cached prefixes = ~8GB — significant on a 24GB card, negligible
+on an 80GB H100.  Size the cache to the hardware.
+
+---
+
 ## Economics and Tier Differentiation
 
 Unit economics: how many tokens per GPU-hour, and what do you charge per
@@ -135,7 +339,12 @@ the same hour — 64× lower cost per token.
 at nearly the same quality.  Charge the same price: 4× margin.  Pass savings
 to users: undercut competitors.
 
-**Tiers are a mix of hardware, quantization, residency, and priority.**
+**Prompt caching is throughput multiplication.**  The GPU cycles saved on
+prefill are available for more decode batches.  A workload that's 60% prefill-bound
+(long system prompts, short responses) can nearly double effective throughput
+with a hot cache — same hardware, same price, 2× the requests served.
+
+**Tiers are a mix of hardware, quantization, residency, caching, and priority.**
 
 ```mermaid
 quadrantChart
@@ -162,7 +371,7 @@ position and how much of the model lives in VRAM.
 graph TD
     Req([API Request]) --> GW{Gateway<br/>checks user tier}
 
-    GW -->|Pro| Pro["Dedicated H100 pool<br/>Low batch size<br/>Full VRAM residency"]
+    GW -->|Pro| Pro["Dedicated H100 pool<br/>Low batch size<br/>Full VRAM residency<br/>Hot prefix cache"]
     GW -->|Standard| Std["Shared A100/L40 pool<br/>Medium batch size<br/>Quantized weights"]
     GW -->|Free| Free["Overflow pool<br/>High batch size<br/>Disk-streamed layers<br/>Queue deprioritized"]
 
@@ -174,6 +383,11 @@ graph TD
 **Smaller models are genuinely cheap.**  A 7B fits on a consumer GPU; a 70B
 needs 4×H100s.  10–50× cost difference.  The large-model premium pays for the
 fleet.
+
+**Prefix-cache affinity routing.**  The gateway routes requests to the server
+that already has the system prompt cached.  See [Prefix-Cache
+Routing](#prefix-cache-routing) above for strategies (dedicated first-party
+pools, hash-based API routing, and why the economics create a virtuous cycle).
 
 ---
 
