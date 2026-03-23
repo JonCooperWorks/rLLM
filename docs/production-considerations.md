@@ -486,16 +486,29 @@ alone would miss.
 
 ### Network isolation
 
-Inference servers live on a private network with **no outbound internet
-access**.  Only two traffic flows are permitted:
+Inference servers live on a private network with **no standing outbound
+network access** — not even to the model registry.  The only persistent
+traffic flow is inference to/from the gateway (prompts in, completions out).
 
-1. **Inbound weights** from the internal model registry.
-2. **Inference traffic** to/from the gateway (prompts in, completions out).
+**JIT registry access.**  When an inference server needs to pull weights
+(new model deploy, scale-up event), a short-lived outbound route to the
+internal model registry is provisioned, the weights are cloned to local
+NVMe, and the route is removed.  The server has no ability to reach the
+registry (or anything else) outside of that window.  Provisioning the route
+requires the same two-person approval as any other connectivity change —
+an engineer requests it, a peer signs off, and the access is time-limited
+and auto-revoked.
 
-This minimises the exfiltration surface.  A compromised inference server
-can't phone home, can't reach external APIs, and can't leak weights or
-outputs to the internet.  The gateway is the sole ingress/egress point for
-the entire inference fleet.
+**Hardware-backed approval.**  All connectivity and access changes require
+physical YubiKey authentication from the approving engineers.  A
+compromised laptop or stolen session token isn't enough — someone has to
+physically tap a key.
+
+This minimises the exfiltration surface to the narrowest possible window.
+A compromised inference server can't phone home, can't reach external APIs,
+can't reach the model registry, and can't leak weights or outputs to the
+internet.  The gateway is the sole persistent ingress/egress point for the
+entire inference fleet.
 
 ### Weight protection
 
@@ -508,8 +521,9 @@ ciphertext and has no crypto responsibilities.
 HuggingFace-style model registry, encrypted at rest.  Decryption keys are
 accessible only to inference server service accounts and authorised
 engineers.  No one else — not the gateway, not the tool cluster, not other
-services — can read weights.  A deploy pipeline or sidecar pulls weights
-from the registry, decrypts, and writes plaintext to local NVMe.
+services — can read weights.  During the JIT registry access window, the
+server clones and decrypts weights to local NVMe, then the route is torn
+down.
 
 **Full-disk encryption.**  The inference server's NVMe is encrypted at the
 OS/infra layer (LUKS, FileVault, cloud-managed encrypted volumes with a
