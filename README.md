@@ -36,7 +36,7 @@ Platform selection uses OS-conditional compilation (`#[cfg(target_os)]`) — no 
 | Phi-4 | Dense | No |
 | DeepSeek-R1-Distill | Dense | No |
 | Mixtral 8x7B | MoE | No |
-| GPT-OSS 20B | MoE | No |
+| GPT-OSS | MoE | No |
 
 All models support bf16 and Q4 quantization. Multi-GPU tensor parallelism (`--tp`) is currently supported for Llama, Mistral, and Gemma only.
 
