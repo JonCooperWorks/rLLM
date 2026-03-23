@@ -140,6 +140,52 @@ same; the precision varies.
 
 ---
 
+## QA and Eval Infrastructure
+
+This is the piece I have the least visibility into, but I think it's one of
+the most important systems a model provider builds.  The question every team
+needs to answer continuously is: "which models, at which precisions, on which
+hardware, are good enough to ship?"
+
+**What providers likely have.**  Some kind of automated framework that can:
+1. Spin up inference servers (or route to existing ones) for a given
+   model + quantization + hardware combination
+2. Run a standardized eval suite against them — accuracy benchmarks, latency
+   percentiles, throughput under load
+3. Report results back in a way that leadership can make decisions:
+   "Llama 70B at Q4 on 2×A100 passes all quality bars, 35ms/tok p50,
+   costs $X/M tokens — ship it" vs "Q3 drops 2 points on coding evals,
+   hold for now"
+
+This probably looks like a CI/CD pipeline for models.  New model drops from
+Meta or Qwen, the framework automatically tests it across a matrix of
+precisions and hardware configs, and produces a report.  The same system
+validates that a kernel change or quantization tweak didn't regress quality
+before it goes to production.
+
+**What I have.**  A set of scripts that I run manually when I rent GPUs.
+They exercise rLLM against a set of prompts and check that the outputs are
+sane.  It's not automated end-to-end — I have to rent the hardware, run the
+scripts, eyeball the results.  But the scripts give me a good idea of what
+a real framework needs:
+- A prompt suite that covers different capabilities (reasoning, code, chat,
+  tool calling)
+- Expected-output checks (exact match for structured outputs, LLM-as-judge
+  for open-ended ones)
+- Latency and throughput measurement under controlled conditions
+- Easy comparison across runs (did this change make things faster? worse?)
+
+**Worth building for rLLM?**  Maybe — even a lightweight version would be
+educational.  The interesting engineering is in the orchestration: how do you
+spin up N inference servers across rented GPUs, run evals in parallel, collect
+results, and tear everything down without burning money on idle machines?
+That's a real systems problem independent of ML.  For now my scripts cover
+the core need, but a proper framework would make it easier to answer
+questions like "does this new kernel actually help?" without a manual GPU
+rental cycle every time.
+
+---
+
 ## What This Means for rLLM
 
 rLLM covers the inference server box in the diagram above.  It handles:
