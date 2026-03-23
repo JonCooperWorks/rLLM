@@ -500,28 +500,40 @@ the entire inference fleet.
 ### Weight protection
 
 Model weights are intellectual property (for fine-tuned or proprietary
-models) and an attack target (for model extraction).  Two layers of
-protection:
+models) and an attack target (for model extraction).  Protection is handled
+entirely at the infrastructure layer — the inference server never sees
+ciphertext and has no crypto responsibilities.
 
 **Registry-level encryption.**  Weights are stored in an internal
 HuggingFace-style model registry, encrypted at rest.  Decryption keys are
 accessible only to inference server service accounts and authorised
 engineers.  No one else — not the gateway, not the tool cluster, not other
-services — can read weights.
+services — can read weights.  A deploy pipeline or sidecar pulls weights
+from the registry, decrypts, and writes plaintext to local NVMe.
 
-**Disk-level encryption.**  On the inference server itself, weights can be
-stored encrypted on NVMe with a key bound to the server's service account
-(e.g., a cloud KMS key policy).  The server decrypts weights into memory at
-load time.
+**Full-disk encryption.**  The inference server's NVMe is encrypted at the
+OS/infra layer (LUKS, FileVault, cloud-managed encrypted volumes with a
+KMS key bound to the server's service account).  The filesystem presents
+decrypted reads transparently — rLLM just calls `mmap` or `pread` and gets
+bytes.  This means expert streaming (`pread` of individual tensors from
+NVMe) works without any application-level crypto, which is critical for
+large MoE models where only a few experts are active per token.
 
-**The expert-streaming trade-off.**  Encrypted-on-disk weights must be
-decrypted into memory in full before use.  This makes on-demand expert
-streaming (`pread` from NVMe, as rLLM does for large MoE models) impossible
-— you can't seek into an encrypted file and decrypt a single expert's
-tensor.  For models that rely on disk streaming (e.g., a 256-expert MoE
-where only 8 are active per token), you either accept the memory cost of
-full decryption or run without disk-level encryption and rely on
-registry-level encryption plus network isolation instead.
+**Access control is the real protection.**  Encryption at rest protects
+against physical disk theft and cloud-provider-level access.  The more
+meaningful control is limiting who and what can reach the box at all: the
+private network has no internet, SSH access is restricted to authorised
+engineers, and the only service that can reach the inference port is the
+gateway.  Even if an attacker gets the decryption key, they can't reach
+the machine to use it.
+
+**Why encryption doesn't belong in the inference engine.**  Embedding
+key management, KMS SDKs, and decryption into the inference server would
+add complexity to a hot path, kill `mmap`/`pread`-based weight loading,
+and couple the inference binary to a specific cloud provider's KMS.  The
+OS-level approach is transparent to the application, supports key rotation
+without redeploying the inference server, and works with any weight-loading
+strategy including expert streaming.
 
 ### Traffic volume monitoring
 
