@@ -185,6 +185,15 @@ Q4 is slower than bf16 for decode on H100 — unlike Apple Silicon where Q4 is a
 
 </details>
 
+### Prompt Prefix Caching
+
+When multiple requests share the same system prompt, the KV cache from the first prefill is reused — subsequent requests skip prefill for the shared portion entirely. This is the common case for API servers where every request includes the same system prompt.
+
+| GPU | Model | Quant | TTFT (cold) | TTFT (cached) | Saved |
+|---|---|---|---|---|---|
+
+Measured via `rllm serve` — first request is a cache miss (full prefill), second request with the same system prompt is a cache hit (suffix-only prefill). "Saved" is the prefill time eliminated by reusing cached KV blocks. Prompt prefix caching works on both Metal and CUDA with no configuration — it's always on.
+
 ## Features
 
 - **Multi-architecture** — Llama 3, Qwen 2.5, Mistral, Mixtral 8x7B, Qwen3 MoE, Qwen3.5, Phi-4, Gemma 3, DeepSeek-R1-Distill, and GPT-OSS from the same codebase
