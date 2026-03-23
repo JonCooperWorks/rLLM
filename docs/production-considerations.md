@@ -108,6 +108,85 @@ same model" at different price points.
 
 ---
 
+## Disk Streaming as a Tier Lever
+
+Not every model has to fit in GPU memory.  rLLM already does this for MoE
+experts — Qwen3.5-35b has 256 experts totaling ~60GB, but only 8 are active
+per token.  Rather than keeping them all on-GPU, rLLM streams the active
+experts from NVMe on demand (`src/model/expert_stream.rs`), reducing expert
+memory from 60GB to ~15MB of buffer slots.
+
+The same idea generalizes to entire models.  A dense 70B at Q4 is ~35GB of
+weights.  A machine with 24GB of VRAM can still run it by streaming layers
+from disk — load a few transformer blocks, run them, evict, load the next
+batch.  Latency per token goes up (you're now NVMe-bound instead of
+VRAM-bandwidth-bound), but the model runs.
+
+**This maps directly to product tiers.**  A "Pro" user gets the model fully
+resident on a GPU with enough VRAM — fast decode, no disk I/O in the hot
+path.  A "Free" user gets the same model on cheaper hardware where it doesn't
+fully fit, with layers streamed from disk.  Same weights, same quality, but
+10–50× higher latency per token.  The free user waits longer; the provider
+pays less per request.
+
+The spectrum looks like:
+
+| Configuration | Latency | Cost | Tier |
+|---------------|---------|------|------|
+| Full model in VRAM, latest GPU | Lowest | Highest | Pro / Premium |
+| Full model in VRAM, older GPU | Low | Medium | Standard |
+| Quantized model in VRAM, older GPU | Low | Lower | Standard / Free |
+| Model streamed from disk, minimal VRAM | High | Lowest | Free |
+
+Each step down trades latency for cost.  The gateway picks the configuration
+based on the user's plan — same model, same API, different hardware behind it.
+
+---
+
+## Economics
+
+The unit economics of inference come down to: how many tokens can you squeeze
+out of a GPU-hour, and what can you charge per token?
+
+**Cost per token drops with utilization.**  A single H100 costs ~$2–3/hr
+rented.  If it's decoding one sequence at a time, you're paying that full
+rate for ~25 tokens/sec.  With continuous batching at 64 concurrent sequences,
+you get ~1600 tokens/sec from the same GPU-hour.  Cost per token falls 64×.
+Batching isn't just a performance optimization — it's the entire business
+model.
+
+**Faster tiers are about priority, not capability.**  The simplest way to
+offer a "faster" tier: give paying users priority in the batch queue.  Free
+users wait until there's spare capacity; Pro users get scheduled immediately.
+The GPU does the same work either way — the difference is queue position.
+More concretely:
+
+- *Pro*: Dedicated GPU pool, low batch sizes (fewer sequences competing for
+  bandwidth), aggressive latency SLOs.
+- *Standard*: Shared pool, higher batch sizes, best-effort latency.
+- *Free*: Overflow pool on cheaper/older hardware, highest batch sizes,
+  disk-streamed models when VRAM is scarce, deprioritized in the queue.
+
+**Quantization is pure margin.**  Serving Q4 instead of bf16 means ~4× more
+tokens per GPU-hour at nearly the same quality.  If you charge the same price
+per token, that's 4× the margin.  If you pass some savings to the user, you
+undercut competitors while staying profitable.  This is why every provider
+quantizes aggressively.
+
+**Model size vs hardware cost.**  Smaller models are dramatically cheaper to
+serve — a 7B model fits on a single consumer GPU, while a 70B needs 4×H100s.
+The cost difference is 10–50×.  When a provider offers a small model for
+cheap, they're not being generous — the hardware cost is genuinely that low.
+The large-model premium pays for the expensive GPU fleet.
+
+**Disk streaming extends the hardware.**  Streaming from NVMe lets you run
+larger models on cheaper GPUs at the cost of latency.  A machine that would
+otherwise be limited to 14B models can serve a 70B model slowly.  This is
+useful for free tiers where latency tolerance is high and the alternative is
+not offering the model at all.
+
+---
+
 ## QA and Eval Infrastructure
 
 The question every team answers continuously: "which models, at which
