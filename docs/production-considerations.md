@@ -480,9 +480,13 @@ ground truth for:
 - **Forensics.**  If a model produces harmful output, trace it back to the
   exact request, customer, and input.
 
-Both the gateway and inference server emit events to the same log sink.
-Cross-referencing the two streams catches discrepancies that either side
-alone would miss.
+Both the gateway and inference server emit events to a **log gateway**
+within the private VPC.  The log gateway is the only component that
+forwards logs off-VPC to a central log store (corporate SIEM, data
+warehouse, etc.).  Inference servers never talk to the central store
+directly — they ship events to the VPC-local log gateway and nothing else.
+Cross-referencing the two streams (inference-side and gateway-side) at the
+central store catches discrepancies that either side alone would miss.
 
 ### Network isolation
 
@@ -493,17 +497,20 @@ graph TD
     subgraph Private["Private Network"]
         direction TB
         Inf["Inference Servers<br/>(GPU fleet)"]
-        Logs["Audit Log Sink"]
+        LogGW["Log Gateway<br/>(VPC-internal)"]
     end
 
     subgraph Isolated["Isolated Registry Network"]
         Reg["Model Registry<br/>(encrypted weights)"]
     end
 
+    Central["Central Log Store<br/>(corporate infra)"]
+
     GW -->|"inference traffic<br/>(persistent)"| Inf
     Inf -->|"completions +<br/>token counts"| GW
-    Inf -->|audit events| Logs
-    GW -->|billing events| Logs
+    Inf -->|audit events| LogGW
+    GW -->|billing events| LogGW
+    LogGW -->|"forward off-VPC"| Central
 
     Reg -.->|"JIT route<br/>(provisioned per deploy,<br/>torn down after clone)"| Inf
 
