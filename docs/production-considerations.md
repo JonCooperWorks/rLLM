@@ -214,7 +214,7 @@ for the provider.
 ```mermaid
 xychart-beta
     title "Effective Cost per Request (1000-token prefix)"
-    x-axis "Cache Hit Rate" [0%, 25%, 50%, 75%, 90%, 100%]
+    x-axis "Cache Hit Rate" ["0%", "25%", "50%", "75%", "90%", "100%"]
     y-axis "Relative Prefill Cost" 0 --> 100
     bar [100, 77, 55, 32, 14, 5]
 ```
