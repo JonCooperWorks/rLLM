@@ -124,6 +124,16 @@ are more sensitive to quantization than others (FFN weights).  Keeping
 sensitive layers at higher precision while quantizing the rest can preserve
 quality at most of the cost savings.
 
+**Production likely runs at the lowest precision that passes eval.**  There's
+no reason to serve a model at bf16 if 4-bit produces the same benchmark
+scores.  The economics push hard in one direction: find the most aggressive
+quantization where quality holds, and ship that.  Every bit you shave off the
+weights is less memory bandwidth, more sequences per GPU, lower cost per
+token.  Providers are probably running extensive eval suites against
+progressively lower precisions and deploying whatever clears the bar — not
+the full-precision version.  The model you interact with through an API is
+almost certainly not running at the precision it was trained at.
+
 This is likely how providers offer "the same model" at different price points
 without actually training different models.  The underlying weights are the
 same; the precision varies.
