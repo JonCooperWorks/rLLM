@@ -420,6 +420,197 @@ not the orchestration layer.
 
 ---
 
+## Security Controls
+
+Inference servers hold the model weights and produce raw completions — two
+things worth protecting.  The security model treats the inference fleet as a
+high-value, low-surface-area zone: no direct internet, no user identity beyond
+a scoped token, and every forward pass attributable to a customer.
+
+```mermaid
+graph LR
+    Internet([Internet]) --> GW["Gateway<br/>(public VPC)"]
+
+    subgraph Private["Private Network (no internet)"]
+        Inf["Inference Servers<br/>(GPU fleet)"]
+        Reg["Model Registry<br/>(encrypted weights)"]
+        Logs["Audit Log<br/>Sink"]
+    end
+
+    GW -->|"signed inference<br/>token + prompt"| Inf
+    Inf -->|"completion +<br/>token count"| GW
+    Reg -->|"decrypt &<br/>load weights"| Inf
+    Inf -->|"per-request<br/>audit events"| Logs
+    GW -->|"billing<br/>events"| Logs
+```
+
+### Authentication and token exchange
+
+The gateway doesn't forward raw API keys to the inference server.  Instead,
+it performs a token exchange: validate the customer's API key, mint a
+short-lived, customer-scoped inference token, and attach it to the request.
+The inference server verifies the token before running a forward pass.
+
+This achieves three things:
+
+1. **Identity at the inference layer.**  Every forward pass is tied to a
+   customer identity, not just a gateway session.
+2. **Token theft detection.**  If inference activity appears for a customer
+   with no active gateway session (no recent API calls, no open SSE streams),
+   something is wrong — either a stolen token or a compromised server.
+3. **Blast radius.**  A leaked inference token expires quickly and only
+   authorises inference, not billing mutations or account changes.
+
+The inference server may refuse to initiate a forward pass without a valid
+customer-scoped token.  This means even a compromised server that somehow
+bypasses the gateway cannot generate tokens without a credential — defense
+in depth.
+
+### Audit logging
+
+Every inference request is logged with customer identity, model, token
+counts (prompt + completion), latency, and timestamp.  The audit log is the
+ground truth for:
+
+- **Billing reconciliation.**  Compare inference-side token counts against
+  gateway-side billing records.  Discrepancies (inference tokens ≠ billed
+  tokens) flag bugs or fraud.
+- **Abuse detection.**  Unusually high token volumes for a customer, requests
+  at odd hours, or patterns inconsistent with their integration's profile.
+- **Forensics.**  If a model produces harmful output, trace it back to the
+  exact request, customer, and input.
+
+Both the gateway and inference server emit events to the same log sink.
+Cross-referencing the two streams catches discrepancies that either side
+alone would miss.
+
+### Network isolation
+
+Inference servers live on a private network with **no outbound internet
+access**.  Only two traffic flows are permitted:
+
+1. **Inbound weights** from the internal model registry.
+2. **Inference traffic** to/from the gateway (prompts in, completions out).
+
+This minimises the exfiltration surface.  A compromised inference server
+can't phone home, can't reach external APIs, and can't leak weights or
+outputs to the internet.  The gateway is the sole ingress/egress point for
+the entire inference fleet.
+
+### Weight protection
+
+Model weights are intellectual property (for fine-tuned or proprietary
+models) and an attack target (for model extraction).  Two layers of
+protection:
+
+**Registry-level encryption.**  Weights are stored in an internal
+HuggingFace-style model registry, encrypted at rest.  Decryption keys are
+accessible only to inference server service accounts and authorised
+engineers.  No one else — not the gateway, not the tool cluster, not other
+services — can read weights.
+
+**Disk-level encryption.**  On the inference server itself, weights can be
+stored encrypted on NVMe with a key bound to the server's service account
+(e.g., a cloud KMS key policy).  The server decrypts weights into memory at
+load time.
+
+**The expert-streaming trade-off.**  Encrypted-on-disk weights must be
+decrypted into memory in full before use.  This makes on-demand expert
+streaming (`pread` from NVMe, as rLLM does for large MoE models) impossible
+— you can't seek into an encrypted file and decrypt a single expert's
+tensor.  For models that rely on disk streaming (e.g., a 256-expert MoE
+where only 8 are active per token), you either accept the memory cost of
+full decryption or run without disk-level encryption and rely on
+registry-level encryption plus network isolation instead.
+
+### Traffic volume monitoring
+
+Outbound traffic volume from inference servers is monitored and compared
+against the token counts in the audit log.  The expected bytes out for a
+given number of completion tokens is predictable (tokens × ~4 bytes for
+token IDs, plus SSE framing overhead).
+
+Unexpected volume — significantly more bytes than the token count warrants —
+triggers alerts.  This catches weight exfiltration attempts (weights are
+large — a 70B Q4 is ~35GB), unauthorised bulk inference, or a compromised
+server streaming data to an attacker via an allowed egress path.
+
+---
+
+## Server-Side Tools
+
+Tool and function calling — web search, code execution, retrieval,
+calculators — looks like it runs on the inference server, but it doesn't.
+The inference server's job is to produce a tool-call response (a structured
+JSON output saying "call function X with args Y").  Actually executing the
+tool is someone else's problem.
+
+```mermaid
+graph TD
+    Client([Client]) -->|1. prompt| GW[Gateway]
+    GW -->|2. prompt| Inf["Inference Server<br/>(GPU)"]
+    Inf -->|"3. tool_call(search, {q: ...})"| GW
+    GW -->|4. dispatch| Tools["Tool Cluster<br/>(Kubernetes)"]
+    Tools -->|5. result| GW
+    GW -->|"6. tool_result + continue"| Inf
+    Inf -->|7. final completion| GW
+    GW -->|8. response| Client
+```
+
+The **gateway orchestrates the loop**: inference produces a tool call, the
+gateway dispatches it to an isolated tool cluster, collects the result, and
+sends it back to the inference server as a continuation message.  The
+inference server never talks to the tool cluster directly.
+
+### Why isolate tool execution
+
+**Different compute profile.**  Inference servers are GPU-bound and
+expensive.  Tool execution is CPU/memory-bound — web search, database
+lookups, code sandboxes.  Running tools on GPU machines wastes $2–3/hr
+hardware on work that a $0.10/hr container can do.
+
+**Different security profile.**  Tools may need network access (web search
+hits the internet), filesystem access (code execution), or database
+credentials (retrieval).  Inference servers have none of these — they sit on
+a locked-down private network with no outbound internet.  Mixing the two
+profiles weakens the inference server's security posture.
+
+**Independent scaling.**  Tool traffic is bursty and unpredictable (a
+retrieval call might take 50ms or 5s depending on the backend).  The tool
+cluster scales on CPU and memory via Kubernetes autoscaling.  The inference
+cluster scales on GPU availability and batch utilisation.  Coupling them
+means one bottlenecks the other.
+
+**Blast radius.**  A tool that crashes, hangs, or times out affects one step
+of one request.  The gateway retries or returns an error to the model.  If
+the same tool ran on the inference server, a hang could block a GPU, stall a
+batch, and degrade latency for every concurrent user.
+
+### The gateway as orchestrator
+
+This design means the gateway is more than a router — it's an agent-loop
+orchestrator.  For a single user request, the gateway may make multiple
+round trips between inference and tools:
+
+```
+User prompt → inference → tool_call → tool cluster → tool_result →
+inference → tool_call → tool cluster → tool_result →
+inference → final completion → user
+```
+
+Each round trip adds latency (~100ms gateway overhead + tool execution
+time), but the alternative — giving inference servers network access and
+tool credentials — breaks the security model.
+
+The gateway also enforces **tool-call limits** (max N tool calls per
+request), **timeouts** (tool must respond within T seconds), and **tool
+allow-lists** (customer X can use tools A and B but not C).  These policies
+live in the gateway, not the inference server — the inference server just
+produces tool-call JSON and doesn't know or care whether the tool actually
+runs.
+
+---
+
 ## What This Means for rLLM
 
 rLLM is the inference server box in the diagram: model loading, Q4
