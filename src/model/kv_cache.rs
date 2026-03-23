@@ -525,6 +525,16 @@ impl<B: GpuCore> SeqKvState<B> {
         self.dirty = true;
     }
 
+    /// Mark leading blocks as shared with the prefix cache.
+    ///
+    /// Called after `prefix_cache_register` inserts this sequence's prefix
+    /// blocks into the cache.  Ensures `free_sequence()` won't free them
+    /// (they now belong to the cache, not this sequence).
+    pub fn mark_prefix_shared(&mut self, num_blocks: usize, prefix_tokens: Vec<u32>) {
+        self.shared_prefix_blocks = num_blocks;
+        self.shared_prefix_tokens = Some(prefix_tokens);
+    }
+
     /// The prefix tokens this sequence is sharing, if any.
     pub fn shared_prefix_tokens(&self) -> Option<&[u32]> {
         self.shared_prefix_tokens.as_deref()

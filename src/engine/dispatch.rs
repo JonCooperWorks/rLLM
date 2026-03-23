@@ -110,7 +110,9 @@ pub(crate) trait Dispatch {
     ///
     /// `tokens` are the full prompt tokens; the implementation extracts the
     /// block-aligned prefix and records the block table entries.
-    fn prefix_cache_register(&mut self, _tokens: &[u32], _state: &Self::SeqState) {}
+    /// `state` is mutable so the implementation can mark the prefix blocks
+    /// as shared (preventing them from being freed when this sequence finishes).
+    fn prefix_cache_register(&mut self, _tokens: &[u32], _state: &mut Self::SeqState) {}
 
     /// Link a sequence's KV state to a cached prefix.
     ///
