@@ -9,6 +9,7 @@ Rust LLM inference engine that runs 397B-parameter MoE models on a MacBook via N
 - **bf16 and Q4 quantization** — 18-byte block format with bf16 scales; Q4 expert streaming cuts NVMe I/O 3.5×
 - **Multi-GPU tensor parallelism** via NCCL for distributed inference
 - **Continuous batching with paged KV cache** — dynamic block allocation across concurrent sequences
+- **Prompt prefix caching** — repeated system prompts skip prefill entirely; shared KV blocks across sequences with generational safety
 - **Hand-written Metal and CUDA shaders** — SIMD-cooperative matmul, WMMA tensor-core GEMM, fused attention, DeltaNet linear attention
 
 Every file includes architectural rationale explaining *why* things work the way they do, not just *what* they do — designed to be read and understood, not just executed.
@@ -191,6 +192,7 @@ Q4 is slower than bf16 for decode on H100 — unlike Apple Silicon where Q4 is a
 - **Multi-GPU tensor parallelism** — split models across GPUs via NCCL (`--tp 2`); currently supported for Llama, Mistral, and Gemma
 - **Batched prefill** — GEMM-based prompt processing (3-10x faster than token-by-token)
 - **Paged KV cache** — on-demand block allocation, shared across sequences
+- **Prompt prefix caching** — when multiple requests share the same system prompt (or any common prefix), the KV cache blocks from the first prefill are reused — subsequent requests skip prefill for the shared portion entirely, reducing TTFT to near-zero for the cached prefix. Uses block-aligned matching with LRU eviction and reference counting. Generational block handles prevent use-after-free if cached blocks are evicted while in use
 - **Continuous batching** — concurrent multi-sequence inference via engine/scheduler
 - **Q4 quantization** — offline 4-bit block quantization via `rllm quantize` (~3.2x memory reduction)
 - **bf16 inference** — native half-precision compute
@@ -348,7 +350,7 @@ src/
 │   ├── loader.rs        — Safetensors loading, pre-quantized Q4 detection
 │   ├── tokenizer.rs     — BPE tokenizer with per-model special tokens
 │   ├── chat.rs          — Chat template formatter
-│   ├── kv_cache.rs      — Paged KV cache (block pool + per-sequence state)
+│   ├── kv_cache.rs      — Paged KV cache (block pool + per-sequence state + prefix cache)
 │   ├── expert_stream.rs — SSD expert streaming (pread-based on-demand loading)
 │   └── sampler.rs       — Temperature + top-p sampling
 ├── engine/              — Continuous batching loop + FCFS scheduler
@@ -369,6 +371,7 @@ src/
 | Weights | Q4 quantization (3.2x less memory bandwidth) | ~1.5x |
 | Prefill | Batched GEMM (load weights once, compute B times) | 3-10x |
 | KV cache | Paged allocation (on-demand blocks, no waste) | — |
+| Prefix caching | Shared KV blocks across sequences with same system prompt | TTFT → ~0 for cached prefix |
 | Attention | Fused single-pass softmax+V, head_dim-specialised pipelines | 1.3-2.8x |
 | Batching | Continuous batching (N sequences share the GPU) | ~Nx |
 | Expert streaming | SSD pread on demand, fused gate+up+SwiGLU kernel | runs models that don't fit in VRAM |
