@@ -486,6 +486,33 @@ alone would miss.
 
 ### Network isolation
 
+```mermaid
+graph TD
+    Internet([Internet]) --> GW["Gateway<br/>(public VPC)"]
+
+    subgraph Private["Private Network"]
+        direction TB
+        Inf["Inference Servers<br/>(GPU fleet)"]
+        Logs["Audit Log Sink"]
+    end
+
+    subgraph Isolated["Isolated Registry Network"]
+        Reg["Model Registry<br/>(encrypted weights)"]
+    end
+
+    GW -->|"inference traffic<br/>(persistent)"| Inf
+    Inf -->|"completions +<br/>token counts"| GW
+    Inf -->|audit events| Logs
+    GW -->|billing events| Logs
+
+    Reg -.->|"JIT route<br/>(provisioned per deploy,<br/>torn down after clone)"| Inf
+
+    Internet x--x|"no outbound"| Private
+
+    style Private fill:#f8d7da,stroke:#dc3545
+    style Isolated fill:#fff3cd,stroke:#ffc107
+```
+
 Inference servers live on a private network with **no standing outbound
 network access** — not even to the model registry.  The only persistent
 traffic flow is inference to/from the gateway (prompts in, completions out).
