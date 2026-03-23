@@ -4,7 +4,7 @@ Rust LLM inference engine that runs 397B-parameter MoE models on a MacBook via N
 
 ### Highlights
 
-- **Expert streaming on Metal and CUDA** — stream hundreds of GB of expert weights from NVMe on demand, with GPU-side LRU caching and async DMA
+- **Expert streaming on Metal and CUDA** — stream hundreds of GB of expert weights from NVMe on demand, with GPU-side LRU caching and async DMA (inspired by [flash-moe](https://github.com/danveloper/flash-moe))
 - **12 architectures** — Llama 3.x, Qwen 2.5/3/3.5, Mistral, Mixtral, Gemma 3, Phi-4, DeepSeek-R1-Distill, GPT-OSS
 - **bf16 and Q4 quantization** — 18-byte block format with bf16 scales; Q4 expert streaming cuts NVMe I/O 3.5×
 - **Multi-GPU tensor parallelism** via NCCL for distributed inference
