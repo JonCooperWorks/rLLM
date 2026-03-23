@@ -78,7 +78,7 @@ Q4 quantization (`rllm quantize`) gives ~1.3-3.5x faster decode by reducing memo
 <details>
 <summary><b>NVIDIA GeForce RTX 4090 48 GB</b> — 1.01 TB/s GDDR6X bandwidth</summary>
 
-Measured via `rllm run --chat`, single run, 128 max tokens.
+Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Measured via `rllm run --chat`, single run, 128 max tokens.
 
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
@@ -92,7 +92,7 @@ Measured via `rllm run --chat`, single run, 128 max tokens.
 <details>
 <summary><b>NVIDIA RTX PRO 6000 Blackwell</b> — 96 GB GDDR7, 1.53 TB/s bandwidth</summary>
 
-Measured via `rllm run --chat`, 3 runs averaged, 128 max tokens.
+Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Measured via `rllm run --chat`, 3 runs averaged, 128 max tokens.
 
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
@@ -108,7 +108,7 @@ Q4 is ~17% faster than bf16 for decode on the RTX PRO 6000 — a middle ground b
 <details>
 <summary><b>2× NVIDIA GeForce RTX 5090 (TP=2)</b> — 2× 1.79 TB/s GDDR7X bandwidth</summary>
 
-Tensor parallelism across 2 GPUs via NCCL. Measured via `rllm run --tp 2`, single run, 128 max tokens.
+Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Tensor parallelism across 2 GPUs via NCCL. Measured via `rllm run --tp 2`, single run, 128 max tokens.
 
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
