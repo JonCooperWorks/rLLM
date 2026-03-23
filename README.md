@@ -189,6 +189,8 @@ Q4 is slower than bf16 for decode on H100 — unlike Apple Silicon where Q4 is a
 
 When multiple requests share the same system prompt, the KV cache from the first prefill is reused — subsequent requests skip prefill for the shared portion entirely. This is the common case for API servers where every request includes the same system prompt.
 
+This reduces **time to first token (TTFT)** but does not affect **decode throughput (tok/s)** — once decoding begins, each token still requires the same forward pass through all layers regardless of how the KV cache was populated.
+
 | GPU | Model | Quant | TTFT (cold) | TTFT (cached) | Saved |
 |---|---|---|---|---|---|
 
