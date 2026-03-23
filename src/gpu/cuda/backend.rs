@@ -66,6 +66,7 @@ use cudarc::driver::{
 
 const CUDA_SOURCE_RMS_NORM: &str = include_str!("shaders/rms_norm.cu");
 const CUDA_SOURCE_MATMUL: &str = include_str!("shaders/matmul.cu");
+const CUDA_SOURCE_MATMUL_TC: &str = include_str!("shaders/matmul_tc.cu");
 const CUDA_SOURCE_ROPE: &str = include_str!("shaders/rope.cu");
 const CUDA_SOURCE_ATTENTION: &str = include_str!("shaders/attention.cu");
 const CUDA_SOURCE_ELEMENTWISE: &str = include_str!("shaders/elementwise.cu");
@@ -101,6 +102,10 @@ pub(crate) struct CudaBackend {
     pub(crate) world_size: usize,
     pub(crate) nccl_comm: Option<Arc<super::nccl::NcclComm>>,
 
+    // GPU compute capability (major, minor). Used to select tensor-core vs
+    // scalar GEMM paths.  bf16 WMMA requires sm_80+ (A100/H100).
+    pub(crate) compute_capability: (i32, i32),
+
     // Compiled kernel functions — one per kernel entry point.
     pub(crate) fn_rms_norm: CudaFunction,
     pub(crate) fn_rms_norm_batch: CudaFunction,
@@ -108,6 +113,11 @@ pub(crate) struct CudaBackend {
     pub(crate) fn_matvec_q4: CudaFunction,
     pub(crate) fn_gemm_bf16: CudaFunction,
     pub(crate) fn_gemm_q4: CudaFunction,
+
+    // Tensor-core WMMA GEMM kernels (sm_80+ only).  None on older GPUs,
+    // which fall back to the scalar gemm_bf16/gemm_q4 above.
+    pub(crate) fn_gemm_bf16_tc: Option<CudaFunction>,
+    pub(crate) fn_gemm_q4_tc: Option<CudaFunction>,
     pub(crate) fn_rope: CudaFunction,
     pub(crate) fn_rope_batch: CudaFunction,
     pub(crate) fn_rope_partial: CudaFunction,
@@ -193,6 +203,12 @@ impl CudaBackend {
         // Query device name via the CudaContext API.
         let name = ctx.name().unwrap_or_else(|_| "NVIDIA GPU".to_string());
 
+        // Query compute capability to decide whether tensor-core WMMA GEMM
+        // kernels are available.  bf16 WMMA requires sm_80+ (A100/H100).
+        let compute_capability = ctx
+            .compute_capability()
+            .unwrap_or((0, 0));
+
         // Compile shader sources via NVRTC.
         // NVRTC needs the CUDA include path for headers like cuda_bf16.h.
         let cuda_include = std::env::var("CUDA_HOME")
@@ -239,6 +255,26 @@ impl CudaBackend {
         let mod_deltanet = load(ptx_deltanet)?;
         let mod_moe = load(ptx_moe)?;
 
+        // Tensor-core WMMA module (sm_80+ only).
+        // Compiled with -arch=compute_80 so NVRTC emits WMMA (mma.h) instructions.
+        // On older GPUs, we skip this entirely and use the scalar GEMM fallback.
+        let mod_matmul_tc = if compute_capability.0 >= 8 {
+            let ptx_tc = {
+                let opts = cudarc::nvrtc::CompileOptions {
+                    options: vec![
+                        format!("-I{include_path}"),
+                        "-arch=compute_80".to_string(),
+                    ],
+                    ..Default::default()
+                };
+                cudarc::nvrtc::compile_ptx_with_opts(CUDA_SOURCE_MATMUL_TC, opts)
+                    .map_err(|e| anyhow!("NVRTC TC compilation failed: {e}"))?
+            };
+            Some(load(ptx_tc)?)
+        } else {
+            None
+        };
+
         let func = |module: &Arc<CudaModule>, name: &str| -> anyhow::Result<CudaFunction> {
             module
                 .load_function(name)
@@ -254,16 +290,21 @@ impl CudaBackend {
             rank,
             world_size,
             nccl_comm,
+            compute_capability,
 
             // RMSNorm
             fn_rms_norm: func(&mod_rms_norm, "rms_norm")?,
             fn_rms_norm_batch: func(&mod_rms_norm, "rms_norm_batch")?,
 
-            // Matmul
+            // Matmul (scalar — used for matvec always, GEMM on sm < 80)
             fn_matvec_bf16: func(&mod_matmul, "matvec_bf16")?,
             fn_matvec_q4: func(&mod_matmul, "matvec_q4")?,
             fn_gemm_bf16: func(&mod_matmul, "gemm_bf16")?,
             fn_gemm_q4: func(&mod_matmul, "gemm_q4")?,
+
+            // Matmul (tensor-core WMMA — sm_80+ only)
+            fn_gemm_bf16_tc: mod_matmul_tc.as_ref().map(|m| func(m, "gemm_bf16_tc")).transpose()?,
+            fn_gemm_q4_tc: mod_matmul_tc.as_ref().map(|m| func(m, "gemm_q4_tc")).transpose()?,
 
             // RoPE
             fn_rope: func(&mod_rope, "rotary_embedding")?,
@@ -350,6 +391,21 @@ impl CudaBackend {
             grid_dim: (num_blocks, 1, 1),
             block_dim: (block_size, 1, 1),
             shared_mem_bytes: 0,
+        }
+    }
+
+    /// LaunchConfig with 2D grid and explicit shared memory allocation.
+    /// Used by tensor-core GEMM which tiles over two output dimensions.
+    pub(crate) fn cfg_2d_smem(
+        grid_x: u32,
+        grid_y: u32,
+        block_size: u32,
+        shared_mem_bytes: u32,
+    ) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: (grid_x, grid_y, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes,
         }
     }
 

@@ -86,6 +86,9 @@ Measured via `rllm run --chat`, 3 runs averaged, 128 max tokens.
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
 | GPT-OSS 20B | 20.0B (3.6B active) | 103 tok/s | 121 tok/s | 153 ms | 144 ms |
+| Qwen3.5 122B-A10B ⚡ | 122B (10B active) | 1.7 tok/s | 3.9 tok/s | 9,500 ms | 6,800 ms |
+
+⚡ = SSD expert streaming (`--stream-experts`).  Expert weights stream from NVMe on demand — the 122B model runs on 96 GB using ~1.2 GB expert cache (64 slots).  Prefill uses WMMA tensor-core GEMM (sm_80+) for batched matrix multiply, with scalar warp-cooperative fallback for single-token decode.
 
 Q4 is ~17% faster than bf16 for decode on the RTX PRO 6000 — a middle ground between Apple Silicon (where Q4 is always much faster) and H100 (where Q4 is slower). The 1.53 TB/s GDDR7 bandwidth is high enough that dequantisation overhead is noticeable but not dominant. GPT-OSS 120B Q4 benchmarks pending.
 
@@ -173,7 +176,7 @@ Q4 is slower than bf16 for decode on H100 — unlike Apple Silicon where Q4 is a
 ## Features
 
 - **Multi-architecture** — Llama 3, Qwen 2.5, Mistral, Mixtral 8x7B, Qwen3 MoE, Qwen3.5, Phi-4, Gemma 3, DeepSeek-R1-Distill, and GPT-OSS from the same codebase
-- **Metal + CUDA backends** — SIMD-cooperative matmul, async command buffer dispatch
+- **Metal + CUDA backends** — SIMD-cooperative matmul, WMMA tensor-core GEMM (sm_80+), async command buffer dispatch
 - **Multi-GPU tensor parallelism** — split models across GPUs via NCCL (`--tp 2`); currently supported for Llama, Mistral, and Gemma
 - **Batched prefill** — GEMM-based prompt processing (3-10x faster than token-by-token)
 - **Paged KV cache** — on-demand block allocation, shared across sequences

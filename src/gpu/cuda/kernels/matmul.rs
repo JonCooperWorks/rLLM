@@ -69,22 +69,52 @@ impl GpuMatmul for CudaBackend {
         k: u32,
     ) {
         let params = GemmParams { batch_size, m, k };
-        let func = match weight.dtype {
-            TensorDtype::Q4 => &self.fn_gemm_q4,
-            _ => &self.fn_gemm_bf16,
-        };
-        // batch × M rows × 32 threads per row.
-        let total = batch_size * m * 32;
-        let cfg = CudaBackend::cfg_1d(total, 256);
-        unsafe {
-            self.stream
-                .launch_builder(func)
-                .arg(&params)
-                .arg(&weight.buf)
-                .arg(&input.buf)
-                .arg(&out.buf)
-                .launch(cfg)
+
+        // Use tensor-core WMMA path on sm_80+ when batch is large enough to
+        // fill the 128×128 output tiles.  Small batches (< 4 rows) have mostly
+        // empty tiles and are faster with the scalar warp-cooperative GEMM.
+        const TC_BATCH_THRESHOLD: u32 = 4;
+        let use_tc = self.fn_gemm_bf16_tc.is_some() && batch_size >= TC_BATCH_THRESHOLD;
+
+        if use_tc {
+            let func = match weight.dtype {
+                TensorDtype::Q4 => self.fn_gemm_q4_tc.as_ref().unwrap(),
+                _ => self.fn_gemm_bf16_tc.as_ref().unwrap(),
+            };
+            // 2D grid: tiles over (M, batch_size), 256 threads (8 warps) per tile.
+            // Shared memory is statically allocated in the kernel (32 KB for
+            // double-buffered A and B tiles), so no dynamic smem needed here.
+            let grid_m = (m + 127) / 128;
+            let grid_n = (batch_size + 127) / 128;
+            let cfg = CudaBackend::cfg_2d_smem(grid_m, grid_n, 256, 0);
+            unsafe {
+                self.stream
+                    .launch_builder(func)
+                    .arg(&params)
+                    .arg(&weight.buf)
+                    .arg(&input.buf)
+                    .arg(&out.buf)
+                    .launch(cfg)
+            }
+            .expect("matmul_batch TC launch failed");
+        } else {
+            let func = match weight.dtype {
+                TensorDtype::Q4 => &self.fn_gemm_q4,
+                _ => &self.fn_gemm_bf16,
+            };
+            // Scalar path: batch × M rows × 32 threads per row.
+            let total = batch_size * m * 32;
+            let cfg = CudaBackend::cfg_1d(total, 256);
+            unsafe {
+                self.stream
+                    .launch_builder(func)
+                    .arg(&params)
+                    .arg(&weight.buf)
+                    .arg(&input.buf)
+                    .arg(&out.buf)
+                    .launch(cfg)
+            }
+            .expect("matmul_batch launch failed");
         }
-        .expect("matmul_batch launch failed");
     }
 }
