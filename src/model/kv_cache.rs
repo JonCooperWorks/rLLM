@@ -960,25 +960,156 @@ mod tests {
         assert_eq!(cache.len(), 2);
     }
 
+    // -----------------------------------------------------------------------
+    // End-to-end prefix cache + pool integration tests
+    //
+    // These exercise the real flow: allocate blocks from the pool, register
+    // a prefix in the cache, mark blocks as shared, free the first sequence,
+    // link a second sequence to the cached prefix, and verify everything.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_prefix_sharing_end_to_end() {
+        // Simulates the full prefix cache lifecycle:
+        //   1. Sequence A prefills 32 tokens (2 blocks)
+        //   2. Register prefix in cache, mark blocks shared
+        //   3. Sequence A finishes → only suffix blocks freed
+        //   4. Sequence B links to cached prefix, allocates suffix
+        //   5. Sequence B's block table is valid (generations match)
+        //   6. Sequence B finishes → only its suffix blocks freed
+        //   7. Cache evicts → prefix blocks finally freed
+        let (b, mut pool) = make_pool(8);
+        let mut cache = PrefixCache::new(4);
+        let prefix_tokens: Vec<u32> = (0..32).collect(); // 2 blocks
+
+        // --- Sequence A: prefill 32 prefix + 16 suffix = 48 tokens ---
+        let mut seq_a = pool.new_sequence(&b);
+        seq_a.ensure_slots(&mut pool, 48).unwrap(); // allocates 3 blocks
+        seq_a.advance_by(48);
+        assert_eq!(seq_a.num_blocks(), 3);
+        assert_eq!(pool.free_block_count(), 5); // 8 - 3 = 5
+
+        // Register the 2-block prefix in the cache.
+        let prefix_handles = seq_a.block_table_cpu_slice()[..2].to_vec();
+        let evicted = cache.insert(prefix_tokens.clone(), prefix_handles.clone());
+        assert!(evicted.is_none());
+
+        // Mark those 2 blocks as shared so free_sequence skips them.
+        seq_a.mark_prefix_shared(2, prefix_tokens.clone());
+
+        // Sequence A finishes.  Only the 1 suffix block should be freed.
+        pool.free_sequence(&seq_a);
+        assert_eq!(pool.free_block_count(), 6); // 5 + 1 suffix block
+        cache.release(&prefix_tokens);
+
+        // --- Sequence B: link cached prefix + 16 suffix ---
+        let mut seq_b = pool.new_sequence(&b);
+        let (cached_handles, cached_count) = cache.lookup(&prefix_tokens).unwrap();
+        assert_eq!(cached_count, 32);
+        assert_eq!(cached_handles, prefix_handles); // same handles, same generations
+
+        seq_b.link_prefix(&cached_handles, cached_count, prefix_tokens.clone());
+        seq_b.ensure_slots(&mut pool, 16).unwrap(); // 1 more block for suffix
+        seq_b.advance_by(16);
+        assert_eq!(seq_b.num_blocks(), 3); // 2 prefix + 1 suffix
+
+        // Validated sync should pass — all handles have correct generations.
+        seq_b.dirty = true;
+        seq_b.sync_block_table_validated(&b, &pool); // no panic
+
+        // Sequence B finishes.
+        pool.free_sequence(&seq_b);
+        cache.release(&prefix_tokens);
+
+        // --- Cache eviction returns prefix blocks ---
+        // Force eviction by filling the cache past capacity.
+        let p2: Vec<u32> = vec![200; BLOCK_SIZE];
+        let p3: Vec<u32> = vec![201; BLOCK_SIZE];
+        let p4: Vec<u32> = vec![202; BLOCK_SIZE];
+        let p5: Vec<u32> = vec![203; BLOCK_SIZE];
+        cache.insert(p2.clone(), vec![bh(50, 0)]); cache.release(&p2);
+        cache.insert(p3.clone(), vec![bh(51, 0)]); cache.release(&p3);
+        cache.insert(p4.clone(), vec![bh(52, 0)]); cache.release(&p4);
+        let evicted = cache.insert(p5.clone(), vec![bh(53, 0)]);
+        assert!(evicted.is_some()); // our original prefix got evicted
+
+        let evicted_handles = evicted.unwrap();
+        assert_eq!(evicted_handles.len(), 2);
+        // Return evicted prefix blocks to the pool.
+        pool.free_blocks(&evicted_handles);
+        assert_eq!(pool.free_block_count(), 8); // all blocks back
+    }
+
+    #[test]
+    fn test_missing_mark_prefix_shared_caught_by_generation() {
+        // Proves generational indices catch the bug if mark_prefix_shared
+        // is accidentally omitted.  Without it, free_sequence frees the
+        // prefix blocks.  A second sequence linking to the cached prefix
+        // gets stale handles — sync_block_table_validated panics.
+        let (b, mut pool) = make_pool(8);
+        let mut cache = PrefixCache::new(4);
+        let prefix_tokens: Vec<u32> = (0..16).collect(); // 1 block
+
+        // Sequence A prefills 16 tokens (1 block).
+        let mut seq_a = pool.new_sequence(&b);
+        seq_a.ensure_slots(&mut pool, 16).unwrap();
+        seq_a.advance_by(16);
+
+        // Register prefix in cache.
+        let prefix_handles = seq_a.block_table_cpu_slice()[..1].to_vec();
+        cache.insert(prefix_tokens.clone(), prefix_handles);
+
+        // BUG: deliberately skip mark_prefix_shared.
+        // seq_a.mark_prefix_shared(1, prefix_tokens.clone());  // <-- omitted!
+
+        // Sequence A finishes — free_sequence frees ALL blocks including
+        // the prefix block, because shared_prefix_blocks is still 0.
+        pool.free_sequence(&seq_a);
+        cache.release(&prefix_tokens);
+
+        // The prefix block's generation is now incremented (freed).
+        // Someone else could allocate it and write different KV data.
+        let _stolen = pool.alloc_block().unwrap(); // takes the freed block
+
+        // Sequence B links to the cached prefix.
+        let mut seq_b = pool.new_sequence(&b);
+        let (cached_handles, cached_count) = cache.lookup(&prefix_tokens).unwrap();
+        seq_b.link_prefix(&cached_handles, cached_count, prefix_tokens.clone());
+        seq_b.dirty = true;
+
+        // Validated sync should panic — the cached handle's generation is
+        // stale (0) but the pool's generation for that block is now 1.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            seq_b.sync_block_table_validated(&b, &pool);
+        }));
+        assert!(
+            result.is_err(),
+            "should panic: prefix block was freed without mark_prefix_shared, \
+             generation mismatch should be caught"
+        );
+    }
+
     #[test]
     fn test_link_prefix_skips_shared_blocks_on_free() {
+        // Same intent as before but with properly allocated blocks.
         let (b, mut pool) = make_pool(8);
         let mut seq = pool.new_sequence(&b);
 
-        // Simulate linking 2 prefix blocks then allocating 1 own block.
-        // Use handles with generation 0 (matching pool's initial state).
-        let prefix_handles = vec![bh(0, 0), bh(1, 0)];
-        seq.link_prefix(&prefix_handles, 32, vec![0; 32]);
+        // Allocate 3 blocks (48 tokens worth).
+        seq.ensure_slots(&mut pool, 48).unwrap();
+        seq.advance_by(48);
+        assert_eq!(seq.num_blocks(), 3);
+        assert_eq!(pool.free_block_count(), 5);
 
-        // Allocate one more block for the suffix.
-        seq.ensure_slots(&mut pool, 16).unwrap();
-        assert_eq!(seq.num_blocks(), 3); // 2 prefix + 1 own
+        // Pretend the first 2 blocks are a shared prefix.
+        let prefix_tokens: Vec<u32> = (0..32).collect();
+        seq.mark_prefix_shared(2, prefix_tokens);
 
-        // Free the sequence — only the suffix block should be freed.
+        // Free the sequence — only the 1 suffix block should be freed.
         let before = pool.free_block_count();
         pool.free_sequence(&seq);
         let after = pool.free_block_count();
-        assert_eq!(after - before, 1); // Only 1 block freed (not the 2 prefix blocks)
+        assert_eq!(after - before, 1);
     }
 
     #[test]
