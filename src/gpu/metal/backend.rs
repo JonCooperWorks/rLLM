@@ -76,6 +76,7 @@ const METAL_SOURCE_ELEMENTWISE: &str = include_str!("shaders/elementwise.metal")
 const METAL_SOURCE_EMBED: &str = include_str!("shaders/embed.metal");
 const METAL_SOURCE_DELTANET: &str = include_str!("shaders/deltanet.metal");
 const METAL_SOURCE_MOE: &str = include_str!("shaders/moe.metal");
+const METAL_SOURCE_VISION: &str = include_str!("shaders/vision.metal");
 
 // ---------------------------------------------------------------------------
 // MetalBackend — holds the Metal device, command queue, and all compiled
@@ -102,6 +103,7 @@ pub(crate) struct MetalBackend {
     pub(crate) pipeline_attention_hd256: metal::ComputePipelineState,
     pub(crate) pipeline_silu_mul: metal::ComputePipelineState,
     pub(crate) pipeline_gelu_mul: metal::ComputePipelineState,
+    pub(crate) pipeline_gelu_act: metal::ComputePipelineState,
     pub(crate) pipeline_scalar_mul: metal::ComputePipelineState,
     pub(crate) pipeline_add: metal::ComputePipelineState,
     pub(crate) pipeline_bias_add: metal::ComputePipelineState,
@@ -120,6 +122,7 @@ pub(crate) struct MetalBackend {
     pub(crate) pipeline_gemm_bf16: metal::ComputePipelineState,
     pub(crate) pipeline_gemm_q4: metal::ComputePipelineState,
     pub(crate) pipeline_rms_norm_batch: metal::ComputePipelineState,
+    pub(crate) pipeline_layer_norm_batch: metal::ComputePipelineState,
     pub(crate) pipeline_embed_lookup_batch: metal::ComputePipelineState,
     pub(crate) pipeline_rope_batch: metal::ComputePipelineState,
     pub(crate) pipeline_paged_copy_kv_batch: metal::ComputePipelineState,
@@ -151,6 +154,10 @@ pub(crate) struct MetalBackend {
     pub(crate) pipeline_gpt_oss_gated_act: metal::ComputePipelineState,
     pub(crate) pipeline_rope_yarn: metal::ComputePipelineState,
     pub(crate) pipeline_rope_yarn_batch: metal::ComputePipelineState,
+
+    // Vision encoder kernels.
+    pub(crate) pipeline_spatial_merge: metal::ComputePipelineState,
+    pub(crate) pipeline_scatter_vision_tokens: metal::ComputePipelineState,
 
     // Batched command encoding state.
     //
@@ -203,6 +210,8 @@ impl MetalBackend {
             Self::make_pipeline(&device, METAL_SOURCE_ELEMENTWISE, "silu_mul", &compile_opts)?;
         let pipeline_gelu_mul =
             Self::make_pipeline(&device, METAL_SOURCE_ELEMENTWISE, "gelu_mul", &compile_opts)?;
+        let pipeline_gelu_act =
+            Self::make_pipeline(&device, METAL_SOURCE_ELEMENTWISE, "gelu_act", &compile_opts)?;
         let pipeline_scalar_mul = Self::make_pipeline(
             &device,
             METAL_SOURCE_ELEMENTWISE,
@@ -265,6 +274,12 @@ impl MetalBackend {
             &device,
             METAL_SOURCE_RMS_NORM,
             "rms_norm_batch",
+            &compile_opts,
+        )?;
+        let pipeline_layer_norm_batch = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_RMS_NORM,
+            "layer_norm_batch",
             &compile_opts,
         )?;
         let pipeline_embed_lookup_batch = Self::make_pipeline(
@@ -404,6 +419,20 @@ impl MetalBackend {
             &compile_opts,
         )?;
 
+        // Vision encoder kernels.
+        let pipeline_spatial_merge = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_VISION,
+            "spatial_merge",
+            &compile_opts,
+        )?;
+        let pipeline_scatter_vision_tokens = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_VISION,
+            "scatter_vision_tokens",
+            &compile_opts,
+        )?;
+
         Ok(Self {
             device,
             queue,
@@ -416,6 +445,7 @@ impl MetalBackend {
             pipeline_attention_hd256,
             pipeline_silu_mul,
             pipeline_gelu_mul,
+            pipeline_gelu_act,
             pipeline_scalar_mul,
             pipeline_add,
             pipeline_bias_add,
@@ -431,6 +461,7 @@ impl MetalBackend {
             pipeline_gemm_bf16,
             pipeline_gemm_q4,
             pipeline_rms_norm_batch,
+            pipeline_layer_norm_batch,
             pipeline_embed_lookup_batch,
             pipeline_rope_batch,
             pipeline_paged_copy_kv_batch,
@@ -454,6 +485,8 @@ impl MetalBackend {
             pipeline_gpt_oss_gated_act,
             pipeline_rope_yarn,
             pipeline_rope_yarn_batch,
+            pipeline_spatial_merge,
+            pipeline_scatter_vision_tokens,
             current_cmd: std::sync::Mutex::new(None),
         })
     }

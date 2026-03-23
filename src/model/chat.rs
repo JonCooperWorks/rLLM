@@ -55,9 +55,44 @@
 //   concatenation does the job — no template engine dependency needed.
 // ===========================================================================
 
+use base64::Engine;
+
 use super::config::ModelArch;
 use super::thinking;
 use super::tools::{self, ToolCall};
+
+/// Raw image data attached to a message for vision models.
+///
+/// Contains the raw bytes of an image file (JPEG, PNG, or WebP).  Images are
+/// base64-encoded for JSON serialisation and decoded back to raw bytes on
+/// deserialisation.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ImageData {
+    /// Raw image bytes (JPEG, PNG, or WebP).
+    #[serde(with = "base64_bytes")]
+    pub data: Vec<u8>,
+}
+
+/// Serde helper: serialise `Vec<u8>` as a base64 string.
+///
+/// This is needed because JSON has no binary type — image bytes must be encoded
+/// as base64 strings for transport.  The OpenAI and Anthropic APIs both use
+/// base64 for inline image data.
+mod base64_bytes {
+    use base64::Engine;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(data: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(data))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(&s)
+            .map_err(serde::de::Error::custom)
+    }
+}
 
 /// A single message in a chat conversation.
 ///
@@ -66,29 +101,207 @@ use super::tools::{self, ToolCall};
 ///   - "user":      the human's message
 ///   - "assistant": the model's response (for multi-turn conversations)
 ///   - "tool":      result from a tool call (paired with tool_call_id)
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+///
+/// For vision models, user messages can include inline images via the `images`
+/// field.  The chat template inserts appropriate image placeholder tokens
+/// (e.g. `<|vision_start|><|image_pad|><|vision_end|>` for Qwen).
+///
+/// Custom deserialization:
+///   The `content` field can be a plain string, null, or an array of content
+///   parts (OpenAI multi-modal format).  When content is an array, text parts
+///   are concatenated into `content` and image_url parts with base64 data URLs
+///   are decoded into `images`.  The Anthropic API uses a similar array format
+///   with `{"type": "image", "source": {"type": "base64", ...}}` blocks.
+#[derive(Clone, Debug, serde::Serialize)]
 pub(crate) struct Message {
     pub role: String,
     /// Message text.  May be empty for assistant tool-call-only messages
     /// (OpenAI sends content=null when the model only produces tool calls).
-    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub content: String,
     /// Tool calls made by the assistant (only present on role="assistant" messages).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     /// ID of the tool call this message is responding to (only on role="tool" messages).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Image data for vision models (raw bytes per image, e.g. JPEG/PNG).
+    /// When present, the chat template prepends vision placeholder tokens
+    /// before the text content so the model knows where image embeddings go.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<ImageData>>,
 }
 
-/// Deserialize a string that may be null (e.g. OpenAI sends content=null
-/// for assistant messages that only contain tool calls).
-fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::Deserialize;
-    Option::<String>::deserialize(deserializer).map(|o| o.unwrap_or_default())
+/// Custom deserializer for Message that handles both plain-string and
+/// multi-modal array content formats.
+///
+/// OpenAI vision API sends content as an array of typed parts:
+/// ```json
+/// {"role": "user", "content": [
+///   {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}},
+///   {"type": "text", "text": "What's in this image?"}
+/// ]}
+/// ```
+///
+/// Anthropic vision API sends content as an array with image blocks:
+/// ```json
+/// {"role": "user", "content": [
+///   {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "..."}},
+///   {"type": "text", "text": "What's in this image?"}
+/// ]}
+/// ```
+///
+/// This deserializer handles all three forms: string, null, and array.
+impl<'de> serde::Deserialize<'de> for Message {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// Raw helper struct for initial JSON deserialization.
+        /// Content is kept as a raw JSON value so we can inspect its type.
+        #[derive(serde::Deserialize)]
+        struct RawMessage {
+            role: String,
+            #[serde(default)]
+            content: Option<serde_json::Value>,
+            #[serde(default)]
+            tool_calls: Option<Vec<ToolCall>>,
+            #[serde(default)]
+            tool_call_id: Option<String>,
+            #[serde(default)]
+            images: Option<Vec<ImageData>>,
+        }
+
+        let raw = RawMessage::deserialize(deserializer)?;
+
+        let (content, mut images) = match raw.content {
+            // Null or absent → empty string (OpenAI sends null for tool-call-only messages).
+            None => (String::new(), None),
+            Some(serde_json::Value::String(s)) => (s, None),
+            Some(serde_json::Value::Array(parts)) => {
+                // Multi-modal content array (OpenAI or Anthropic format).
+                parse_content_parts(&parts)
+            }
+            Some(_) => (String::new(), None),
+        };
+
+        // Merge images from the content array with any explicitly provided images field.
+        if let Some(explicit) = raw.images {
+            match &mut images {
+                Some(existing) => existing.extend(explicit),
+                None => images = Some(explicit),
+            }
+        }
+
+        Ok(Message {
+            role: raw.role,
+            content,
+            tool_calls: raw.tool_calls,
+            tool_call_id: raw.tool_call_id,
+            images,
+        })
+    }
+}
+
+/// Parse an array of content parts from either OpenAI or Anthropic vision format.
+///
+/// Returns (concatenated_text, optional_images).
+fn parse_content_parts(parts: &[serde_json::Value]) -> (String, Option<Vec<ImageData>>) {
+    let mut text = String::new();
+    let mut images: Vec<ImageData> = Vec::new();
+
+    for part in parts {
+        let type_ = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        match type_ {
+            // Text content block (shared by OpenAI and Anthropic).
+            "text" => {
+                if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                    if !text.is_empty() {
+                        text.push(' ');
+                    }
+                    text.push_str(t);
+                }
+            }
+            // OpenAI image_url block: {"type": "image_url", "image_url": {"url": "data:...;base64,DATA"}}
+            "image_url" => {
+                if let Some(url) = part
+                    .get("image_url")
+                    .and_then(|v| v.get("url"))
+                    .and_then(|v| v.as_str())
+                {
+                    if let Some(data) = decode_data_url(url) {
+                        images.push(ImageData { data });
+                    }
+                }
+            }
+            // Anthropic image block: {"type": "image", "source": {"type": "base64", "data": "..."}}
+            "image" => {
+                if let Some(source) = part.get("source") {
+                    let source_type = source.get("type").and_then(|v| v.as_str());
+                    if source_type == Some("base64") {
+                        if let Some(b64) = source.get("data").and_then(|v| v.as_str()) {
+                            if let Ok(data) =
+                                base64::engine::general_purpose::STANDARD.decode(b64)
+                            {
+                                images.push(ImageData { data });
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {} // Unknown content type — skip gracefully.
+        }
+    }
+
+    let images = if images.is_empty() { None } else { Some(images) };
+    (text, images)
+}
+
+/// Decode a `data:image/...;base64,DATA` URL into raw bytes.
+///
+/// Returns None if the URL is not a valid base64 data URL.  Regular HTTP URLs
+/// are not supported (we don't fetch remote images).
+fn decode_data_url(url: &str) -> Option<Vec<u8>> {
+    // data:image/jpeg;base64,/9j/4AAQ...
+    let suffix = url.strip_prefix("data:")?;
+    let (_, b64) = suffix.split_once(";base64,")?;
+    base64::engine::general_purpose::STANDARD.decode(b64).ok()
+}
+
+/// Return the number of images attached to a message (0 if none).
+fn image_count(msg: &Message) -> usize {
+    msg.images.as_ref().map_or(0, |imgs| imgs.len())
+}
+
+/// Prepend vision placeholder tokens for each image in a message.
+///
+/// Different model families use different marker formats:
+///   - ChatML (Qwen): `<|vision_start|><|image_pad|><|vision_end|>\n` per image
+///   - Gemma 3:       `<start_of_image><image_soft_token><end_of_image>\n` per image
+///
+/// We insert a single `<|image_pad|>` / `<image_soft_token>` per image as a
+/// placeholder.  The actual number of vision tokens depends on the processed
+/// image resolution and will be expanded during tokenization / embedding scatter.
+fn vision_prefix(msg: &Message, arch: ModelArch) -> String {
+    let n = image_count(msg);
+    if n == 0 {
+        return String::new();
+    }
+    let mut prefix = String::new();
+    for _ in 0..n {
+        match arch {
+            ModelArch::Qwen2 | ModelArch::Qwen3Moe | ModelArch::Qwen3_5 | ModelArch::GptOss => {
+                prefix.push_str("<|vision_start|><|image_pad|><|vision_end|>\n");
+            }
+            ModelArch::Gemma3 => {
+                prefix.push_str("<start_of_image><image_soft_token><end_of_image>\n");
+            }
+            // Other architectures don't have vision support yet — images are
+            // silently ignored rather than crashing.
+            _ => {}
+        }
+    }
+    prefix
 }
 
 /// Format messages using the correct chat template for the model architecture.
@@ -203,10 +416,13 @@ fn format_chatml(messages: &[Message]) -> String {
             continue;
         }
 
-        // <|im_start|>role\ncontent<|im_end|>\n
+        // <|im_start|>role\n[vision_prefix]content<|im_end|>\n
         out.push_str("<|im_start|>");
         out.push_str(&msg.role);
         out.push('\n');
+        // Insert vision placeholders before text for user messages with images.
+        // Uses the Qwen/ChatML vision token format (shared by all ChatML archs).
+        out.push_str(&vision_prefix(msg, ModelArch::Qwen2));
         out.push_str(&msg.content);
         out.push_str("<|im_end|>\n");
     }
@@ -249,6 +465,8 @@ fn format_gemma3(messages: &[Message]) -> String {
         };
         out.push_str(role);
         out.push('\n');
+        // Insert vision placeholders before text for user messages with images.
+        out.push_str(&vision_prefix(msg, ModelArch::Gemma3));
         out.push_str(&msg.content);
         out.push_str("<end_of_turn>\n");
     }
@@ -356,6 +574,7 @@ mod tests {
             content: content.to_string(),
             tool_calls: None,
             tool_call_id: None,
+            images: None,
         }
     }
 

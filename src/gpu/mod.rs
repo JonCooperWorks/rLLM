@@ -48,7 +48,7 @@ pub(crate) mod parallel;
 
 pub(crate) use ops::{
     GpuAllReduce, GpuAttention, GpuCore, GpuDeltaNet, GpuElementwise, GpuEmbed, GpuMatmul, GpuMoe,
-    GpuNorm, GpuRope,
+    GpuNorm, GpuRope, GpuVision,
 };
 
 // ---------------------------------------------------------------------------
@@ -70,6 +70,7 @@ pub(crate) trait GpuBackend:
     + GpuDeltaNet
     + GpuAllReduce
     + GpuMoe
+    + GpuVision
 {
 }
 
@@ -84,6 +85,7 @@ impl<T> GpuBackend for T where
         + GpuDeltaNet
         + GpuAllReduce
         + GpuMoe
+        + GpuVision
 {
 }
 

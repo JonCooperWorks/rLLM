@@ -80,4 +80,16 @@ impl GpuNorm for CudaBackend {
         }
         .expect("rms_norm_batch launch failed");
     }
+
+    fn layer_norm_batch(
+        &self,
+        _input: &CudaTensor,
+        _weight: &CudaTensor,
+        _bias: &CudaTensor,
+        _eps: f32,
+        _out: &CudaTensor,
+        _batch_size: u32,
+    ) {
+        todo!("layer_norm_batch not yet implemented for CUDA backend")
+    }
 }

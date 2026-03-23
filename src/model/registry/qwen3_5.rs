@@ -532,9 +532,6 @@ pub(crate) fn forward_prefill_paged<
     let start_pos = seq_state.seq_len as u32;
     let rotary_dim = m.config.rotary_dim() as u32;
 
-    primitives::upload_prefill_inputs(m.backend, bufs, tokens, start_pos, bs);
-    primitives::embed_batch(m.backend, &m.weights, bufs, bs, d.hidden_size);
-
     for layer_idx in 0..m.config.num_hidden_layers {
         let layer = &m.weights.layers[layer_idx];
 
@@ -697,6 +694,7 @@ pub(crate) fn forward_prefill_paged<
                 0,
                 0.0,
                 None,
+                true, // causal
             );
             // GQA output gate (batched): attn_out = attn_out * sigmoid(z).
             if has_output_gate {

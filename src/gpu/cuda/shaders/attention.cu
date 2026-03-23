@@ -544,6 +544,8 @@ struct PrefillAttentionParams {
     unsigned int head_dim;
     unsigned int window_size;
     float attn_scale;
+    unsigned int has_sinks;
+    unsigned int causal;
 };
 
 extern "C" __global__ void prefill_attention(
@@ -575,8 +577,8 @@ extern "C" __global__ void prefill_attention(
 
     const __nv_bfloat16* q_ptr = q + qi * q_stride + head_id * head_dim;
 
-    const unsigned int attend_len = qi + 1;
-    const unsigned int attend_start = (params.window_size > 0 && attend_len > params.window_size)
+    const unsigned int attend_len = params.causal ? (qi + 1) : chunk_size;
+    const unsigned int attend_start = (params.causal && params.window_size > 0 && attend_len > params.window_size)
                                       ? (attend_len - params.window_size) : 0;
 
     __shared__ float q_shared[MAX_HD];

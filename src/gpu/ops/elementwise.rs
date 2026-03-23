@@ -21,6 +21,10 @@ pub(crate) trait GpuElementwise: GpuCore {
     /// GeGLU: out[i] = gelu(gate[i]) * up[i].
     fn gelu_mul(&self, gate: &Self::Tensor, up: &Self::Tensor, out: &Self::Tensor, size: u32);
 
+    /// Plain GELU: out[i] = gelu(input[i]).
+    /// Used by vision encoder FFN (SigLIP ViT) which uses GELU without gating.
+    fn gelu(&self, input: &Self::Tensor, out: &Self::Tensor, size: u32);
+
     /// Scalar multiply: out[i] = scalar * input[i].
     fn scalar_mul(&self, input: &Self::Tensor, out: &Self::Tensor, scalar: f32, size: u32);
 

@@ -118,6 +118,10 @@ impl GpuElementwise for CudaBackend {
         .expect("gelu_mul launch failed");
     }
 
+    fn gelu(&self, _input: &CudaTensor, _out: &CudaTensor, _size: u32) {
+        todo!("gelu not yet implemented for CUDA backend")
+    }
+
     fn scalar_mul(&self, input: &CudaTensor, out: &CudaTensor, scalar: f32, size: u32) {
         let params = ScalarMulParams { size, scalar };
         let block = 256.min(size);

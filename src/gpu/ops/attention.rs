@@ -135,7 +135,11 @@ pub(crate) trait GpuAttention: GpuCore {
         );
     }
 
-    /// Causal prefill attention on dense Q/K/V tensors.
+    /// Prefill attention on dense Q/K/V tensors.
+    ///
+    /// When `causal` is true (default for LLM text), applies a causal mask so
+    /// each position only attends to itself and earlier positions.  When false
+    /// (vision encoder), allows bidirectional attention across all positions.
     fn prefill_attention(
         &self,
         q: &Self::Tensor,
@@ -150,5 +154,6 @@ pub(crate) trait GpuAttention: GpuCore {
         window_size: u32,
         attn_scale: f32,
         sinks: Option<&Self::Tensor>,
+        causal: bool,
     );
 }

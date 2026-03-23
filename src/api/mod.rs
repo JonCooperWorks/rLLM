@@ -52,6 +52,7 @@ use crate::ServeArgs;
 use crate::engine;
 use crate::engine::SeqId;
 use crate::gpu;
+use crate::model::chat::ImageData;
 use crate::model::{config, tokenizer};
 
 // ---------------------------------------------------------------------------
@@ -76,6 +77,10 @@ pub(crate) struct WorkerRequest {
     /// Whether thinking (extended reasoning) was requested.
     /// Some(true) = enabled, Some(false) = explicitly disabled, None = not specified.
     pub thinking: Option<bool>,
+    /// Preprocessed images for vision models.
+    /// Decoded and normalised on the handler thread (CPU), passed to the
+    /// worker for GPU encoding during prefill.
+    pub images: Vec<crate::model::vision::ProcessedImage>,
 }
 
 /// Events sent from the inference worker back to an HTTP handler.
@@ -115,6 +120,8 @@ pub(crate) struct ServerState {
     pub tokenizer: Arc<tokenizer::Tokenizer>,
     /// Model architecture (for chat template selection).
     pub arch: config::ModelArch,
+    /// Vision config for image preprocessing (None for text-only models).
+    pub vision_config: Option<crate::model::config::VisionConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -247,7 +254,13 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         request_tx,
         tokenizer,
         arch,
+        vision_config: _,
     } = spawn_worker(args.model.clone(), args.stream_experts, tp)?;
+
+    // Parse vision config directly from config.json for handler-side image preprocessing.
+    let vision_config = config::ModelConfig::from_file(&args.model.join("config.json"))
+        .ok()
+        .and_then(|c| c.vision);
 
     // ------------------------------------------------------------------
     // 3. Start HTTP server.
@@ -262,6 +275,7 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         model_name,
         tokenizer,
         arch,
+        vision_config,
     });
 
     // Build axum router with all API endpoints.
@@ -317,6 +331,7 @@ struct WorkerHandle {
     request_tx: std::sync::mpsc::SyncSender<WorkerRequest>,
     tokenizer: Arc<tokenizer::Tokenizer>,
     arch: config::ModelArch,
+    vision_config: Option<crate::model::config::VisionConfig>,
 }
 
 /// Spawn the inference worker thread.
@@ -329,8 +344,9 @@ fn spawn_worker(
     tp: usize,
 ) -> anyhow::Result<WorkerHandle> {
     let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
+    type ReadyPayload = (Arc<tokenizer::Tokenizer>, config::ModelArch, Option<crate::model::config::VisionConfig>);
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<
-        Result<(Arc<tokenizer::Tokenizer>, config::ModelArch), String>,
+        Result<ReadyPayload, String>,
     >(1);
 
     std::thread::spawn(move || {
@@ -342,7 +358,7 @@ fn spawn_worker(
             tp,
             max_active,
             |tok, arch| {
-                let _ = ready_tx.send(Ok((Arc::new(tok.clone()), arch)));
+                let _ = ready_tx.send(Ok((Arc::new(tok.clone()), arch, None)));
             },
             |eng| run_worker_loop(eng, request_rx),
         );
@@ -353,10 +369,11 @@ fn spawn_worker(
     });
 
     match ready_rx.recv() {
-        Ok(Ok((tokenizer, arch))) => Ok(WorkerHandle {
+        Ok(Ok((tokenizer, arch, vision_config))) => Ok(WorkerHandle {
             request_tx,
             tokenizer,
             arch,
+            vision_config,
         }),
         Ok(Err(e)) => anyhow::bail!("worker failed to start: {e}"),
         Err(_) => anyhow::bail!("worker thread died during startup"),
@@ -429,6 +446,7 @@ fn run_worker_loop(
                 req.max_tokens,
                 req.temperature,
                 req.top_p,
+                req.images,
             );
             registry.insert(
                 seq_id,
@@ -458,6 +476,7 @@ fn run_worker_loop(
                         req.max_tokens,
                         req.temperature,
                         req.top_p,
+                        req.images,
                     );
                     registry.insert(
                         seq_id,

@@ -91,6 +91,7 @@ fn load_and_run_single_gpu(
         weights,
         expert_index,
         is_quantized,
+        vision_weights,
     } = loader::load_model(&backend, model_dir, stream_experts)?;
     let load_secs = t_load.elapsed().as_secs_f64();
     eprintln!("loaded in {:.2}s", load_secs);
@@ -102,6 +103,18 @@ fn load_and_run_single_gpu(
         let k = config.num_experts_per_tok;
         let streamer = model::expert_stream::ExpertStreamer::new(&backend, index, k);
         model.expert_streamer = Some(streamer);
+    }
+
+    // Set up vision encoder if VLM weights were loaded.
+    if let Some(vw) = vision_weights {
+        if let Some(vc) = &config.vision {
+            // Max patches for a 448×448 image with patch_size=16: 28×28 = 784.
+            let max_patches = (448 / vc.patch_size) * (448 / vc.patch_size);
+            let bufs = model::vision::alloc_vision_buffers(&backend, vc, max_patches);
+            model.vision_weights = Some(vw);
+            model.vision_bufs = Some(bufs);
+            eprintln!("vision encoder ready ({} blocks, hidden={})", vc.depth, vc.hidden_size);
+        }
     }
 
     // Dynamic KV cache sizing based on remaining GPU memory.

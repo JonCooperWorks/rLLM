@@ -76,7 +76,13 @@ mod imp {
             self.multi.ensure_slots_for(state, token_count)
         }
 
-        fn forward_prefill(&self, tokens: &[u32], state: &Self::SeqState) -> anyhow::Result<()> {
+        fn forward_prefill(
+            &self,
+            tokens: &[u32],
+            state: &Self::SeqState,
+            _images: &[crate::model::vision::ProcessedImage],
+        ) -> anyhow::Result<()> {
+            // TODO: vision encoding for multi-GPU not yet implemented.
             self.multi.forward_prefill_paged_with(tokens, state)
         }
 

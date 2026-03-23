@@ -82,6 +82,7 @@ pub(crate) trait InferenceEngine {
         max_gen_tokens: usize,
         temperature: f32,
         top_p: f32,
+        images: Vec<crate::model::vision::ProcessedImage>,
     ) -> SeqId;
 
     /// Run one engine step: admit → prefill → decode → sample → collect.
@@ -143,6 +144,8 @@ pub(crate) struct SequenceRequest {
     pub max_gen_tokens: usize,
     pub temperature: f32,
     pub top_p: f32,
+    /// Preprocessed images for vision models (consumed during first prefill).
+    pub images: Vec<crate::model::vision::ProcessedImage>,
 }
 
 /// State of a single active sequence.
@@ -167,6 +170,8 @@ pub(crate) struct Sequence<S> {
     pub finished: bool,
     /// Number of prompt tokens served from the prefix cache.
     pub cached_tokens: usize,
+    /// Preprocessed images (consumed during first prefill chunk, then empty).
+    pub images: Vec<crate::model::vision::ProcessedImage>,
 }
 
 /// Manages the waiting queue and active set for continuous batching.
@@ -228,6 +233,7 @@ impl<S> Scheduler<S> {
                 top_p: req.top_p,
                 finished: false,
                 cached_tokens: 0,
+                images: req.images,
             };
             self.active.insert(id, seq);
             admitted.push(id);
@@ -356,11 +362,20 @@ pub(crate) fn run_step<D: Dispatch>(
         let suffix_tokens = &tokens[cached_prefix_len..];
 
         // Chunk the suffix (or full prompt) and run prefill.
+        // Images are passed only for the FIRST chunk (vision encoding happens
+        // once; subsequent chunks are pure text continuation).
         if !suffix_tokens.is_empty() {
+            let mut first_chunk = true;
             for chunk in suffix_tokens.chunks(max_chunk) {
                 let chunk_size = chunk.len();
                 dispatch.prepare_prefill(&mut seq.kv_state, chunk_size)?;
-                dispatch.forward_prefill(chunk, &seq.kv_state)?;
+                let images = if first_chunk {
+                    first_chunk = false;
+                    std::mem::take(&mut seq.images)
+                } else {
+                    Vec::new()
+                };
+                dispatch.forward_prefill(chunk, &seq.kv_state, &images)?;
                 D::finish_prefill(&mut seq.kv_state, chunk_size);
             }
         }
@@ -588,9 +603,14 @@ impl<'a, B: GpuBackend> Dispatch for SingleGpuDispatch<'a, B> {
         Ok(())
     }
 
-    fn forward_prefill(&self, tokens: &[u32], state: &SeqKvState<B>) -> anyhow::Result<()> {
+    fn forward_prefill(
+        &self,
+        tokens: &[u32],
+        state: &SeqKvState<B>,
+        images: &[crate::model::vision::ProcessedImage],
+    ) -> anyhow::Result<()> {
         self.model
-            .forward_prefill_paged(tokens, &self.kv_pool, state, &self.prefill_bufs)
+            .forward_prefill_paged(tokens, &self.kv_pool, state, &self.prefill_bufs, images)
     }
 
     fn finish_prefill(state: &mut SeqKvState<B>, token_count: usize) {
@@ -737,12 +757,14 @@ impl<'a, B: GpuBackend> InferenceEngine for Engine<'a, B> {
         max_gen_tokens: usize,
         temperature: f32,
         top_p: f32,
+        images: Vec<crate::model::vision::ProcessedImage>,
     ) -> SeqId {
         self.scheduler.add_request(SequenceRequest {
             prompt_tokens,
             max_gen_tokens,
             temperature,
             top_p,
+            images,
         })
     }
 
@@ -825,7 +847,7 @@ mod tests {
             Ok(())
         }
 
-        fn forward_prefill(&self, _tokens: &[u32], _state: &Self::SeqState) -> anyhow::Result<()> {
+        fn forward_prefill(&self, _tokens: &[u32], _state: &Self::SeqState, _images: &[crate::model::vision::ProcessedImage]) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -917,7 +939,7 @@ mod tests {
             Ok(())
         }
 
-        fn forward_prefill(&self, _tokens: &[u32], _state: &MockSeqState) -> anyhow::Result<()> {
+        fn forward_prefill(&self, _tokens: &[u32], _state: &MockSeqState, _images: &[crate::model::vision::ProcessedImage]) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -960,6 +982,7 @@ mod tests {
             max_gen_tokens: max_gen,
             temperature: 1.0,
             top_p: 0.9,
+            images: Vec::new(),
         }
     }
 
@@ -1170,6 +1193,7 @@ mod tests {
             max_gen_tokens: 3,
             temperature: 0.0,
             top_p: 1.0,
+            images: Vec::new(),
         });
 
         // Step 1: admit + prefill + decode (2 tokens in one step)
@@ -1203,6 +1227,7 @@ mod tests {
             max_gen_tokens: 10,
             temperature: 0.0,
             top_p: 1.0,
+            images: Vec::new(),
         });
 
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1226,6 +1251,7 @@ mod tests {
             max_gen_tokens: 10,
             temperature: 0.0,
             top_p: 1.0,
+            images: Vec::new(),
         });
 
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1248,12 +1274,14 @@ mod tests {
             max_gen_tokens: 2,
             temperature: 0.0,
             top_p: 1.0,
+            images: Vec::new(),
         });
         scheduler.add_request(SequenceRequest {
             prompt_tokens: vec![3, 4],
             max_gen_tokens: 2,
             temperature: 0.0,
             top_p: 1.0,
+            images: Vec::new(),
         });
 
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1273,6 +1301,7 @@ mod tests {
             max_gen_tokens: 5,
             temperature: 0.0,
             top_p: 1.0,
+            images: Vec::new(),
         });
 
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1292,6 +1321,7 @@ mod tests {
             max_gen_tokens: 10,
             temperature: 0.0,
             top_p: 1.0,
+            images: Vec::new(),
         });
 
         run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1328,6 +1358,7 @@ mod tests {
             max_gen_tokens: 1,
             temperature: 0.0,
             top_p: 1.0,
+            images: Vec::new(),
         });
 
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1351,12 +1382,14 @@ mod tests {
             max_gen_tokens: 1,
             temperature: 0.0,
             top_p: 1.0,
+            images: Vec::new(),
         });
         scheduler.add_request(SequenceRequest {
             prompt_tokens: vec![2],
             max_gen_tokens: 1,
             temperature: 0.0,
             top_p: 1.0,
+            images: Vec::new(),
         });
 
         // Step 1: A admitted + prefilled + finished (max_tokens=1)
@@ -1437,7 +1470,7 @@ mod tests {
             Ok(())
         }
 
-        fn forward_prefill(&self, tokens: &[u32], _state: &Self::SeqState) -> anyhow::Result<()> {
+        fn forward_prefill(&self, tokens: &[u32], _state: &Self::SeqState, _images: &[crate::model::vision::ProcessedImage]) -> anyhow::Result<()> {
             // Record what was actually prefilled (for cache-hit verification).
             self.prefilled_tokens.borrow_mut().push(tokens.to_vec());
             Ok(())
@@ -1517,6 +1550,7 @@ mod tests {
             max_gen_tokens: 1,
             temperature: 0.0,
             top_p: 1.0,
+            images: Vec::new(),
         });
 
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1540,6 +1574,7 @@ mod tests {
             max_gen_tokens: 1,
             temperature: 0.0,
             top_p: 1.0,
+            images: Vec::new(),
         });
 
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1572,6 +1607,7 @@ mod tests {
             max_gen_tokens: 1,
             temperature: 0.0,
             top_p: 1.0,
+            images: Vec::new(),
         });
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
         assert_eq!(out.finished.len(), 1);
@@ -1595,6 +1631,7 @@ mod tests {
             max_gen_tokens: 1,
             temperature: 0.0,
             top_p: 1.0,
+            images: Vec::new(),
         });
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
         assert_eq!(out.finished.len(), 1);
@@ -1644,6 +1681,7 @@ mod tests {
             max_gen_tokens: 1,
             temperature: 0.0,
             top_p: 1.0,
+            images: Vec::new(),
         });
 
         run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1665,6 +1703,7 @@ mod tests {
             max_gen_tokens: 1,
             temperature: 0.0,
             top_p: 1.0,
+            images: Vec::new(),
         });
         run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
 
@@ -1676,6 +1715,7 @@ mod tests {
             max_gen_tokens: 2,
             temperature: 0.0,
             top_p: 1.0,
+            images: Vec::new(),
         });
 
         // Step: admit + cache hit (32 tokens) + prefill suffix (24 tokens)

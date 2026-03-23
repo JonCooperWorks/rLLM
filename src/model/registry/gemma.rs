@@ -341,15 +341,6 @@ pub(crate) fn forward_prefill_paged<
     } else {
         0.0
     };
-    let embed_scale = (m.config.hidden_size as f32).sqrt();
-
-    primitives::upload_prefill_inputs(m.backend, bufs, tokens, start_pos, bs);
-    primitives::embed_batch(m.backend, &m.weights, bufs, bs, d.hidden_size);
-
-    // Scale all embeddings by sqrt(hidden_size).
-    m.backend
-        .scalar_mul(&bufs.hidden, &bufs.hidden, embed_scale, bs * d.hidden_size);
-
     for layer_idx in 0..m.config.num_hidden_layers {
         let layer = &m.weights.layers[layer_idx];
         let rope_theta = layer_rope_theta(&m.config, layer_idx);

@@ -99,6 +99,7 @@ struct PrefillAttentionParams {
     window_size: u32,
     attn_scale: f32,
     has_sinks: u32,
+    causal: u32,
 }
 
 impl GpuAttention for MetalBackend {
@@ -344,6 +345,7 @@ impl GpuAttention for MetalBackend {
         window_size: u32,
         attn_scale: f32,
         sinks: Option<&MetalTensor>,
+        causal: bool,
     ) {
         let params = PrefillAttentionParams {
             chunk_size,
@@ -354,6 +356,7 @@ impl GpuAttention for MetalBackend {
             window_size,
             attn_scale,
             has_sinks: if sinks.is_some() { 1 } else { 0 },
+            causal: if causal { 1 } else { 0 },
         };
         let sinks_buf = sinks.map(|s| &s.buffer).unwrap_or(&out.buffer);
         let threads_per_group: u64 = 256;

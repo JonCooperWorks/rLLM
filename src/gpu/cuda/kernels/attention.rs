@@ -101,6 +101,7 @@ struct PrefillAttentionParams {
     window_size: u32,
     attn_scale: f32,
     has_sinks: u32,
+    causal: u32,
 }
 unsafe impl DeviceRepr for PrefillAttentionParams {}
 
@@ -347,6 +348,7 @@ impl GpuAttention for CudaBackend {
         window_size: u32,
         attn_scale: f32,
         sinks: Option<&CudaTensor>,
+        causal: bool,
     ) {
         let params = PrefillAttentionParams {
             chunk_size,
@@ -357,6 +359,7 @@ impl GpuAttention for CudaBackend {
             window_size,
             attn_scale,
             has_sinks: if sinks.is_some() { 1 } else { 0 },
+            causal: if causal { 1 } else { 0 },
         };
         let sinks_buf = sinks.map(|s| &s.buf).unwrap_or(&out.buf);
         let num_blocks = chunk_size * num_heads;

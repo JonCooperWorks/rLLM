@@ -862,6 +862,7 @@ struct PrefillAttentionParams {
     uint window_size;   // Sliding window (0 = full causal attention).
     float attn_scale;   // Custom scale (0 = default 1/√head_dim).
     uint has_sinks;     // 0 = no sinks, 1 = sinks buffer present (attention sinks).
+    uint causal;        // 1 = causal mask (LLM text), 0 = bidirectional (vision).
 };
 
 kernel void prefill_attention(
@@ -897,16 +898,14 @@ kernel void prefill_attention(
     // Pointer to this query token's head vector.
     device const bfloat* q_ptr = q + qi * q_stride + head_id * head_dim;
 
-    // Causal mask: this query attends to chunk positions 0..=qi.
-    // With sliding window: also limit to at most window_size positions.
+    // Attention mask: causal (LLM text) or bidirectional (vision encoder).
     //
-    // Learning note: during prefill the K/V tensors are dense (not paged),
-    // indexed 0..chunk_size-1 within this chunk.  The absolute position of
-    // chunk token `qi` is `start_pos + qi`.  With sliding window, we only
-    // attend to positions whose absolute position is >= (start_pos + qi + 1 - window_size).
-    // Mapped back to chunk-local indices: attend_start = max(0, qi + 1 - window_size).
-    const uint attend_len = qi + 1;
-    const uint attend_start = (params.window_size > 0 && attend_len > params.window_size)
+    // Causal: each query attends to chunk positions 0..=qi.
+    // Bidirectional: each query attends to all chunk positions 0..chunk_size-1.
+    //
+    // With sliding window (causal only): limit to at most window_size positions.
+    const uint attend_len = params.causal ? (qi + 1) : chunk_size;
+    const uint attend_start = (params.causal && params.window_size > 0 && attend_len > params.window_size)
                               ? (attend_len - params.window_size) : 0;
 
     // --- Load Q into threadgroup shared memory ---

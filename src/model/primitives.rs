@@ -838,6 +838,7 @@ pub(crate) fn paged_kv_and_prefill_attention<B: GpuAttention>(
         window_size,
         attn_scale,
         sinks,
+        true, // causal — LLM text generation
     );
 }
 

@@ -100,6 +100,17 @@ impl GpuElementwise for MetalBackend {
         );
     }
 
+    fn gelu(&self, input: &MetalTensor, out: &MetalTensor, size: u32) {
+        let params = ElemParams { size };
+        self.dispatch_async(
+            &self.pipeline_gelu_act,
+            &params,
+            &[(&input.buffer, 1), (&out.buffer, 2)],
+            MTLSize::new(size as u64, 1, 1),
+            MTLSize::new(256.min(size as u64), 1, 1),
+        );
+    }
+
     fn scalar_mul(&self, input: &MetalTensor, out: &MetalTensor, scalar: f32, size: u32) {
         let params = ScalarMulParams { size, scalar };
         self.dispatch_async(

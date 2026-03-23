@@ -11,15 +11,16 @@ The GPU interface is a set of composable sub-traits, not a monolithic god-trait:
 
 ```
 GpuCore          — tensor lifecycle, device info, command buffer control
-GpuNorm          — RMS normalization
+GpuNorm          — RMS normalization + LayerNorm (vision encoder)
 GpuMatmul        — matrix-vector + batched GEMM
 GpuRope          — rotary positional embeddings
-GpuAttention     — attention + KV cache
-GpuElementwise   — activations, arithmetic, MoE routing
+GpuAttention     — attention + KV cache (causal + bidirectional)
+GpuElementwise   — activations (SiLU, GELU, GeGLU), arithmetic, MoE routing
 GpuEmbed         — embedding lookup
 GpuMoe           — fused MoE kernels (gate+up+SwiGLU, combine+residual)
 GpuDeltaNet      — Qwen 3.5 linear attention kernels
 GpuAllReduce     — collective communication for tensor parallelism
+GpuVision        — vision encoder kernels (spatial merge, token scatter)
 ```
 
 All extend `GpuCore` (which owns the associated `Tensor` type).  `GpuBackend` is a blanket
@@ -53,9 +54,11 @@ mixtral.rs     — Mixtral (MoE)
 gpt_oss.rs     — GPT Open Source
 ```
 
-Config parsing: `src/model/config.rs` (`ModelArch` enum).
-Weight loading: `src/model/loader.rs` (safetensors, single + multi-shard, pre-quantized Q4 auto-detection).
+Config parsing: `src/model/config.rs` (`ModelArch` enum + `VisionConfig` for VLMs).
+Weight loading: `src/model/loader.rs` (safetensors, single + multi-shard, pre-quantized Q4 auto-detection,
+  vision encoder weights with f32→bf16 conversion and fused QKV splitting).
 Expert streaming: `src/model/expert_stream.rs` (SSD-backed on-demand expert loading for large MoE models).
+Vision encoder: `src/model/vision.rs` (SigLIP ViT forward pass, image preprocessing, patch embedding).
 
 ### Inference Engine (`src/engine/`)
 
@@ -83,12 +86,61 @@ api/
 Tool/function calling lives in `src/model/tools.rs` with architecture-specific prompt formatting
 and output parsing (Llama 3.1, Qwen, Mistral, Anthropic formats).
 
+### Vision Encoder (`src/model/vision.rs`)
+
+Vision-language models (VLMs) like Qwen 3.5 and Gemma 3 include a SigLIP-based Vision
+Transformer (ViT) that converts images into token embeddings the LLM can process.
+
+**Architecture:**
+```
+Image [3, H, W]
+  ↓ CPU: decode, resize, CLIP-normalise, patchify
+Patches [N, 768]          (768 = 3 channels × 16² pixels per patch)
+  ↓ GPU: patch_embed matmul + positional embedding add
+Patch embeddings [N, 1152]
+  ↓ GPU: 27× ViT blocks (LayerNorm → bidirectional attention → GELU FFN)
+Vision features [N, 1152]
+  ↓ GPU: spatial merge (2×2) + MLP projector
+Vision tokens [M, 5120]   (M = N/4 after merge, matches LLM hidden_size)
+  ↓ GPU: scatter into text embedding buffer at <|image_pad|> positions
+```
+
+**Key design decisions:**
+- LayerNorm (not RMSNorm) — matches the frozen SigLIP encoder's training
+- Bidirectional attention (`causal=false`) — images have no left-to-right ordering
+- Plain GELU (not GeGLU/SwiGLU) — standard ViT activation
+- Patch embedding via matmul — equivalent to Conv2D with stride==kernel_size
+- Spatial merge (Qwen 3.5) — 2×2 adjacent patches concatenated to reduce token count 4×
+- All projections have bias — SigLIP design choice (unlike LLM layers)
+
+**Data flow through the system:**
+```
+API request (base64 image)
+  → chat.rs: deserialise content array, extract ImageData
+  → api/openai.rs: preprocess_image() on handler thread (CPU)
+  → WorkerRequest.images: Vec<ProcessedImage>
+  → engine: SequenceRequest.images → Sequence.images
+  → forward_prefill_paged: embed_lookup → vision_encode → scatter → transformer
+```
+
+**Files:**
+```
+model/vision.rs         — VisionWeights, VisionBuffers, preprocess_image(), vision_encode()
+model/config.rs         — VisionConfig (parsed from vision_config in config.json)
+model/loader.rs         — load_vision_weights() (handles f32→bf16, fused QKV split, temporal avg)
+model/chat.rs           — ImageData, vision placeholder tokens in chat templates
+model/mod.rs            — forward_prefill_paged() vision scatter integration
+gpu/ops/vision.rs       — GpuVision trait (spatial_merge, scatter_vision_tokens)
+gpu/ops/norm.rs         — layer_norm_batch (LayerNorm for ViT)
+gpu/metal/shaders/vision.metal — spatial merge + scatter kernels
+```
+
 ### CLI Commands (`src/commands/`)
 
 ```
-rllm run    — single-prompt inference
+rllm run    — single-prompt inference (--image <path> for vision models)
 rllm batch  — batched inference from file
-rllm serve  — HTTP API server
+rllm serve  — HTTP API server (accepts images via OpenAI/Anthropic multimodal format)
 ```
 
 ### Adding a New Kernel Family

@@ -33,6 +33,14 @@ struct RmsNormBatchParams {
     batch_size: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LayerNormBatchParams {
+    hidden_size: u32,
+    eps: f32,
+    batch_size: u32,
+}
+
 impl GpuNorm for MetalBackend {
     fn rms_norm(&self, input: &MetalTensor, weight: &MetalTensor, eps: f32, out: &MetalTensor) {
         let hidden_size = input.shape[0] as u32;
@@ -64,6 +72,35 @@ impl GpuNorm for MetalBackend {
             &self.pipeline_rms_norm_batch,
             &params,
             &[(&input.buffer, 1), (&weight.buffer, 2), (&out.buffer, 3)],
+            MTLSize::new(batch_size as u64 * 256, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+    }
+
+    fn layer_norm_batch(
+        &self,
+        input: &MetalTensor,
+        weight: &MetalTensor,
+        bias: &MetalTensor,
+        eps: f32,
+        out: &MetalTensor,
+        batch_size: u32,
+    ) {
+        let hidden_size = weight.shape[0] as u32;
+        let params = LayerNormBatchParams {
+            hidden_size,
+            eps,
+            batch_size,
+        };
+        self.dispatch_async(
+            &self.pipeline_layer_norm_batch,
+            &params,
+            &[
+                (&input.buffer, 1),
+                (&weight.buffer, 2),
+                (&bias.buffer, 3),
+                (&out.buffer, 4),
+            ],
             MTLSize::new(batch_size as u64 * 256, 1, 1),
             MTLSize::new(256, 1, 1),
         );

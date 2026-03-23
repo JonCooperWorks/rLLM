@@ -484,6 +484,92 @@ pub struct ModelConfig {
     // during config loading, not deserialized from JSON.
     #[serde(skip)]
     pub weight_prefix: String,
+
+    // --- Vision encoder config ---
+    // Present when the model is multimodal (VLM).  Parsed from the top-level
+    // `vision_config` field in config.json.  Set during from_file(), not
+    // deserialized directly (because the VLM wrapper nests text_config).
+    #[serde(skip)]
+    pub vision: Option<VisionConfig>,
+
+    /// Token ID for image placeholders in the token sequence.
+    /// Each image produces N of these tokens, replaced by vision encoder output.
+    #[serde(skip)]
+    pub image_token_id: Option<u32>,
+
+    /// Token ID marking the start of a vision segment.
+    #[serde(skip)]
+    pub vision_start_token_id: Option<u32>,
+
+    /// Token ID marking the end of a vision segment.
+    #[serde(skip)]
+    pub vision_end_token_id: Option<u32>,
+}
+
+/// Vision encoder configuration, parsed from `vision_config` in config.json.
+///
+/// Both Qwen 3.5 and Gemma 3 VLMs use SigLIP-based ViT encoders with very
+/// similar architectures (27 layers, 1152 hidden, 16 heads, LayerNorm).
+/// Differences are captured by fields like `fused_qkv` and `spatial_merge_size`.
+///
+/// LEARNING NOTE: This struct is NOT derived via Deserialize — it's constructed
+/// manually in `parse_vision_config()` because HuggingFace config.json uses
+/// different field names for different model families (Qwen uses "depth" while
+/// Gemma uses "num_hidden_layers", etc.).  The manual construction normalises
+/// these differences into a single shared representation.
+///
+/// The `fused_qkv` and `weight_prefix` / `projector_prefix` fields encode the
+/// structural differences that matter at weight-loading time (see loader.rs):
+///   - Qwen: fused QKV weight [3*hd, hd], prefix "visual."
+///   - Gemma: separate Q/K/V weights, prefix "vision_tower.vision_model."
+///
+/// Related: model/vision.rs (forward pass), model/loader.rs (weight loading),
+///          gpu/ops/vision.rs (spatial_merge + scatter kernels)
+#[derive(Debug, Clone)]
+pub(crate) struct VisionConfig {
+    /// Patch size for image tokenization (16 for Qwen 3.5, 14 for Gemma 3).
+    /// The image is divided into non-overlapping patch_size×patch_size blocks,
+    /// each flattened into a vector of in_channels * patch_size² dimensions.
+    pub patch_size: usize,
+    /// Number of ViT transformer blocks (typically 27).
+    /// Both Qwen and Gemma SigLIP encoders use 27 layers — a sweet spot
+    /// between quality and latency for the ~400M parameter vision encoder.
+    pub depth: usize,
+    /// Hidden dimension of the vision encoder (typically 1152).
+    /// This is the internal width of the ViT — distinct from the text model's
+    /// hidden_size.  A projection layer bridges the two at the end.
+    pub hidden_size: usize,
+    /// Number of attention heads (typically 16).
+    pub num_heads: usize,
+    /// FFN intermediate dimension (typically 4304).
+    pub intermediate_size: usize,
+    /// Spatial merge factor (Qwen: 2, Gemma: 0 = no spatial merge).
+    /// When > 0, every merge_size×merge_size block of tokens is concatenated
+    /// into a single token, reducing token count by ms² before feeding into
+    /// the text model.  See gpu/ops/vision.rs for the kernel.
+    pub spatial_merge_size: usize,
+    /// Output hidden dimension after projection, matching text model's hidden_size.
+    /// The merger/projector MLP maps from vision hidden_size (or hidden_size * ms²
+    /// after spatial merge) down to this dimension.
+    pub out_hidden_size: usize,
+    /// Number of input channels (3 for RGB).
+    pub in_channels: usize,
+    /// Whether QKV projections are fused into a single weight (Qwen: true, Gemma: false).
+    /// When true, the loader splits [3*hd, hd] into separate Q, K, V tensors
+    /// at load time so the forward pass can use the same code path for both.
+    pub fused_qkv: bool,
+    /// Hidden activation function in the vision FFN.
+    /// Typically "gelu_pytorch_tanh" — both Qwen and Gemma vision encoders use
+    /// plain GELU (not SwiGLU), unlike the text transformer.
+    pub hidden_act: String,
+    /// Vision weight tensor prefix in safetensors (e.g. "visual." for Qwen,
+    /// "vision_tower.vision_model." for Gemma).  Used by the loader to find
+    /// tensors in the safetensors file.
+    pub weight_prefix: String,
+    /// Projector weight prefix (e.g. "visual.merger." for Qwen,
+    /// "multi_modal_projector." for Gemma).  The projector bridges the vision
+    /// encoder output to the text model's embedding space.
+    pub projector_prefix: String,
 }
 
 /// RoPE parameters for models with nested rope configuration (Qwen 3.5).
@@ -569,6 +655,14 @@ impl ModelConfig {
     pub fn from_file(path: &std::path::Path) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
         let raw: Value = serde_json::from_str(&contents)?;
+
+        // Extract vision config and token IDs from the top-level JSON before
+        // we destructure `raw` into text_config.  These fields live at the
+        // outer level for both Qwen 3.5 and Gemma 3 VLMs.
+        let raw_vision_config = raw.get("vision_config").cloned();
+        let raw_image_token_id = raw.get("image_token_id").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let raw_vision_start = raw.get("vision_start_token_id").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let raw_vision_end = raw.get("vision_end_token_id").and_then(|v| v.as_u64()).map(|v| v as u32);
 
         // Detect nested VLM config: if `text_config` exists, extract it and
         // merge top-level fields (like `tie_word_embeddings`) into it.
@@ -718,6 +812,50 @@ impl ModelConfig {
                     }
                 })
                 .collect();
+        }
+
+        // Parse vision encoder config from the top-level vision_config field.
+        if let Some(vc) = raw_vision_config {
+            let is_gemma = config.model_type == "gemma3_text" || config.model_type == "gemma3";
+            let patch_size = vc.get("patch_size").and_then(|v| v.as_u64()).unwrap_or(16) as usize;
+            let depth = vc.get("depth").and_then(|v| v.as_u64())
+                .or_else(|| vc.get("num_hidden_layers").and_then(|v| v.as_u64()))
+                .unwrap_or(27) as usize;
+            let hidden_size = vc.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(1152) as usize;
+            let num_heads = vc.get("num_heads").and_then(|v| v.as_u64())
+                .or_else(|| vc.get("num_attention_heads").and_then(|v| v.as_u64()))
+                .unwrap_or(16) as usize;
+            let intermediate_size = vc.get("intermediate_size").and_then(|v| v.as_u64()).unwrap_or(4304) as usize;
+            let spatial_merge_size = vc.get("spatial_merge_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let out_hidden_size = vc.get("out_hidden_size").and_then(|v| v.as_u64()).unwrap_or(config.hidden_size as u64) as usize;
+            let in_channels = vc.get("in_channels").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+            let hidden_act = vc.get("hidden_act").and_then(|v| v.as_str()).unwrap_or("gelu_pytorch_tanh").to_string();
+
+            config.vision = Some(VisionConfig {
+                patch_size,
+                depth,
+                hidden_size,
+                num_heads,
+                intermediate_size,
+                spatial_merge_size,
+                out_hidden_size,
+                in_channels,
+                fused_qkv: !is_gemma,  // Qwen uses fused QKV, Gemma uses separate
+                hidden_act,
+                weight_prefix: if is_gemma {
+                    "vision_tower.vision_model.".to_string()
+                } else {
+                    "model.visual.".to_string()
+                },
+                projector_prefix: if is_gemma {
+                    "multi_modal_projector.".to_string()
+                } else {
+                    "model.visual.merger.".to_string()
+                },
+            });
+            config.image_token_id = raw_image_token_id;
+            config.vision_start_token_id = raw_vision_start;
+            config.vision_end_token_id = raw_vision_end;
         }
 
         Ok(config)
@@ -1658,6 +1796,10 @@ mod tests {
             swiglu_limit: 0.0,
             hidden_activation: String::new(),
             weight_prefix: "model.".to_string(),
+            vision: None,
+            image_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
         }
     }
 }

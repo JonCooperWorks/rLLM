@@ -226,3 +226,78 @@ kernel void rms_norm_batch(
         row_out[i] = bfloat(val * scale * float(weight[i]));
     }
 }
+
+// ===========================================================================
+// Batched LayerNorm — full normalisation with mean-centering and learned bias.
+//
+// Used by vision encoders (SigLIP ViT) which use LayerNorm instead of RMSNorm.
+// LayerNorm: out[i] = weight[i] * (input[i] - mean) / sqrt(var + eps) + bias[i]
+// Needs two reductions (mean + variance) instead of RMSNorm's one (sum-of-squares).
+// ===========================================================================
+
+struct LayerNormBatchParams {
+    uint hidden_size;
+    float eps;
+    uint batch_size;
+};
+
+kernel void layer_norm_batch(
+    constant LayerNormBatchParams& params [[buffer(0)]],
+    device const bfloat* input           [[buffer(1)]],
+    device const bfloat* weight          [[buffer(2)]],
+    device const bfloat* bias            [[buffer(3)]],
+    device bfloat* output                [[buffer(4)]],
+    uint row_id                          [[threadgroup_position_in_grid]],
+    uint tid                             [[thread_position_in_threadgroup]],
+    uint tg_size                         [[threads_per_threadgroup]]
+) {
+    if (row_id >= params.batch_size) return;
+
+    const uint hidden = params.hidden_size;
+    device const bfloat* row_in  = input  + row_id * hidden;
+    device bfloat*       row_out = output + row_id * hidden;
+
+    // Reduction 1: compute mean.
+    float local_sum = 0.0f;
+    for (uint i = tid; i < hidden; i += tg_size) {
+        local_sum += float(row_in[i]);
+    }
+    local_sum = simd_sum(local_sum);
+
+    threadgroup float shared[32];
+    uint sg = tid / 32, sl = tid % 32;
+    if (sl == 0) shared[sg] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        uint nsg = (tg_size + 31) / 32;
+        float v = (sl < nsg) ? shared[sl] : 0.0f;
+        v = simd_sum(v);
+        if (sl == 0) shared[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float mean = shared[0] / float(hidden);
+
+    // Reduction 2: compute variance.
+    float sum_sq = 0.0f;
+    for (uint i = tid; i < hidden; i += tg_size) {
+        float d = float(row_in[i]) - mean;
+        sum_sq += d * d;
+    }
+    sum_sq = simd_sum(sum_sq);
+    if (sl == 0) shared[sg] = sum_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        uint nsg = (tg_size + 31) / 32;
+        float v = (sl < nsg) ? shared[sl] : 0.0f;
+        v = simd_sum(v);
+        if (sl == 0) shared[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float scale = rsqrt(shared[0] / float(hidden) + params.eps);
+
+    // Normalise, scale, bias.
+    for (uint i = tid; i < hidden; i += tg_size) {
+        float val = (float(row_in[i]) - mean) * scale;
+        row_out[i] = bfloat(val * float(weight[i]) + float(bias[i]));
+    }
+}

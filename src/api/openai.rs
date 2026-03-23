@@ -206,6 +206,7 @@ fn inject_tools(
                 content: tool_prompt,
                 tool_calls: None,
                 tool_call_id: None,
+                images: None,
             },
         );
     }
@@ -246,6 +247,23 @@ pub(crate) async fn chat_completions(
         .encode_messages_with_thinking(&messages, state.arch, thinking_requested)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
+    // Preprocess images from the last user message (if any) for vision models.
+    let images = if let Some(vc) = &state.vision_config {
+        messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .and_then(|m| m.images.as_ref())
+            .map(|imgs| {
+                imgs.iter()
+                    .filter_map(|img| crate::model::vision::preprocess_image(&img.data, vc).ok())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     let (response_tx, response_rx) = tokio::sync::mpsc::channel(64);
 
     let worker_req = WorkerRequest {
@@ -255,6 +273,7 @@ pub(crate) async fn chat_completions(
         top_p: req.top_p,
         response_tx,
         thinking: thinking_requested,
+        images,
     };
 
     state.request_tx.try_send(worker_req).map_err(|e| match e {
@@ -454,6 +473,7 @@ pub(crate) async fn completions(
         top_p: req.top_p,
         response_tx,
         thinking: None,
+        images: Vec::new(), // Text completions don't support images.
     };
 
     state.request_tx.try_send(worker_req).map_err(|e| match e {

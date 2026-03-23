@@ -68,7 +68,13 @@ pub(crate) trait Dispatch {
     ) -> anyhow::Result<()>;
 
     /// Run the batched (GEMM) forward pass for prefill.
-    fn forward_prefill(&self, tokens: &[u32], state: &Self::SeqState) -> anyhow::Result<()>;
+    /// `images` contains preprocessed vision data (empty for text-only).
+    fn forward_prefill(
+        &self,
+        tokens: &[u32],
+        state: &Self::SeqState,
+        images: &[crate::model::vision::ProcessedImage],
+    ) -> anyhow::Result<()>;
 
     /// Advance KV state after prefill (marks positions as filled).
     fn finish_prefill(state: &mut Self::SeqState, token_count: usize);

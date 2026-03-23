@@ -283,9 +283,6 @@ pub(crate) fn forward_prefill_paged<
     let num_experts = m.config.num_experts;
     let num_experts_per_tok = m.config.num_experts_per_tok;
 
-    primitives::upload_prefill_inputs(m.backend, bufs, tokens, start_pos, bs);
-    primitives::embed_batch(m.backend, &m.weights, bufs, bs, d.hidden_size);
-
     for layer_idx in 0..m.config.num_hidden_layers {
         let layer = &m.weights.layers[layer_idx];
 

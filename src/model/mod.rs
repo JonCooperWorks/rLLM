@@ -67,11 +67,12 @@ pub(crate) mod sampler;
 pub(crate) mod thinking;
 pub(crate) mod tokenizer;
 pub(crate) mod tools;
+pub(crate) mod vision;
 
 use self::config::{ModelArch, ModelConfig};
 use self::kv_cache::{KvPool, SeqKvState};
 use self::loader::ModelWeights;
-use crate::gpu::{GpuBackend, GpuCore, GpuElementwise, TensorDtype};
+use crate::gpu::{GpuBackend, GpuCore, GpuElementwise, GpuVision, TensorDtype};
 
 /// Maximum sequence length supported by the flat KV cache (legacy mode).
 /// The paged cache mode supports up to 131072 tokens (8192 blocks x 16
@@ -193,6 +194,17 @@ pub(crate) struct Model<'a, B: GpuCore> {
     // the streamer loads selected experts from disk on-demand during the
     // MoE dispatch loop.  See expert_stream.rs.
     pub(crate) expert_streamer: Option<expert_stream::ExpertStreamer<B>>,
+
+    // -----------------------------------------------------------------------
+    // Vision encoder (VLM models only).
+    //
+    // When present, the model can process images.  Vision weights are loaded
+    // from the safetensors file's `model.visual.*` (Qwen) or
+    // `vision_tower.*` (Gemma) tensors.  Vision buffers are scratch memory
+    // reused for each image encoding pass.
+    // -----------------------------------------------------------------------
+    pub(crate) vision_weights: Option<vision::VisionWeights<B>>,
+    pub(crate) vision_bufs: Option<vision::VisionBuffers<B>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -433,6 +445,8 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
             dn_norm_out,
             kv_layer_map,
             expert_streamer: None,
+            vision_weights: None,
+            vision_bufs: None,
         })
     }
 
@@ -591,6 +605,8 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
             dn_norm_out,
             kv_layer_map,
             expert_streamer: None,
+            vision_weights: None,
+            vision_bufs: None,
         })
     }
 
@@ -689,6 +705,25 @@ impl<'a, B: GpuBackend> Model<'a, B> {
     /// to the paged cache.  Only the last token's logits are produced (into
     /// the model's single-token logits_buf).
     ///
+    /// When `images` is non-empty, vision encoding runs after embedding lookup
+    /// and the resulting vision tokens are scattered into the embedding buffer
+    /// at positions where `token_id == image_token_id`.
+    ///
+    /// LEARNING NOTE: The prefill pipeline for VLMs is:
+    ///
+    ///   1. Embedding lookup — convert token IDs to embeddings (shared code)
+    ///   2. Vision encode — run the SigLIP ViT on each image (model/vision.rs)
+    ///   3. Scatter — overwrite `<image>` placeholder embeddings with vision
+    ///      encoder output (gpu/ops/vision.rs :: scatter_vision_tokens)
+    ///   4. Transformer forward — arch-specific attention + FFN layers
+    ///
+    /// Steps 1-3 are shared across ALL architectures and happen here in mod.rs.
+    /// Embedding lookup used to live inside each arch's prefill function, but
+    /// was hoisted out so that vision scatter can happen between embedding and
+    /// the transformer — the scatter must overwrite rows in the embedding
+    /// buffer *before* the first transformer layer sees them.  This avoids
+    /// duplicating vision logic in every architecture file.
+    ///
     /// The caller must:
     ///   - Pre-allocate KV blocks via `seq_state.ensure_slots(tokens.len())`
     ///   - Sync the block table via `seq_state.sync_block_table()`
@@ -699,7 +734,52 @@ impl<'a, B: GpuBackend> Model<'a, B> {
         pool: &KvPool<B>,
         seq_state: &SeqKvState<B>,
         bufs: &PrefillBuffers<B>,
+        images: &[vision::ProcessedImage],
     ) -> anyhow::Result<()> {
+        let bs = tokens.len() as u32;
+        let start_pos = seq_state.seq_len as u32;
+
+        // Shared embedding: upload token IDs and look up embeddings.
+        // This used to live inside each arch's prefill function.
+        primitives::upload_prefill_inputs(self.backend, bufs, tokens, start_pos, bs);
+        primitives::embed_batch(self.backend, &self.weights, bufs, bs, self.config.hidden_size as u32);
+
+        // Gemma 3: scale embeddings by √hidden_size (other archs skip this).
+        if self.arch == ModelArch::Gemma3 {
+            let embed_scale = (self.config.hidden_size as f32).sqrt();
+            self.backend.scalar_mul(&bufs.hidden, &bufs.hidden, embed_scale, bs * self.config.hidden_size as u32);
+        }
+
+        // Vision: encode images and scatter into embedding buffer.
+        // LEARNING NOTE: This block runs the full vision pipeline — encode each
+        // image through the SigLIP ViT, then scatter the resulting embeddings
+        // into the text embedding buffer at placeholder positions.  The token_ids
+        // buffer (still on GPU from embedding lookup) is reused by the scatter
+        // kernel to locate `<image>` placeholder positions.
+        if !images.is_empty() {
+            if let (Some(vw), Some(vb), Some(vc)) =
+                (&self.vision_weights, &self.vision_bufs, &self.config.vision)
+            {
+                // Encode each image and collect vision embeddings.
+                // For now, support single image per prefill chunk.
+                for img in images {
+                    vision::vision_encode(self.backend, img, vw, vc, vb)?;
+
+                    // Scatter vision embeddings into the text embedding buffer.
+                    if let Some(image_token_id) = self.config.image_token_id {
+                        self.backend.scatter_vision_tokens(
+                            &bufs.hidden,
+                            &vb.proj_out,
+                            &bufs.token_ids,
+                            image_token_id,
+                            bs,
+                            self.config.hidden_size as u32,
+                        );
+                    }
+                }
+            }
+        }
+
         match self.arch {
             ModelArch::Gemma3 => {
                 registry::gemma::forward_prefill_paged(self, tokens, pool, seq_state, bufs)

@@ -57,6 +57,12 @@ pub(crate) struct RunArgs {
     /// Tensor parallelism: number of GPUs (0 = auto-detect all available).
     #[arg(long, default_value = "0")]
     tp: usize,
+
+    /// Path to an image file (JPEG, PNG, or WebP) to include with the prompt.
+    /// Requires --chat mode.  The image is attached to the user message so
+    /// vision models can process it alongside the text prompt.
+    #[arg(long, requires = "chat")]
+    image: Option<PathBuf>,
 }
 
 pub(crate) fn exec(mut args: RunArgs) -> anyhow::Result<()> {
@@ -94,6 +100,34 @@ pub(crate) fn exec(mut args: RunArgs) -> anyhow::Result<()> {
     let chat = args.chat;
     let system = args.system.clone();
 
+    // Read and preprocess image file if provided.
+    let processed_images: Vec<crate::model::vision::ProcessedImage> =
+        if let Some(ref image_path) = args.image {
+            let data = std::fs::read(image_path).map_err(|e| {
+                anyhow::anyhow!("failed to read image '{}': {e}", image_path.display())
+            })?;
+            eprintln!("image: {} ({} bytes)", image_path.display(), data.len());
+            // Parse config.json just for vision config (cheap — only reads JSON header).
+            let vc = crate::model::config::ModelConfig::from_file(
+                &args.model.join("config.json"),
+            )?
+            .vision
+            .ok_or_else(|| anyhow::anyhow!("--image requires a vision model (no vision_config in config.json)"))?;
+            let processed = crate::model::vision::preprocess_image(&data, &vc)?;
+            eprintln!(
+                "image preprocessed: {}×{} patches, {} vision tokens",
+                processed.grid_h, processed.grid_w, processed.num_vision_tokens
+            );
+            vec![processed]
+        } else {
+            Vec::new()
+        };
+    let image_data = if args.image.is_some() {
+        Some(std::fs::read(args.image.as_ref().unwrap())?)
+    } else {
+        None
+    };
+
     use crate::model::config::ModelArch;
     use std::cell::Cell;
     let arch_cell: Cell<Option<ModelArch>> = Cell::new(None);
@@ -109,9 +143,34 @@ pub(crate) fn exec(mut args: RunArgs) -> anyhow::Result<()> {
         |eng| {
             let arch = arch_cell.get().unwrap();
 
-            // Encode prompt.
-            let system_ref = chat.then(|| system.as_str());
-            let prompt_tokens = eng.tokenizer().encode_prompt(&prompt, arch, system_ref)?;
+            // Encode prompt.  When an image is provided, build messages manually
+            // so vision placeholder tokens are included in the chat template.
+            let prompt_tokens = if chat && image_data.is_some() {
+                use crate::model::chat::{self, ImageData, Message};
+                let messages = vec![
+                    Message {
+                        role: "system".into(),
+                        content: system.clone(),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        images: None,
+                    },
+                    Message {
+                        role: "user".into(),
+                        content: prompt.clone(),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        images: Some(vec![ImageData {
+                            data: image_data.clone().unwrap(),
+                        }]),
+                    },
+                ];
+                let formatted = chat::format_chat(arch, &messages);
+                eng.tokenizer().encode_chat(&formatted)?
+            } else {
+                let system_ref = chat.then(|| system.as_str());
+                eng.tokenizer().encode_prompt(&prompt, arch, system_ref)?
+            };
             if chat {
                 eprintln!("chat template applied ({:?})", arch);
             }
@@ -123,7 +182,7 @@ pub(crate) fn exec(mut args: RunArgs) -> anyhow::Result<()> {
 
             // Submit request and run generation loop.
             let prompt_len = prompt_tokens.len();
-            eng.add_request(prompt_tokens, max_tokens, temperature, top_p);
+            eng.add_request(prompt_tokens, max_tokens, temperature, top_p, processed_images);
 
             let start = std::time::Instant::now();
             let mut gen_count = 0usize;

@@ -210,6 +210,34 @@ impl GpuNorm for CpuBackend {
             write_bf16_at(out, offset, &result);
         }
     }
+
+    fn layer_norm_batch(
+        &self,
+        input: &CpuTensor,
+        weight: &CpuTensor,
+        bias: &CpuTensor,
+        eps: f32,
+        out: &CpuTensor,
+        batch_size: u32,
+    ) {
+        let dim = weight.data.len() / 2;
+        let w = read_bf16(weight, dim);
+        let b = read_bf16(bias, dim);
+
+        for row in 0..batch_size as usize {
+            let offset = row * dim * 2;
+            let x = read_bf16_bytes(&input.data[offset..], dim);
+            let mean: f32 = x.iter().sum::<f32>() / dim as f32;
+            let var: f32 = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / dim as f32;
+            let scale = 1.0 / (var + eps).sqrt();
+            let result: Vec<f32> = x
+                .iter()
+                .zip(w.iter().zip(b.iter()))
+                .map(|(xi, (wi, bi))| (xi - mean) * scale * wi + bi)
+                .collect();
+            write_bf16_at(out, offset, &result);
+        }
+    }
 }
 
 // ===========================================================================
@@ -245,6 +273,17 @@ impl GpuElementwise for CpuBackend {
                 let gelu = 0.5 * gi * (1.0 + (c * (gi + 0.044715 * gi * gi * gi)).tanh());
                 gelu * ui
             })
+            .collect();
+        write_bf16(out, &result);
+    }
+
+    fn gelu(&self, input: &CpuTensor, out: &CpuTensor, size: u32) {
+        let n = size as usize;
+        let x = read_bf16(input, n);
+        let c = (2.0f32 / std::f32::consts::PI).sqrt();
+        let result: Vec<f32> = x
+            .iter()
+            .map(|xi| 0.5 * xi * (1.0 + (c * (xi + 0.044715 * xi * xi * xi)).tanh()))
             .collect();
         write_bf16(out, &result);
     }
@@ -1050,6 +1089,7 @@ impl GpuAttention for CpuBackend {
         window_size: u32,
         attn_scale: f32,
         sinks: Option<&CpuTensor>,
+        causal: bool,
     ) {
         let cs = chunk_size as usize;
         let nh = num_heads as usize;
@@ -1070,10 +1110,9 @@ impl GpuAttention for CpuBackend {
                 let kv_h = h / heads_per_group;
                 let q_head = &q_data[qi * q_stride + h * hd..qi * q_stride + (h + 1) * hd];
 
-                // Causal mask: attend to positions 0..=qi within chunk.
-                // With sliding window: attend_start = max(0, qi + 1 - window_size).
-                let attend_len = qi + 1;
-                let attend_start = if window_size > 0 && attend_len > window_size as usize {
+                // Causal: attend to 0..=qi. Bidirectional: attend to 0..chunk_size-1.
+                let attend_len = if causal { qi + 1 } else { cs };
+                let attend_start = if causal && window_size > 0 && attend_len > window_size as usize {
                     attend_len - window_size as usize
                 } else {
                     0
@@ -1324,6 +1363,77 @@ impl GpuMoe for CpuBackend {
             result[j] = sum;
         }
         write_bf16(output, &result);
+    }
+}
+
+// ===========================================================================
+// GpuVision — vision encoder utility operations
+// ===========================================================================
+
+impl GpuVision for CpuBackend {
+    fn spatial_merge(
+        &self,
+        input: &CpuTensor,
+        output: &CpuTensor,
+        grid_h: u32,
+        grid_w: u32,
+        hidden_dim: u32,
+        merge_size: u32,
+    ) {
+        let ms = merge_size as usize;
+        let hd = hidden_dim as usize;
+        let gh = grid_h as usize;
+        let gw = grid_w as usize;
+        let out_h = gh / ms;
+        let out_w = gw / ms;
+        let merged_hd = hd * ms * ms;
+
+        let inp = read_bf16(input, gh * gw * hd);
+        let mut result = vec![0.0f32; out_h * out_w * merged_hd];
+
+        for oh in 0..out_h {
+            for ow in 0..out_w {
+                let out_idx = oh * out_w + ow;
+                for dy in 0..ms {
+                    for dx in 0..ms {
+                        let src_row = oh * ms + dy;
+                        let src_col = ow * ms + dx;
+                        let src_token = src_row * gw + src_col;
+                        let sub_token = dy * ms + dx;
+                        for e in 0..hd {
+                            result[out_idx * merged_hd + sub_token * hd + e] =
+                                inp[src_token * hd + e];
+                        }
+                    }
+                }
+            }
+        }
+
+        write_bf16(output, &result);
+    }
+
+    fn scatter_vision_tokens(
+        &self,
+        text_embeds: &CpuTensor,
+        vision_embeds: &CpuTensor,
+        token_ids: &CpuTensor,
+        image_token_id: u32,
+        seq_len: u32,
+        hidden_dim: u32,
+    ) {
+        let hd = hidden_dim as usize;
+        let ids: &[u32] = bytemuck::cast_slice(&token_ids.data[..seq_len as usize * 4]);
+        let vision = read_bf16(vision_embeds, vision_embeds.data.len() / 2);
+
+        let mut vision_idx = 0usize;
+        for pos in 0..seq_len as usize {
+            if ids[pos] == image_token_id {
+                let src_offset = vision_idx * hd;
+                let result: Vec<f32> = vision[src_offset..src_offset + hd].to_vec();
+                write_bf16_at(text_embeds, pos * hd * 2, &result);
+                vision_idx += 1;
+            }
+        }
     }
 }
 
@@ -2893,6 +3003,7 @@ mod tests {
                 0,
                 attn_scale,
                 None,
+                true,
             );
 
             let mq =
@@ -2921,6 +3032,7 @@ mod tests {
                 0,
                 attn_scale,
                 None,
+                true,
             );
 
             assert_tensors_close(
@@ -2979,6 +3091,7 @@ mod tests {
                 0,
                 attn_scale,
                 None,
+                true,
             );
 
             let mq =
@@ -3007,6 +3120,7 @@ mod tests {
                 0,
                 attn_scale,
                 None,
+                true,
             );
 
             assert_tensors_close(
@@ -3814,6 +3928,7 @@ mod tests {
                 0,
                 attn_scale,
                 None,
+                true,
             );
 
             let gq =
@@ -3842,6 +3957,7 @@ mod tests {
                 0,
                 attn_scale,
                 None,
+                true,
             );
 
             assert_tensors_close_bf16(
@@ -3854,5 +3970,169 @@ mod tests {
                 "prefill_attn_hd128",
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Vision kernel tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_layer_norm_batch() {
+        let cpu = CpuBackend;
+
+        // 2 rows, 4 elements each.
+        let input = cpu.upload_tensor(&bf16_bytes(&[1.0, 2.0, 3.0, 4.0, -1.0, 0.0, 1.0, 2.0]), &[2, 4], TensorDtype::BF16);
+        let weight = cpu.upload_tensor(&bf16_bytes(&[1.0, 1.0, 1.0, 1.0]), &[4], TensorDtype::BF16);
+        let bias = cpu.upload_tensor(&bf16_bytes(&[0.0, 0.0, 0.0, 0.0]), &[4], TensorDtype::BF16);
+        let out = cpu.alloc_tensor(&[2, 4], TensorDtype::BF16);
+
+        cpu.layer_norm_batch(&input, &weight, &bias, 1e-5, &out, 2);
+
+        let result = read_bf16(&out, 8);
+
+        // Row 0: mean=2.5, var=1.25. Scale = 1/sqrt(1.25+1e-5) ≈ 0.8944
+        // (1-2.5)*0.8944 ≈ -1.3416, (2-2.5)*0.8944 ≈ -0.4472, etc.
+        let mean0 = 2.5f32;
+        let var0 = ((1.0 - mean0).powi(2) + (2.0 - mean0).powi(2) + (3.0 - mean0).powi(2) + (4.0 - mean0).powi(2)) / 4.0;
+        let scale0 = 1.0 / (var0 + 1e-5f32).sqrt();
+        assert!((result[0] - (1.0 - mean0) * scale0).abs() < 0.05, "row0 elem0: got {}", result[0]);
+        assert!((result[3] - (4.0 - mean0) * scale0).abs() < 0.05, "row0 elem3: got {}", result[3]);
+
+        // Row 1: mean=0.5, var=1.25.
+        let mean1 = 0.5f32;
+        let var1 = ((-1.0 - mean1).powi(2) + (0.0 - mean1).powi(2) + (1.0 - mean1).powi(2) + (2.0 - mean1).powi(2)) / 4.0;
+        let scale1 = 1.0 / (var1 + 1e-5f32).sqrt();
+        assert!((result[4] - (-1.0 - mean1) * scale1).abs() < 0.05, "row1 elem0: got {}", result[4]);
+    }
+
+    #[test]
+    fn test_spatial_merge() {
+        let cpu = CpuBackend;
+
+        // 4×4 grid of tokens, hidden_dim=2, merge_size=2.
+        // Input: 16 tokens, output: 4 merged tokens (2×2 grid), hidden=8.
+        let mut input_vals = Vec::new();
+        for i in 0..16 {
+            input_vals.push(i as f32);        // elem 0
+            input_vals.push(100.0 + i as f32); // elem 1
+        }
+        let input = cpu.upload_tensor(&bf16_bytes(&input_vals), &[16, 2], TensorDtype::BF16);
+        let output = cpu.alloc_tensor(&[4, 8], TensorDtype::BF16);
+
+        cpu.spatial_merge(&input, &output, 4, 4, 2, 2);
+
+        let result = read_bf16(&output, 32);
+
+        // Output token 0 (row=0, col=0) should contain tokens (0,0), (0,1), (1,0), (1,1).
+        // Token (0,0) is input row 0: [0.0, 100.0]
+        // Token (0,1) is input row 1: [1.0, 101.0]
+        // Token (1,0) is input row 4: [4.0, 104.0]
+        // Token (1,1) is input row 5: [5.0, 105.0]
+        // Merged: [0, 100, 1, 101, 4, 104, 5, 105]
+        assert!((result[0] - 0.0).abs() < 0.1, "merge[0][0]: got {}", result[0]);
+        assert!((result[1] - 100.0).abs() < 0.5, "merge[0][1]: got {}", result[1]);
+        assert!((result[2] - 1.0).abs() < 0.1, "merge[0][2]: got {}", result[2]);
+        assert!((result[4] - 4.0).abs() < 0.1, "merge[0][4]: got {}", result[4]);
+    }
+
+    #[test]
+    fn test_scatter_vision_tokens() {
+        let cpu = CpuBackend;
+
+        let hd = 4;
+        let seq_len = 5u32;
+        let image_token_id = 42u32;
+
+        // Text embeddings: 5 tokens × 4 hidden (all zeros initially).
+        let text = cpu.upload_tensor(&bf16_bytes(&vec![0.0; 20]), &[5, 4], TensorDtype::BF16);
+
+        // Vision embeddings: 2 vision tokens.
+        let vision = cpu.upload_tensor(
+            &bf16_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+            &[2, 4],
+            TensorDtype::BF16,
+        );
+
+        // Token IDs: positions 1 and 3 are image tokens.
+        let ids: Vec<u32> = vec![10, image_token_id, 20, image_token_id, 30];
+        let token_ids = cpu.upload_tensor(bytemuck::cast_slice(&ids), &[5], TensorDtype::F32);
+
+        cpu.scatter_vision_tokens(&text, &vision, &token_ids, image_token_id, seq_len, hd as u32);
+
+        let result = read_bf16(&text, 20);
+
+        // Position 0: unchanged (0s).
+        assert!((result[0]).abs() < 0.01, "pos0: {}", result[0]);
+        // Position 1: vision token 0 [1, 2, 3, 4].
+        assert!((result[4] - 1.0).abs() < 0.1, "pos1[0]: {}", result[4]);
+        assert!((result[7] - 4.0).abs() < 0.1, "pos1[3]: {}", result[7]);
+        // Position 2: unchanged.
+        assert!((result[8]).abs() < 0.01, "pos2: {}", result[8]);
+        // Position 3: vision token 1 [5, 6, 7, 8].
+        assert!((result[12] - 5.0).abs() < 0.1, "pos3[0]: {}", result[12]);
+        assert!((result[15] - 8.0).abs() < 0.1, "pos3[3]: {}", result[15]);
+    }
+
+    #[test]
+    fn test_gelu() {
+        let cpu = CpuBackend;
+
+        let input = cpu.upload_tensor(&bf16_bytes(&[0.0, 1.0, -1.0, 2.0]), &[4], TensorDtype::BF16);
+        let out = cpu.alloc_tensor(&[4], TensorDtype::BF16);
+
+        cpu.gelu(&input, &out, 4);
+
+        let result = read_bf16(&out, 4);
+
+        // gelu(0) = 0, gelu(1) ≈ 0.841, gelu(-1) ≈ -0.159, gelu(2) ≈ 1.955
+        assert!((result[0]).abs() < 0.01, "gelu(0): {}", result[0]);
+        assert!((result[1] - 0.841).abs() < 0.05, "gelu(1): {}", result[1]);
+        assert!((result[2] - (-0.159)).abs() < 0.05, "gelu(-1): {}", result[2]);
+        assert!((result[3] - 1.955).abs() < 0.05, "gelu(2): {}", result[3]);
+    }
+
+    #[test]
+    fn test_bidirectional_attention() {
+        let cpu = CpuBackend;
+
+        // 4 tokens, 2 heads, head_dim=4.
+        let chunk_size: u32 = 4;
+        let num_heads: u32 = 2;
+        let head_dim: u32 = 4;
+        let q_stride = (num_heads * head_dim) as usize;
+
+        let mut rng = rand::rng();
+        let q_data: Vec<f32> = (0..chunk_size as usize * q_stride).map(|_| rand::Rng::random_range(&mut rng, -1.0..1.0)).collect();
+        let k_data: Vec<f32> = (0..chunk_size as usize * q_stride).map(|_| rand::Rng::random_range(&mut rng, -1.0..1.0)).collect();
+        let v_data: Vec<f32> = (0..chunk_size as usize * q_stride).map(|_| rand::Rng::random_range(&mut rng, -1.0..1.0)).collect();
+
+        let q = cpu.upload_tensor(&bf16_bytes(&q_data), &[chunk_size as usize, q_stride], TensorDtype::BF16);
+        let k = cpu.upload_tensor(&bf16_bytes(&k_data), &[chunk_size as usize, q_stride], TensorDtype::BF16);
+        let v = cpu.upload_tensor(&bf16_bytes(&v_data), &[chunk_size as usize, q_stride], TensorDtype::BF16);
+
+        // Causal attention.
+        let out_causal = cpu.alloc_tensor(&[chunk_size as usize, q_stride], TensorDtype::BF16);
+        cpu.prefill_attention(&q, &k, &v, &out_causal, chunk_size, 0, num_heads, num_heads, head_dim, 0, 0.0, None, true);
+
+        // Bidirectional attention.
+        let out_bidir = cpu.alloc_tensor(&[chunk_size as usize, q_stride], TensorDtype::BF16);
+        cpu.prefill_attention(&q, &k, &v, &out_bidir, chunk_size, 0, num_heads, num_heads, head_dim, 0, 0.0, None, false);
+
+        let causal = read_bf16(&out_causal, chunk_size as usize * q_stride);
+        let bidir = read_bf16(&out_bidir, chunk_size as usize * q_stride);
+
+        // With multiple tokens, causal and bidirectional should produce
+        // different outputs for intermediate tokens (causal only sees past,
+        // bidirectional sees all).  Both should produce valid (non-NaN, non-zero)
+        // outputs.
+        let mut any_diff = false;
+        for i in 0..chunk_size as usize * q_stride {
+            assert!(!causal[i].is_nan(), "causal output has NaN at {i}");
+            assert!(!bidir[i].is_nan(), "bidir output has NaN at {i}");
+            if (causal[i] - bidir[i]).abs() > 0.01 {
+                any_diff = true;
+            }
+        }
+        assert!(any_diff, "causal and bidirectional attention should produce different outputs");
     }
 }

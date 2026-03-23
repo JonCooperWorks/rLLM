@@ -91,6 +91,24 @@ kernel void gelu_mul(
 }
 
 // ---------------------------------------------------------------------------
+// Plain GELU: out[i] = gelu(input[i])
+// Used by vision encoder FFN (SigLIP ViT).
+// ---------------------------------------------------------------------------
+
+kernel void gelu_act(
+    constant ElemParams& params [[buffer(0)]],
+    device const bfloat* input  [[buffer(1)]],
+    device bfloat* output       [[buffer(2)]],
+    uint gid                    [[thread_position_in_grid]]
+) {
+    if (gid >= params.size) return;
+    float x = float(input[gid]);
+    const float SQRT_2_OVER_PI = 0.7978845608028654f;
+    float inner = SQRT_2_OVER_PI * (x + 0.044715f * x * x * x);
+    output[gid] = bfloat(0.5f * x * (1.0f + precise::tanh(inner)));
+}
+
+// ---------------------------------------------------------------------------
 // Scalar multiply: out[i] = scalar * input[i]
 //
 // Used by Gemma 3 for embedding scaling: after looking up a token's embedding
