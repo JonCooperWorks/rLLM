@@ -126,10 +126,10 @@ pub enum ModelArch {
     /// No QKV bias, no QK-norm.  Chat template uses `<|im_start|>`/`<|im_sep|>`
     /// markers (similar to ChatML but with a separator token).
     Phi,
-    /// GPT-OSS family (OpenAI, 20B sparse MoE).
+    /// GPT-OSS family (OpenAI, sparse MoE).
     ///
-    /// Learning note: GPT-OSS-20B is a 20B-parameter Mixture-of-Experts model
-    /// with only 3.6B parameters active per token (32 experts, top-4 routing).
+    /// Learning note: GPT-OSS models are Mixture-of-Experts models with a
+    /// fraction of total parameters active per token (e.g. 32 experts, top-4 routing).
     ///
     /// Key differences from other MoE models:
     ///   1. **QKV AND O-proj bias**: all projection layers have learned bias,
