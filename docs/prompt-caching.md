@@ -176,6 +176,12 @@ prefill is shorter.  For a 1000-token system prompt with a 50-token user
 message, the cache turns a 1050-token prefill into a 50-token prefill — a
 ~20× reduction in prefill compute.
 
+**Decode throughput (tok/s) is unaffected.**  Prefix caching only eliminates
+redundant prefill work.  Once decoding begins, each new token requires the
+same single-token forward pass through all layers, reading from the full KV
+cache.  The per-token cost is identical whether those KV entries were computed
+fresh or restored from the cache.
+
 ---
 
 ## Correctness

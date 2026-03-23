@@ -223,6 +223,11 @@ At 90% hit rate, prefill cost per request drops to ~14% of the uncached
 baseline.  The remaining cost is the suffix prefill (always required) plus
 the decode phase (unaffected by caching).
 
+**What caching does NOT improve.**  Decode throughput (tok/s) is unchanged —
+each generated token still requires a full forward pass through all layers,
+reading the entire KV cache.  Caching is purely a TTFT and prefill-compute
+optimisation.
+
 ---
 
 ## Economics and Tier Differentiation
