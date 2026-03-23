@@ -230,6 +230,102 @@ optimisation.
 
 ---
 
+## Prefix-Cache Routing
+
+The prefix cache is **local to each engine instance** — an in-process hash map
+with no cross-server coordination.  A request only hits a cached prefix if it
+lands on the server that computed it.  This makes load-balancer routing the
+single biggest lever for cache hit rate.
+
+### Routing strategies
+
+```mermaid
+graph TD
+    Req([Request]) --> LB{Load Balancer}
+
+    LB -->|Round-robin| RR["Even load<br/>Low hit rate<br/>Each server builds<br/>its own partial cache"]
+    LB -->|Hash system prompt| HP["High hit rate<br/>Uneven if prompts<br/>are unbalanced"]
+    LB -->|First-party pool| FP["Dedicated servers<br/>One prompt, always hot"]
+
+    style FP fill:#d4edda
+    style HP fill:#fff3cd
+    style RR fill:#f8d7da
+```
+
+**Round-robin** — Even load, but every server independently caches the same
+prefixes.  N servers means N× the VRAM spent on duplicate cache entries and N×
+the cold prefills.  Fine for low-volume or heterogeneous traffic where no prefix
+dominates.
+
+**Hash on system prompt** — Hash the system prompt content (or a stable prefix
+of it) and use it as the routing key.  All requests with the same system prompt
+land on the same server(s).  High cache hit rate, and naturally groups traffic
+by integration rather than by user.  The risk is hot spots if one prompt
+dominates — mitigate with consistent hashing across a small pool per prompt.
+
+**Dedicated first-party pools** — The highest-leverage pattern.  First-party
+clients (mobile app, web app, internal tools) all share a single system prompt
+that you control.  Route them to a dedicated server pool where that prefix is
+always hot.  The prefix never competes with other entries for cache slots and
+never gets evicted.
+
+### The first-party / API split
+
+In practice, traffic splits into two categories with very different caching
+profiles:
+
+```
+First-party clients          API customers
+─────────────────           ──────────────
+You control the prompt       They control the prompt
+One system prompt            One per customer (mostly stable)
+100% cache hit rate          High hit rate with affinity routing
+Dedicated server pool        Shared pool, hash-routed
+```
+
+**First-party clients** are the easy case.  You wrote the system prompt, it
+never changes mid-session, and every request from every user starts with the
+exact same tokens.  A dedicated pool of 2–4 servers with sticky routing gives
+near-100% cache hit rate.  The system prompt's KV blocks are computed once at
+first request and stay resident indefinitely.
+
+**API customers** converge on the same pattern organically.  Each customer
+typically has one or a few system prompts (one per app they've built).  Route
+by API key or by hash of the system prompt and each customer's prefix stays
+warm on their assigned servers.  The pricing incentive reinforces this:
+charging cached input tokens at a discount (e.g., Anthropic's 90% discount)
+nudges API users toward stable, cacheable system prompts — which improves
+GPU utilisation for the provider.  A virtuous cycle.
+
+### Why this works economically
+
+System prompts are simultaneously:
+- **The longest part** of the input (hundreds to thousands of tokens of
+  instructions, tool schemas, few-shot examples)
+- **The most repetitive** (identical across every request from the same client)
+- **The most expensive to compute** (prefill is compute-bound, cost scales
+  with prompt length)
+
+Caching the thing that is longest, most repetitive, and most expensive to
+compute gives the biggest return.  A 4000-token system prompt at ~800ms
+prefill, cached at 90% hit rate, saves ~720ms of GPU compute per request.
+At 100 req/s that's 72 seconds of GPU time saved per second of wall time —
+the equivalent of adding 72 GPUs worth of prefill capacity for free.
+
+### Capacity planning
+
+The default cache holds 64 prefixes per instance.  In the first-party pool
+pattern, you only need one slot.  In the API pattern, 64 slots covers your
+top 64 API customers by traffic — which likely accounts for 95%+ of requests
+(API traffic follows a power law).
+
+The real constraint is VRAM.  Each cached prefix holds KV blocks that can't
+be used for active sequences.  A 1000-token prefix costs ~128MB at typical
+dimensions.  64 cached prefixes = ~8GB — significant on a 24GB card, negligible
+on an 80GB H100.  Size the cache to the hardware.
+
+---
+
 ## Economics and Tier Differentiation
 
 Unit economics: how many tokens per GPU-hour, and what do you charge per
@@ -288,10 +384,10 @@ graph TD
 needs 4×H100s.  10–50× cost difference.  The large-model premium pays for the
 fleet.
 
-**Prefix-cache affinity routing.**  The gateway can route requests to the
-server instance that already has the system prompt cached, avoiding cold
-prefills.  Hash the system prompt, use it as a routing key.  This turns prompt
-caching from a per-instance optimisation into a fleet-wide one.
+**Prefix-cache affinity routing.**  The gateway routes requests to the server
+that already has the system prompt cached.  See [Prefix-Cache
+Routing](#prefix-cache-routing) above for strategies (dedicated first-party
+pools, hash-based API routing, and why the economics create a virtuous cycle).
 
 ---
 
