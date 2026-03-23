@@ -1,19 +1,17 @@
 # Production Considerations
 
-Learning notes on how LLM inference might work at scale.  This is my intuition
-from building [rLLM](https://github.com/JonCooperWorks/rLLM) and
-[Dyson](https://github.com/JonCooperWorks/dyson) — not insider knowledge of
-how any particular provider runs their infrastructure.  Take it as one
-developer's mental model, not a reference architecture.
+Notes on how LLM inference works at scale, based on building
+[rLLM](https://github.com/JonCooperWorks/rLLM) and
+[Dyson](https://github.com/JonCooperWorks/dyson).  One developer's mental
+model, not a reference architecture.
 
 ---
 
 ## The Gateway
 
-rLLM is a single-model inference server.  In production, you'd run many
-instances of it (or something like it), each serving one model on one or more
-GPUs.  A gateway sits in front of all of them and handles everything that
-isn't inference:
+rLLM is a single-model inference server.  In production you'd run many
+instances, each serving one model on one or more GPUs.  A gateway sits in
+front and handles everything that isn't inference:
 
 ```
                     ┌─────────────┐
@@ -34,167 +32,113 @@ isn't inference:
      └────────────┘ └────────────┘ └────────────┘
 ```
 
-**Authentication and access control.**  The gateway validates API keys,
-checks which models a user's plan grants access to, and rejects requests
-before they ever reach a GPU.  An inference server should not know or care
-about user identity.
+**Auth.**  Validate API keys, check model access, reject bad requests before
+they reach a GPU.  Inference servers should not know about user identity.
 
-**Billing and metering.**  Token counts (prompt + completion) come back from
-the inference server.  The gateway records usage against the user's account.
-Streaming responses can be metered as tokens arrive — the gateway sees every
-SSE chunk.
+**Billing.**  Token counts come back from the inference server.  The gateway
+records usage against the user's account.  Streaming responses are metered as
+tokens arrive — the gateway sees every SSE chunk.
 
-**Model routing.**  The gateway maps the `model` field in the request to a
-pool of backends running that model.  Load balancing across the pool can be
-simple round-robin, or smarter — route to the instance with the shortest
-queue, or the one that already has a similar prompt prefix cached.
+**Routing.**  Map the `model` field to a pool of backends.  Load balance via
+round-robin, shortest queue, or prefix-cache affinity.
 
-**Image fetching.**  For multimodal requests, the gateway can fetch images
-from URLs and convert them to base64 before forwarding to the inference
-server.  This keeps the inference server free of HTTP client dependencies and
-eliminates SSRF as an attack surface on the GPU machines.
+**Image fetching.**  For multimodal requests, fetch images from URLs and
+convert to base64 before forwarding.  Keeps the inference server free of HTTP
+client dependencies and eliminates SSRF on GPU machines.
 
 ---
 
 ## GPU Throughput and Batching
 
 A single LLM forward pass is memory-bandwidth-bound: the GPU reads every
-weight matrix once per token.  If you're decoding one token at a time, most
-of the GPU's compute capacity sits idle.
+weight matrix once per token.  Decoding one sequence at a time leaves most
+compute idle.
 
 **Continuous batching** (what rLLM's engine does) packs multiple sequences
-into a single forward pass.  Instead of N separate mat-vec operations, you
-run one GEMM of size [N, hidden_dim] × [hidden_dim, vocab_size].  The weight
-read is the same, but you produce N tokens of useful work instead of 1.
+into one forward pass.  Instead of N mat-vec ops, you run one
+[N, hidden] × [hidden, vocab] GEMM.  Same weight read, N tokens of output
+instead of 1.
 
-This is why inference providers batch aggressively.  A 70B model on 4×H100s
-might decode 1 token at ~40ms latency for a single user — but at that same
-latency, continuous batching can serve 32–128 concurrent sequences.  The GPU
-does the same memory reads regardless; you're just doing more useful math per
-byte read.
+A 70B model on 4×H100s might decode at ~40ms for a single user.  With
+continuous batching, that same latency serves 32–128 concurrent sequences —
+same memory reads, more useful math per byte.
 
-Prefill (processing the prompt) is compute-bound and parallelizes naturally —
-large GEMMs already saturate the GPU.  Decode (generating tokens one at a
-time) is where batching matters most.
+Prefill is compute-bound and parallelizes naturally.  Decode is where
+batching matters.
 
 ---
 
 ## Hardware Tiers
 
-Not every request needs the fastest GPU.  Providers likely segment hardware
-into tiers:
+Not every request needs the fastest GPU.
 
-**Fast tier (latest GPUs).**  H100s, B200s — used for flagship models and
-premium plans.  Higher memory bandwidth means lower latency per token.
-Premium pricing funds the hardware cost.
+| Tier | Hardware | Use case |
+|------|----------|----------|
+| Fast | H100, B200 | Flagship models, premium plans |
+| Standard | A100, L40 | Same models at slightly higher latency, or smaller models at full speed |
+| Budget | V100, A10, consumer | Small/quantized models for free/low-cost plans |
 
-**Standard tier (previous generation).**  A100s, L40s — still fast, but lower
-bandwidth.  Run the same models at slightly higher latency, or run smaller
-models at full speed.  Good for mid-tier plans.
-
-**Budget tier (older hardware).**  V100s, A10s, or even consumer GPUs — run
-small models (7B–14B) or heavily quantized versions of larger ones.  The
-models are less capable, but the hardware is dramatically cheaper.  Free
-tiers and low-cost plans likely land here.
-
-The gateway routes requests to the appropriate tier based on the user's plan
-and the requested model.  A "fast" plan gets routed to H100 pools; a "free"
-plan gets routed to older hardware running a smaller model.
+The gateway routes based on user plan and requested model.
 
 ---
 
 ## Quantization as a Product Lever
 
-Quantization compresses model weights — for example, rLLM's Q4 format packs
-32 weights into 18 bytes (vs 64 bytes at bf16).  This has direct product
-implications:
+Quantization compresses weights — rLLM's Q4 packs 32 weights into 18 bytes
+(vs 64 at bf16).  Product implications:
 
-**Smaller models are likely quantized large models.**  When a provider offers
-a "small" or "fast" variant of a model, it may literally be the same model
-with aggressive quantization.  A 70B model quantized to 4-bit fits in the
-same memory as a 20B model at bf16 — and often performs comparably.
+**"Small" models are often quantized large models.**  A 70B at 4-bit fits in
+the same memory as a 20B at bf16 and often performs comparably.
 
-**Quantization trades quality for cost.**  4-bit quantization reduces memory
-bandwidth by ~4× vs bf16, which directly maps to ~4× higher throughput (since
-decode is bandwidth-bound).  The quality loss is small for most tasks — good
-enough for a cheaper pricing tier.
+**Quantization trades quality for throughput.**  4-bit cuts bandwidth ~4× vs
+bf16, which maps directly to ~4× higher throughput (decode is
+bandwidth-bound).  Quality loss is small for most tasks.
 
-**Mixed precision as a middle ground.**  Some layers (attention projections)
-are more sensitive to quantization than others (FFN weights).  Keeping
-sensitive layers at higher precision while quantizing the rest can preserve
-quality at most of the cost savings.
+**Mixed precision helps.**  Attention projections are more sensitive to
+quantization than FFN weights.  Keep sensitive layers at higher precision,
+quantize the rest.
 
-**Production likely runs at the lowest precision that passes eval.**  There's
-no reason to serve a model at bf16 if 4-bit produces the same benchmark
-scores.  The economics push hard in one direction: find the most aggressive
-quantization where quality holds, and ship that.  Every bit you shave off the
-weights is less memory bandwidth, more sequences per GPU, lower cost per
-token.  Providers are probably running extensive eval suites against
-progressively lower precisions and deploying whatever clears the bar — not
-the full-precision version.  The model you interact with through an API is
-almost certainly not running at the precision it was trained at.
+**Production runs at the lowest precision that passes eval.**  No reason to
+serve bf16 if Q4 produces the same scores.  Every bit shaved off is less
+bandwidth, more sequences per GPU, lower cost per token.  The model behind an
+API is almost certainly not running at training precision.
 
-This is likely how providers offer "the same model" at different price points
-without actually training different models.  The underlying weights are the
-same; the precision varies.
+Same weights, different precision — that's likely how providers offer "the
+same model" at different price points.
 
 ---
 
 ## QA and Eval Infrastructure
 
-This is the piece I have the least visibility into, but I think it's one of
-the most important systems a model provider builds.  The question every team
-needs to answer continuously is: "which models, at which precisions, on which
-hardware, are good enough to ship?"
+The question every team answers continuously: "which models, at which
+precisions, on which hardware, are good enough to ship?"
 
-**What providers likely have.**  Some kind of automated framework that can:
-1. Spin up inference servers (or route to existing ones) for a given
-   model + quantization + hardware combination
-2. Run a standardized eval suite against them — accuracy benchmarks, latency
-   percentiles, throughput under load
-3. Report results back in a way that leadership can make decisions:
-   "Llama 70B at Q4 on 2×A100 passes all quality bars, 35ms/tok p50,
-   costs $X/M tokens — ship it" vs "Q3 drops 2 points on coding evals,
-   hold for now"
+**What providers likely have.**  An automated framework that:
+1. Spins up inference servers for a model + quantization + hardware combo
+2. Runs evals — accuracy benchmarks, latency percentiles, throughput under load
+3. Produces actionable reports: "Llama 70B Q4 on 2×A100: passes quality bars,
+   35ms/tok p50, $X/M tokens — ship it"
 
-This probably looks like a CI/CD pipeline for models.  New model drops from
-Meta or Qwen, the framework automatically tests it across a matrix of
-precisions and hardware configs, and produces a report.  The same system
-validates that a kernel change or quantization tweak didn't regress quality
-before it goes to production.
+This is essentially CI/CD for models.  New model drops, the framework tests
+it across a matrix of precisions and hardware, and reports results.
 
-**What I have.**  A set of scripts that I run manually when I rent GPUs.
-They exercise rLLM against a set of prompts and check that the outputs are
-sane.  It's not automated end-to-end — I have to rent the hardware, run the
-scripts, eyeball the results.  But the scripts give me a good idea of what
-a real framework needs:
-- A prompt suite that covers different capabilities (reasoning, code, chat,
-  tool calling)
-- Expected-output checks (exact match for structured outputs, LLM-as-judge
-  for open-ended ones)
-- Latency and throughput measurement under controlled conditions
-- Easy comparison across runs (did this change make things faster? worse?)
+**What I have.**  Scripts I run manually on rented GPUs: a prompt suite
+(reasoning, code, chat, tool calling), expected-output checks (exact match
+for structured outputs, LLM-as-judge for open-ended), latency/throughput
+measurement, and cross-run comparison.
 
-**Worth building?**  A proper eval framework that handles provisioning
-machines, installing rLLM, downloading models, running eval suites, and
-tearing everything down would be a useful project — but it's a separate tool,
-not part of rLLM itself.  rLLM is an inference engine; eval orchestration is
-infrastructure tooling that happens to point at an inference engine.  For now
-my scripts cover the core need and give me a good sense of what a real
-framework requires.
+A proper eval framework — provisioning, model download, eval execution,
+teardown — would be useful but is a separate project.  rLLM is the inference
+engine; eval orchestration is infrastructure tooling that points at one.
 
 ---
 
 ## What This Means for rLLM
 
-rLLM covers the inference server box in the diagram above.  It handles:
-- Model loading and weight management (including Q4 quantization)
-- Continuous batching across concurrent sequences
-- GPU kernel dispatch (Metal/CUDA)
-- Streaming token generation
-- OpenAI/Anthropic-compatible API surface
+rLLM is the inference server box in the diagram.  It handles model loading,
+Q4 quantization, continuous batching, GPU kernel dispatch, streaming
+generation, and an OpenAI/Anthropic-compatible API.
 
-Everything above the inference server — auth, billing, model routing, plan
-tiers, image fetching — belongs in a separate gateway service.  rLLM's job
-is to turn tokens into tokens as fast as possible.  The gateway's job is to
-decide which tokens go where and who pays for them.
+Everything above — auth, billing, routing, plan tiers, image fetching —
+belongs in a gateway.  rLLM turns tokens into tokens as fast as possible.
+The gateway decides which tokens go where and who pays.
