@@ -175,14 +175,13 @@ a real framework needs:
 - Latency and throughput measurement under controlled conditions
 - Easy comparison across runs (did this change make things faster? worse?)
 
-**Worth building for rLLM?**  Maybe — even a lightweight version would be
-educational.  The interesting engineering is in the orchestration: how do you
-spin up N inference servers across rented GPUs, run evals in parallel, collect
-results, and tear everything down without burning money on idle machines?
-That's a real systems problem independent of ML.  For now my scripts cover
-the core need, but a proper framework would make it easier to answer
-questions like "does this new kernel actually help?" without a manual GPU
-rental cycle every time.
+**Worth building?**  A proper eval framework that handles provisioning
+machines, installing rLLM, downloading models, running eval suites, and
+tearing everything down would be a useful project — but it's a separate tool,
+not part of rLLM itself.  rLLM is an inference engine; eval orchestration is
+infrastructure tooling that happens to point at an inference engine.  For now
+my scripts cover the core need and give me a good sense of what a real
+framework requires.
 
 ---
 
