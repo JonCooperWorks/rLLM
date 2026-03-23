@@ -1,6 +1,6 @@
 # rLLM
 
-Rust LLM inference engine that runs 397B-parameter MoE models on a single 48 GB GPU via NVMe expert streaming. 12 model architectures, two GPU backends (Metal + CUDA), continuous batching, paged KV cache, and an OpenAI/Anthropic-compatible API server — built from scratch in Rust with no frameworks or GGML.
+Rust LLM inference engine that runs 397B-parameter MoE models on a MacBook via NVMe expert streaming — using ~20 GB of GPU memory on a 64 GB M4 Max, or a single 48 GB NVIDIA GPU. 12 model architectures, two GPU backends (Metal + CUDA), continuous batching, paged KV cache, and an OpenAI/Anthropic-compatible API server — built from scratch in Rust with no frameworks or GGML.
 
 ### Highlights
 
