@@ -191,10 +191,22 @@ When multiple requests share the same system prompt, the KV cache from the first
 
 This reduces **time to first token (TTFT)** but does not affect **decode throughput (tok/s)** — once decoding begins, each token still requires the same forward pass through all layers regardless of how the KV cache was populated.
 
-| GPU | Model | Quant | TTFT (cold) | TTFT (cached) | Saved |
-|---|---|---|---|---|---|
+<details open>
+<summary><b>Apple M4 Max</b> — 16-core CPU, 40-core GPU, 64 GB unified, 546 GB/s</summary>
 
-Measured via `rllm serve` — first request is a cache miss (full prefill), second request with the same system prompt is a cache hit (suffix-only prefill). "Saved" is the prefill time eliminated by reusing cached KV blocks. Prompt prefix caching works on both Metal and CUDA with no configuration — it's always on.
+| Model | Params | Quant | TTFT (cold) | TTFT (cached) | Speedup | Decode |
+|---|---|---|---|---|---|---|
+| Qwen3.5 9B | ~9B | bf16 | 5,427 ms | 616 ms | **8.81x** | 25.3 tok/s |
+| Qwen3.5 122B-A10B ⚡ | 122B (10B active) | Q4 | 3,665 ms | 1,089 ms | **3.37x** | 13.6 tok/s |
+| Qwen3.5 122B-A10B ⚡ | 122B (10B active) | bf16 | 27,176 ms | 13,644 ms | **1.99x** | 1.3 tok/s |
+| Qwen3.5 397B-A17B ⚡ | 397B (17B active) | Q4 | 5,676 ms | 1,817 ms | **3.12x** | 7.9 tok/s |
+| Qwen3.5 397B-A17B ⚡ | 397B (17B active) | bf16 | 60,462 ms | 29,501 ms | **2.05x** | 0.3 tok/s |
+
+⚡ = SSD expert streaming (`--stream-experts`).
+
+</details>
+
+Measured via `rllm bench` — 8 requests sharing the same system prompt (~32 cached prefix tokens). First request is a cache miss (full prefill), subsequent 7 are cache hits (suffix-only prefill). "TTFT (cached)" is the average across cache-hit requests. Prompt prefix caching works on both Metal and CUDA with no configuration — it's always on.
 
 ## Features
 
