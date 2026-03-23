@@ -522,10 +522,16 @@ large MoE models where only a few experts are active per token.
 **Access control is the real protection.**  Encryption at rest protects
 against physical disk theft and cloud-provider-level access.  The more
 meaningful control is limiting who and what can reach the box at all: the
-private network has no internet, SSH access is restricted to authorised
-engineers, and the only service that can reach the inference port is the
-gateway.  Even if an attacker gets the decryption key, they can't reach
-the machine to use it.
+private network has no internet, the only service that can reach the
+inference port is the gateway, and there is **no standing SSH access**.
+
+Shell access to inference servers is behind a break-glass process: an
+engineer opens a PR requesting access, a second engineer approves it, and
+only then is a short-lived SSH session provisioned.  Two-person rule — no
+one gets a shell on a machine holding model weights without a peer signing
+off.  Sessions are logged, time-limited, and auto-revoked.  The default
+state of the fleet is zero human access.  Even if an attacker gets the
+disk encryption key, they can't reach the machine to use it.
 
 **Why encryption doesn't belong in the inference engine.**  Embedding
 key management, KMS SDKs, and decryption into the inference server would
