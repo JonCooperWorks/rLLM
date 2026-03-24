@@ -650,4 +650,165 @@ mod tests {
         let (_, calls) = parse_tool_calls(ModelArch::Qwen2, text);
         assert!(calls.is_empty());
     }
+
+    // -- Multiple tool call tests (parallel tool calling) --
+
+    #[test]
+    fn test_mistral_multiple_tool_calls() {
+        let text = "[TOOL_CALLS][{\"name\": \"get_weather\", \"arguments\": {\"city\": \"NYC\"}}, {\"name\": \"get_time\", \"arguments\": {\"tz\": \"EST\"}}]";
+        let (content, calls) = parse_tool_calls(ModelArch::Mistral, text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[1].function.name, "get_time");
+        assert!(content.is_empty());
+    }
+
+    #[test]
+    fn test_mistral_multiple_with_text_before() {
+        let text = "Let me look that up for you.\n[TOOL_CALLS][{\"name\": \"a\", \"arguments\": {}}, {\"name\": \"b\", \"arguments\": {}}]";
+        let (content, calls) = parse_tool_calls(ModelArch::Mistral, text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(content, "Let me look that up for you.");
+    }
+
+    #[test]
+    fn test_chatml_text_between_tool_calls() {
+        // Text before, between, and after tool_call blocks should be preserved.
+        let text = "First.\n<tool_call>\n{\"name\": \"a\", \"arguments\": {}}\n</tool_call>\nMiddle.\n<tool_call>\n{\"name\": \"b\", \"arguments\": {}}\n</tool_call>\nLast.";
+        let (content, calls) = parse_tool_calls(ModelArch::Qwen2, text);
+        assert_eq!(calls.len(), 2);
+        assert!(content.contains("First."));
+        assert!(content.contains("Middle."));
+        assert!(content.contains("Last."));
+    }
+
+    #[test]
+    fn test_chatml_unclosed_tag_with_valid_json() {
+        // Unclosed <tool_call> with valid JSON after it — should still parse.
+        let text = "Here you go:\n<tool_call>\n{\"name\": \"search\", \"arguments\": {\"q\": \"rust\"}}";
+        let (content, calls) = parse_tool_calls(ModelArch::Qwen2, text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "search");
+        assert!(content.contains("Here you go:"));
+    }
+
+    #[test]
+    fn test_chatml_malformed_json_skipped() {
+        // Malformed JSON inside <tool_call> should be silently skipped.
+        let text = "<tool_call>\n{not valid json}\n</tool_call>\n<tool_call>\n{\"name\": \"ok\", \"arguments\": {}}\n</tool_call>";
+        let (_, calls) = parse_tool_calls(ModelArch::Qwen2, text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "ok");
+    }
+
+    #[test]
+    fn test_chatml_missing_name_field_skipped() {
+        // JSON object without "name" should be skipped.
+        let text = "<tool_call>\n{\"function\": \"wrong_field\", \"arguments\": {}}\n</tool_call>";
+        let (_, calls) = parse_tool_calls(ModelArch::Qwen2, text);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_tool_call_ids_are_unique() {
+        let text = "<tool_call>\n{\"name\": \"a\", \"arguments\": {}}\n</tool_call>\n<tool_call>\n{\"name\": \"b\", \"arguments\": {}}\n</tool_call>\n<tool_call>\n{\"name\": \"c\", \"arguments\": {}}\n</tool_call>";
+        let (_, calls) = parse_tool_calls(ModelArch::Qwen2, text);
+        assert_eq!(calls.len(), 3);
+        // All IDs should be unique.
+        let ids: std::collections::HashSet<&str> = calls.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids.len(), 3);
+        // All IDs should have the "call_" prefix.
+        for call in &calls {
+            assert!(call.id.starts_with("call_"));
+        }
+    }
+
+    #[test]
+    fn test_llama_text_before_json_not_parsed() {
+        // If there's text before the JSON, Llama parser should not find tool calls
+        // (it only parses when the trimmed text starts with '{' or has JSON lines).
+        let text = "Sure, here's the answer.\n\nThe weather is nice.";
+        let (content, calls) = parse_tool_calls(ModelArch::Llama, text);
+        assert!(calls.is_empty());
+        assert_eq!(content, text);
+    }
+
+    #[test]
+    fn test_llama_multiline_with_non_json_lines() {
+        // Mix of JSON tool calls and regular text lines — only JSON should be parsed.
+        let text = "{\"name\": \"a\", \"arguments\": {\"x\": 1}}\nsome text\n{\"name\": \"b\", \"arguments\": {\"y\": 2}}";
+        let (content, calls) = parse_tool_calls(ModelArch::Llama, text);
+        assert_eq!(calls.len(), 2);
+        assert!(content.contains("some text"));
+        assert!(!content.contains("\"name\""));
+    }
+
+    #[test]
+    fn test_tool_call_with_nested_arguments() {
+        // Deeply nested argument objects should be preserved correctly.
+        let args = r#"{"query": {"bool": {"must": [{"match": {"field": "value"}}]}}}"#;
+        let text = format!(
+            "<tool_call>\n{{\"name\": \"search\", \"arguments\": {args}}}\n</tool_call>"
+        );
+        let (_, calls) = parse_tool_calls(ModelArch::Qwen2, &text);
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].function.arguments.contains("bool"));
+        assert!(calls[0].function.arguments.contains("must"));
+    }
+
+    #[test]
+    fn test_mistral_malformed_json_array() {
+        // If the JSON array after [TOOL_CALLS] is invalid, no calls extracted.
+        let text = "[TOOL_CALLS]{not an array}";
+        let (content, calls) = parse_tool_calls(ModelArch::Mistral, text);
+        assert!(calls.is_empty());
+        assert_eq!(content, text);
+    }
+
+    #[test]
+    fn test_format_tools_multiple() {
+        let tools = vec![
+            ToolDefinition {
+                type_: "function".into(),
+                function: FunctionDefinition {
+                    name: "get_weather".into(),
+                    description: Some("Get weather".into()),
+                    parameters: None,
+                },
+            },
+            ToolDefinition {
+                type_: "function".into(),
+                function: FunctionDefinition {
+                    name: "get_time".into(),
+                    description: Some("Get time".into()),
+                    parameters: None,
+                },
+            },
+        ];
+        // All formatters should include both tool names.
+        for arch in [ModelArch::Llama, ModelArch::Mistral, ModelArch::Qwen2] {
+            let prompt = format_tool_system_prompt(arch, &tools);
+            assert!(
+                prompt.contains("get_weather"),
+                "{arch:?} missing get_weather"
+            );
+            assert!(prompt.contains("get_time"), "{arch:?} missing get_time");
+        }
+    }
+
+    #[test]
+    fn test_chatml_no_description() {
+        // Tool with no description should use fallback text.
+        let tools = vec![ToolDefinition {
+            type_: "function".into(),
+            function: FunctionDefinition {
+                name: "mystery".into(),
+                description: None,
+                parameters: None,
+            },
+        }];
+        let prompt = format_tool_system_prompt(ModelArch::Qwen2, &tools);
+        assert!(prompt.contains("mystery"));
+        assert!(prompt.contains("No description."));
+    }
 }

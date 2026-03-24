@@ -276,17 +276,22 @@ pub(crate) async fn chat_completions(
         std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
     })?;
 
-    // When thinking is enabled, we must collect all tokens to parse
-    // the thinking block — same as tool calling.
-    let needs_blocking = has_tools || thinking_requested.is_some_and(|t| t);
-    if req.stream && !needs_blocking {
-        Ok(chat_completions_stream(state, response_rx).await)
+    // Thinking requires collecting all tokens to parse the thinking block.
+    // Tool calls also require collecting all tokens to find call markers,
+    // but we can still emit the result as SSE events (pseudo-streaming).
+    let thinking_enabled = thinking_requested.is_some_and(|t| t);
+    if req.stream && !thinking_enabled {
+        if has_tools && !tools_disabled {
+            Ok(chat_completions_stream_with_tools(state, response_rx).await)
+        } else {
+            Ok(chat_completions_stream(state, response_rx).await)
+        }
     } else {
         Ok(chat_completions_blocking(
             state,
             response_rx,
             has_tools && !tools_disabled,
-            thinking_requested.unwrap_or(false),
+            thinking_enabled,
         )
         .await)
     }
@@ -380,6 +385,144 @@ async fn chat_completions_blocking(
         },
     })
     .into_response()
+}
+
+/// Streaming with tool calls: collect all tokens (tool call markers can span
+/// multiple tokens), then emit SSE events for text content followed by tool
+/// call deltas.  This gives clients proper SSE format even when tools are
+/// active — the previous behaviour silently returned a non-streaming JSON
+/// response, which broke SSE clients.
+///
+/// The sequence matches OpenAI's streaming tool call format:
+///   1. Content deltas (the text portion, with tool markers stripped)
+///   2. Tool call deltas (one chunk per tool call with name + arguments)
+///   3. Final chunk with finish_reason "tool_calls" or "stop"
+///   4. [DONE] sentinel
+async fn chat_completions_stream_with_tools(
+    state: Arc<ServerState>,
+    mut response_rx: tokio::sync::mpsc::Receiver<InferenceEvent>,
+) -> Response {
+    let id = format!("chatcmpl-{}", super::generate_id());
+    let model = state.model_name.clone();
+
+    let stream = async_stream::stream! {
+        // Collect all tokens first — we need the full text to find tool call markers.
+        let mut text = String::new();
+        let mut prompt_tokens = 0usize;
+        let mut completion_tokens = 0usize;
+        let mut stop_reason = StopReason::MaxTokens;
+
+        while let Some(event) = response_rx.recv().await {
+            match event {
+                InferenceEvent::Token { text: t } => text.push_str(&t),
+                InferenceEvent::Done {
+                    stop_reason: sr,
+                    prompt_tokens: pt,
+                    completion_tokens: ct,
+                    cached_tokens: _,
+                } => {
+                    prompt_tokens = pt;
+                    completion_tokens = ct;
+                    stop_reason = sr;
+                }
+                InferenceEvent::Error(e) => {
+                    let err = serde_json::json!({
+                        "error": { "message": e, "type": "server_error" }
+                    });
+                    yield Ok::<_, std::convert::Infallible>(format!("data: {}\n\n", err));
+                    return;
+                }
+            }
+        }
+
+        // Parse tool calls from the collected text.
+        let (content, tool_calls) = tools::parse_tool_calls(state.arch, &text);
+        let has_calls = !tool_calls.is_empty();
+        let final_reason = if has_calls { StopReason::ToolCalls } else { stop_reason };
+
+        // Emit the first chunk with role (OpenAI convention for streaming).
+        let first_chunk = serde_json::json!({
+            "id": &id,
+            "object": "chat.completion.chunk",
+            "created": super::unix_timestamp(),
+            "model": &model,
+            "choices": [{
+                "index": 0,
+                "delta": { "role": "assistant" },
+                "finish_reason": serde_json::Value::Null
+            }]
+        });
+        yield Ok(format!("data: {}\n\n", first_chunk));
+
+        // Emit text content (if any) as a single content delta.
+        if !content.is_empty() {
+            let chunk = serde_json::json!({
+                "id": &id,
+                "object": "chat.completion.chunk",
+                "created": super::unix_timestamp(),
+                "model": &model,
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": content },
+                    "finish_reason": serde_json::Value::Null
+                }]
+            });
+            yield Ok(format!("data: {}\n\n", chunk));
+        }
+
+        // Emit tool call deltas.  OpenAI format: each tool call gets a chunk
+        // with index, id, function name, and arguments.
+        for (i, call) in tool_calls.iter().enumerate() {
+            let chunk = serde_json::json!({
+                "id": &id,
+                "object": "chat.completion.chunk",
+                "created": super::unix_timestamp(),
+                "model": &model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": i,
+                            "id": &call.id,
+                            "type": "function",
+                            "function": {
+                                "name": &call.function.name,
+                                "arguments": &call.function.arguments
+                            }
+                        }]
+                    },
+                    "finish_reason": serde_json::Value::Null
+                }]
+            });
+            yield Ok(format!("data: {}\n\n", chunk));
+        }
+
+        // Final chunk with finish_reason.
+        let final_chunk = serde_json::json!({
+            "id": &id,
+            "object": "chat.completion.chunk",
+            "created": super::unix_timestamp(),
+            "model": &model,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": finish_reason_str(final_reason)
+            }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens
+            }
+        });
+        yield Ok(format!("data: {}\n\n", final_chunk));
+        yield Ok("data: [DONE]\n\n".to_string());
+    };
+
+    Response::builder()
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap()
 }
 
 /// Streaming: return SSE events with one token per chunk.
@@ -923,6 +1066,144 @@ mod tests {
         let json = r#"{"messages": [{"role": "user", "content": "Hi"}]}"#;
         let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.thinking, None);
+    }
+
+    #[test]
+    fn test_chat_response_with_multiple_tool_calls() {
+        let response = ChatCompletionResponse {
+            id: "chatcmpl-multi".into(),
+            object: "chat.completion",
+            created: 1234567890,
+            model: "test-model".into(),
+            choices: vec![ChatChoice {
+                index: 0,
+                message: ChatResponseMessage {
+                    role: "assistant",
+                    content: Some("Let me check both.".into()),
+                    tool_calls: Some(vec![
+                        tools::ToolCall {
+                            id: "call_aaa".into(),
+                            type_: "function".into(),
+                            function: tools::FunctionCall {
+                                name: "get_weather".into(),
+                                arguments: "{\"city\":\"SF\"}".into(),
+                            },
+                        },
+                        tools::ToolCall {
+                            id: "call_bbb".into(),
+                            type_: "function".into(),
+                            function: tools::FunctionCall {
+                                name: "get_time".into(),
+                                arguments: "{\"tz\":\"PST\"}".into(),
+                            },
+                        },
+                    ]),
+                    reasoning_content: None,
+                },
+                finish_reason: Some("tool_calls".into()),
+            }],
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                total_tokens: 30,
+            },
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        let tc = json["choices"][0]["message"]["tool_calls"].as_array().unwrap();
+        assert_eq!(tc.len(), 2);
+        assert_eq!(tc[0]["function"]["name"], "get_weather");
+        assert_eq!(tc[1]["function"]["name"], "get_time");
+        // Content should coexist with tool_calls.
+        assert_eq!(
+            json["choices"][0]["message"]["content"],
+            "Let me check both."
+        );
+    }
+
+    #[test]
+    fn test_inject_tools_appends_to_existing_system() {
+        let messages = vec![
+            Message {
+                role: "system".into(),
+                content: "You are helpful.".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                images: None,
+            },
+            Message {
+                role: "user".into(),
+                content: "Hi".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                images: None,
+            },
+        ];
+        let tools = vec![tools::ToolDefinition {
+            type_: "function".into(),
+            function: tools::FunctionDefinition {
+                name: "test_fn".into(),
+                description: Some("A test".into()),
+                parameters: None,
+            },
+        }];
+        let result = inject_tools(messages, &tools, crate::model::config::ModelArch::Qwen2);
+        // System message should be augmented, not duplicated.
+        assert_eq!(result.iter().filter(|m| m.role == "system").count(), 1);
+        assert!(result[0].content.contains("You are helpful."));
+        assert!(result[0].content.contains("test_fn"));
+    }
+
+    #[test]
+    fn test_inject_tools_creates_system_when_absent() {
+        let messages = vec![Message {
+            role: "user".into(),
+            content: "Hi".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            images: None,
+        }];
+        let tools = vec![tools::ToolDefinition {
+            type_: "function".into(),
+            function: tools::FunctionDefinition {
+                name: "search".into(),
+                description: Some("Search".into()),
+                parameters: None,
+            },
+        }];
+        let result = inject_tools(messages, &tools, crate::model::config::ModelArch::Llama);
+        // Should have inserted a system message at position 0.
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].role, "system");
+        assert!(result[0].content.contains("search"));
+        assert_eq!(result[1].role, "user");
+    }
+
+    #[test]
+    fn test_inject_tools_empty_tools_noop() {
+        let messages = vec![Message {
+            role: "user".into(),
+            content: "Hi".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            images: None,
+        }];
+        let result = inject_tools(messages.clone(), &[], crate::model::config::ModelArch::Llama);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].content, "Hi");
+    }
+
+    #[test]
+    fn test_chat_request_tool_choice_none() {
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tools": [{"type": "function", "function": {"name": "f"}}],
+            "tool_choice": "none"
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req.tool_choice.as_ref().unwrap().as_str(),
+            Some("none")
+        );
     }
 
     #[test]

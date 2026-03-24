@@ -340,6 +340,7 @@ fn argmax_bf16(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
     use half::bf16;
+    use rand::SeedableRng;
 
     fn bf16_bytes(values: &[f32]) -> Vec<u8> {
         let bf16_values: Vec<bf16> = values.iter().map(|&v| bf16::from_f32(v)).collect();
@@ -380,5 +381,121 @@ mod tests {
     fn test_argmax_bf16_mixed() {
         let data = bf16_bytes(&[-100.0, 0.0, 100.0, 50.0, -50.0]);
         assert_eq!(argmax_bf16(&data), 2);
+    }
+
+    // -- sample_row tests --
+
+    #[test]
+    fn test_sample_row_very_low_temperature_acts_like_argmax() {
+        // Very low temperature should pick the highest-logit token.
+        let data = bf16_bytes(&[1.0, 5.0, 2.0, 0.5]);
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(42);
+        // Run multiple times — should always pick index 1.
+        for _ in 0..20 {
+            let token = sample_row(&data, 0.01, 1.0, &mut rng);
+            assert_eq!(token, 1, "Very low temperature should pick argmax");
+        }
+    }
+
+    #[test]
+    fn test_sample_row_deterministic_with_same_seed() {
+        let data = bf16_bytes(&[1.0, 2.0, 3.0, 2.0, 1.0]);
+        // Same seed should produce the same sequence of tokens.
+        let mut rng1 = rand::rngs::SmallRng::seed_from_u64(123);
+        let mut rng2 = rand::rngs::SmallRng::seed_from_u64(123);
+        for _ in 0..50 {
+            let t1 = sample_row(&data, 1.0, 1.0, &mut rng1);
+            let t2 = sample_row(&data, 1.0, 1.0, &mut rng2);
+            assert_eq!(t1, t2, "Same seed should produce same token");
+        }
+    }
+
+    #[test]
+    fn test_sample_row_top_p_filters_tail() {
+        // Create a distribution where one token dominates.
+        // logits: [10.0, 0.0, 0.0, 0.0] — after softmax, token 0 has ~99.99%
+        let data = bf16_bytes(&[10.0, 0.0, 0.0, 0.0]);
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(99);
+        // With top_p=0.5, only the dominant token should be sampled.
+        for _ in 0..50 {
+            let token = sample_row(&data, 1.0, 0.5, &mut rng);
+            assert_eq!(token, 0, "Top-p should filter to dominant token");
+        }
+    }
+
+    #[test]
+    fn test_sample_row_single_token_vocab() {
+        let data = bf16_bytes(&[42.0]);
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(0);
+        let token = sample_row(&data, 1.0, 1.0, &mut rng);
+        assert_eq!(token, 0);
+    }
+
+    #[test]
+    fn test_sample_row_equal_logits_samples_all_tokens() {
+        // With equal logits and temperature=1.0, all tokens should be sampled
+        // over enough trials.
+        let data = bf16_bytes(&[0.0, 0.0, 0.0, 0.0]);
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(7);
+        let mut counts = [0u32; 4];
+        for _ in 0..1000 {
+            let token = sample_row(&data, 1.0, 1.0, &mut rng);
+            counts[token as usize] += 1;
+        }
+        // Each token should be sampled at least once (expected ~250 each).
+        for (i, &count) in counts.iter().enumerate() {
+            assert!(count > 50, "Token {i} sampled only {count} times out of 1000");
+        }
+    }
+
+    #[test]
+    fn test_sample_row_high_temperature_more_uniform() {
+        // High temperature should spread probability more evenly.
+        // Use logits with a clear winner and see if high temp reduces its dominance.
+        let data = bf16_bytes(&[5.0, 0.0, 0.0, 0.0]);
+
+        // Low temperature: token 0 should dominate.
+        let mut rng_low = rand::rngs::SmallRng::seed_from_u64(42);
+        let mut count_low = 0u32;
+        for _ in 0..500 {
+            if sample_row(&data, 0.5, 1.0, &mut rng_low) == 0 {
+                count_low += 1;
+            }
+        }
+
+        // High temperature: token 0 should still be most common but less dominant.
+        let mut rng_high = rand::rngs::SmallRng::seed_from_u64(42);
+        let mut count_high = 0u32;
+        for _ in 0..500 {
+            if sample_row(&data, 3.0, 1.0, &mut rng_high) == 0 {
+                count_high += 1;
+            }
+        }
+
+        assert!(
+            count_low > count_high,
+            "Low temp ({count_low}) should pick token 0 more than high temp ({count_high})"
+        );
+    }
+
+    #[test]
+    fn test_sample_row_top_p_one_no_filtering() {
+        // top_p=1.0 should not filter any tokens (all are candidates).
+        let data = bf16_bytes(&[1.0, 1.0, 1.0, 1.0, 1.0]);
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(55);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            seen.insert(sample_row(&data, 1.0, 1.0, &mut rng));
+        }
+        assert_eq!(seen.len(), 5, "top_p=1.0 should allow all 5 tokens");
+    }
+
+    #[test]
+    fn test_argmax_bf16_two_elements_equal() {
+        // Two equal values — max_by returns the last equal element.
+        let data = bf16_bytes(&[5.0, 5.0]);
+        let result = argmax_bf16(&data);
+        // Either index is valid since they're equal.
+        assert!(result == 0 || result == 1);
     }
 }
