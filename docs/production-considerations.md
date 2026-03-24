@@ -173,48 +173,11 @@ graph LR
 Reference counting keeps shared blocks alive.  Eviction is LRU among entries
 with zero active references.
 
-### Economics
+### Cache routing
 
-Prompt caching saves **prefill compute** — the dominant per-request cost.
-Prefill is compute-bound (GEMM through every layer for every prompt token).
-
-| Metric | No cache | 90% hit rate |
-|--------|----------|-------------|
-| Prefill per request | 1000 tokens | 100 tokens (suffix only) |
-| TTFT | ~200 ms | ~20 ms |
-| Prefill compute | ~200 TFLOP | ~20 TFLOP |
-| Max prefills/sec | ~5 | ~50 |
-
-A 4000-token system prompt takes ~800ms to prefill.  Cache it and TTFT drops
-to the user-message suffix — typically 10–50ms.
-
-**Memory trade-off.**  A 1000-token prefix costs ~128MB of VRAM.  On 80GB
-that's 0.16% for a cache entry serving thousands of requests.
-
-**Pricing.**  Anthropic charges cached input tokens at 90% discount.  The
-provider's marginal cost is near zero — the KV already exists.  The discount
-incentivises users to structure prompts for cacheability (stable prefix first,
-variable content last), improving GPU utilisation for the provider.
-
-```mermaid
-xychart-beta
-    title "Effective Prefill Cost (1000-token prefix)"
-    x-axis "Cache Hit Rate" ["0%", "25%", "50%", "75%", "90%", "100%"]
-    y-axis "Relative Cost %" 0 --> 100
-    bar [100, 77, 55, 32, 14, 5]
-```
-
-**What caching does NOT improve.**  Decode throughput is unchanged — each
-generated token still reads the full KV cache.  Caching is purely a TTFT
-and prefill-compute optimisation.
-
----
-
-## Prefix-Cache Routing
-
-The prefix cache is **local to each engine instance** — an in-process hash
-map.  A request only hits a cached prefix if it lands on the server that
-computed it.  Load-balancer routing is the biggest lever for hit rate.
+The prefix cache is **local to each engine instance**.  A request only hits
+cache if it lands on the server that computed it.  Routing strategy is the
+biggest lever for hit rate.
 
 ```mermaid
 graph TD
@@ -229,59 +192,98 @@ graph TD
     style RR fill:#f8d7da
 ```
 
-- **Round-robin** — even load, but N servers independently cache the same
-  prefixes.  N× the VRAM, N× the cold prefills.
-- **Hash on system prompt** — all requests with the same prefix land on the
-  same server.  High hit rate; mitigate hot spots with consistent hashing.
-- **Dedicated first-party pools** — your own clients share one system prompt.
-  Route them to a dedicated pool.  The prefix never competes for cache slots.
+- **Round-robin** — even load, N× duplicate cache entries, N× cold prefills
+- **Hash on system prompt** — high hit rate; consistent hashing mitigates hot spots
+- **Dedicated first-party pools** — your clients share one prompt, always hot
 
-### First-party vs API traffic
-
-```
-First-party clients          API customers
-─────────────────           ──────────────
-You control the prompt       They control the prompt
-One system prompt            One per customer (mostly stable)
-100% cache hit rate          High hit rate with affinity routing
-Dedicated server pool        Shared pool, hash-routed
-```
-
-First-party is the easy case — one system prompt, never changes, every
-request hits cache.  API customers converge organically: each has a few
-stable system prompts.  Route by API key or prompt hash and each customer's
-prefix stays warm.
-
-### Why this works
-
-System prompts are the longest, most repetitive, and most expensive part
-of the input.  Caching the thing that costs the most gives the biggest
-return.  A 4000-token prefix cached at 90% hit rate saves ~720ms of GPU
-compute per request.  At 100 req/s, that's 72 GPU-seconds saved per
-wall-clock second.
-
-### Capacity planning
-
-Default: 64 prefixes per instance.  First-party pool needs one slot.  API
-pattern: 64 covers your top customers by traffic (API traffic follows a
-power law).  A 1000-token prefix costs ~128MB; 64 entries = ~8GB — significant
-on 24GB, negligible on 80GB.
+First-party traffic is easy: one system prompt, 100% hit rate.  API customers
+converge organically — each has a few stable prompts.  Route by API key or
+prompt hash.
 
 ---
 
-## Economics and Tiers
+## Economics
+
+LLM inference economics come down to one question: how many tokens can you
+extract per GPU-hour, and what do you charge per token?  Three levers —
+batching, quantization, and prompt caching — determine cost per token.
+Hardware selection and tier differentiation determine what you charge.
+Everything connects: cheaper cost per token lets you offer lower prices or
+higher margins, and the pricing structure itself shapes user behaviour in
+ways that improve GPU utilisation.
+
+### Cost levers
+
+```mermaid
+graph LR
+    subgraph Levers["Cost per Token"]
+        B["Batching<br/>64× more tok/s<br/>same GPU-hour"]
+        Q["Quantization<br/>4× less bandwidth<br/>4× faster decode"]
+        C["Prompt Caching<br/>skip prefill compute<br/>for repeated prefixes"]
+    end
+
+    B --> Low["Lower $/token"]
+    Q --> Low
+    C --> Low
+```
 
 **Batching is the business model.**  An H100 at ~$2–3/hr decoding one
-sequence: ~25 tok/s.  Batch 64 sequences: ~1600 tok/s.  64× lower cost per
-token.
+sequence produces ~25 tok/s.  Batch 64 sequences from the same GPU-hour:
+~1600 tok/s.  64× lower cost per token.  Without batching, LLM inference
+APIs don't work economically.
 
-**Quantization is pure margin.**  Q4 vs bf16 = ~4× more tokens per GPU-hour
-at near-identical quality.
+**Quantization is pure margin.**  Q4 vs bf16 gives ~4× more tokens per
+GPU-hour at near-identical quality.  Charge the same price: 4× margin.
+Pass savings to users: undercut competitors.  Either way, it's a direct
+multiplier on unit economics.
 
-**Prompt caching is throughput multiplication.**  A workload that's 60%
-prefill-bound can nearly double effective throughput with a hot cache.
+**Prompt caching is throughput multiplication.**  Prefill (processing the
+prompt) is compute-bound and often the dominant per-request cost.  A
+4000-token system prompt takes ~800ms to prefill on a 70B model.  Cache that
+prefix and subsequent requests skip it entirely — TTFT drops from ~800ms to
+the user-message suffix (10–50ms).
 
-**Tiers = hardware × quantization × residency × priority.**
+| Metric | No cache | 90% hit rate |
+|--------|----------|-------------|
+| Prefill per request | 1000 tokens | 100 tokens (suffix only) |
+| TTFT | ~200 ms | ~20 ms |
+| Prefill compute | ~200 TFLOP | ~20 TFLOP |
+| Max prefills/sec | ~5 | ~50 |
+
+A workload that's 60% prefill-bound can nearly double effective throughput
+with a hot cache — same hardware, same price, 2× the requests served.
+
+### Pricing
+
+Pricing can incentivise user behaviour that improves your GPU utilisation.
+
+**Cached token discounts.**  Anthropic charges cached input tokens at 90%
+discount.  The provider's marginal cost for a cached token is near zero — the
+KV already exists in GPU memory.  The discount nudges users to structure
+prompts for cacheability (stable prefix first, variable content last), which
+improves hit rates and GPU utilisation for the provider.  A virtuous cycle.
+
+```mermaid
+xychart-beta
+    title "Effective Prefill Cost (1000-token prefix)"
+    x-axis "Cache Hit Rate" ["0%", "25%", "50%", "75%", "90%", "100%"]
+    y-axis "Relative Cost %" 0 --> 100
+    bar [100, 77, 55, 32, 14, 5]
+```
+
+**Model size premium.**  A 7B fits on a consumer GPU; a 70B needs 4×H100s.
+10–50× cost difference.  The large-model premium pays for the fleet.
+
+**Why caching economics work.**  System prompts are simultaneously the
+longest, most repetitive, and most expensive part of the input.  Caching the
+thing that costs the most gives the biggest return.  At 100 req/s with a
+4000-token prefix at 90% hit rate, that's 72 GPU-seconds of prefill compute
+saved per wall-clock second.
+
+### Tiers
+
+Same model, same API, different hardware behind it.  Tiers are a mix of
+hardware generation, quantization level, VRAM residency, and queue priority.
 
 ```mermaid
 quadrantChart
@@ -298,28 +300,35 @@ quadrantChart
     "Disk-streamed, minimal VRAM": [0.15, 0.15]
 ```
 
-Same model, same API, different hardware.  Pro: dedicated pools, low batch
-sizes, aggressive latency SLOs.  Free: overflow pools, older GPUs,
-disk-streamed, deprioritized queues.
-
 ```mermaid
 graph TD
     Req([API Request]) --> GW{Gateway<br/>checks user tier}
 
-    GW -->|Pro| Pro["Dedicated H100 pool<br/>Low batch, full VRAM"]
+    GW -->|Pro| Pro["Dedicated H100 pool<br/>Low batch, full VRAM<br/>Hot prefix cache"]
     GW -->|Standard| Std["Shared A100/L40 pool<br/>Medium batch, quantized"]
-    GW -->|Free| Free["Overflow pool<br/>High batch, disk-streamed"]
+    GW -->|Free| Free["Overflow pool<br/>High batch, disk-streamed<br/>Deprioritized queue"]
 
     Pro --> Resp([Response])
     Std --> Resp
     Free --> Resp
 ```
 
----
+Pro users get dedicated GPU pools with low batch sizes and aggressive latency
+SLOs.  Free users get overflow pools on older hardware, higher batch sizes,
+disk-streamed models, and lower queue priority.  The GPU does the same work —
+the difference is queue position and how much of the model lives in VRAM.
 
-## QA and Eval
+### Capacity planning
 
-Which models, at which precisions, on which hardware, pass the quality bar?
+Default: 64 cached prefixes per instance.  First-party pool needs one slot.
+API pattern: 64 covers your top customers by traffic (power-law
+distribution).  A 1000-token prefix costs ~128MB; 64 entries = ~8GB —
+significant on 24GB, negligible on 80GB.
+
+### QA and eval
+
+The gate between a model drop and a tier deployment: which models, at which
+precisions, on which hardware, pass the quality bar?
 
 ```mermaid
 graph LR
