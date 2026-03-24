@@ -54,9 +54,15 @@ pub(crate) struct ServeArgs {
     #[arg(long, requires = "letsencrypt", default_value = ".rllm-certs")]
     pub cert_cache_dir: PathBuf,
 
-    /// Allow running without TLS (plain HTTP).  Required when no TLS config is set.
+    /// Allow running without TLS (plain HTTP) on external interfaces.
+    /// Not required for localhost/127.0.0.1/::1 — those skip TLS automatically.
     #[arg(long)]
     pub dangerous_no_tls: bool,
+
+    /// Allow running without authentication on external interfaces.
+    /// Not required for localhost/127.0.0.1/::1 — those skip auth automatically.
+    #[arg(long)]
+    pub dangerous_no_auth: bool,
 
     /// Tensor parallelism: number of GPUs (0 = auto-detect all available).
     #[arg(long, default_value = "0")]

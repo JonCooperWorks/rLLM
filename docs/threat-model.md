@@ -70,7 +70,7 @@ can be added by implementing the trait and adding a variant to `AuthProviderKind
 - Authorization policy — model access, token budgets, per-customer limits
 
 **Auth without TLS.**  When auth is enabled but TLS is disabled
-(`--auth-config` + `--dangerous-no-tls`), rLLM prints a startup warning.
+(auth enabled, no TLS), rLLM prints a startup warning.
 Bearer tokens, prompts, and completions are sent in plaintext.  An attacker
 with network access (man-in-the-middle) can:
 
@@ -84,10 +84,11 @@ transport is already encrypted), but dangerous on any network an attacker can
 observe.  If binding to a non-localhost address with auth enabled, always
 enable TLS (`--cert`/`--private-key` or `--letsencrypt`).
 
-**If you expose rLLM to the internet without a gateway or auth, anyone can use it.**
-The `--host 0.0.0.0` flag exists for convenience on trusted networks (rented
-GPU boxes, local dev), not for production.  Enable `--auth-config` if binding
-to a non-localhost address.
+**Safety nets on external interfaces.**  When binding to a non-loopback
+address (`--host 0.0.0.0`), rLLM requires explicit opt-in for running
+without TLS (`--dangerous-no-tls`) and without auth (`--dangerous-no-auth`).
+On localhost (the default), neither flag is needed — traffic never leaves
+the machine.
 
 ---
 

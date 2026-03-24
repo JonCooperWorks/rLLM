@@ -101,7 +101,7 @@ visible in the type system.  Same pattern as `TlsMode` in `tls.rs`.
 Auth is configured via a JSON file passed with `--auth-config`:
 
 ```bash
-rllm serve --model ./my-model --auth-config auth.json --dangerous-no-tls
+rllm serve --model ./my-model --auth-config auth.json
 ```
 
 The file has a `"provider"` field that selects the implementation.  The rest
@@ -128,6 +128,11 @@ provider's `init()` hook.
 
 When `--auth-config` is omitted, all requests are allowed and the user
 identity is "anonymous".  No auth headers are required.
+
+On localhost (the default bind address), this just works.  On external
+interfaces (`--host 0.0.0.0`), rLLM requires `--dangerous-no-auth` to
+confirm you intentionally want to run without authentication — anyone who
+can reach the port gets unlimited access.
 
 ---
 
@@ -188,16 +193,19 @@ values.
 
 ## Auth Without TLS
 
-When auth is enabled but TLS is disabled (`--auth-config` + `--dangerous-no-tls`),
-rLLM prints a startup warning.  Bearer tokens, prompts, and completions are
-sent in plaintext.  An attacker with network access can:
+When auth is enabled but TLS is disabled, rLLM prints a startup warning.
+Bearer tokens, prompts, and completions are sent in plaintext.  An attacker
+with network access can:
 
 - **Intercept tokens** — steal a valid JWT and impersonate the user
 - **Read traffic** — observe all prompts and completions
 - **Modify requests/responses** — alter prompts or completions in transit
 
-This is safe over localhost or an SSH tunnel (the transport is already
-encrypted).  On any other network, enable TLS.
+On localhost (the default bind address), this is safe — traffic never leaves
+the machine.  rLLM allows plain HTTP on localhost without `--dangerous-no-tls`.
+If binding to an external interface (`--host 0.0.0.0`), TLS is required
+unless you explicitly pass `--dangerous-no-tls`.  For SSH tunnels, the tunnel
+provides encryption — localhost on the remote machine is fine.
 
 ---
 

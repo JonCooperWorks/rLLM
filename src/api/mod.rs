@@ -178,6 +178,13 @@ pub(crate) fn unix_timestamp() -> u64 {
 // Server entry point.
 // ---------------------------------------------------------------------------
 
+/// Check if the host is a loopback address (127.0.0.1, ::1, localhost).
+/// Traffic on loopback never leaves the machine, so TLS and auth are
+/// unnecessary for single-user local development.
+fn is_loopback(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "::1" | "localhost")
+}
+
 /// Validate TLS-related CLI args before doing any heavy work.
 ///
 /// Returns the resolved TlsMode on success, or a descriptive error
@@ -205,13 +212,14 @@ fn validate_tls_args(args: &ServeArgs) -> anyhow::Result<tls::TlsMode> {
         });
     }
 
-    if args.dangerous_no_tls {
+    if args.dangerous_no_tls || is_loopback(&args.host) {
         return Ok(tls::TlsMode::None);
     }
 
     anyhow::bail!(
         "no TLS configuration provided. Use --cert/--private-key or --letsencrypt \
-         to enable TLS, or pass --dangerous-no-tls to serve over plain HTTP."
+         to enable TLS, or pass --dangerous-no-tls to serve over plain HTTP.\n\
+         (localhost binds don't require TLS — this check only applies to external interfaces.)"
     )
 }
 
@@ -324,6 +332,17 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
             other => anyhow::bail!("unknown auth provider: {other}"),
         }
     } else {
+        // On external interfaces, require --dangerous-no-auth to run without auth.
+        // On loopback, auth is unnecessary — you're the only user.
+        if !is_loopback(&args.host) && !args.dangerous_no_auth {
+            anyhow::bail!(
+                "no auth configured on external interface (--host {}).\n\
+                 Use --auth-config to enable authentication, or pass --dangerous-no-auth \
+                 to serve without auth.\n\
+                 (localhost binds don't require auth — this check only applies to external interfaces.)",
+                args.host
+            );
+        }
         eprintln!("  auth      : none");
         auth::AuthProviderKind::None
     };
