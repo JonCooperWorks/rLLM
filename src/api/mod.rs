@@ -12,6 +12,7 @@
 //   mod.rs        — server setup, shared types, spawn_worker, run_worker_loop
 //   openai.rs     — /v1/chat/completions, /v1/completions, /v1/models
 //   anthropic.rs  — /v1/messages
+//   auth/         — pluggable auth hooks (init, request, background)
 //   tls.rs        — TLS support (manual certs, Let's Encrypt)
 //
 // Architecture:
@@ -41,6 +42,7 @@
 // ===========================================================================
 
 pub(crate) mod anthropic;
+pub(crate) mod auth;
 pub(crate) mod openai;
 pub(crate) mod tls;
 
@@ -48,6 +50,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use auth::AuthProvider;
 use crate::ServeArgs;
 use crate::engine;
 use crate::engine::SeqId;
@@ -80,6 +83,8 @@ pub(crate) struct WorkerRequest {
     /// Decoded and normalised on the handler thread (CPU), passed to the
     /// worker for GPU encoding during prefill.
     pub images: Vec<crate::model::vision::ProcessedImage>,
+    /// Authenticated user identity (None when auth is disabled).
+    pub user: Option<auth::AuthUser>,
 }
 
 /// Events sent from the inference worker back to an HTTP handler.
@@ -121,6 +126,8 @@ pub(crate) struct ServerState {
     pub arch: config::ModelArch,
     /// Vision config for image preprocessing (None for text-only models).
     pub vision_config: Option<crate::model::config::VisionConfig>,
+    /// Auth provider (None variant when auth is disabled).
+    pub auth: auth::AuthProviderKind,
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +296,56 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // ------------------------------------------------------------------
     // 3. Start HTTP server.
     // ------------------------------------------------------------------
+
+    // Build the tokio runtime early — auth init may need async I/O (OIDC
+    // discovery, JWKS fetch).  The inference worker is a plain std::thread
+    // and never needs the runtime.
+    let rt = tokio::runtime::Runtime::new()?;
+
+    // ------------------------------------------------------------------
+    // 3a. Initialize auth provider (if configured).
+    // ------------------------------------------------------------------
+    let auth_provider = if let Some(path) = &args.auth_config {
+        let config: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(path).map_err(|e| {
+                anyhow::anyhow!("failed to open auth config '{}': {e}", path.display())
+            })?)?;
+        let provider_name = config
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("auth config missing \"provider\" field"))?;
+        match provider_name {
+            "oidc" => {
+                eprintln!("  auth      : oidc");
+                let provider =
+                    rt.block_on(auth::oidc::OidcProvider::init(&config))?;
+                auth::AuthProviderKind::Oidc(Arc::new(provider))
+            }
+            other => anyhow::bail!("unknown auth provider: {other}"),
+        }
+    } else {
+        eprintln!("  auth      : none");
+        auth::AuthProviderKind::None
+    };
+
+    // Warn if auth is enabled but TLS is not — tokens, prompts, and
+    // completions are sent in plaintext and can be intercepted or modified
+    // by an attacker with network access (man-in-the-middle).
+    if !matches!(auth_provider, auth::AuthProviderKind::None)
+        && matches!(tls_mode, tls::TlsMode::None)
+    {
+        eprintln!();
+        eprintln!("  WARNING: auth is enabled but TLS is disabled.");
+        eprintln!("  Bearer tokens, prompts, and completions are sent in plaintext.");
+        eprintln!("  An attacker with network access can intercept tokens to");
+        eprintln!("  impersonate users, read prompts and completions, or modify");
+        eprintln!("  requests and responses in transit (man-in-the-middle).");
+        eprintln!("  This is safe over localhost or an SSH tunnel, but dangerous");
+        eprintln!("  on any network an attacker can observe.");
+        eprintln!("  To fix: add --cert/--private-key or --letsencrypt.");
+        eprintln!();
+    }
+
     eprintln!("  ----------------------------------------");
     eprintln!("  endpoint  : {scheme}://{addr}/v1/chat/completions");
     eprintln!("  health    : {scheme}://{addr}/health");
@@ -300,6 +357,7 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         tokenizer,
         arch,
         vision_config,
+        auth: auth_provider,
     });
 
     // Build axum router with all API endpoints.
@@ -315,13 +373,20 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .route("/v1/messages", axum::routing::post(anthropic::messages))
         // Health check.
         .route("/health", axum::routing::get(|| async { "ok" }))
+        // Auth middleware — inside CORS so preflight OPTIONS get CORS headers
+        // even when auth denies them.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::auth_middleware,
+        ))
         .layer(tower_http::cors::CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state.clone());
 
-    // Build the tokio runtime here (not in main) so the rest of the binary
-    // stays synchronous.  The inference worker is a plain std::thread —
-    // it never needs async I/O.
-    let rt = tokio::runtime::Runtime::new()?;
+    // Spawn auth provider's background task (JWKS refresh, etc.).
+    rt.block_on(async {
+        state.auth.spawn_background();
+    });
+
     rt.block_on(async {
         match tls_mode {
             tls::TlsMode::None => {
@@ -436,6 +501,8 @@ struct RequestContext {
     /// in the incremental decode buffer.  This field accumulates markers
     /// that were seen since the last decode.
     inject_marker: Option<&'static str>,
+    /// Authenticated user identity (for per-user logging).
+    user: Option<auth::AuthUser>,
 }
 
 // ---------------------------------------------------------------------------
@@ -465,6 +532,7 @@ fn run_worker_loop(
         while let Ok(req) = request_rx.try_recv() {
             let prompt_token_count = req.prompt_tokens.len();
             let thinking = req.thinking.unwrap_or(false);
+            let user = req.user;
             let seq_id = engine.add_request(
                 req.prompt_tokens,
                 req.max_tokens,
@@ -485,6 +553,7 @@ fn run_worker_loop(
                     first_token_at: None,
                     thinking,
                     inject_marker: None,
+                    user,
                 },
             );
         }
@@ -495,6 +564,7 @@ fn run_worker_loop(
                 Ok(req) => {
                     let prompt_token_count = req.prompt_tokens.len();
                     let thinking = req.thinking.unwrap_or(false);
+                    let user = req.user;
                     let seq_id = engine.add_request(
                         req.prompt_tokens,
                         req.max_tokens,
@@ -515,6 +585,7 @@ fn run_worker_loop(
                             first_token_at: None,
                             thinking,
                             inject_marker: None,
+                            user,
                         },
                     );
                 }
@@ -639,9 +710,14 @@ fn run_worker_loop(
                 } else {
                     String::new()
                 };
+                // Include user identity in the log line when auth is enabled.
+                let user_label = ctx.user.as_ref().map(|u| {
+                    format!("  {}  |", u.name.as_deref().unwrap_or(&u.sub))
+                }).unwrap_or_default();
                 eprintln!(
-                    "  seq {:>3}  |  {} prompt{} + {} gen  |  TTFT {:.0} ms  |  {:.1} tok/s  |  {:.2}s  |  {}",
+                    "  seq {:>3}  |{} {} prompt{} + {} gen  |  TTFT {:.0} ms  |  {:.1} tok/s  |  {:.2}s  |  {}",
                     finished.id,
+                    user_label,
                     ctx.prompt_token_count,
                     cache_label,
                     ctx.generated_count,

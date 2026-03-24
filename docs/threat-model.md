@@ -1,10 +1,11 @@
 # Threat Model
 
 STRIDE analysis of rLLM as a deployment component.  rLLM is an inference
-engine — it turns prompts into completions on a GPU.  It deliberately excludes
-auth, billing, rate limiting, and encryption, pushing those to infrastructure
-and an API gateway.  This document explains what rLLM protects against, what
-it leaves to the deployment environment, and why.
+engine — it turns prompts into completions on a GPU.  It pushes billing, rate
+limiting, and authorization to infrastructure and an API gateway, but provides
+optional pluggable authentication via an auth hook system (`--auth-config`).
+This document explains what rLLM protects against, what it leaves to the
+deployment environment, and why.
 
 **Primary assets:**
 - **Model weights** — proprietary or licensed, stored on local NVMe
@@ -23,26 +24,70 @@ for the reference deployment architecture.
 
 | Threat | Who is spoofed | rLLM's stance |
 |--------|---------------|---------------|
-| Unauthenticated requests reach the inference server | The server treats any TCP connection as a legitimate caller | **rLLM does not authenticate requests.** |
-| Attacker impersonates the gateway | The server cannot distinguish gateway traffic from other traffic | **rLLM has no caller identity checks.** |
+| Unauthenticated requests reach the inference server | The server treats any TCP connection as a legitimate caller | **Optional: auth hook validates JWT tokens when configured.** Disabled by default. |
+| Attacker impersonates the gateway | The server cannot distinguish gateway traffic from other traffic | **Optional: OIDC auth validates token signatures against the issuer's published keys.** |
 
-**Why rLLM has no auth.**  Authentication belongs in the gateway, not the
-inference engine.  The gateway validates API keys, mints short-lived inference
-tokens, and enforces access policies.  rLLM should never be reachable from the
-internet — it binds to `127.0.0.1` by default and relies on network isolation
-to restrict access to the gateway alone.
+**Two deployment modes for authentication:**
+
+1. **Solo / dev (default)** — no auth.  rLLM binds to `127.0.0.1` and relies
+   on network isolation (localhost, SSH tunnel to a rented GPU, trusted LAN).
+   This is the right choice when you are the only user and don't want to
+   configure an OAuth2 provider just to have auth.
+
+2. **Gateway + rLLM auth (defense-in-depth)** — the gateway authenticates the
+   end user, does token exchange, and mints a scoped JWT for rLLM.  rLLM
+   validates the JWT via its auth hook (`--auth-config auth.json`), enforcing
+   identity end-to-end.  Even if the network boundary is breached,
+   unauthenticated requests are rejected before reaching the inference engine.
+   The gateway handles authorization (rate limits, model access, token budgets);
+   rLLM handles identity verification.
+
+**Auth hook system.**  rLLM provides a pluggable `AuthProvider` trait with
+three hooks:
+
+- **Init** — called once at startup with the provider-specific config from
+  `auth.json`.  This is where the provider fetches JWKs, loads keys, and sets
+  up caching.
+- **Request** — called on every HTTP request.  Receives the raw headers,
+  returns `Allow(User)` or `Deny(Reason, StatusCode)`.
+- **Background** — optional long-running task for maintenance work (JWKS
+  rotation, cache refresh).  Spawned after init, runs for the server's lifetime.
+
+The built-in OIDC provider fetches the issuer's `/.well-known/openid-configuration`,
+caches the JWKS, and validates Bearer tokens on each request.  Custom providers
+can be added by implementing the trait and adding a variant to `AuthProviderKind`.
+
+**What OIDC auth does NOT provide:**
+- Authorization — all authenticated users have equal access
+- Rate limiting or token budgets — still a gateway concern
+- Audit logging of prompt content — only caller identity is logged to stderr
 
 **What the deployment must provide:**
 - Network isolation — inference servers on a private network, only the gateway
   can reach the inference port
-- API gateway — authenticates callers, enforces rate limits, routes to backends
-- Short-lived inference tokens (optional defense-in-depth) — the gateway mints
-  a scoped token per request; the inference server validates it before running
-  a forward pass.  rLLM does not implement this today
+- API gateway — enforces rate limits, routes to backends, optionally does token
+  exchange to mint scoped JWTs for rLLM
+- Authorization policy — model access, token budgets, per-customer limits
 
-**If you expose rLLM to the internet without a gateway, anyone can use it.**
+**Auth without TLS.**  When auth is enabled but TLS is disabled
+(`--auth-config` + `--dangerous-no-tls`), rLLM prints a startup warning.
+Bearer tokens, prompts, and completions are sent in plaintext.  An attacker
+with network access (man-in-the-middle) can:
+
+- **Intercept tokens** — steal a valid JWT and impersonate the user
+- **Read prompts and completions** — observe all inference traffic
+- **Modify requests and responses** — alter prompts before they reach the
+  server or tamper with completions before the client sees them
+
+This is safe when rLLM is accessed over localhost or an SSH tunnel (the
+transport is already encrypted), but dangerous on any network an attacker can
+observe.  If binding to a non-localhost address with auth enabled, always
+enable TLS (`--cert`/`--private-key` or `--letsencrypt`).
+
+**If you expose rLLM to the internet without a gateway or auth, anyone can use it.**
 The `--host 0.0.0.0` flag exists for convenience on trusted networks (rented
-GPU boxes, local dev), not for production.
+GPU boxes, local dev), not for production.  Enable `--auth-config` if binding
+to a non-localhost address.
 
 ---
 
@@ -52,7 +97,7 @@ GPU boxes, local dev), not for production.
 |--------|-----------------|---------------|
 | Modified weight files on disk | Model produces wrong or poisoned outputs | **rLLM does not verify weight integrity.** |
 | Modified config/tokenizer files | Broken tokenization, wrong model behaviour | **No integrity checks.** |
-| Man-in-the-middle on the inference API | Prompts or completions altered in transit | **TLS supported but optional.** |
+| Man-in-the-middle on the inference API | Prompts or completions altered in transit | **TLS supported but optional.** Auth tokens also exposed without TLS. |
 | Tampered safetensors index | Wrong shard loaded, potential crash | **Index trusted as-is.** |
 
 **Weight integrity.**  rLLM loads weights from local safetensors files via
@@ -89,23 +134,23 @@ link crosses an untrusted boundary, enable TLS.
 
 | Threat | What is denied | rLLM's stance |
 |--------|---------------|---------------|
-| No record of who sent a request | Cannot attribute inference to a customer | **rLLM does not log request identity.** |
+| No record of who sent a request | Cannot attribute inference to a customer | **When auth is enabled, caller identity is logged to stderr per-request.** Without auth, no identity is logged. |
 | No record of what was generated | Cannot investigate harmful outputs | **rLLM does not log prompts or completions.** |
 
 **Logging.**  rLLM logs operational metrics to stderr: model loading progress,
-per-request token counts, latency, and throughput.  It does **not** log prompt
-content, generated text, or caller identity.  There is no audit trail at the
-inference layer.
+per-request token counts, latency, and throughput.  When auth is enabled
+(`--auth-config`), the authenticated user identity is included inline in the
+per-request log line alongside token counts and latency.  rLLM does **not**
+log prompt content or generated text.
 
 **Why rLLM doesn't log prompts.**  Prompt and completion logging is a policy
 decision with privacy and compliance implications.  The inference engine
 shouldn't decide what to retain — that belongs in the gateway and audit
-infrastructure.  rLLM reports token counts and timing; the gateway correlates
-these with customer identity and stores audit records.
+infrastructure.  rLLM reports token counts, timing, and (when auth is enabled)
+caller identity; the gateway stores full audit records.
 
 **What the deployment must provide:**
-- Gateway-side audit logging — customer identity, model, token counts, latency,
-  timestamps
+- Gateway-side audit logging — request details, billing
 - Inference-side event forwarding — rLLM's stderr metrics shipped to a log
   aggregator for cross-referencing with gateway logs
 - Log retention policy — how long to keep, what to redact, compliance
@@ -233,22 +278,23 @@ access to anything beyond its own scratch space.
 
 | Concern | rLLM | Deployment / Gateway |
 |---------|------|---------------------|
-| Authentication | None — binds to localhost by default | API gateway authenticates all callers |
-| Authorisation | None | Gateway enforces model access, rate limits, token budgets |
+| Authentication | Optional auth hook via `--auth-config` (OIDC JWT validation); disabled by default, binds to localhost | Gateway authenticates callers, optionally mints scoped JWTs for rLLM |
+| Authorisation | None — all authenticated users have equal access | Gateway enforces model access, rate limits, token budgets |
 | Encryption in transit | TLS supported (optional) | Gateway terminates client TLS; internal TLS if needed |
 | Encryption at rest | None (application layer) | Full-disk encryption, registry-level encryption |
 | Weight integrity | Trusts local filesystem | Checksums at clone time, immutable deploys, no standing SSH |
-| Audit logging | Metrics to stderr (token counts, latency) | Gateway logs customer identity, request details, billing |
+| Audit logging | Per-user metrics to stderr when auth is enabled (identity, token counts, latency) | Gateway logs request details, billing |
 | Rate limiting | None | Gateway enforces per-customer limits |
 | Input validation | Image pixel bounds from model config | Gateway enforces prompt length, max_tokens caps |
-| Network isolation | Makes no outbound connections | Private network, no internet, JIT registry access |
+| Network isolation | OIDC provider makes outbound HTTPS to issuer's JWKS endpoint (at startup + periodic refresh); no other outbound connections | Private network, no internet, JIT registry access |
 | Prompt/completion privacy | Does not log content | Gateway controls retention policy |
 
 **The design principle:** rLLM is a compute engine.  It should be fast, correct,
-and small-surface-area.  Every security concern that can be handled outside the
-inference hot path — auth, encryption, logging, rate limiting — is pushed to
-infrastructure.  This keeps the inference binary simple and avoids coupling it
-to any specific deployment environment.
+and small-surface-area.  Most security concerns are pushed to infrastructure.
+Authentication is the exception — optional, pluggable auth hooks let rLLM
+validate identity end-to-end without coupling it to a specific auth provider.
+The hook system is designed so an org's existing auth infrastructure can be
+integrated with minimal effort.
 
 ---
 
@@ -272,8 +318,10 @@ Things that network isolation and a gateway do not fully address:
 
 4. **Supply chain.**  Compromised dependencies (Rust crates, system libraries)
    could introduce backdoors.  Mitigated by `cargo audit`, pinned
-   dependencies, and reproducible builds.  rLLM's Cargo.toml has no outbound
-   HTTP client dependencies — the binary cannot phone home.
+   dependencies, and reproducible builds.  Note: the OIDC auth provider adds
+   `reqwest` (HTTP client) and `jsonwebtoken` to the dependency tree.  When
+   auth is disabled (default), these crates are compiled but never invoked —
+   the binary makes no outbound connections.
 
 5. **Error message leakage.**  Inference errors are returned to the client
    unsanitised.  Could expose internal tensor shapes, layer names, or memory
@@ -281,6 +329,7 @@ Things that network isolation and a gateway do not fully address:
 
 ---
 
-See also: [Production Considerations](production-considerations.md) ·
+See also: [Authentication](authentication.md) ·
+[Production Considerations](production-considerations.md) ·
 [KV Cache](kv-cache.md) · [Expert Streaming](expert-streaming.md) ·
 [Prompt Caching](prompt-caching.md)

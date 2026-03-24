@@ -61,6 +61,12 @@ pub(crate) struct ServeArgs {
     /// Tensor parallelism: number of GPUs (0 = auto-detect all available).
     #[arg(long, default_value = "0")]
     pub tp: usize,
+
+    /// Path to auth config file (JSON).  Enables pluggable authentication.
+    /// When omitted, no auth is applied (all requests allowed).
+    /// See docs/threat-model.md for config format and deployment guidance.
+    #[arg(long)]
+    pub auth_config: Option<PathBuf>,
 }
 
 pub(crate) fn exec(args: ServeArgs) -> anyhow::Result<()> {

@@ -44,7 +44,9 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
+use axum::Extension;
 
+use super::auth::AuthUser;
 use super::{InferenceEvent, ServerState, StopReason, WorkerRequest};
 use crate::model::chat::Message;
 use crate::model::thinking;
@@ -221,6 +223,7 @@ fn inject_tools(
 /// Handle OpenAI chat completion requests (streaming and non-streaming).
 pub(crate) async fn chat_completions(
     State(state): State<Arc<ServerState>>,
+    user: Option<Extension<AuthUser>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, StatusCode> {
     let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
@@ -260,6 +263,7 @@ pub(crate) async fn chat_completions(
         response_tx,
         thinking: thinking_requested,
         images,
+        user: user.map(|Extension(u)| u),
     };
 
     state.request_tx.try_send(worker_req).map_err(|e| match e {
@@ -442,6 +446,7 @@ async fn chat_completions_stream(
 /// apply a chat template — suitable for base models or custom prompting.
 pub(crate) async fn completions(
     State(state): State<Arc<ServerState>>,
+    user: Option<Extension<AuthUser>>,
     Json(req): Json<CompletionRequest>,
 ) -> Result<Response, StatusCode> {
     // Tokenize raw prompt (no chat template) on the async handler thread.
@@ -460,6 +465,7 @@ pub(crate) async fn completions(
         response_tx,
         thinking: None,
         images: Vec::new(), // Text completions don't support images.
+        user: user.map(|Extension(u)| u),
     };
 
     state.request_tx.try_send(worker_req).map_err(|e| match e {
