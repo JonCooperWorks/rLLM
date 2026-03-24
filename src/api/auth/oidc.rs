@@ -510,7 +510,7 @@ impl OidcProvider {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use jsonwebtoken::{EncodingKey, Header};
 
@@ -553,6 +553,10 @@ jEbiqV8OJp7dP2SZJvhLidY=
     const TEST_RSA_E: &str = "AQAB";
 
     /// Build test RSA keys: (encoding_key for signing, jwk_set for verifying, kid).
+    pub(crate) fn test_rsa_keys_pub() -> (EncodingKey, JwkSet, String) {
+        test_rsa_keys()
+    }
+
     fn test_rsa_keys() -> (EncodingKey, JwkSet, String) {
         use jsonwebtoken::jwk::{
             CommonParameters, Jwk, KeyAlgorithm, RSAKeyParameters, RSAKeyType,

@@ -29,7 +29,7 @@
 //
 // Deployment modes:
 //   1. Solo/dev (default) — no auth, localhost or SSH tunnel, single user.
-//      AuthProviderKind::None, all requests get Allow("anonymous").
+//      AuthProviderKind::None, middleware is a no-op, no AuthUser in extensions.
 //
 //   2. Gateway + rLLM auth (defense-in-depth) — gateway authenticates the
 //      end user, does token exchange, mints a scoped JWT.  rLLM validates
@@ -175,7 +175,8 @@ pub(crate) trait AuthProvider: Send + Sync + 'static {
 // ---------------------------------------------------------------------------
 
 pub(crate) enum AuthProviderKind {
-    /// No auth — all requests allowed.  Default when --auth-config is omitted.
+    /// No auth — auth middleware is a no-op, requests pass through without
+    /// an AuthUser.  Default when --auth-config is omitted.
     None,
     /// OIDC JWT validation.  Wrapped in Arc because the background task
     /// (JWKS refresh) and the request path share the same provider instance.
@@ -183,13 +184,11 @@ pub(crate) enum AuthProviderKind {
 }
 
 impl AuthProviderKind {
-    /// Authenticate a request.  Delegates to the active provider.
+    /// Authenticate a request.  Only called when auth is configured —
+    /// the middleware skips this entirely for AuthProviderKind::None.
     pub(crate) async fn authenticate(&self, headers: &HeaderMap) -> AuthDecision {
         match self {
-            Self::None => AuthDecision::Allow(AuthUser {
-                sub: "anonymous".into(),
-                name: None,
-            }),
+            Self::None => unreachable!("authenticate() should not be called when auth is disabled"),
             Self::Oidc(provider) => provider.authenticate(headers).await,
         }
     }
@@ -202,6 +201,11 @@ impl AuthProviderKind {
                 tokio::spawn(Arc::clone(provider).background());
             }
         }
+    }
+
+    /// Whether auth is enabled.
+    pub(crate) fn is_enabled(&self) -> bool {
+        !matches!(self, Self::None)
     }
 }
 
@@ -227,9 +231,8 @@ pub(crate) async fn auth_middleware(
     mut request: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> Response {
-    // Health check is always unauthenticated — load balancers and monitoring
-    // systems need to probe it without credentials.
-    if request.uri().path() == "/health" {
+    // Skip auth entirely when disabled or for health checks.
+    if !state.auth.is_enabled() || request.uri().path() == "/health" {
         return next.run(request).await;
     }
 
@@ -263,29 +266,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_no_auth_allows_all() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+    fn test_no_auth_is_not_enabled() {
         let provider = AuthProviderKind::None;
-        let headers = HeaderMap::new();
-        let decision = rt.block_on(provider.authenticate(&headers));
-        match decision {
-            AuthDecision::Allow(user) => assert_eq!(user.sub, "anonymous"),
-            AuthDecision::Deny { .. } => panic!("expected Allow"),
-        }
+        assert!(!provider.is_enabled());
     }
 
     #[test]
-    fn test_no_auth_empty_headers() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let provider = AuthProviderKind::None;
-        let decision = rt.block_on(provider.authenticate(&HeaderMap::new()));
-        match decision {
-            AuthDecision::Allow(user) => {
-                assert_eq!(user.sub, "anonymous");
-                assert!(user.name.is_none());
-            }
-            AuthDecision::Deny { .. } => panic!("expected Allow"),
-        }
+    fn test_oidc_is_enabled() {
+        let (_, jwks, _) = super::oidc::tests::test_rsa_keys_pub();
+        let provider = AuthProviderKind::Oidc(Arc::new(
+            super::oidc::OidcProvider::new_for_test(
+                jwks,
+                "https://issuer.example.com".into(),
+                "test-audience".into(),
+            ),
+        ));
+        assert!(provider.is_enabled());
     }
 
     #[test]

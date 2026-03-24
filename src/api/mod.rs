@@ -350,7 +350,7 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // Warn if auth is enabled but TLS is not — tokens, prompts, and
     // completions are sent in plaintext and can be intercepted or modified
     // by an attacker with network access (man-in-the-middle).
-    if !matches!(auth_provider, auth::AuthProviderKind::None)
+    if auth_provider.is_enabled()
         && matches!(tls_mode, tls::TlsMode::None)
     {
         eprintln!();
