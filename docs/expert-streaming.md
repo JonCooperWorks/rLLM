@@ -33,38 +33,34 @@ Streaming:    64 LRU cache slots on GPU    → ~384 MB VRAM (Q4)
 
 ### Architecture Overview
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                       Model Loading                              │
-│                                                                  │
-│  1. Non-expert weights (attention, norms, embeddings, router     │
-│     gates, shared experts) → uploaded to GPU normally            │
-│                                                                  │
-│  2. Expert weights → NOT uploaded.  Safetensors headers parsed   │
-│     to record file offsets in ExpertIndex:                       │
-│       layers[L][E] → (shard_file, gate_offset, up_offset,       │
-│                        down_offset, byte_sizes)                  │
-│                                                                  │
-│  3. LRU cache allocated: 64 GPU buffer slots (configurable),    │
-│     each holding one expert's gate/up/down projections.          │
-│     CPU staging buffers allocated per active slot (pinned on     │
-│     CUDA, heap on Metal).                                        │
-└──────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph LOAD["Model Loading"]
+        L1["1. Non-expert weights<br/>(attention, norms, embeddings, router gates, shared experts)<br/>→ uploaded to GPU normally"]
+        L2["2. Expert weights → NOT uploaded<br/>Safetensors headers parsed → ExpertIndex<br/>layers[L][E] → (shard_file, offsets, byte_sizes)"]
+        L3["3. LRU cache allocated: 64 GPU buffer slots<br/>+ CPU staging buffers (pinned on CUDA, heap on Metal)"]
+        L1 --> L2 --> L3
+    end
 
-┌──────────────────────────────────────────────────────────────────┐
-│                   Per-Layer MoE Dispatch                          │
-│                                                                  │
-│  1. Router matmul → per-expert scores              [GPU]         │
-│  2. Top-K softmax → select K experts               [GPU]         │
-│  3. Copy routing indices to CPU                    [sync]        │
-│  4. LRU cache lookup for each selected expert:                   │
-│     ├─ HIT:  update timestamp, reuse GPU slot      [free]        │
-│     └─ MISS: evict LRU slot, pread from SSD        [I/O]         │
-│  5. Parallel pread + GPU upload for misses only    [I/O+DMA]     │
-│  6. Fused gate+up+SwiGLU per expert                [GPU]         │
-│  7. Down projection per expert                     [GPU]         │
-│  8. Weighted sum → residual add                    [GPU]         │
-└──────────────────────────────────────────────────────────────────┘
+    subgraph DISPATCH["Per-Layer MoE Dispatch"]
+        D1["1. Router matmul → per-expert scores [GPU]"]
+        D2["2. Top-K softmax → select K experts [GPU]"]
+        D3["3. Copy routing indices to CPU [sync]"]
+        D4{"4. LRU cache lookup"}
+        HIT["HIT: reuse GPU slot [free]"]
+        MISS["MISS: evict LRU, pread from SSD [I/O]"]
+        D5["5. Parallel pread + GPU upload [I/O+DMA]"]
+        D6["6. Fused gate+up+SwiGLU [GPU]"]
+        D7["7. Down projection [GPU]"]
+        D8["8. Weighted sum → residual add [GPU]"]
+
+        D1 --> D2 --> D3 --> D4
+        D4 --> HIT --> D6
+        D4 --> MISS --> D5 --> D6
+        D6 --> D7 --> D8
+    end
+
+    LOAD --> DISPATCH
 ```
 
 ### LRU Cache

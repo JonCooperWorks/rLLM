@@ -15,31 +15,23 @@ with synchronous GPU inference.
 
 ## Architecture
 
-```
-                    ┌─────────────────────────────────┐
-                    │   Tokio Async Runtime            │
-                    │                                  │
-  HTTP request ───► │  Axum handler                    │
-                    │    ├─ parse request               │
-                    │    ├─ tokenize prompt (CPU)       │
-                    │    ├─ send WorkerRequest ──────┐  │
-                    │    └─ await InferenceEvents ◄──┼──┼─────┐
-                    │                               │  │     │
-                    └───────────────────────────────┼──┘     │
-                                                    │        │
-                    ┌───────────────────────────────┼────────┼┐
-                    │   Worker Thread               │        ││
-                    │                               ▼        ││
-                    │   recv_channel ◄── WorkerRequest       ││
-                    │        │                               ││
-                    │        ▼                               ││
-                    │   run_worker_loop()                    ││
-                    │     ├─ try_recv() all pending requests ││
-                    │     ├─ engine.add_request() for each   ││
-                    │     ├─ engine.step()                   ││
-                    │     └─ send InferenceEvents ───────────┘│
-                    │                                         │
-                    └─────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    HTTP["HTTP request"]
+
+    subgraph TOKIO["Tokio Async Runtime"]
+        HANDLER["Axum handler<br/>parse request<br/>tokenize prompt (CPU)"]
+    end
+
+    subgraph WORKER["Worker Thread"]
+        RECV["recv_channel"]
+        LOOP["run_worker_loop()<br/>try_recv() all pending requests<br/>engine.add_request() for each<br/>engine.step()"]
+        RECV --> LOOP
+    end
+
+    HTTP --> HANDLER
+    HANDLER -->|"WorkerRequest"| RECV
+    LOOP -->|"InferenceEvents"| HANDLER
 ```
 
 ### Why a dedicated worker thread?

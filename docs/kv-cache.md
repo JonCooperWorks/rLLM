@@ -29,36 +29,29 @@ to virtual memory page tables.
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  KvPool<B>  (shared across all sequences)                       │
-│                                                                 │
-│  k_pool: Vec<Tensor>      ─── one tensor per layer              │
-│    shape: [num_blocks * BLOCK_SIZE, kv_dim]                     │
-│                                                                 │
-│  v_pool: Vec<Tensor>      ─── one tensor per layer              │
-│    shape: [num_blocks * BLOCK_SIZE, kv_dim]                     │
-│                                                                 │
-│  free_blocks: Vec<u32>    ─── LIFO stack of available blocks    │
-│  generations: Vec<u32>    ─── per-slot generation counter       │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+classDiagram
+    class KvPool~B~ {
+        k_pool: Vec﹤Tensor﹥  (one per layer, [num_blocks * BLOCK_SIZE, kv_dim])
+        v_pool: Vec﹤Tensor﹥  (one per layer, [num_blocks * BLOCK_SIZE, kv_dim])
+        free_blocks: Vec﹤u32﹥  (LIFO stack)
+        generations: Vec﹤u32﹥  (per-slot counter)
+    }
+    class BlockHandle {
+        index: u32  (physical block index)
+        generation: u32  (must match pool's generation)
+    }
+    class SeqKvState~B~ {
+        block_table_cpu: Vec﹤BlockHandle﹥  (logical → physical)
+        block_table_gpu: Tensor  (GPU copy, raw u32)
+        seq_len: usize
+        dirty: bool
+        shared_prefix_blocks: usize
+    }
 
-┌─────────────────────────────────────────────────────────────────┐
-│  BlockHandle  (replaces raw u32 block indices)                  │
-│                                                                 │
-│  index: u32       ─── physical block index (GPU kernel uses)    │
-│  generation: u32  ─── must match pool's generation for slot     │
-└─────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────┐
-│  SeqKvState<B>  (per sequence)                                  │
-│                                                                 │
-│  block_table_cpu: Vec<BlockHandle> ─── logical → physical map   │
-│  block_table_gpu: Tensor           ─── GPU copy (raw u32 only)  │
-│  seq_len: usize                    ─── current sequence length  │
-│  dirty: bool                       ─── needs GPU re-sync?       │
-│  shared_prefix_blocks: usize       ─── prefix cache block count │
-└─────────────────────────────────────────────────────────────────┘
+    KvPool --> BlockHandle : allocates
+    SeqKvState --> BlockHandle : holds in block_table_cpu
+    SeqKvState --> KvPool : borrows blocks from
 ```
 
 ### Constants
@@ -84,16 +77,13 @@ For a 32-layer model with 1024 kv_dim and 2048 blocks:
 
 ## Block Lifecycle
 
-```
-                    allocate_blocks()
- free_blocks ─────────────────────────► sequence block_table
- (LIFO stack)                           (logical → physical)
-                                              │
-                                              │  sequence completes
-                                              │
-                    free_blocks() ◄────────────┘
- free_blocks ◄──────────────────
- (returned to pool)
+```mermaid
+flowchart LR
+    FREE["free_blocks<br/>(LIFO stack)"]
+    BT["sequence block_table<br/>(logical → physical)"]
+
+    FREE -->|"allocate_blocks()"| BT
+    BT -->|"sequence completes<br/>free_blocks()"| FREE
 ```
 
 ### Allocation

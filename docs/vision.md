@@ -25,33 +25,20 @@ Both Qwen 3.5 VL and Gemma 3 use a SigLIP-based Vision Transformer (ViT) with
 
 ### Pipeline
 
-```
-Image [3, H, W]
-  |
-  | CPU: decode, resize, CLIP-normalise,
-  |      patchify into [N, 768] (rayon-parallel by patch row)
-  v
-Patches [N, 768]                  (768 = 3 channels x 16^2 pixels per patch)
-  |
-  | GPU: patch_embed matmul + positional embedding add
-  v
-Patch embeddings [N, 1152]
-  |
-  | GPU: 27x ViT blocks:
-  |        LayerNorm -> fused QKV matmul [N,1152]->[N,3456]
-  |        -> bidirectional attention (fused QKV kernel)
-  |        -> output projection -> residual
-  |        -> LayerNorm -> GELU FFN -> residual
-  v
-Vision features [N, 1152]
-  |
-  | GPU: fused spatial merge + LayerNorm (single kernel, Qwen only)
-  |      + MLP projector [4608] -> GELU -> [5120]
-  v
-Vision tokens [M, 5120]           (M = N/4 after 2x2 merge)
-  |
-  | GPU: scatter into text embedding buffer at <|image_pad|> position
-  v
+```mermaid
+flowchart TD
+    IMG["Image [3, H, W]"]
+    PATCH["Patches [N, 768]<br/>(768 = 3 channels × 16² pixels per patch)"]
+    EMBED["Patch embeddings [N, 1152]"]
+    VIT["Vision features [N, 1152]"]
+    TOKENS["Vision tokens [M, 5120]<br/>(M = N/4 after 2×2 merge)"]
+    SCATTER["Scattered into text embedding buffer"]
+
+    IMG -->|"CPU: decode, resize, CLIP-normalise,<br/>patchify (rayon-parallel)"| PATCH
+    PATCH -->|"GPU: patch_embed matmul<br/>+ positional embedding add"| EMBED
+    EMBED -->|"GPU: 27× ViT blocks<br/>LayerNorm → fused QKV → bidir attention<br/>→ output proj → GELU FFN"| VIT
+    VIT -->|"GPU: fused spatial merge + LayerNorm<br/>+ MLP projector [4608] → GELU → [5120]"| TOKENS
+    TOKENS -->|"GPU: scatter at ﹤❘image_pad❘﹥ position"| SCATTER
 ```
 
 ### ViT Block Detail

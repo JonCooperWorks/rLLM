@@ -8,40 +8,16 @@ to generated tokens, and how the major subsystems connect.
 
 ## High-Level Components
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  CLI / HTTP API                                                  │
-│  src/commands/{run,batch,serve}.rs    src/api/{mod,openai,…}.rs  │
-└──────────────────┬───────────────────────────────────────────────┘
-                   │  WorkerRequest (tokenized prompt)
-                   ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  Inference Engine                                                │
-│  src/engine/mod.rs        — step loop, scheduler, sequences      │
-│  src/engine/dispatch.rs   — Dispatch trait (single/multi-GPU)    │
-│  src/engine/multi_gpu.rs  — tensor-parallel multi-GPU engine     │
-└──────────────────┬───────────────────────────────────────────────┘
-                   │  forward_single_paged / forward_prefill_paged
-                   ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  Model Layer                                                     │
-│  src/model/mod.rs         — Model struct, arch dispatch          │
-│  src/model/config.rs      — ModelArch enum, ModelConfig          │
-│  src/model/loader.rs      — safetensors weight loading           │
-│  src/model/primitives.rs  — shared transformer building blocks   │
-│  src/model/registry/*.rs  — 9 model family forward passes        │
-│  src/model/kv_cache.rs    — paged KV cache (KvPool + SeqKvState) │
-└──────────────────┬───────────────────────────────────────────────┘
-                   │  trait method calls (B: GpuBackend)
-                   ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  GPU Backend                                                     │
-│  src/gpu/ops/*.rs         — 9 composable sub-traits              │
-│  src/gpu/mod.rs           — GpuBackend blanket supertrait        │
-│  src/gpu/metal/           — Metal backend (macOS)                │
-│  src/gpu/cuda/            — CUDA backend (Linux)                 │
-│  src/gpu/cpu/             — CPU reference backend (tests)        │
-└──────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    CLI["CLI / HTTP API<br/><code>src/commands/{run,batch,serve}.rs</code><br/><code>src/api/{mod,openai,…}.rs</code>"]
+    ENGINE["Inference Engine<br/><code>src/engine/mod.rs</code> — step loop, scheduler, sequences<br/><code>src/engine/dispatch.rs</code> — Dispatch trait (single/multi-GPU)<br/><code>src/engine/multi_gpu.rs</code> — tensor-parallel multi-GPU engine"]
+    MODEL["Model Layer<br/><code>src/model/mod.rs</code> — Model struct, arch dispatch<br/><code>src/model/config.rs</code> — ModelArch enum, ModelConfig<br/><code>src/model/loader.rs</code> — safetensors weight loading<br/><code>src/model/primitives.rs</code> — shared transformer building blocks<br/><code>src/model/registry/*.rs</code> — 9 model family forward passes<br/><code>src/model/kv_cache.rs</code> — paged KV cache"]
+    GPU["GPU Backend<br/><code>src/gpu/ops/*.rs</code> — 9 composable sub-traits<br/><code>src/gpu/mod.rs</code> — GpuBackend blanket supertrait<br/><code>src/gpu/metal/</code> — Metal backend (macOS)<br/><code>src/gpu/cuda/</code> — CUDA backend (Linux)<br/><code>src/gpu/cpu/</code> — CPU reference backend (tests)"]
+
+    CLI -->|"WorkerRequest (tokenized prompt)"| ENGINE
+    ENGINE -->|"forward_single_paged / forward_prefill_paged"| MODEL
+    MODEL -->|"trait method calls (B: GpuBackend)"| GPU
 ```
 
 ---
@@ -66,24 +42,15 @@ thread that owns the engine.
 
 Every entry point drives the same `run_step()` function:
 
-```
-run_step(dispatch, scheduler, tokenizer)
-│
-├─ 1. schedule()        — admit waiting → active (FCFS, check KV blocks)
-│
-├─ 2. Prefill phase     — for each sequence with pending tokens:
-│     prepare_prefill()  │
-│     forward_prefill()  │  GEMM (mat-mat), compute-bound
-│     finish_prefill()   │
-│     sample()           │
-│
-├─ 3. Decode phase      — for each active sequence:
-│     prepare_decode()   │
-│     forward_decode()   │  mat-vec, bandwidth-bound
-│     finish_decode()    │
-│     sample()           │
-│
-└─ 4. collect_finished() — free KV blocks, return completed sequences
+```mermaid
+flowchart TD
+    STEP["run_step(dispatch, scheduler, tokenizer)"]
+    ADMIT["1. schedule()<br/>admit waiting → active (FCFS, check KV blocks)"]
+    PREFILL["2. Prefill phase<br/>for each sequence with pending tokens:<br/>prepare_prefill → forward_prefill (GEMM) → finish_prefill → sample"]
+    DECODE["3. Decode phase<br/>for each active sequence:<br/>prepare_decode → forward_decode (mat-vec) → finish_decode → sample"]
+    COLLECT["4. collect_finished()<br/>free KV blocks, return completed sequences"]
+
+    STEP --> ADMIT --> PREFILL --> DECODE --> COLLECT
 ```
 
 The `Dispatch` trait abstracts over single-GPU vs multi-GPU topologies.  Both

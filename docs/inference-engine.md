@@ -40,32 +40,15 @@ selects based on the `--tp` flag and returns `Box<dyn InferenceEngine>`.
 Each call to `step()` executes one iteration of the inference loop via
 `run_step()`, which is generic over `D: Dispatch`:
 
-```
-run_step(dispatch, scheduler, tokenizer)
-│
-├─ 1. ADMIT
-│     scheduler.schedule(free_blocks)
-│     Moves requests from waiting queue → active set
-│     Gated by KV block availability (FCFS policy)
-│
-├─ 2. PREFILL (new sequences with pending tokens)
-│     for each sequence with non-empty pending_prefill:
-│       dispatch.prepare_prefill(state, token_count)
-│       dispatch.forward_prefill(tokens, state)   ← GEMM (mat-mat)
-│       dispatch.finish_prefill(state, count)
-│       sample(logits, temperature, top_p)
-│
-├─ 3. DECODE (active sequences generating tokens)
-│     for each sequence with empty pending_prefill:
-│       dispatch.prepare_decode(state)
-│       dispatch.forward_decode(token, state)      ← mat-vec
-│       dispatch.finish_decode(state)
-│       sample(logits, temperature, top_p)
-│
-└─ 4. COLLECT
-      scheduler.collect_finished()
-      Free KV blocks for completed sequences
-      Return StepOutput { tokens, finished }
+```mermaid
+flowchart TD
+    STEP["run_step(dispatch, scheduler, tokenizer)"]
+    ADMIT["1. ADMIT<br/>scheduler.schedule(free_blocks)<br/>waiting queue → active set<br/>gated by KV block availability (FCFS)"]
+    PREFILL["2. PREFILL<br/>for each sequence with pending tokens:<br/>prepare_prefill → forward_prefill (GEMM)<br/>→ finish_prefill → sample"]
+    DECODE["3. DECODE<br/>for each active sequence:<br/>prepare_decode → forward_decode (mat-vec)<br/>→ finish_decode → sample"]
+    COLLECT["4. COLLECT<br/>scheduler.collect_finished()<br/>free KV blocks, return StepOutput"]
+
+    STEP --> ADMIT --> PREFILL --> DECODE --> COLLECT
 ```
 
 ### Why separate prefill and decode?
@@ -124,23 +107,15 @@ pub(crate) trait Dispatch {
 
 The scheduler manages the lifecycle of inference sequences:
 
-```
-                     add_request()
-                          │
-                          ▼
-                    ┌───────────┐
-                    │  WAITING   │  VecDeque (FCFS order)
-                    └─────┬─────┘
-                          │ schedule() — check free KV blocks
-                          ▼
-                    ┌───────────┐
-                    │  ACTIVE    │  HashMap<SeqId, Sequence>
-                    └─────┬─────┘
-                          │ collect_finished() — max tokens or EOS
-                          ▼
-                    ┌───────────┐
-                    │  FINISHED  │  returned in StepOutput
-                    └───────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> WAITING : add_request()
+    WAITING --> ACTIVE : schedule() — check free KV blocks
+    ACTIVE --> FINISHED : collect_finished() — max tokens or EOS
+
+    note right of WAITING : VecDeque (FCFS order)
+    note right of ACTIVE : HashMap﹤SeqId, Sequence﹥
+    note right of FINISHED : returned in StepOutput
 ```
 
 ### Admission Policy

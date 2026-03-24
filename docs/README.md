@@ -18,4 +18,3 @@ big picture, then drill into subsystem docs as needed.
 | [Vision](vision.md) | SigLIP ViT encoder for vision-language models — image preprocessing, patch embedding, spatial merge, and LLM token scatter |
 | [Prompt Caching](prompt-caching.md) | Reuse prefill KV cache across requests that share a common prefix — system prompt caching, hash-based matching |
 | [Production Considerations](production-considerations.md) | Learning notes on how LLM inference might work at scale — gateway architecture, batching, hardware tiers, quantization as a product lever |
-| [Scripts](../scripts/README.md) | Quick-setup scripts for rented GPUs — Rust, HF CLI, Claude Code installers, model download tiers, benchmarking |

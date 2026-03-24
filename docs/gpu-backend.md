@@ -5,7 +5,7 @@ composable traits for GPU operations, with platform-specific implementations
 for Metal (macOS), CUDA (Linux), and CPU (testing).
 
 **Key files:**
-- `src/gpu/ops/*.rs` — trait definitions (9 files)
+- `src/gpu/ops/*.rs` — trait definitions (11 files)
 - `src/gpu/mod.rs` — `GpuBackend` blanket supertrait, `Backend` type alias, Q4 quantization
 - `src/gpu/metal/` — Metal backend
 - `src/gpu/cuda/` — CUDA backend
@@ -15,19 +15,33 @@ for Metal (macOS), CUDA (Linux), and CPU (testing).
 
 ## Trait Hierarchy
 
-The GPU interface is split into composable sub-traits rather than a single
+The GPU interface is split into 11 composable sub-traits rather than a single
 monolithic trait.  Each sub-trait maps to one kernel family:
 
-```
-GpuCore              — tensor lifecycle, device info, command buffer control
-├── GpuNorm          — RMS normalization (single + batched)
-├── GpuMatmul        — matrix-vector multiply + batched GEMM
-├── GpuRope          — rotary positional embeddings (standard, partial, YaRN)
-├── GpuAttention     — paged attention + KV cache write
-├── GpuElementwise   — activations (SiLU, GELU), arithmetic, MoE routing
-├── GpuEmbed         — embedding lookup (single + batched)
-├── GpuDeltaNet      — Qwen 3.5 linear attention kernels
-└── GpuAllReduce     — collective ops for tensor parallelism (sum, gather)
+```mermaid
+flowchart TD
+    CORE["GpuCore<br/>tensor lifecycle, device info, command buffer control"]
+    NORM["GpuNorm<br/>RMS normalization + LayerNorm"]
+    MATMUL["GpuMatmul<br/>matrix-vector multiply + batched GEMM"]
+    ROPE["GpuRope<br/>rotary positional embeddings"]
+    ATTN["GpuAttention<br/>paged attention + KV cache write"]
+    ELEM["GpuElementwise<br/>activations (SiLU, GELU), arithmetic, MoE routing"]
+    EMBED["GpuEmbed<br/>embedding lookup"]
+    MOE["GpuMoe<br/>fused MoE kernels"]
+    DELTA["GpuDeltaNet<br/>Qwen 3.5 linear attention"]
+    ALLREDUCE["GpuAllReduce<br/>collective ops for tensor parallelism"]
+    VISION["GpuVision<br/>spatial merge, token scatter"]
+
+    CORE --> NORM
+    CORE --> MATMUL
+    CORE --> ROPE
+    CORE --> ATTN
+    CORE --> ELEM
+    CORE --> EMBED
+    CORE --> MOE
+    CORE --> DELTA
+    CORE --> ALLREDUCE
+    CORE --> VISION
 ```
 
 All sub-traits extend `GpuCore` (which owns the associated `Tensor` type).
@@ -36,7 +50,8 @@ The `GpuBackend` supertrait is defined via a blanket impl:
 ```rust
 pub(crate) trait GpuBackend:
     GpuCore + GpuNorm + GpuMatmul + GpuRope + GpuAttention
-    + GpuElementwise + GpuEmbed + GpuDeltaNet + GpuAllReduce { }
+    + GpuElementwise + GpuEmbed + GpuDeltaNet + GpuAllReduce
+    + GpuMoe + GpuVision { }
 
 impl<T> GpuBackend for T
 where T: GpuCore + GpuNorm + GpuMatmul + ... { }
@@ -70,7 +85,10 @@ metal/
 │   ├── attention.rs
 │   ├── elementwise.rs
 │   ├── embed.rs
-│   └── deltanet.rs
+│   ├── moe.rs
+│   ├── deltanet.rs
+│   ├── allreduce.rs
+│   └── vision.rs
 └── shaders/       — .metal shader source files (embedded via include_str!)
 ```
 
@@ -162,10 +180,10 @@ rLLM supports 4-bit symmetric quantization.  Models are pre-quantized using
 | Property | Value |
 |----------|-------|
 | Block size | 32 weights |
-| Bytes per block | 20 (4-byte f32 scale + 16 bytes packed nibbles) |
+| Bytes per block | 18 (2-byte bf16 scale + 16 bytes packed nibbles) |
 | Scheme | Symmetric: `scale = max(abs(block)) / 7` |
 | Encoding | `q = clamp(round(w / scale), -8, 7)`, stored as `q + 8` (unsigned nibble) |
-| Memory reduction | ~3.2× vs BFloat16 |
+| Memory reduction | ~3.5× vs BFloat16 |
 
 The quantization is performed by `GpuCore::quantize_upload()` during weight
 loading.  The matmul kernels have dedicated Q4 pipelines that dequantize
@@ -182,7 +200,7 @@ on-the-fly during computation.
 5. Create `metal/kernels/new_family.rs` implementing the trait
 6. Add `mod new_family;` to `metal/kernels/mod.rs`
 7. Add the trait to the `GpuBackend` supertrait bound in `gpu/mod.rs`
-8. Add a stub impl in `gpu/cuda/mod.rs` and `gpu/cpu/mod.rs`
+8. Add a stub impl in `gpu/cuda/` and `gpu/cpu/`
 
 ---
 

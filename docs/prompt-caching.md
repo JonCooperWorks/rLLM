@@ -84,19 +84,17 @@ request with the same prefix pays only the suffix cost.
 
 ## Block Lifecycle with Caching
 
-```
-                                    ┌──────────────────┐
-                                    │   PrefixCache    │
-                                    │   (hash → entry) │
-                                    └──────┬───────────┘
-                                           │
-         ┌─────────────────────────────────┼─────────────────────┐
-         │                                 │                     │
-    insert (after prefill)           lookup (before prefill)   evict (LRU)
-         │                                 │                     │
-         ▼                                 ▼                     ▼
-  blocks held out of             block indices copied      blocks returned
-  free list, ref=1               to new seq, ref++         to free list
+```mermaid
+flowchart TD
+    CACHE["PrefixCache<br/>(hash → entry)"]
+
+    INSERT["insert (after prefill)<br/>blocks held out of free list, ref=1"]
+    LOOKUP["lookup (before prefill)<br/>block indices copied to new seq, ref++"]
+    EVICT["evict (LRU)<br/>blocks returned to free list"]
+
+    CACHE --> INSERT
+    CACHE --> LOOKUP
+    CACHE --> EVICT
 ```
 
 ### Sequence free (prefix-aware)

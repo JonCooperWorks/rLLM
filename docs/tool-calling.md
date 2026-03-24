@@ -8,29 +8,19 @@ with per-architecture prompt formatting and output parsing.
 
 ## End-to-End Flow
 
-```
-Client                    API handler              Engine / Model
-  │                          │                          │
-  │  POST with tools[]       │                          │
-  ├─────────────────────────►│                          │
-  │                          │  inject tool defs into   │
-  │                          │  system prompt            │
-  │                          │  (format_tool_system_prompt)
-  │                          ├─────────────────────────►│
-  │                          │                          │  generate text
-  │                          │                          │  with tool markers
-  │                          │◄─────────────────────────┤
-  │                          │  parse_tool_calls()       │
-  │                          │  extract ToolCall structs  │
-  │  response with           │                          │
-  │  tool_calls + stop_reason│                          │
-  │◄─────────────────────────┤                          │
-  │                          │                          │
-  │  send tool results       │                          │
-  │  (role: "tool")          │                          │
-  ├─────────────────────────►│  format result into       │
-  │                          │  chat template            │
-  │                          ├─────────────────────────►│
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API as API handler
+    participant Engine as Engine / Model
+
+    Client->>API: POST with tools[]
+    API->>Engine: inject tool defs into system prompt<br/>(format_tool_system_prompt)
+    Engine->>API: generate text with tool markers
+    Note over API: parse_tool_calls()<br/>extract ToolCall structs
+    API->>Client: response with tool_calls + stop_reason
+    Client->>API: send tool results (role: "tool")
+    API->>Engine: format result into chat template
 ```
 
 1. Client sends a request with `tools` (array of function definitions)
