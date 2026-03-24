@@ -1,8 +1,15 @@
 # LLM Inference Framework Comparison
 
 A comparison of rLLM against vLLM, Ollama, and llama.cpp across
-ease of understanding, features, and code quality. rLLM builds on ideas
-pioneered by these projects.
+ease of understanding, features, and code quality.
+
+**rLLM is an educational codebase.** It exists so its author can learn how LLM inference
+works from the inside, with Claude as a teaching partner walking through every design
+decision. The other frameworks here are production systems optimized for throughput,
+hardware coverage, or ease of use. rLLM is optimized for *clarity* — every file is
+annotated, every architectural choice is explained, and the codebase is small enough to
+read end-to-end. It builds on ideas pioneered by these projects and aims to make those
+ideas understandable.
 
 ---
 
@@ -15,6 +22,7 @@ pioneered by these projects.
 | **In-code docs** | Every file annotated with purpose, rationale, cross-references | Extensive official docs site, blog posts, RFCs | Minimal in-code, good user-facing docs | Community wiki, GitHub discussions |
 | **Architecture** | Composable GPU sub-traits, clear module separation | Multi-layer (scheduler, engine, executor, distributed) | Simple (thin CLI, HTTP server, scheduler, runner) | Multi-backend with ongoing modularization |
 | **Learning curve** | Moderate (Rust + small annotated codebase) | High (large codebase + distributed systems) | Low (Go is approachable, CLI-first UX) | High (C++ complexity, large codebase) |
+| **Teaching value** | Built for this — Claude-guided learning, annotated throughout | Good reference once you already understand the concepts | Good for learning Go patterns, not inference internals | Deep optimization knowledge, but hard to extract from C++ |
 
 ---
 
@@ -37,17 +45,23 @@ pioneered by these projects.
 **rLLM's unique feature**: Expert streaming loads MoE experts on-demand from NVMe with
 GPU-side LRU caching, enabling models larger than GPU memory without full offloading.
 
+**Why some features are absent**: rLLM intentionally omits features like speculative decoding
+and LoRA that would add cross-cutting complexity to the codebase. Each feature rLLM *does*
+implement is meant to be readable and self-contained — a teaching example, not a production
+checkbox. Features are added when they deepen understanding, not just capability.
+
 ---
 
 ## Code Quality
 
 ### rLLM
+- **Designed to teach**: every file has a header explaining *why* it exists, with cross-references
+  to related files (trait ↔ impl, Rust ↔ shader) — built for learning with Claude as guide
 - Rust with compile-time memory safety and `pub(crate)` visibility discipline
-- Trait-based GPU abstraction (9 composable sub-traits)
+- Trait-based GPU abstraction (9 composable sub-traits) — each trait is small enough to understand in isolation
 - `#[repr(C)]` param structs byte-matched to shader layouts
 - CPU backend serves as reference implementation for GPU kernel testing
-- Single crate, ~40K lines — feasible to read end-to-end
-- Every file has mandatory header annotation
+- Single crate, ~40K lines — feasible to read end-to-end in a few sessions
 
 ### vLLM
 - Python (high-level logic) + C++/CUDA (kernels) — rapid iteration with strong kernel implementations
@@ -79,9 +93,12 @@ GPU-side LRU caching, enabling models larger than GPU memory without full offloa
 | **Features** | Focused | Broadest | Broad (inherited) | Broad |
 | **Code quality** | High | High | Good | Good |
 
-**rLLM** trades breadth for depth: fewer model architectures and hardware backends, but
-a codebase small enough to understand fully and unique capabilities like expert streaming.
-It is an educational project that aims to make LLM inference internals accessible.
+**rLLM** is a learning tool, not a production serving engine. It exists so its author can
+understand LLM inference from first principles, with Claude walking through every layer —
+from Metal shaders to the HTTP API. It trades breadth for depth: fewer models and backends,
+but a codebase you can hold in your head. Features like expert streaming and paged KV caches
+are implemented because they're *interesting to understand*, not because they're needed for
+a production workload.
 
 **vLLM** leads on features and pioneered PagedAttention, which fundamentally changed how
 LLM serving manages memory. The go-to choice for high-throughput production GPU serving.
