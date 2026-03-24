@@ -472,7 +472,7 @@ impl<B: GpuCore> ExpertStreamer<B> {
                 let shard_files = &self.index.shard_files;
                 let ptrs = gpu_ptrs[miss_idx];
 
-                handles.push(s.spawn(move || {
+                handles.push(s.spawn(move || -> std::io::Result<()> {
                     let gate_up = slot_bufs.gate_up.as_mut_slice();
                     if loc.gate_up_contiguous() {
                         let total = loc.gate_bytes + loc.up_bytes;
@@ -480,25 +480,25 @@ impl<B: GpuCore> ExpertStreamer<B> {
                             &shard_files[loc.shard_gate_up],
                             &mut gate_up[..total],
                             loc.gate_offset,
-                        );
+                        )?;
                     } else {
                         pread_exact(
                             &shard_files[loc.shard_gate_up],
                             &mut gate_up[..loc.gate_bytes],
                             loc.gate_offset,
-                        );
+                        )?;
                         pread_exact(
                             &shard_files[loc.shard_gate_up],
                             &mut gate_up[loc.gate_bytes..loc.gate_bytes + loc.up_bytes],
                             loc.up_offset,
-                        );
+                        )?;
                     }
 
                     pread_exact(
                         &shard_files[loc.shard_down],
                         &mut slot_bufs.down.as_mut_slice()[..loc.down_bytes],
                         loc.down_offset,
-                    );
+                    )?;
 
                     // Phase 2 (direct): memcpy for unified memory backends.
                     if let Some([g, u, d]) = ptrs {
@@ -521,11 +521,16 @@ impl<B: GpuCore> ExpertStreamer<B> {
                             );
                         }
                     }
+                    Ok(())
                 }));
             }
 
             for h in handles {
-                h.join().unwrap();
+                match h.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => panic!("expert streaming I/O failed: {e}"),
+                    Err(_) => panic!("expert streaming thread panicked"),
+                }
             }
         });
 
@@ -556,10 +561,9 @@ impl<B: GpuCore> ExpertStreamer<B> {
 // position) and efficient (single syscall, no lseek + read race).
 // ---------------------------------------------------------------------------
 
-fn pread_exact(file: &File, buf: &mut [u8], offset: u64) {
+fn pread_exact(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
     file.read_exact_at(buf, offset)
-        .expect("pread failed during expert streaming");
 }
 
 // ---------------------------------------------------------------------------
@@ -571,8 +575,19 @@ fn pread_exact(file: &File, buf: &mut [u8], offset: u64) {
 /// Safetensors layout: [8-byte LE header_len][JSON header (header_len bytes)][tensor data...]
 /// The `data_offset` from the JSON header is relative to the start of the tensor data region.
 pub(crate) fn safetensors_data_start(mmap: &[u8]) -> u64 {
+    assert!(
+        mmap.len() >= 8,
+        "safetensors file too small ({} bytes, need at least 8)",
+        mmap.len()
+    );
     let header_len = u64::from_le_bytes(mmap[..8].try_into().unwrap());
-    8 + header_len
+    let data_start = 8 + header_len;
+    assert!(
+        data_start as usize <= mmap.len(),
+        "safetensors header_len ({header_len}) exceeds file size ({})",
+        mmap.len()
+    );
+    data_start
 }
 
 /// Build an ExpertIndex for fused Qwen3.5-style expert tensors.
@@ -708,4 +723,46 @@ pub(crate) struct PerExpertInfo {
     pub gate_file_offset: u64,
     pub up_file_offset: u64,
     pub down_file_offset: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Tests.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_safetensors_data_start_valid() {
+        // 8-byte LE header_len = 16, then 16 bytes of header, then data.
+        let mut mmap = vec![0u8; 32];
+        mmap[..8].copy_from_slice(&16u64.to_le_bytes());
+        assert_eq!(safetensors_data_start(&mmap), 24); // 8 + 16
+    }
+
+    #[test]
+    fn test_safetensors_data_start_zero_header() {
+        // header_len = 0: data starts immediately after the 8-byte length.
+        let mut mmap = vec![0u8; 8];
+        mmap[..8].copy_from_slice(&0u64.to_le_bytes());
+        assert_eq!(safetensors_data_start(&mmap), 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "safetensors file too small")]
+    fn test_safetensors_data_start_too_short() {
+        // Only 4 bytes — should panic with a clear message.
+        let mmap = vec![0u8; 4];
+        safetensors_data_start(&mmap);
+    }
+
+    #[test]
+    #[should_panic(expected = "header_len")]
+    fn test_safetensors_data_start_header_exceeds_file() {
+        // header_len = 1000, but file is only 16 bytes.
+        let mut mmap = vec![0u8; 16];
+        mmap[..8].copy_from_slice(&1000u64.to_le_bytes());
+        safetensors_data_start(&mmap);
+    }
 }

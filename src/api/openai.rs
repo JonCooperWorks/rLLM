@@ -255,9 +255,14 @@ pub(crate) async fn chat_completions(
 
     let (response_tx, response_rx) = tokio::sync::mpsc::channel(64);
 
+    // Clamp max_tokens to a server-side cap to prevent resource exhaustion.
+    // A client requesting millions of tokens could exhaust GPU memory.
+    const MAX_TOKENS_CAP: usize = 131_072;
+    let max_tokens = req.max_tokens.min(MAX_TOKENS_CAP);
+
     let worker_req = WorkerRequest {
         prompt_tokens,
-        max_tokens: req.max_tokens,
+        max_tokens,
         temperature: req.temperature,
         top_p: req.top_p,
         response_tx,

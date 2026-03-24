@@ -24,8 +24,8 @@ for the reference deployment architecture.
 
 | Threat | Who is spoofed | rLLM's stance |
 |--------|---------------|---------------|
-| Unauthenticated requests reach the inference server | The server treats any TCP connection as a legitimate caller | **Optional: auth hook validates JWT tokens when configured.** Disabled by default. |
-| Attacker impersonates the gateway | The server cannot distinguish gateway traffic from other traffic | **Optional: OIDC auth validates token signatures against the issuer's published keys.** |
+| Unauthenticated requests reach the inference server | The server treats any TCP connection as a legitimate caller | **Optional: auth hook validates tokens when configured.** Disabled by default. |
+| Attacker impersonates the gateway | The server cannot distinguish gateway traffic from other traffic | **Optional: OIDC validates JWT signatures; static API key uses argon2id hash comparison (timing-safe).** |
 
 **Two deployment modes for authentication:**
 
@@ -53,9 +53,17 @@ three hooks:
 - **Background** — optional long-running task for maintenance work (JWKS
   rotation, cache refresh).  Spawned after init, runs for the server's lifetime.
 
-The built-in OIDC provider fetches the issuer's `/.well-known/openid-configuration`,
-caches the JWKS, and validates Bearer tokens on each request.  Custom providers
-can be added by implementing the trait and adding a variant to `AuthProviderKind`.
+Two built-in providers:
+- **OIDC** — fetches the issuer's `/.well-known/openid-configuration`, caches
+  the JWKS, and validates JWT Bearer tokens on each request.
+- **Static API Key** — compares the Bearer token against an argon2id hash stored
+  in the config file.  Constant-time via argon2id verify (immune to timing
+  attacks).  Supports hot reload — the background task watches the config file
+  every 30 seconds and swaps the hash if it changes (key rotation without restart).
+  Suboptimal for production: single shared key, no per-user identity, no token expiry.
+
+Custom providers can be added by implementing the trait and adding a variant to
+`AuthProviderKind`.
 
 **What OIDC auth does NOT provide:**
 - Authorization — all authenticated users have equal access

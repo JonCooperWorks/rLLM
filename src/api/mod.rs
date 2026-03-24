@@ -329,6 +329,18 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
                     rt.block_on(auth::oidc::OidcProvider::init(&config))?;
                 auth::AuthProviderKind::Oidc(Arc::new(provider))
             }
+            "static_api_key" => {
+                eprintln!("  auth      : static_api_key");
+                // Inject the config file path so the background task can
+                // re-read it for hot reload of the key hash.
+                let mut config = config;
+                config["_config_path"] =
+                    serde_json::Value::String(path.display().to_string());
+                let provider = rt.block_on(
+                    auth::static_api_key::StaticApiKeyProvider::init(&config),
+                )?;
+                auth::AuthProviderKind::StaticApiKey(Arc::new(provider))
+            }
             other => anyhow::bail!("unknown auth provider: {other}"),
         }
     } else {
@@ -399,6 +411,11 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
             auth::auth_middleware,
         ))
         .layer(tower_http::cors::CorsLayer::permissive())
+        // Reject request bodies larger than 50 MB to prevent memory
+        // exhaustion from oversized payloads (e.g. huge base64 images).
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            50 * 1024 * 1024,
+        ))
         .with_state(state.clone());
 
     // Spawn auth provider's background task (JWKS refresh, etc.).

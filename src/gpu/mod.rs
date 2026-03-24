@@ -134,9 +134,14 @@ impl TensorDtype {
 }
 
 /// Compute total byte count for a Q4 weight tensor [m, k].
+///
+/// Panics on overflow instead of silently wrapping around, which would cause
+/// undersized GPU buffer allocations and memory corruption.
 pub(crate) fn q4_byte_count(m: usize, k: usize) -> usize {
     let blocks_per_row = k / 32;
-    m * blocks_per_row * 18
+    m.checked_mul(blocks_per_row)
+        .and_then(|v| v.checked_mul(18))
+        .expect("q4_byte_count overflow: tensor dimensions too large")
 }
 
 // ---------------------------------------------------------------------------
@@ -375,5 +380,13 @@ mod tests {
     fn test_q4_byte_count_large() {
         // 2048 rows, 2048 cols = 2048 * 64 * 18 = 2359296
         assert_eq!(q4_byte_count(2048, 2048), 2048 * (2048 / 32) * 18);
+    }
+
+    #[test]
+    #[should_panic(expected = "q4_byte_count overflow")]
+    fn test_q4_byte_count_overflow_panics() {
+        // Dimensions large enough to overflow usize — should panic with a
+        // clear message instead of silently wrapping around.
+        let _ = q4_byte_count(usize::MAX / 2, 64);
     }
 }

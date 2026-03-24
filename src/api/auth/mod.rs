@@ -60,6 +60,7 @@
 // ===========================================================================
 
 pub(crate) mod oidc;
+pub(crate) mod static_api_key;
 
 use std::sync::Arc;
 
@@ -181,6 +182,10 @@ pub(crate) enum AuthProviderKind {
     /// OIDC JWT validation.  Wrapped in Arc because the background task
     /// (JWKS refresh) and the request path share the same provider instance.
     Oidc(Arc<oidc::OidcProvider>),
+    /// Static API key — argon2id hash comparison.  For personal inference
+    /// servers where OIDC is overkill.  See static_api_key.rs for security
+    /// gaps and design rationale.
+    StaticApiKey(Arc<static_api_key::StaticApiKeyProvider>),
 }
 
 impl AuthProviderKind {
@@ -190,6 +195,7 @@ impl AuthProviderKind {
         match self {
             Self::None => unreachable!("authenticate() should not be called when auth is disabled"),
             Self::Oidc(provider) => provider.authenticate(headers).await,
+            Self::StaticApiKey(provider) => provider.authenticate(headers).await,
         }
     }
 
@@ -198,6 +204,9 @@ impl AuthProviderKind {
         match self {
             Self::None => {}
             Self::Oidc(provider) => {
+                tokio::spawn(Arc::clone(provider).background());
+            }
+            Self::StaticApiKey(provider) => {
                 tokio::spawn(Arc::clone(provider).background());
             }
         }
@@ -280,6 +289,21 @@ mod tests {
                 "https://issuer.example.com".into(),
                 "test-audience".into(),
             ),
+        ));
+        assert!(provider.is_enabled());
+    }
+
+    #[test]
+    fn test_static_api_key_is_enabled() {
+        use argon2::password_hash::SaltString;
+        use argon2::PasswordHasher;
+        let salt = SaltString::from_b64("dGVzdHNhbHR2YWx1ZQ").unwrap();
+        let hash = argon2::Argon2::default()
+            .hash_password(b"test", &salt)
+            .unwrap()
+            .to_string();
+        let provider = AuthProviderKind::StaticApiKey(Arc::new(
+            static_api_key::StaticApiKeyProvider::new_for_test(hash),
         ));
         assert!(provider.is_enabled());
     }

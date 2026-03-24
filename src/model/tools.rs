@@ -276,16 +276,21 @@ fn parse_tool_calls_chatml(text: &str) -> (String, Vec<ToolCall>) {
             .map(|i| start + i + end_tag.len());
 
         if let Some(end) = end {
-            let block = &cleaned[start + "<tool_call>".len()..end - end_tag.len()];
-            if let Some(call) = parse_json_tool_call(block.trim()) {
-                calls.push(call);
+            let inner_start = start + "<tool_call>".len();
+            let inner_end = end - end_tag.len();
+            if let Some(block) = cleaned.get(inner_start..inner_end) {
+                if let Some(call) = parse_json_tool_call(block.trim()) {
+                    calls.push(call);
+                }
             }
             cleaned.replace_range(start..end, "");
         } else {
             // Unclosed tag — try to parse the rest as a tool call.
-            let block = &cleaned[start + "<tool_call>".len()..];
-            if let Some(call) = parse_json_tool_call(block.trim()) {
-                calls.push(call);
+            let inner_start = start + "<tool_call>".len();
+            if let Some(block) = cleaned.get(inner_start..) {
+                if let Some(call) = parse_json_tool_call(block.trim()) {
+                    calls.push(call);
+                }
             }
             cleaned.truncate(start);
             break;
@@ -607,5 +612,42 @@ mod tests {
             assert!(calls.is_empty(), "arch {arch:?} should not parse bare JSON");
             assert_eq!(content, text);
         }
+    }
+
+    // -- Security: bounds-safe string slicing tests --
+
+    #[test]
+    fn test_tool_call_extraction_empty_tags() {
+        // Empty <tool_call></tool_call> — should not panic, no call extracted.
+        // When no calls are found, original text is returned (by design).
+        let text = "<tool_call></tool_call>";
+        let (_, calls) = parse_tool_calls(ModelArch::Qwen2, text);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_tool_call_extraction_nested_angle_brackets() {
+        // Edge case: angle brackets inside the tool_call body.
+        let text = "<tool_call>{\"name\": \"f\", \"arguments\": {\"query\": \"a < b > c\"}}</tool_call>";
+        let (_, calls) = parse_tool_calls(ModelArch::Qwen2, text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "f");
+    }
+
+    #[test]
+    fn test_tool_call_extraction_just_opening_tag() {
+        // Only an opening tag with nothing after it — should not panic.
+        // When no calls are found, original text is returned (by design).
+        let text = "<tool_call>";
+        let (_, calls) = parse_tool_calls(ModelArch::Qwen2, text);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_tool_call_extraction_whitespace_only() {
+        // Opening and closing tags with only whitespace — should not panic.
+        let text = "<tool_call>   </tool_call>";
+        let (_, calls) = parse_tool_calls(ModelArch::Qwen2, text);
+        assert!(calls.is_empty());
     }
 }

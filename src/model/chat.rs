@@ -265,6 +265,11 @@ fn decode_data_url(url: &str) -> Option<Vec<u8>> {
     // data:image/jpeg;base64,/9j/4AAQ...
     let suffix = url.strip_prefix("data:")?;
     let (_, b64) = suffix.split_once(";base64,")?;
+    // Reject oversized payloads before decoding to prevent OOM.
+    // 100 MB of base64 ≈ 75 MB decoded — far larger than any reasonable image.
+    if b64.len() > 100_000_000 {
+        return None;
+    }
     base64::engine::general_purpose::STANDARD.decode(b64).ok()
 }
 
@@ -748,5 +753,35 @@ mod tests {
         // Llama doesn't support thinking — should be same as without
         let without = format_chat(ModelArch::Llama, &messages);
         assert_eq!(result, without);
+    }
+
+    // -- Security: decode_data_url size limit tests --
+
+    #[test]
+    fn test_decode_data_url_normal_image() {
+        // Small valid base64 PNG (1x1 transparent pixel).
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&[0u8; 32]);
+        let url = format!("data:image/png;base64,{b64}");
+        assert!(decode_data_url(&url).is_some());
+    }
+
+    #[test]
+    fn test_decode_data_url_rejects_oversized() {
+        // 101 MB of base64 characters — should be rejected before decoding.
+        let huge = "A".repeat(101_000_000);
+        let url = format!("data:image/png;base64,{huge}");
+        assert!(decode_data_url(&url).is_none());
+    }
+
+    #[test]
+    fn test_decode_data_url_just_under_limit() {
+        // 99 MB — should be accepted (though will fail base64 decode with
+        // invalid data, that's fine — we're testing the size gate).
+        let big = "A".repeat(99_000_000);
+        let url = format!("data:image/png;base64,{big}");
+        // May return None due to invalid base64, but should NOT be rejected
+        // by the size check — the size check only rejects > 100M.
+        // Just verify it doesn't panic.
+        let _ = decode_data_url(&url);
     }
 }

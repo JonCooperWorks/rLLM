@@ -16,7 +16,7 @@ bytemuck = { version = "1", features = ["derive"] }
 rand = "0.9"
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.6", features = ["cors", "limit"] }
 async-stream = "0.3"
 rustls = "0.23"
 tokio-rustls = "0.26"
@@ -30,6 +30,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 rayon = "1.10"
 base64 = "0.22"
 jsonwebtoken = "9"
+argon2 = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

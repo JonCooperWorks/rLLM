@@ -5,21 +5,21 @@ default — enabled via `--auth-config auth.json`.
 
 ---
 
-## Why Optional
+## Design
+
+### Why Optional
 
 rLLM's default deployment is single-user: localhost, SSH tunnel, trusted LAN.
 Auth adds nothing when you're the only user.  It becomes valuable when rLLM
 is behind a gateway that mints scoped tokens, or shared among a team.
 
-## Why Not Gateway-Only
+### Why Not Gateway-Only
 
-A gateway can handle all auth and forward requests to a "dumb" inference
-server.  But that leaves gaps: no identity at the inference layer, no audit
-trail on the server itself.  If the network boundary is breached, anyone who
-reaches the port gets unlimited access.
+A gateway can handle all auth, but that leaves no identity at the inference
+layer and no audit trail on the server itself.  If the network boundary is
+breached, anyone who reaches the port gets unlimited access.
 
-rLLM's auth closes this gap — the gateway authenticates the user and mints
-a scoped JWT, rLLM validates it.  Defense-in-depth, not a replacement.
+rLLM's auth closes this gap — defense-in-depth, not a replacement.
 
 ```mermaid
 sequenceDiagram
@@ -28,74 +28,95 @@ sequenceDiagram
     participant rLLM
 
     Client->>Gateway: API key + prompt
-    Gateway->>Gateway: validate key, check access
-    Gateway->>Gateway: mint short-lived JWT (sub=customer, aud=rllm)
+    Gateway->>Gateway: validate key, mint short-lived JWT
     Gateway->>rLLM: JWT + prompt
     rLLM->>rLLM: verify signature, exp, iss, aud
     rLLM->>rLLM: forward pass (identity in audit log)
-    rLLM->>Gateway: completion + token count
+    rLLM->>Gateway: completion
     Gateway->>Client: completion
 ```
 
-## Why Not Sessions / OAuth Flows / Login Pages
+### Architecture
 
-rLLM is an inference API, not a web app.  It validates tokens — someone else
-mints them.  That someone might be a gateway, an identity provider, or a CLI
-tool that hits the OIDC token endpoint.  rLLM checks the signature, expiry,
-issuer, and audience.  Nothing more.
-
----
-
-## How It Works
-
-Auth is either fully on or fully off.  No fallbacks, no fake identities.
+Auth is fully on or fully off.  No fallbacks, no fake identities.
 
 ```mermaid
 graph TD
     Req([HTTP Request]) --> MW{auth_middleware}
 
-    MW -->|auth disabled| Pass["pass through<br/>no AuthUser"]
-    MW -->|auth enabled| Check["authenticate(headers)"]
+    MW -->|disabled| Pass["pass through — no AuthUser"]
+    MW -->|enabled| Check["authenticate(headers)"]
 
-    Check -->|Allow| Insert["insert AuthUser<br/>into request extensions"]
-    Check -->|Deny| Reject["return HTTP 401<br/>JSON error body"]
-
-    Insert --> Handler["handler extracts AuthUser<br/>attaches to WorkerRequest"]
-    Handler --> Worker["worker logs user.sub<br/>in per-sequence metrics"]
-    Pass --> Handler2["handler proceeds<br/>no AuthUser, no identity logged"]
+    Check -->|Allow| Insert["AuthUser → extensions → handler → audit log"]
+    Check -->|Deny| Reject["HTTP 401 + JSON error"]
 ```
 
-### The Trait
-
-Three hooks cover the full provider lifecycle:
+Three hooks cover the provider lifecycle:
 
 | Hook | When | What |
 |------|------|------|
-| `init(config)` | Startup | Fetch JWKs, load keys, validate config. Errors abort startup. |
-| `authenticate(headers)` | Every request | Headers in, `Allow(User)` or `Deny(Status, Reason)` out. Hot path — no network I/O. |
-| `background(self: Arc<Self>)` | After init | Optional maintenance (JWKS refresh, cache expiry). Default: no-op. |
+| `init(config)` | Startup | Parse config, fetch keys. Errors abort startup. |
+| `authenticate(headers)` | Every request | `Allow(User)` or `Deny(Status, Reason)`. Hot path. |
+| `background(Arc<Self>)` | After init | Optional maintenance (JWKS refresh, hash reload). |
 
-HTTP-close design: `authenticate()` takes `&HeaderMap`, returns an HTTP
-`StatusCode`.  No framework-specific abstractions.
-
-### Enum Dispatch
-
-The set of providers is known at compile time.  `AuthProviderKind` is an
-enum (`None`, `Oidc`) — no `dyn`, no `async-trait` crate.  Same pattern as
-`TlsMode` in `tls.rs`.
+Providers use enum dispatch (`AuthProviderKind`), not `dyn` — the set is
+known at compile time.
 
 ---
 
-## Configuration
+## Providers
 
-```bash
-rllm serve --model ./my-model --auth-config auth.json
+### Static API Key
+
+For personal inference servers where OIDC is overkill.  A shared secret
+compared against an argon2id hash — no identity provider, no JWTs, no key
+rotation infrastructure.
+
+```json
+{
+  "provider": "static_api_key",
+  "key_hash": "$argon2id$v=19$m=19456,t=2,p=1$SALT$HASH"
+}
 ```
 
-The JSON file has a `"provider"` field that selects the implementation.
-The rest is passed to the provider's `init()` hook.
+Generate the hash:
+
+```bash
+# argon2 CLI:
+echo -n "my-secret-key" | argon2 $(openssl rand -hex 16) -id -e
+
+# Python (pip install argon2-cffi):
+python3 -c "from argon2 import PasswordHasher; print(PasswordHasher().hash('my-secret-key'))"
+```
+
+Use it:
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer my-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+**Hot reload.**  The background task watches the config file's mtime every
+30 seconds.  If the file changes, the new hash is loaded — no restart needed.
+Invalid config keeps the old hash and logs a warning.
+
+**Gaps vs OIDC:**
+
+| Gap | Impact |
+|-----|--------|
+| Single shared key | `sub` is always `"apikey"` — no per-user audit trail |
+| No token expiry | Key valid forever until you edit the config |
+| No per-user quotas | All callers share one identity |
+| ~30-50ms verify | argon2id is intentionally slow (anti-brute-force) |
+| 30s reload window | Old key works briefly after rotation |
+
+Use OIDC if you need per-user identity, token expiry, or instant rotation.
 
 ### OIDC
+
+Validates JWTs against an OpenID Connect issuer's published signing keys.
 
 ```json
 {
@@ -107,24 +128,10 @@ The rest is passed to the provider's `init()` hook.
 
 | Field | What |
 |-------|------|
-| `issuer` | OIDC issuer URL. rLLM fetches `{issuer}/.well-known/openid-configuration` at startup. Must match the `iss` claim. |
-| `audience` | Expected `aud` claim. Typically the client ID or service identifier the gateway uses when minting tokens. |
+| `issuer` | OIDC issuer URL.  rLLM fetches `{issuer}/.well-known/openid-configuration` at startup.  Must match the `iss` claim. |
+| `audience` | Expected `aud` claim.  Typically the client ID or service identifier. |
 
-### No Auth (Default)
-
-When `--auth-config` is omitted, the middleware is a no-op.  No headers
-checked, no identity logged, no token validation.  Auth doesn't exist.
-
-On localhost this just works.  On external interfaces (`--host 0.0.0.0`),
-rLLM requires `--dangerous-no-auth` to confirm you want no authentication.
-
----
-
-## OIDC Provider
-
-Validates JWTs against an OpenID Connect issuer's published signing keys.
-
-### Startup
+**Startup:**
 
 ```mermaid
 sequenceDiagram
@@ -137,66 +144,64 @@ sequenceDiagram
     rLLM->>Issuer: GET {jwks_uri}
     Issuer->>rLLM: { keys: [{ kid, n, e, ... }] }
     rLLM->>rLLM: cache JWKS in Arc<RwLock>
-
-    Note over rLLM: server starts accepting requests
 ```
 
-If any step fails, the server refuses to start.
+Fails fast — server refuses to start if any step fails.
 
-### Per-Request Validation
+**Per-request validation:**
 
 1. Extract `Authorization: Bearer <token>`
-2. Decode JWT header (unverified) → get `kid`
+2. Decode JWT header (unverified) -> `kid`
 3. Look up `kid` in cached JWKS (read lock)
-4. If not found → one eager refresh (rate-limited to 1/30s)
+4. If missing -> one eager refresh (rate-limited to 1/30s)
 5. Verify signature + `exp` + `iss` + `aud`
-6. Return `Allow(AuthUser { sub })` or `Deny(401, reason)`
+6. `Allow(AuthUser { sub })` or `Deny(401, reason)`
 
 Common case: one read lock + one signature check.  Microseconds, no network.
 
-### Key Rotation
+**Key rotation:**
 
 ```mermaid
 graph LR
     BG["Background task<br/>(every 60 min)"] --> Fetch["GET jwks_uri"]
     Fetch --> Compare{"keys changed?"}
-    Compare -->|no| Done["done<br/>(read lock only)"]
-    Compare -->|yes| Write["write lock<br/>swap JWKS"]
+    Compare -->|no| Done["done (read lock only)"]
+    Compare -->|yes| Write["write lock — swap JWKS"]
 
-    Eager["Request with<br/>unknown kid"] --> Rate{"last refresh<br/>< 30s ago?"}
+    Eager["Unknown kid"] --> Rate{"< 30s since<br/>last refresh?"}
     Rate -->|yes| Reject[reject]
-    Rate -->|no| Fetch2["GET jwks_uri"] --> Write2["write lock<br/>swap JWKS"]
+    Rate -->|no| Fetch2["GET jwks_uri"] --> Write2["write lock — swap"]
 ```
 
-The write lock is only acquired when keys actually rotate.  Routine refreshes
-never block request-path readers.
+Write lock only acquired when keys actually rotate.
 
-### What We Validate
+**What we validate:**
 
 | Claim | Check |
 |-------|-------|
 | Signature | Algorithm from JWK (RS256, ES256, etc.) |
-| `exp` | Token not expired |
+| `exp` | Not expired |
 | `iss` | Matches configured issuer |
 | `aud` | Matches configured audience |
 
-### What We Don't
+**What we don't:** authorization (all authenticated users are equal), token
+revocation (short-lived tokens; revocation is a gateway concern), scopes or
+roles (not relevant for an inference API).
 
-- **Authorization** — all authenticated users have equal access
-- **Token revocation** — tokens are short-lived; revocation is a gateway concern
-- **Scopes or roles** — not relevant for an inference API
+### No Auth (Default)
+
+When `--auth-config` is omitted, the middleware is a no-op.  On localhost
+this just works.  On external interfaces (`--host 0.0.0.0`), rLLM requires
+`--dangerous-no-auth` to confirm.
 
 ---
 
-## Auth Without TLS
+## TLS
 
-When auth is enabled without TLS, rLLM prints a startup warning.  Tokens,
-prompts, and completions are plaintext — an attacker with network access can
-intercept, read, or modify them.
-
-On localhost this is safe (traffic stays on the machine).  On external
-interfaces, TLS is required unless you pass `--dangerous-no-tls`.  SSH
-tunnels are also fine — the tunnel encrypts the transport.
+When auth is enabled without TLS, rLLM prints a startup warning — tokens,
+prompts, and completions are plaintext.  On localhost or over an SSH tunnel
+this is fine.  On external interfaces, enable TLS (`--cert`/`--private-key`
+or `--letsencrypt`).
 
 ---
 
@@ -212,7 +217,7 @@ Auth disabled:
 seq 123  |  500 prompt (200 cached) + 150 gen  |  TTFT 45 ms  |  32.1 tok/s  |  4.67s  |  eos
 ```
 
-Always uses `AuthUser.sub` — the stable subject identifier from the JWT.
+Always uses `AuthUser.sub` — the stable identifier, not a display name.
 
 ---
 
@@ -220,12 +225,11 @@ Always uses `AuthUser.sub` — the stable subject identifier from the JWT.
 
 1. Create `src/api/auth/your_provider.rs` implementing `AuthProvider`
 2. Add `pub(crate) mod your_provider;` to `src/api/auth/mod.rs`
-3. Add a variant to `AuthProviderKind` (e.g., `Custom(Arc<YourProvider>)`)
+3. Add a variant to `AuthProviderKind`
 4. Add match arms in `authenticate()`, `spawn_background()`, `is_enabled()`
 5. Add a match arm in the factory in `src/api/mod.rs`
 
-The trait takes `&HeaderMap` and returns `Allow`/`Deny`.  If you know HTTP,
-you can implement it.
+The trait takes `&HeaderMap` and returns `Allow`/`Deny`.
 
 ---
 
@@ -235,6 +239,7 @@ you can implement it.
 |------|------|
 | `src/api/auth/mod.rs` | Trait, types, enum dispatch, middleware |
 | `src/api/auth/oidc.rs` | OIDC discovery, JWKS caching, JWT verification |
+| `src/api/auth/static_api_key.rs` | Static API key, argon2id hash, hot reload |
 | `src/api/mod.rs` | Wires auth into ServerState and router |
 | `src/commands/serve.rs` | `--auth-config` CLI arg |
 
