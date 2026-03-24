@@ -784,4 +784,179 @@ mod tests {
         // Just verify it doesn't panic.
         let _ = decode_data_url(&url);
     }
+
+    // -- Tool message formatting tests --
+
+    #[test]
+    fn test_llama_tool_result_formatting() {
+        let messages = vec![
+            msg("user", "Weather?"),
+            Message {
+                role: "tool".into(),
+                content: "Sunny, 72F".into(),
+                tool_calls: None,
+                tool_call_id: Some("call_123".into()),
+                images: None,
+            },
+        ];
+        let result = format_chat(ModelArch::Llama, &messages);
+        assert!(result.contains("ipython"));
+        assert!(result.contains("Sunny, 72F"));
+    }
+
+    #[test]
+    fn test_chatml_tool_result_formatting() {
+        let messages = vec![
+            msg("user", "Weather?"),
+            Message {
+                role: "tool".into(),
+                content: "Sunny, 72F".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                images: None,
+            },
+        ];
+        let result = format_chat(ModelArch::Qwen2, &messages);
+        assert!(result.contains("<tool_response>"));
+        assert!(result.contains("Sunny, 72F"));
+        assert!(result.contains("</tool_response>"));
+    }
+
+    #[test]
+    fn test_gemma_tool_result_formatting() {
+        let messages = vec![
+            msg("user", "Weather?"),
+            Message {
+                role: "tool".into(),
+                content: "{\"temp\": 72}".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                images: None,
+            },
+        ];
+        let result = format_chat(ModelArch::Gemma3, &messages);
+        assert!(result.contains("<start_of_turn>tool"));
+        assert!(result.contains("{\"temp\": 72}"));
+    }
+
+    #[test]
+    fn test_mistral_tool_result_formatting() {
+        let messages = vec![
+            msg("user", "Weather?"),
+            Message {
+                role: "tool".into(),
+                content: "Sunny".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                images: None,
+            },
+        ];
+        let result = format_chat(ModelArch::Mistral, &messages);
+        assert!(result.contains("[TOOL_RESULTS]"));
+        assert!(result.contains("Sunny"));
+        assert!(result.contains("[/TOOL_RESULTS]"));
+    }
+
+    #[test]
+    fn test_phi_tool_result_formatting() {
+        let messages = vec![
+            msg("user", "Weather?"),
+            Message {
+                role: "tool".into(),
+                content: "Sunny".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                images: None,
+            },
+        ];
+        let result = format_chat(ModelArch::Phi, &messages);
+        assert!(result.contains("<|im_start|>tool<|im_sep|>"));
+        assert!(result.contains("Sunny"));
+    }
+
+    // -- Content deserialization tests --
+
+    #[test]
+    fn test_null_content_deserializes_to_empty() {
+        let json = r#"{"role": "assistant", "content": null}"#;
+        let msg: Message = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.content, "");
+    }
+
+    #[test]
+    fn test_content_array_text_parts() {
+        let json = r#"{"role": "user", "content": [
+            {"type": "text", "text": "Hello"},
+            {"type": "text", "text": "World"}
+        ]}"#;
+        let msg: Message = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.content, "Hello World");
+    }
+
+    #[test]
+    fn test_content_array_with_image_url() {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&[1u8, 2, 3]);
+        let json = format!(
+            r#"{{"role": "user", "content": [
+                {{"type": "image_url", "image_url": {{"url": "data:image/png;base64,{b64}"}}}},
+                {{"type": "text", "text": "Describe this"}}
+            ]}}"#
+        );
+        let msg: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg.content, "Describe this");
+        assert_eq!(msg.images.as_ref().unwrap().len(), 1);
+        assert_eq!(msg.images.as_ref().unwrap()[0].data, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_content_array_anthropic_image() {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&[4u8, 5, 6]);
+        let json = format!(
+            r#"{{"role": "user", "content": [
+                {{"type": "image", "source": {{"type": "base64", "data": "{b64}"}}}},
+                {{"type": "text", "text": "What is this?"}}
+            ]}}"#
+        );
+        let msg: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg.content, "What is this?");
+        assert_eq!(msg.images.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_vision_prefix_qwen_multiple_images() {
+        let msg = Message {
+            role: "user".into(),
+            content: "Describe both.".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            images: Some(vec![
+                ImageData { data: vec![1] },
+                ImageData { data: vec![2] },
+            ]),
+        };
+        let prefix = vision_prefix(&msg, ModelArch::Qwen2);
+        // Should have two vision placeholder blocks.
+        assert_eq!(prefix.matches("<|image_pad|>").count(), 2);
+    }
+
+    #[test]
+    fn test_vision_prefix_gemma() {
+        let msg = Message {
+            role: "user".into(),
+            content: "Describe.".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            images: Some(vec![ImageData { data: vec![1] }]),
+        };
+        let prefix = vision_prefix(&msg, ModelArch::Gemma3);
+        assert!(prefix.contains("<start_of_image>"));
+        assert!(prefix.contains("<image_soft_token>"));
+    }
+
+    #[test]
+    fn test_vision_prefix_no_images() {
+        let msg = msg("user", "Hello");
+        let prefix = vision_prefix(&msg, ModelArch::Qwen2);
+        assert!(prefix.is_empty());
+    }
 }

@@ -99,7 +99,7 @@ pub(crate) fn exec(args: BenchArgs) -> anyhow::Result<()> {
                 let prompt_len = prompt_tokens.len();
 
                 // Submit and drive to completion.
-                eng.add_request(prompt_tokens, max_tokens, 0.0, 1.0, Vec::new()); // greedy
+                eng.add_request(prompt_tokens, max_tokens, 0.0, 1.0, Vec::new(), None); // greedy
 
                 let start = Instant::now();
                 let mut ttft = None;

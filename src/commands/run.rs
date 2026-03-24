@@ -181,7 +181,7 @@ pub(crate) fn exec(mut args: RunArgs) -> anyhow::Result<()> {
 
             // Submit request and run generation loop.
             let prompt_len = prompt_tokens.len();
-            eng.add_request(prompt_tokens, max_tokens, temperature, top_p, processed_images);
+            eng.add_request(prompt_tokens, max_tokens, temperature, top_p, processed_images, None);
 
             let start = std::time::Instant::now();
             let mut gen_count = 0usize;
