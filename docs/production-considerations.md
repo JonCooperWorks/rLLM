@@ -368,6 +368,22 @@ The gateway validates the customer's API key, mints a short-lived,
 customer-scoped inference token, and attaches it to the request.  The
 inference server verifies the token before running a forward pass.
 
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Gateway
+    participant rLLM
+
+    Client->>Gateway: API key + prompt
+    Gateway->>Gateway: validate key, check access, rate limit
+    Gateway->>Gateway: mint short-lived JWT (sub=customer, aud=rllm)
+    Gateway->>rLLM: JWT + prompt
+    rLLM->>rLLM: verify JWT (signature, exp, iss, aud)
+    rLLM->>rLLM: forward pass (user.sub in audit log)
+    rLLM->>Gateway: completion + token count
+    Gateway->>Client: completion
+```
+
 Three properties:
 
 1. **Identity at the inference layer** — every forward pass is tied to a
@@ -377,15 +393,11 @@ Three properties:
 3. **Blast radius** — a leaked inference token expires quickly and only
    authorises inference, not billing or account mutations
 
-**rLLM implements this** via its pluggable auth hook system.  Pass
-`--auth-config auth.json` to enable.  The built-in OIDC provider validates
-JWTs against the issuer's published JWKS — the gateway mints a scoped token,
-rLLM verifies it.  The `AuthProvider` trait has three hooks (init, request,
-background) and can be extended to support an org's specific auth
-infrastructure — custom token formats, internal CAs, proprietary identity
-systems — by implementing the trait and adding a provider variant.
-See [Threat Model — Spoofing](threat-model.md#spoofing) for deployment
-guidance.
+**rLLM implements this** via its pluggable auth hook system (`--auth-config`).
+The built-in OIDC provider validates JWTs against the issuer's published
+JWKS.  The `AuthProvider` trait can be extended to support an org's specific
+auth — custom token formats, internal CAs, proprietary identity systems.
+See [Authentication](authentication.md) for the full design.
 
 ### Audit logging
 
