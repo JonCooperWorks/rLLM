@@ -9,9 +9,6 @@ model, not a reference architecture.
 
 ## The Gateway
 
-> See [API Server](api-server.md) for rLLM's HTTP server internals, worker
-> thread architecture, and OpenAI/Anthropic endpoint compatibility.
-
 rLLM is a single-model inference server.  In production you'd run many
 instances, each serving one model on one or more GPUs.  A gateway sits in
 front and handles everything that isn't inference:
