@@ -15,4 +15,7 @@ big picture, then drill into subsystem docs as needed.
 | [API Server](api-server.md) | HTTP server with OpenAI and Anthropic endpoint compatibility using a worker-thread architecture |
 | [Tool Calling](tool-calling.md) | Tool/function calling with per-architecture prompt formatting, output parsing, and both OpenAI and Anthropic API surfaces |
 | [Expert Streaming](expert-streaming.md) | SSD-backed MoE inference — stream expert weights from NVMe on demand for models that don't fit in GPU memory |
+| [Vision](vision.md) | SigLIP ViT encoder for vision-language models — image preprocessing, patch embedding, spatial merge, and LLM token scatter |
+| [Prompt Caching](prompt-caching.md) | Reuse prefill KV cache across requests that share a common prefix — system prompt caching, hash-based matching |
 | [Production Considerations](production-considerations.md) | Learning notes on how LLM inference might work at scale — gateway architecture, batching, hardware tiers, quantization as a product lever |
+| [Scripts](../scripts/README.md) | Quick-setup scripts for rented GPUs — Rust, HF CLI, Claude Code installers, model download tiers, benchmarking |
