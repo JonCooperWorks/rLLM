@@ -9,6 +9,9 @@ model, not a reference architecture.
 
 ## The Gateway
 
+> See [API Server](api-server.md) for rLLM's HTTP server internals, worker
+> thread architecture, and OpenAI/Anthropic endpoint compatibility.
+
 rLLM is a single-model inference server.  In production you'd run many
 instances, each serving one model on one or more GPUs.  A gateway sits in
 front and handles everything that isn't inference:
@@ -45,6 +48,9 @@ convert to base64 before forwarding.  Eliminates SSRF on GPU machines.
 
 ## Batching
 
+> See [Inference Engine](inference-engine.md) for rLLM's continuous batching
+> implementation and step loop.
+
 A single forward pass is memory-bandwidth-bound: the GPU reads every weight
 matrix once per token.  Decoding one sequence at a time wastes compute.
 
@@ -67,6 +73,9 @@ batching matters — and where the economics live.
 ---
 
 ## Quantization
+
+> See [Quantization](quantization.md) for the full Q4 format spec, kernel
+> internals, and pre-quantization workflow.
 
 Quantization compresses weights — rLLM's Q4 packs 32 weights into 18 bytes
 (vs 64 at bf16), cutting memory bandwidth ~4× and directly increasing decode
@@ -93,6 +102,9 @@ model behind an API is almost certainly not at training precision.
 ---
 
 ## Disk Streaming
+
+> See [Expert Streaming](expert-streaming.md) for the full SSD-backed MoE
+> implementation, LRU cache, and platform-specific transfer paths.
 
 Not every model has to fit in GPU memory.  rLLM already streams MoE experts
 from NVMe on demand (`src/model/expert_stream.rs`) — Qwen3.5-35b has 256
@@ -123,6 +135,9 @@ transformer blocks, run them, evict, load the next batch.  Latency goes up
 ---
 
 ## Prompt Caching
+
+> See [Prompt Caching](prompt-caching.md) for the implementation: hash-based
+> lookup, reference counting, block-aligned sharing, and eviction.
 
 Most API traffic shares a common prefix.  System prompts, tool definitions,
 and few-shot examples appear identically at the start of every request for a
@@ -605,6 +620,9 @@ server streaming data to an attacker via an allowed egress path.
 
 ## Server-Side Tools
 
+> See [Tool Calling](tool-calling.md) for rLLM's per-architecture prompt
+> formatting, output parsing, and API surface.
+
 Tool and function calling — web search, code execution, retrieval,
 calculators — looks like it runs on the inference server, but it doesn't.
 The inference server's job is to produce a tool-call response (a structured
@@ -694,3 +712,16 @@ OpenAI/Anthropic-compatible API.
 Everything above — auth, billing, routing, tiers — belongs in a gateway.
 rLLM turns tokens into tokens.  The gateway decides which tokens go where and
 who pays.
+
+---
+
+## Related Documents
+
+- [Architecture Overview](architecture-overview.md) — end-to-end flow from request to token
+- [Inference Engine](inference-engine.md) — step loop, scheduler, continuous batching
+- [KV Cache](kv-cache.md) — paged allocation, block tables, generational indices
+- [Prompt Caching](prompt-caching.md) — prefix sharing, ref counting, eviction
+- [Quantization](quantization.md) — Q4 format, pre-quantization, kernel dequantization
+- [Expert Streaming](expert-streaming.md) — SSD-backed MoE, LRU cache, pread I/O
+- [API Server](api-server.md) — HTTP endpoints, worker thread, streaming
+- [Tool Calling](tool-calling.md) — per-architecture formats, parsing, API surface
