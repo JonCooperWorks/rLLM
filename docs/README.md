@@ -21,3 +21,4 @@ big picture, then drill into subsystem docs as needed.
 | [Authentication](authentication.md) | Pluggable auth hook system — trait design, OIDC JWT provider, per-user logging, custom provider guide |
 | [Threat Model](threat-model.md) | STRIDE analysis — weight theft, customer data, auth-without-TLS risks, what rLLM protects vs what the deployment must provide |
 | [Production Considerations](production-considerations.md) | How LLM inference works at scale — gateway architecture, batching, prompt caching economics, tiers, security controls |
+| [Framework Comparison](framework-comparison.md) | How rLLM compares to vLLM, Ollama, and llama.cpp — rLLM is an educational codebase for learning inference with Claude, not a production system |
