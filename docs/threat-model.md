@@ -1,19 +1,12 @@
 # Threat Model
 
-STRIDE analysis of rLLM as a deployment component.  rLLM is an inference
-engine — it turns prompts into completions on a GPU.  It deliberately excludes
-auth, billing, rate limiting, and encryption, pushing those to infrastructure
-and an API gateway.  This document explains what rLLM protects against, what
-it leaves to the deployment environment, and why.
+STRIDE analysis of rLLM's threat surface.  rLLM is a local inference
+engine — it turns prompts into completions on a GPU.  This document
+explains what rLLM protects against, what it doesn't, and why.
 
 **Primary assets:**
-- **Model weights** — proprietary or licensed, stored on local NVMe
-- **Customer prompts and completions** — transit through the inference server
-
-**Deployment assumption:** rLLM runs behind an API gateway on a private network
-with no direct internet access.  See
-[Production Considerations — Security Controls](production-considerations.md#security-controls)
-for the reference deployment architecture.
+- **Model weights** — stored on local disk
+- **Prompts and completions** — transit through the inference server
 
 ---
 
@@ -23,26 +16,12 @@ for the reference deployment architecture.
 
 | Threat | Who is spoofed | rLLM's stance |
 |--------|---------------|---------------|
-| Unauthenticated requests reach the inference server | The server treats any TCP connection as a legitimate caller | **rLLM does not authenticate requests.** |
-| Attacker impersonates the gateway | The server cannot distinguish gateway traffic from other traffic | **rLLM has no caller identity checks.** |
+| Unauthenticated requests reach the server | The server treats any TCP connection as a legitimate caller | **rLLM does not authenticate requests.** |
 
-**Why rLLM has no auth.**  Authentication belongs in the gateway, not the
-inference engine.  The gateway validates API keys, mints short-lived inference
-tokens, and enforces access policies.  rLLM should never be reachable from the
-internet — it binds to `127.0.0.1` by default and relies on network isolation
-to restrict access to the gateway alone.
-
-**What the deployment must provide:**
-- Network isolation — inference servers on a private network, only the gateway
-  can reach the inference port
-- API gateway — authenticates callers, enforces rate limits, routes to backends
-- Short-lived inference tokens (optional defense-in-depth) — the gateway mints
-  a scoped token per request; the inference server validates it before running
-  a forward pass.  rLLM does not implement this today
-
-**If you expose rLLM to the internet without a gateway, anyone can use it.**
-The `--host 0.0.0.0` flag exists for convenience on trusted networks (rented
-GPU boxes, local dev), not for production.
+**rLLM has no auth** and doesn't need it.  It's a local inference engine —
+it binds to `127.0.0.1` by default and only serves requests from the local
+machine.  If you use `--host 0.0.0.0` on a trusted network, anyone on that
+network can use it.
 
 ---
 
@@ -60,28 +39,14 @@ GPU boxes, local dev), not for production.
 The safetensors format itself is safe — unlike pickle, it cannot execute
 arbitrary code — but rLLM trusts that the bytes on disk are correct.
 
-**Why rLLM doesn't verify weights.**  Weight integrity is an infrastructure
-concern:
-- Weights are cloned from an internal model registry with checksums verified
-  at transfer time
-- Local NVMe is encrypted at the OS layer (LUKS, FileVault, cloud KMS)
-- No standing SSH access — filesystem modifications require break-glass
-  approval
-- Adding signature verification to `mmap`/`pread` paths would add latency
-  to every weight read, especially for [expert streaming](expert-streaming.md)
-  where individual experts are loaded from SSD per token
+**Why rLLM doesn't verify weights.**  Adding signature verification to
+`mmap`/`pread` paths would add latency to every weight read, especially for
+[expert streaming](expert-streaming.md) where individual experts are loaded
+from SSD per token.  For a local setup, you trust your own filesystem.
 
 **TLS.**  rLLM supports TLS via manual certificates (`--tls-cert`, `--tls-key`)
-or automatic Let's Encrypt provisioning.  On a private network behind a
-gateway, TLS between gateway and inference server may be unnecessary — the
-network is already trusted.  For deployments where the gateway-to-inference
-link crosses an untrusted boundary, enable TLS.
-
-**What the deployment must provide:**
-- Filesystem integrity — encrypted volumes, restricted access, immutable
-  deployment images
-- Weight provenance — verify checksums when cloning from the model registry
-- TLS termination at the gateway for client-facing traffic
+or automatic Let's Encrypt provisioning.  For local use, plain HTTP on
+localhost is fine (`--dangerous-no-tls`).
 
 ---
 
@@ -89,34 +54,18 @@ link crosses an untrusted boundary, enable TLS.
 
 | Threat | What is denied | rLLM's stance |
 |--------|---------------|---------------|
-| No record of who sent a request | Cannot attribute inference to a customer | **rLLM does not log request identity.** |
+| No record of who sent a request | Cannot attribute inference to a caller | **rLLM does not log request identity.** |
 | No record of what was generated | Cannot investigate harmful outputs | **rLLM does not log prompts or completions.** |
 
 **Logging.**  rLLM logs operational metrics to stderr: model loading progress,
 per-request token counts, latency, and throughput.  It does **not** log prompt
-content, generated text, or caller identity.  There is no audit trail at the
-inference layer.
-
-**Why rLLM doesn't log prompts.**  Prompt and completion logging is a policy
-decision with privacy and compliance implications.  The inference engine
-shouldn't decide what to retain — that belongs in the gateway and audit
-infrastructure.  rLLM reports token counts and timing; the gateway correlates
-these with customer identity and stores audit records.
-
-**What the deployment must provide:**
-- Gateway-side audit logging — customer identity, model, token counts, latency,
-  timestamps
-- Inference-side event forwarding — rLLM's stderr metrics shipped to a log
-  aggregator for cross-referencing with gateway logs
-- Log retention policy — how long to keep, what to redact, compliance
-  requirements
+content, generated text, or caller identity.
 
 ---
 
 ### Information Disclosure
 
-This is the most significant threat category.  Two assets are at risk:
-**model weights** and **customer data** (prompts + completions).
+Two assets are at risk: **model weights** and **prompts + completions**.
 
 #### Weight theft
 
@@ -124,30 +73,18 @@ This is the most significant threat category.  Two assets are at risk:
 |--------|--------|---------------|
 | Read weights from disk | Filesystem access to safetensors files | **Weights stored unencrypted in application layer.** |
 | Exfiltrate weights over the network | Compromised server sends weights to attacker | **rLLM makes no outbound connections.** |
-| Extract weights via model extraction attack | Repeated API queries to reconstruct weights | **No protection — API gateway must rate-limit.** |
+| Extract weights via model extraction attack | Repeated API queries to reconstruct weights | **No protection — no rate limiting.** |
 | Read weights from GPU memory | Side-channel or co-tenant attack | **No GPU memory isolation beyond OS defaults.** |
 
-**rLLM stores weights as plaintext safetensors on local NVMe.** This is
+**rLLM stores weights as plaintext safetensors on local disk.** This is
 deliberate — `mmap` and `pread` require unencrypted bytes for zero-copy and
 direct-I/O weight loading.  Application-level encryption would break expert
 streaming (which `pread`s individual expert tensors from arbitrary file
 offsets) and add per-read decryption overhead to every forward pass.
 
-**Encryption happens at the infrastructure layer:**
-- Full-disk encryption (LUKS, FileVault, cloud KMS-managed volumes) makes
-  weights unreadable without the decryption key bound to the server's service
-  account
-- Weights stored encrypted at rest in the model registry; decrypted only during
-  the JIT clone window
-- No standing network egress — a compromised server cannot send weights
-  anywhere.  The only persistent outbound path is completions back to the
-  gateway, monitored for anomalous volume
+For local use, your OS-level disk encryption (FileVault, LUKS) is sufficient.
 
-**Model extraction attacks** (querying the API to reconstruct weights) are
-mitigated by the gateway: rate limiting, token budgets, and abuse detection.
-rLLM has no visibility into request patterns across customers.
-
-#### Customer data exposure
+#### Prompt/completion exposure
 
 | Threat | Vector | rLLM's stance |
 |--------|--------|---------------|
@@ -170,16 +107,10 @@ the block table, not data remanence in GPU memory.
 
 **Prompt caching shares KV blocks** across sequences with identical prefixes.
 This is by design — the shared blocks contain the same data (deterministic
-KV from identical tokens).  There is no cross-customer data leakage because
+KV from identical tokens).  There is no cross-sequence data leakage because
 shared blocks are read-only and only match on exact token equality.  See
 [Prompt Caching — Correctness](prompt-caching.md#correctness).
 
-**What the deployment must provide:**
-- TLS for prompt/completion transit (gateway terminates client TLS; optionally
-  TLS between gateway and inference)
-- Prompt/completion retention policy enforced at the gateway layer
-- GPU isolation if running multi-tenant on shared hardware (not an rLLM
-  concern — use separate processes or VMs)
 
 ---
 
@@ -193,18 +124,11 @@ shared blocks are read-only and only match on exact token equality.  See
 | Large image uploads | Oversized images consume CPU during preprocessing | **Image pixel count bounded by model config** (typically 1008–262144 pixels). |
 | Slowloris / connection exhaustion | Hold TCP connections open without sending | **Tokio's async accept loop handles this reasonably**, but no explicit connection timeout. |
 
-**rLLM relies on the gateway for rate limiting and request validation.**
-The inference server accepts whatever arrives on its port.  The scheduler's
-KV block admission check provides natural backpressure — if GPU memory is
-full, new sequences wait — but this doesn't prevent compute-bound attacks
-like submitting prompts that are expensive to prefill.
-
-**What the deployment must provide:**
-- Request rate limiting at the gateway (per-customer, per-model)
-- `max_tokens` cap at the gateway (enforce a server-side maximum regardless of
-  client request)
-- Prompt length limits at the gateway
-- Connection timeouts and concurrent connection limits at the load balancer
+rLLM accepts whatever arrives on its port.  The scheduler's KV block
+admission check provides natural backpressure — if GPU memory is full, new
+sequences wait — but there's no rate limiting or request validation.  For
+local use this is fine; if you expose the port on a network, be aware that
+anyone who can reach it can submit prompts.
 
 ---
 
@@ -229,58 +153,41 @@ access to anything beyond its own scratch space.
 
 ---
 
-## What rLLM Does vs What the Deployment Does
+## Summary
 
-| Concern | rLLM | Deployment / Gateway |
-|---------|------|---------------------|
-| Authentication | None — binds to localhost by default | API gateway authenticates all callers |
-| Authorisation | None | Gateway enforces model access, rate limits, token budgets |
-| Encryption in transit | TLS supported (optional) | Gateway terminates client TLS; internal TLS if needed |
-| Encryption at rest | None (application layer) | Full-disk encryption, registry-level encryption |
-| Weight integrity | Trusts local filesystem | Checksums at clone time, immutable deploys, no standing SSH |
-| Audit logging | Metrics to stderr (token counts, latency) | Gateway logs customer identity, request details, billing |
-| Rate limiting | None | Gateway enforces per-customer limits |
-| Input validation | Image pixel bounds from model config | Gateway enforces prompt length, max_tokens caps |
-| Network isolation | Makes no outbound connections | Private network, no internet, JIT registry access |
-| Prompt/completion privacy | Does not log content | Gateway controls retention policy |
+| Concern | rLLM's stance |
+|---------|---------------|
+| Authentication | None — binds to localhost by default |
+| Encryption in transit | TLS supported but optional; localhost doesn't need it |
+| Encryption at rest | Relies on OS-level disk encryption |
+| Weight integrity | Trusts local filesystem |
+| Logging | Metrics to stderr (token counts, latency); no prompt content |
+| Rate limiting | None |
+| Input validation | Image pixel bounds from model config |
+| Network access | Makes no outbound connections |
 
-**The design principle:** rLLM is a compute engine.  It should be fast, correct,
-and small-surface-area.  Every security concern that can be handled outside the
-inference hot path — auth, encryption, logging, rate limiting — is pushed to
-infrastructure.  This keeps the inference binary simple and avoids coupling it
-to any specific deployment environment.
+**The design principle:** rLLM is a local compute engine.  It should be fast,
+correct, and small-surface-area.  Security concerns like auth and rate limiting
+don't apply to a local inference server.
 
 ---
 
 ## Residual Risks
 
-Things that network isolation and a gateway do not fully address:
+1. **GPU memory remanence.**  Freed KV cache blocks are not zeroed.  Stale
+   K/V data remains in GPU memory until overwritten by the next sequence.
+   Not relevant for single-user local use.
 
-1. **Insider threat.**  An engineer with break-glass access can read weights
-   from disk.  Mitigated by two-person approval, session logging, time-limited
-   access, and YubiKey-backed auth.  Not eliminated.
-
-2. **GPU memory remanence.**  Freed KV cache blocks are not zeroed.  A
-   co-tenant on shared GPU hardware could theoretically read stale data.
-   Mitigated by running single-tenant (one model per GPU process).  Not
-   relevant for dedicated hardware.
-
-3. **Model extraction via API.**  Enough queries can approximate model weights.
-   Mitigated by rate limiting, token budgets, and usage monitoring at the
-   gateway.  Fundamentally unsolvable — any API that exposes model outputs
-   leaks information about weights.
-
-4. **Supply chain.**  Compromised dependencies (Rust crates, system libraries)
+2. **Supply chain.**  Compromised dependencies (Rust crates, system libraries)
    could introduce backdoors.  Mitigated by `cargo audit`, pinned
    dependencies, and reproducible builds.  rLLM's Cargo.toml has no outbound
    HTTP client dependencies — the binary cannot phone home.
 
-5. **Error message leakage.**  Inference errors are returned to the client
+3. **Error message leakage.**  Inference errors are returned to the client
    unsanitised.  Could expose internal tensor shapes, layer names, or memory
-   state.  Low severity but worth sanitising in a production gateway.
+   state.  Low severity for local use.
 
 ---
 
-See also: [Production Considerations](production-considerations.md) ·
-[KV Cache](kv-cache.md) · [Expert Streaming](expert-streaming.md) ·
+See also: [KV Cache](kv-cache.md) · [Expert Streaming](expert-streaming.md) ·
 [Prompt Caching](prompt-caching.md)

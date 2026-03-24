@@ -9,37 +9,19 @@ model, not a reference architecture.
 
 ## The Gateway
 
-rLLM is a single-model inference server.  In production you'd run many
-instances, each serving one model on one or more GPUs.  A gateway sits in
-front and handles everything that isn't inference:
+rLLM is a single-model inference server.  At scale you'd run many instances
+behind a gateway that handles routing, billing, and rate limiting.  For local
+use, rLLM serves directly on localhost.
 
 ```mermaid
 graph TD
-    Client([Client]) --> Gateway
-
-    subgraph Gateway[Gateway]
-        Auth[Auth]
-        Billing[Billing]
-        Routing[Routing]
-        RateLimit[Rate Limiting]
-    end
-
-    Gateway --> A["rLLM<br/>Llama 70B<br/>4×H100"]
-    Gateway --> B["rLLM<br/>Qwen 32B<br/>1×A100"]
-    Gateway --> C["rLLM<br/>Gemma 27B<br/>1×L40"]
+    Client([Client]) --> A["rLLM<br/>Local Model<br/>GPU"]
 ```
 
-**Auth.**  Validate API keys, check model access, reject bad requests before
-they reach a GPU.  Inference servers should not know about user identity.
-
-**Billing.**  Token counts come back from the inference server; the gateway
-records usage.  Streaming responses are metered as tokens arrive via SSE.
-
-**Routing.**  Map the `model` field to a backend pool.  Balance via
-round-robin, shortest queue, or prefix-cache affinity.
-
-**Image fetching.**  For multimodal requests, fetch images from URLs and
-convert to base64 before forwarding.  Eliminates SSRF on GPU machines.
+At scale, a gateway would sit in front of multiple instances and handle
+routing (mapping the `model` field to a backend), billing (metering token
+counts), and rate limiting.  rLLM itself doesn't implement any of these —
+it just runs inference.
 
 ---
 
@@ -381,7 +363,7 @@ position and how much of the model lives in VRAM.
 
 ```mermaid
 graph TD
-    Req([API Request]) --> GW{Gateway<br/>checks user tier}
+    Req([API Request]) --> GW{Gateway<br/>checks tier}
 
     GW -->|Pro| Pro["Dedicated H100 pool<br/>Low batch size<br/>Full VRAM residency<br/>Hot prefix cache"]
     GW -->|Standard| Std["Shared A100/L40 pool<br/>Medium batch size<br/>Quantized weights"]
@@ -432,189 +414,17 @@ not the orchestration layer.
 
 ---
 
-## Security Controls
+## Security
 
-> See [Threat Model](threat-model.md) for the full STRIDE analysis — what rLLM
-> protects against, what it leaves to infrastructure, and why.
+> See [Threat Model](threat-model.md) for the full STRIDE analysis.
 
-Inference servers hold the model weights and produce raw completions — two
-things worth protecting.  The security model treats the inference fleet as a
-high-value, low-surface-area zone: no direct internet, no user identity beyond
-a scoped token, and every forward pass attributable to a customer.
+rLLM binds to `127.0.0.1` by default — only the local machine can reach it.
+It makes no outbound network connections.  Weights are loaded from local
+safetensors files via `mmap`/`pread` and are never transmitted over the
+network.
 
-```mermaid
-graph LR
-    Internet([Internet]) --> GW["Gateway<br/>(public VPC)"]
-
-    subgraph Private["Private Network (no internet)"]
-        Inf["Inference Servers<br/>(GPU fleet)"]
-        Reg["Model Registry<br/>(encrypted weights)"]
-        Logs["Audit Log<br/>Sink"]
-    end
-
-    GW -->|"signed inference<br/>token + prompt"| Inf
-    Inf -->|"completion +<br/>token count"| GW
-    Reg -->|"decrypt &<br/>load weights"| Inf
-    Inf -->|"per-request<br/>audit events"| Logs
-    GW -->|"billing<br/>events"| Logs
-```
-
-### Authentication and token exchange
-
-The gateway doesn't forward raw API keys to the inference server.  Instead,
-it performs a token exchange: validate the customer's API key, mint a
-short-lived, customer-scoped inference token, and attach it to the request.
-The inference server verifies the token before running a forward pass.
-
-This achieves three things:
-
-1. **Identity at the inference layer.**  Every forward pass is tied to a
-   customer identity, not just a gateway session.
-2. **Token theft detection.**  If inference activity appears for a customer
-   with no active gateway session (no recent API calls, no open SSE streams),
-   something is wrong — either a stolen token or a compromised server.
-3. **Blast radius.**  A leaked inference token expires quickly and only
-   authorises inference, not billing mutations or account changes.
-
-The inference server may refuse to initiate a forward pass without a valid
-customer-scoped token.  This means even a compromised server that somehow
-bypasses the gateway cannot generate tokens without a credential — defense
-in depth.
-
-### Audit logging
-
-Every inference request is logged with customer identity, model, token
-counts (prompt + completion), latency, and timestamp.  The audit log is the
-ground truth for:
-
-- **Billing reconciliation.**  Compare inference-side token counts against
-  gateway-side billing records.  Discrepancies (inference tokens ≠ billed
-  tokens) flag bugs or fraud.
-- **Abuse detection.**  Unusually high token volumes for a customer, requests
-  at odd hours, or patterns inconsistent with their integration's profile.
-- **Forensics.**  If a model produces harmful output, trace it back to the
-  exact request, customer, and input.
-
-Both the gateway and inference server emit events to a **log gateway**
-within the private VPC.  The log gateway is the only component that
-forwards logs off-VPC to a central log store (corporate SIEM, data
-warehouse, etc.).  Inference servers never talk to the central store
-directly — they ship events to the VPC-local log gateway and nothing else.
-Cross-referencing the two streams (inference-side and gateway-side) at the
-central store catches discrepancies that either side alone would miss.
-
-### Network isolation
-
-```mermaid
-graph TD
-    Internet([Internet]) --> GW["Gateway<br/>(public VPC)"]
-
-    subgraph Private["Private Network"]
-        direction TB
-        Inf["Inference Servers<br/>(GPU fleet)"]
-        LogGW["Log Gateway<br/>(VPC-internal)"]
-    end
-
-    subgraph Isolated["Isolated Registry Network"]
-        Reg["Model Registry<br/>(encrypted weights)"]
-    end
-
-    Central["Central Log Store<br/>(corporate infra)"]
-
-    GW -->|"inference traffic<br/>(persistent)"| Inf
-    Inf -->|"completions +<br/>token counts"| GW
-    Inf -->|audit events| LogGW
-    GW -->|billing events| LogGW
-    LogGW -->|"forward off-VPC"| Central
-
-    Reg -.->|"JIT route<br/>(provisioned per deploy,<br/>torn down after clone)"| Inf
-
-    Internet x--x|"no outbound"| Private
-
-    style Private fill:#f8d7da,stroke:#dc3545
-    style Isolated fill:#fff3cd,stroke:#ffc107
-```
-
-Inference servers live on a private network with **no standing outbound
-network access** — not even to the model registry.  The only persistent
-traffic flow is inference to/from the gateway (prompts in, completions out).
-
-**JIT registry access.**  When an inference server needs to pull weights
-(new model deploy, scale-up event), a short-lived outbound route to the
-internal model registry is provisioned, the weights are cloned to local
-NVMe, and the route is removed.  The server has no ability to reach the
-registry (or anything else) outside of that window.  Provisioning the route
-requires the same two-person approval as any other connectivity change —
-an engineer requests it, a peer signs off, and the access is time-limited
-and auto-revoked.
-
-**Hardware-backed approval.**  All connectivity and access changes require
-physical YubiKey authentication from the approving engineers.  A
-compromised laptop or stolen session token isn't enough — someone has to
-physically tap a key.
-
-This minimises the exfiltration surface to the narrowest possible window.
-A compromised inference server can't phone home, can't reach external APIs,
-can't reach the model registry, and can't leak weights or outputs to the
-internet.  The gateway is the sole persistent ingress/egress point for the
-entire inference fleet.
-
-### Weight protection
-
-Model weights are intellectual property (for fine-tuned or proprietary
-models) and an attack target (for model extraction).  Protection is handled
-entirely at the infrastructure layer — the inference server never sees
-ciphertext and has no crypto responsibilities.
-
-**Registry-level encryption.**  Weights are stored in an internal
-HuggingFace-style model registry, encrypted at rest.  Decryption keys are
-accessible only to inference server service accounts and authorised
-engineers.  No one else — not the gateway, not the tool cluster, not other
-services — can read weights.  During the JIT registry access window, the
-server clones and decrypts weights to local NVMe, then the route is torn
-down.
-
-**Full-disk encryption.**  The inference server's NVMe is encrypted at the
-OS/infra layer (LUKS, FileVault, cloud-managed encrypted volumes with a
-KMS key bound to the server's service account).  The filesystem presents
-decrypted reads transparently — rLLM just calls `mmap` or `pread` and gets
-bytes.  This means expert streaming (`pread` of individual tensors from
-NVMe) works without any application-level crypto, which is critical for
-large MoE models where only a few experts are active per token.
-
-**Access control is the real protection.**  Encryption at rest protects
-against physical disk theft and cloud-provider-level access.  The more
-meaningful control is limiting who and what can reach the box at all: the
-private network has no internet, the only service that can reach the
-inference port is the gateway, and there is **no standing SSH access**.
-
-Shell access to inference servers is behind a break-glass process: an
-engineer opens a PR requesting access, a second engineer approves it, and
-only then is a short-lived SSH session provisioned.  Two-person rule — no
-one gets a shell on a machine holding model weights without a peer signing
-off.  Sessions are logged, time-limited, and auto-revoked.  The default
-state of the fleet is zero human access.  Even if an attacker gets the
-disk encryption key, they can't reach the machine to use it.
-
-**Why encryption doesn't belong in the inference engine.**  Embedding
-key management, KMS SDKs, and decryption into the inference server would
-add complexity to a hot path, kill `mmap`/`pread`-based weight loading,
-and couple the inference binary to a specific cloud provider's KMS.  The
-OS-level approach is transparent to the application, supports key rotation
-without redeploying the inference server, and works with any weight-loading
-strategy including expert streaming.
-
-### Traffic volume monitoring
-
-Outbound traffic volume from inference servers is monitored and compared
-against the token counts in the audit log.  The expected bytes out for a
-given number of completion tokens is predictable (tokens × ~4 bytes for
-token IDs, plus SSE framing overhead).
-
-Unexpected volume — significantly more bytes than the token count warrants —
-triggers alerts.  This catches weight exfiltration attempts (weights are
-large — a 70B Q4 is ~35GB), unauthorised bulk inference, or a compromised
-server streaming data to an attacker via an allowed egress path.
+For local use, this is sufficient.  rLLM has no auth, no rate limiting, and
+no audit logging — it's a compute engine, not a multi-tenant service.
 
 ---
 
@@ -649,7 +459,7 @@ a **tool worker** — a lightweight, stateful process that owns the
 multi-round-trip loop.  The worker talks to the inference server, dispatches
 tool calls to an isolated tool cluster, feeds results back, and repeats
 until the model produces a final completion.  The gateway stays free for
-routing, auth, and billing.  The inference server never talks to the tool
+routing and billing.  The inference server never talks to the tool
 cluster directly.
 
 ### Why isolate tool execution
@@ -692,9 +502,9 @@ Each round trip adds latency (~100ms worker overhead + tool execution time),
 but the alternative — giving inference servers network access and tool
 credentials — breaks the security model.
 
-**Policy enforcement is split.**  The **gateway** enforces per-customer
-policies before handing off: **tool allow-lists** (customer X can use tools
-A and B but not C) and **rate limits**.  The **tool worker** enforces
+**Policy enforcement is split** (at scale).  The **gateway** enforces
+per-customer policies before handing off: **tool allow-lists** and **rate
+limits**.  The **tool worker** enforces
 per-request limits during the loop: **max tool calls** (at most N round
 trips), **per-tool timeouts** (tool must respond within T seconds), and
 **loop deadlines** (total wall-clock cap across all round trips).  The
@@ -709,9 +519,8 @@ rLLM is the inference server box in the diagram: model loading, Q4
 quantization, continuous batching, GPU dispatch, streaming generation, and an
 OpenAI/Anthropic-compatible API.
 
-Everything above — auth, billing, routing, tiers — belongs in a gateway.
-rLLM turns tokens into tokens.  The gateway decides which tokens go where and
-who pays.
+Everything above — billing, routing, tiers — would belong in a gateway.
+rLLM turns tokens into tokens.
 
 ---
 
@@ -725,4 +534,4 @@ who pays.
 - [Expert Streaming](expert-streaming.md) — SSD-backed MoE, LRU cache, pread I/O
 - [API Server](api-server.md) — HTTP endpoints, worker thread, streaming
 - [Tool Calling](tool-calling.md) — per-architecture formats, parsing, API surface
-- [Threat Model](threat-model.md) — STRIDE analysis, weight theft, customer data, residual risks
+- [Threat Model](threat-model.md) — STRIDE analysis, weight storage, residual risks
