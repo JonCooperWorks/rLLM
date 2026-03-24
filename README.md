@@ -15,6 +15,8 @@ Rust LLM inference engine that runs 397B-parameter MoE models on a MacBook via N
 
 Every file includes architectural rationale explaining *why* things work the way they do, not just *what* they do — designed to be read and understood, not just executed.
 
+**This is an educational codebase.** It exists so I can learn how LLM inference works from the inside, with Claude as a teaching partner walking through every design decision. It builds on ideas pioneered by [vLLM](https://github.com/vllm-project/vllm) (PagedAttention, continuous batching), [llama.cpp](https://github.com/ggerganov/llama.cpp) (efficient quantization, single-binary inference), [Ollama](https://github.com/ollama/ollama) (approachable local LLM UX), and [flash-moe](https://github.com/danveloper/flash-moe) (NVMe expert streaming) — reimplemented from scratch in Rust so I can understand how they work, not just use them. See [docs/framework-comparison.md](docs/framework-comparison.md) for a detailed comparison.
+
 ## Backends
 
 | Platform | Backend | Status |

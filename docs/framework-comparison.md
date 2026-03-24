@@ -1,0 +1,111 @@
+# LLM Inference Framework Comparison
+
+A comparison of rLLM against vLLM, Ollama, and llama.cpp across
+ease of understanding, features, and code quality.
+
+**rLLM is an educational codebase.** It exists so its author can learn how LLM inference
+works from the inside, with Claude as a teaching partner walking through every design
+decision. The other frameworks here are production systems optimized for throughput,
+hardware coverage, or ease of use. rLLM is optimized for *clarity* — every file is
+annotated, every architectural choice is explained, and the codebase is small enough to
+read end-to-end. It builds on ideas pioneered by these projects and aims to make those
+ideas understandable.
+
+---
+
+## Ease of Understanding
+
+| Dimension | rLLM | vLLM | Ollama | llama.cpp |
+|---|---|---|---|---|
+| **Language** | Rust | Python + C++/CUDA | Go + C/C++ | C/C++ |
+| **Codebase size** | ~40K lines, 88 files | ~587K+ lines, 2,600+ files | Medium (Go wrapper over llama.cpp) | Large, 1,200+ contributors |
+| **In-code docs** | Every file annotated with purpose, rationale, cross-references | Extensive official docs site, blog posts, RFCs | Minimal in-code, good user-facing docs | Community wiki, GitHub discussions |
+| **Architecture** | Composable GPU sub-traits, clear module separation | Multi-layer (scheduler, engine, executor, distributed) | Simple (thin CLI, HTTP server, scheduler, runner) | Multi-backend with ongoing modularization |
+| **Learning curve** | Moderate (Rust + small annotated codebase) | High (large codebase + distributed systems) | Low (Go is approachable, CLI-first UX) | High (C++ complexity, large codebase) |
+| **Teaching value** | Built for this — Claude-guided learning, annotated throughout | Good reference once you already understand the concepts | Good for learning Go patterns, not inference internals | Deep optimization knowledge, but hard to extract from C++ |
+
+---
+
+## Features
+
+| Feature | rLLM | vLLM | Ollama | llama.cpp |
+|---|---|---|---|---|
+| **Model architectures** | 9 families | ~100+ | Inherits llama.cpp | Dozens via GGUF |
+| **Quantization** | Q4 (bf16 scale, block-32) | FP8, AWQ, GPTQ, INT4/8 | Q2–Q8, K-quants | Q2–Q8, K-quants, 1.58-bit |
+| **API compatibility** | OpenAI + Anthropic | OpenAI | OpenAI | OpenAI |
+| **Continuous batching** | Yes (paged KV cache) | Yes (PagedAttention pioneer) | Basic scheduling | Yes (server mode) |
+| **Hardware** | Metal, CUDA, CPU (test) | NVIDIA, AMD, Intel, TPU, ARM | CUDA, ROCm, Vulkan, Metal, CPU | 12+ backends |
+| **Vision/multimodal** | Yes (SigLIP ViT) | Yes (image, audio, video) | Yes (image-to-text) | Yes (LLaVA) |
+| **Tool calling** | Yes (4 formats) | Yes | Yes | Yes |
+| **Distributed** | Tensor parallelism | TP, PP, DP, EP; multi-node | Ollama Cloud | RPC multi-node |
+| **Expert streaming** | Yes (SSD-backed MoE) | No | No | No |
+| **Speculative decoding** | No | Yes | No | Yes |
+| **LoRA** | No | Yes (multi-LoRA batching) | Yes | Yes |
+
+**rLLM's unique feature**: Expert streaming loads MoE experts on-demand from NVMe with
+GPU-side LRU caching, enabling models larger than GPU memory without full offloading.
+
+**Why some features are absent**: rLLM intentionally omits features like speculative decoding
+and LoRA that would add cross-cutting complexity to the codebase. Each feature rLLM *does*
+implement is meant to be readable and self-contained — a teaching example, not a production
+checkbox. Features are added when they deepen understanding, not just capability.
+
+---
+
+## Code Quality
+
+### rLLM
+- **Designed to teach**: every file has a header explaining *why* it exists, with cross-references
+  to related files (trait ↔ impl, Rust ↔ shader) — built for learning with Claude as guide
+- Rust with compile-time memory safety and `pub(crate)` visibility discipline
+- Trait-based GPU abstraction (9 composable sub-traits) — each trait is small enough to understand in isolation
+- `#[repr(C)]` param structs byte-matched to shader layouts
+- CPU backend serves as reference implementation for GPU kernel testing
+- Single crate, ~40K lines — feasible to read end-to-end in a few sessions
+
+### vLLM
+- Python (high-level logic) + C++/CUDA (kernels) — rapid iteration with strong kernel implementations
+- Pioneered PagedAttention, a foundational contribution to LLM serving
+- Large codebase reflecting broad model and hardware support
+- Active V1 engine refactoring to simplify architecture
+- Extensive CI/CD with Buildkite, pytest, and RFC-driven development process
+
+### Ollama
+- Clean Go architecture with process isolation
+- Content-addressed model storage with SHA256 deduplication
+- Excellent developer experience — `ollama run` is the simplest way to get started with local LLMs
+- Dual engine approach (llama.cpp + native Go) provides migration flexibility
+
+### llama.cpp
+- Zero external dependencies; compiles to single binary — remarkable portability
+- 1,200+ contributors, ~4,000 releases — massive community and velocity
+- Defined the GGUF format, now the de facto standard for distributing quantized models
+- 12+ hardware backends providing the broadest device support of any framework
+- Active modularization effort to improve maintainability
+
+---
+
+## Summary
+
+| Dimension | rLLM | vLLM | Ollama | llama.cpp |
+|---|---|---|---|---|
+| **Understandability** | High | Moderate | High | Moderate |
+| **Features** | Focused | Broadest | Broad (inherited) | Broad |
+| **Code quality** | High | High | Good | Good |
+
+**rLLM** is a learning tool, not a production serving engine. It exists so its author can
+understand LLM inference from first principles, with Claude walking through every layer —
+from Metal shaders to the HTTP API. It trades breadth for depth: fewer models and backends,
+but a codebase you can hold in your head. Features like expert streaming and paged KV caches
+are implemented because they're *interesting to understand*, not because they're needed for
+a production workload.
+
+**vLLM** leads on features and pioneered PagedAttention, which fundamentally changed how
+LLM serving manages memory. The go-to choice for high-throughput production GPU serving.
+
+**Ollama** made local LLM inference accessible to everyone. Its CLI-first design and model
+library set the standard for developer experience.
+
+**llama.cpp** proved that efficient LLM inference doesn't require a GPU or a heavy framework.
+GGUF and its quantization ecosystem are foundational contributions that the entire community
+builds on.
