@@ -614,19 +614,25 @@ tool is someone else's problem.
 ```mermaid
 graph TD
     Client([Client]) -->|1. prompt| GW[Gateway]
-    GW -->|2. prompt| Inf["Inference Server<br/>(GPU)"]
-    Inf -->|"3. tool_call(search, {q: ...})"| GW
-    GW -->|4. dispatch| Tools["Tool Cluster<br/>(Kubernetes)"]
-    Tools -->|5. result| GW
-    GW -->|"6. tool_result + continue"| Inf
-    Inf -->|7. final completion| GW
-    GW -->|8. response| Client
+    GW -->|2. hand off| W["Tool Worker<br/>(stateful)"]
+    W -->|3. prompt| Inf["Inference Server<br/>(GPU)"]
+    Inf -->|"4. tool_call(search, {q: ...})"| W
+    W -->|5. dispatch| Tools["Tool Cluster<br/>(Kubernetes)"]
+    Tools -->|6. result| W
+    W -->|"7. tool_result + continue"| Inf
+    Inf -->|8. final completion| W
+    W -->|9. response| GW
+    GW -->|10. response| Client
 ```
 
-The **gateway orchestrates the loop**: inference produces a tool call, the
-gateway dispatches it to an isolated tool cluster, collects the result, and
-sends it back to the inference server as a continuation message.  The
-inference server never talks to the tool cluster directly.
+The **gateway hands off tool-call requests to a worker** so it doesn't get
+bogged down.  When a request includes tools, the gateway spawns (or assigns)
+a **tool worker** — a lightweight, stateful process that owns the
+multi-round-trip loop.  The worker talks to the inference server, dispatches
+tool calls to an isolated tool cluster, feeds results back, and repeats
+until the model produces a final completion.  The gateway stays free for
+routing, auth, and billing.  The inference server never talks to the tool
+cluster directly.
 
 ### Why isolate tool execution
 
@@ -652,28 +658,30 @@ of one request.  The gateway retries or returns an error to the model.  If
 the same tool ran on the inference server, a hang could block a GPU, stall a
 batch, and degrade latency for every concurrent user.
 
-### The gateway as orchestrator
+### Worker-based orchestration
 
-This design means the gateway is more than a router — it's an agent-loop
-orchestrator.  For a single user request, the gateway may make multiple
-round trips between inference and tools:
+The tool worker is the agent-loop orchestrator — not the gateway.  For a
+single user request, the worker may make multiple round trips between
+inference and tools:
 
 ```
-User prompt → inference → tool_call → tool cluster → tool_result →
+Gateway → worker → inference → tool_call → tool cluster → tool_result →
 inference → tool_call → tool cluster → tool_result →
-inference → final completion → user
+inference → final completion → worker → gateway → client
 ```
 
-Each round trip adds latency (~100ms gateway overhead + tool execution
-time), but the alternative — giving inference servers network access and
-tool credentials — breaks the security model.
+Each round trip adds latency (~100ms worker overhead + tool execution time),
+but the alternative — giving inference servers network access and tool
+credentials — breaks the security model.
 
-The gateway also enforces **tool-call limits** (max N tool calls per
-request), **timeouts** (tool must respond within T seconds), and **tool
-allow-lists** (customer X can use tools A and B but not C).  These policies
-live in the gateway, not the inference server — the inference server just
-produces tool-call JSON and doesn't know or care whether the tool actually
-runs.
+**Policy enforcement is split.**  The **gateway** enforces per-customer
+policies before handing off: **tool allow-lists** (customer X can use tools
+A and B but not C) and **rate limits**.  The **tool worker** enforces
+per-request limits during the loop: **max tool calls** (at most N round
+trips), **per-tool timeouts** (tool must respond within T seconds), and
+**loop deadlines** (total wall-clock cap across all round trips).  The
+inference server just produces tool-call JSON and doesn't know or care
+whether the tool actually runs.
 
 ---
 

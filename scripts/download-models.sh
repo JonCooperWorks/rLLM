@@ -10,6 +10,7 @@
 #   --small   1B–8B models only (fast iteration, ~100 GB)
 #   --medium  default tier: all models ≤35B (~500 GB)
 #   --big     add 70B+ models for multi-GPU / high-VRAM testing (~1 TB+)
+#   --massive add 300B+ models (~2 TB+)
 #   dest      download directory (default: models/)
 #
 # Environment:
@@ -34,6 +35,7 @@ for arg in "$@"; do
     --small)  TIER="small" ;;
     --medium) TIER="medium" ;;
     --big)    TIER="big" ;;
+    --massive) TIER="massive" ;;
     *)        DEST="$arg" ;;
   esac
 done
@@ -92,7 +94,7 @@ MODELS=(
 )
 
 # ---- Medium tier: add MoE, larger dense, Phi-4 -------------------------
-if [[ "$TIER" == "medium" || "$TIER" == "big" ]]; then
+if [[ "$TIER" == "medium" || "$TIER" == "big" || "$TIER" == "massive" ]]; then
   MODELS+=(
     # Phi-4 — head_dim=96 (odd one out)
     "microsoft/phi-4"
@@ -122,7 +124,7 @@ if [[ "$TIER" == "medium" || "$TIER" == "big" ]]; then
 fi
 
 # ---- Big tier: 70B+ for multi-GPU / high-VRAM --------------------------
-if [[ "$TIER" == "big" ]]; then
+if [[ "$TIER" == "big" || "$TIER" == "massive" ]]; then
   MODELS+=(
     # Llama 70B — the standard large-model benchmark
     "meta-llama/Llama-3.1-70B-Instruct"
@@ -136,6 +138,14 @@ if [[ "$TIER" == "big" ]]; then
     # Qwen 3.5 122B MoE — 122B total (10B active), largest MoE we test
     "Qwen/Qwen3.5-122B-A10B"
     "openai/gpt-oss-120b"
+  )
+fi
+
+# ---- Massive tier: 300B+ for large multi-GPU clusters --------------------
+if [[ "$TIER" == "massive" ]]; then
+  MODELS+=(
+    # Qwen 3.5 397B MoE — 397B total (27B active)
+    "Qwen/Qwen3.5-397B-A27B"
   )
 fi
 

@@ -11,6 +11,7 @@
 #   --medium   small + medium-tier models (default)
 #   --big      only 70B+ models
 #   --all      all tiers
+#   --massive  300B+ models only
 #   --q4-only  skip bf16 runs (useful for models that don't fit in VRAM)
 #   --bf16-only skip Q4 runs
 #   --runs N   number of runs per config (default: 1)
@@ -37,6 +38,7 @@ for arg in "$@"; do
     --medium)    TIER="medium" ;;
     --big)       TIER="big" ;;
     --all)       TIER="all" ;;
+    --massive)   TIER="massive" ;;
     --q4-only)   SKIP_BF16=true ;;
     --bf16-only) SKIP_Q4=true ;;
     --tp)        shift_next=tp ;;
@@ -110,6 +112,10 @@ BIG_MODELS=(
   "openai/gpt-oss-120b"
 )
 
+MASSIVE_MODELS=(
+  "qwen3.5-397b-a27b"
+)
+
 case "$TIER" in
   small)
     MODELS=("${SMALL_MODELS[@]}") ;;
@@ -117,8 +123,10 @@ case "$TIER" in
     MODELS=("${SMALL_MODELS[@]}" "${MEDIUM_MODELS[@]}") ;;
   big)
     MODELS=("${BIG_MODELS[@]}") ;;
+  massive)
+    MODELS=("${MASSIVE_MODELS[@]}") ;;
   all)
-    MODELS=("${SMALL_MODELS[@]}" "${MEDIUM_MODELS[@]}" "${BIG_MODELS[@]}") ;;
+    MODELS=("${SMALL_MODELS[@]}" "${MEDIUM_MODELS[@]}" "${BIG_MODELS[@]}" "${MASSIVE_MODELS[@]}") ;;
 esac
 
 # ---- Helper: run one benchmark and extract metrics -----------------------
