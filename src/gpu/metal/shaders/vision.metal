@@ -96,6 +96,105 @@ kernel void spatial_merge(
 }
 
 // ---------------------------------------------------------------------------
+// Fused spatial merge + LayerNorm.
+//
+// Combines two operations in one dispatch:
+//   1. Gather merge_size×merge_size patches and concatenate
+//   2. Apply LayerNorm on the concatenated vector
+//
+// One threadgroup of 256 threads per merged output token.  Each threadgroup:
+//   - Loads the patches from the input grid into shared memory
+//   - Computes mean and variance via SIMD reduction
+//   - Writes the normalised output
+// ---------------------------------------------------------------------------
+
+struct SpatialMergeNormParams {
+    uint grid_h;
+    uint grid_w;
+    uint hidden_dim;
+    uint merge_size;
+    float eps;
+};
+
+kernel void spatial_merge_norm(
+    constant SpatialMergeNormParams& params [[buffer(0)]],
+    device const bfloat* input              [[buffer(1)]],
+    device const bfloat* weight             [[buffer(2)]],
+    device const bfloat* bias               [[buffer(3)]],
+    device bfloat* output                   [[buffer(4)]],
+    uint row_id                             [[threadgroup_position_in_grid]],
+    uint tid                                [[thread_position_in_threadgroup]],
+    uint tg_size                            [[threads_per_threadgroup]]
+) {
+    const uint ms = params.merge_size;
+    const uint hd = params.hidden_dim;
+    const uint out_w = params.grid_w / ms;
+    const uint merged_hd = hd * ms * ms;
+    const uint num_merged = (params.grid_h / ms) * out_w;
+
+    if (row_id >= num_merged) return;
+
+    uint out_row = row_id / out_w;
+    uint out_col = row_id % out_w;
+
+    device bfloat* row_out = output + row_id * merged_hd;
+
+    // Phase 1: gather patches and compute sum (for mean).
+    float local_sum = 0.0f;
+    for (uint i = tid; i < merged_hd; i += tg_size) {
+        uint sub_token = i / hd;
+        uint sub_elem = i % hd;
+        uint dy = sub_token / ms;
+        uint dx = sub_token % ms;
+        uint src_row = out_row * ms + dy;
+        uint src_col = out_col * ms + dx;
+        uint src_idx = (src_row * params.grid_w + src_col) * hd + sub_elem;
+        float val = float(input[src_idx]);
+        row_out[i] = bfloat(val);  // Temporary write for phase 2 re-read.
+        local_sum += val;
+    }
+
+    // SIMD + cross-SIMD reduction for mean.
+    local_sum = simd_sum(local_sum);
+    threadgroup float shared[32];
+    uint sg = tid / 32, sl = tid % 32;
+    if (sl == 0) shared[sg] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        uint nsg = (tg_size + 31) / 32;
+        float v = (sl < nsg) ? shared[sl] : 0.0f;
+        v = simd_sum(v);
+        if (sl == 0) shared[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float mean = shared[0] / float(merged_hd);
+
+    // Phase 2: compute variance.
+    float sum_sq = 0.0f;
+    for (uint i = tid; i < merged_hd; i += tg_size) {
+        float d = float(row_out[i]) - mean;
+        sum_sq += d * d;
+    }
+    sum_sq = simd_sum(sum_sq);
+    if (sl == 0) shared[sg] = sum_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        uint nsg = (tg_size + 31) / 32;
+        float v = (sl < nsg) ? shared[sl] : 0.0f;
+        v = simd_sum(v);
+        if (sl == 0) shared[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float scale = rsqrt(shared[0] / float(merged_hd) + params.eps);
+
+    // Phase 3: normalise, scale, bias.
+    for (uint i = tid; i < merged_hd; i += tg_size) {
+        float val = (float(row_out[i]) - mean) * scale;
+        row_out[i] = bfloat(val * float(weight[i]) + float(bias[i]));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Scatter vision tokens into text embeddings.
 //
 // Scans token_ids[0..seq_len], and for each position where

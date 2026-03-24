@@ -56,9 +56,10 @@ gpt_oss.rs     — GPT Open Source
 
 Config parsing: `src/model/config.rs` (`ModelArch` enum + `VisionConfig` for VLMs).
 Weight loading: `src/model/loader.rs` (safetensors, single + multi-shard, pre-quantized Q4 auto-detection,
-  vision encoder weights with f32→bf16 conversion and fused QKV splitting).
+  vision encoder weights with f32→bf16 conversion and fused QKV tensor handling — Qwen's
+  fused weights kept as-is, Gemma's separate Q/K/V concatenated into fused format).
 Expert streaming: `src/model/expert_stream.rs` (SSD-backed on-demand expert loading for large MoE models).
-Vision encoder: `src/model/vision.rs` (SigLIP ViT forward pass, image preprocessing, patch embedding).
+Vision encoder: `src/model/vision.rs` (SigLIP ViT forward pass, image preprocessing with tiling, patch embedding).
 
 ### Inference Engine (`src/engine/`)
 
@@ -94,30 +95,33 @@ Transformer (ViT) that converts images into token embeddings the LLM can process
 **Architecture:**
 ```
 Image [3, H, W]
-  ↓ CPU: decode, resize, CLIP-normalise, patchify
-Patches [N, 768]          (768 = 3 channels × 16² pixels per patch)
+  ↓ CPU: decode, resize, CLIP-normalise, patchify (rayon-parallel)
+Patches [N, 768]             (768 = 3 channels × 16² pixels per patch)
   ↓ GPU: patch_embed matmul + positional embedding add
 Patch embeddings [N, 1152]
-  ↓ GPU: 27× ViT blocks (LayerNorm → bidirectional attention → GELU FFN)
+  ↓ GPU: 27× ViT blocks (LayerNorm → fused QKV matmul → bidirectional attention → GELU FFN)
 Vision features [N, 1152]
-  ↓ GPU: spatial merge (2×2) + MLP projector
-Vision tokens [M, 5120]   (M = N/4 after merge, matches LLM hidden_size)
-  ↓ GPU: scatter into text embedding buffer at <|image_pad|> positions
+  ↓ GPU: fused spatial merge + LayerNorm (single kernel) + MLP projector
+Vision tokens [M, 5120]      (M = N/4 after merge, matches LLM hidden_size)
+  ↓ GPU: scatter into text embedding buffer at <|image_pad|> position
 ```
 
 **Key design decisions:**
+- Fused QKV matmul — single [3\*hd, hd] weight, one matmul per ViT block instead of three
+- Fused spatial merge + LayerNorm — one kernel dispatch instead of two, avoids intermediate buffer round-trip
 - LayerNorm (not RMSNorm) — matches the frozen SigLIP encoder's training
 - Bidirectional attention (`causal=false`) — images have no left-to-right ordering
 - Plain GELU (not GeGLU/SwiGLU) — standard ViT activation
 - Patch embedding via matmul — equivalent to Conv2D with stride==kernel_size
 - Spatial merge (Qwen 3.5) — 2×2 adjacent patches concatenated to reduce token count 4×
 - All projections have bias — SigLIP design choice (unlike LLM layers)
+- Rayon-parallel preprocessing — patch rows processed in parallel on CPU
 
 **Data flow through the system:**
 ```
 API request (base64 image)
   → chat.rs: deserialise content array, extract ImageData
-  → api/openai.rs: preprocess_image() on handler thread (CPU)
+  → api/mod.rs: preprocess_images() on handler thread (CPU, rayon-parallel)
   → WorkerRequest.images: Vec<ProcessedImage>
   → engine: SequenceRequest.images → Sequence.images
   → forward_prefill_paged: embed_lookup → vision_encode → scatter → transformer
@@ -127,12 +131,14 @@ API request (base64 image)
 ```
 model/vision.rs         — VisionWeights, VisionBuffers, preprocess_image(), vision_encode()
 model/config.rs         — VisionConfig (parsed from vision_config in config.json)
-model/loader.rs         — load_vision_weights() (handles f32→bf16, fused QKV split, temporal avg)
+model/loader.rs         — load_vision_weights() (handles f32→bf16, fused QKV concat, temporal avg)
 model/chat.rs           — ImageData, vision placeholder tokens in chat templates
 model/mod.rs            — forward_prefill_paged() vision scatter integration
-gpu/ops/vision.rs       — GpuVision trait (spatial_merge, scatter_vision_tokens)
+gpu/ops/vision.rs       — GpuVision trait (spatial_merge, spatial_merge_norm, scatter_vision_tokens)
+gpu/ops/attention.rs    — prefill_attention_fused_qkv (interleaved QKV attention)
 gpu/ops/norm.rs         — layer_norm_batch (LayerNorm for ViT)
-gpu/metal/shaders/vision.metal — spatial merge + scatter kernels
+gpu/metal/shaders/vision.metal    — spatial merge, fused merge+norm, scatter kernels
+gpu/metal/shaders/attention.metal — fused QKV bidirectional attention kernel
 ```
 
 ### CLI Commands (`src/commands/`)

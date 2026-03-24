@@ -158,6 +158,8 @@ pub(crate) struct MetalBackend {
     // Vision encoder kernels.
     pub(crate) pipeline_spatial_merge: metal::ComputePipelineState,
     pub(crate) pipeline_scatter_vision_tokens: metal::ComputePipelineState,
+    pub(crate) pipeline_spatial_merge_norm: metal::ComputePipelineState,
+    pub(crate) pipeline_prefill_attention_fused_qkv: metal::ComputePipelineState,
 
     // Batched command encoding state.
     //
@@ -432,6 +434,18 @@ impl MetalBackend {
             "scatter_vision_tokens",
             &compile_opts,
         )?;
+        let pipeline_spatial_merge_norm = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_VISION,
+            "spatial_merge_norm",
+            &compile_opts,
+        )?;
+        let pipeline_prefill_attention_fused_qkv = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_ATTENTION,
+            "prefill_attention_fused_qkv",
+            &compile_opts,
+        )?;
 
         Ok(Self {
             device,
@@ -487,6 +501,8 @@ impl MetalBackend {
             pipeline_rope_yarn_batch,
             pipeline_spatial_merge,
             pipeline_scatter_vision_tokens,
+            pipeline_spatial_merge_norm,
+            pipeline_prefill_attention_fused_qkv,
             current_cmd: std::sync::Mutex::new(None),
         })
     }

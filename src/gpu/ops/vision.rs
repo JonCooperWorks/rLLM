@@ -56,6 +56,27 @@ pub(crate) trait GpuVision: GpuCore {
         merge_size: u32,
     );
 
+    /// Fused spatial merge + LayerNorm: rearrange 2D grid tokens AND normalise
+    /// in one kernel dispatch, avoiding an intermediate global memory write.
+    ///
+    /// Each output token is computed by:
+    ///   1. Gather merge_size×merge_size patches from the input grid
+    ///   2. Concatenate into one wide vector
+    ///   3. Apply LayerNorm (mean-center, scale by weight, add bias)
+    ///   4. Write the normalised merged token to output
+    fn spatial_merge_norm(
+        &self,
+        input: &Self::Tensor,
+        output: &Self::Tensor,
+        weight: &Self::Tensor,
+        bias: &Self::Tensor,
+        grid_h: u32,
+        grid_w: u32,
+        hidden_dim: u32,
+        merge_size: u32,
+        eps: f32,
+    );
+
     /// Scatter vision embeddings into a text embedding buffer.
     ///
     /// For each position `i` in `token_ids` where `token_ids[i] == image_token_id`,

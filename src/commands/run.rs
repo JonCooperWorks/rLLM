@@ -107,7 +107,6 @@ pub(crate) fn exec(mut args: RunArgs) -> anyhow::Result<()> {
                 anyhow::anyhow!("failed to read image '{}': {e}", image_path.display())
             })?;
             eprintln!("image: {} ({} bytes)", image_path.display(), data.len());
-            // Parse config.json just for vision config (cheap — only reads JSON header).
             let vc = crate::model::config::ModelConfig::from_file(
                 &args.model.join("config.json"),
             )?
@@ -115,7 +114,7 @@ pub(crate) fn exec(mut args: RunArgs) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("--image requires a vision model (no vision_config in config.json)"))?;
             let processed = crate::model::vision::preprocess_image(&data, &vc)?;
             eprintln!(
-                "image preprocessed: {}×{} patches, {} vision tokens",
+                "image preprocessed: {}x{} patches, {} vision tokens",
                 processed.grid_h, processed.grid_w, processed.num_vision_tokens
             );
             vec![processed]

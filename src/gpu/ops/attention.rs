@@ -135,6 +135,41 @@ pub(crate) trait GpuAttention: GpuCore {
         );
     }
 
+    /// Fused QKV prefill attention for vision encoders.
+    ///
+    /// Takes a single interleaved QKV buffer [chunk_size, 3 * num_heads * head_dim]
+    /// instead of separate Q, K, V tensors.  Within each row, the layout is:
+    ///   [Q₀..Q_{hd-1}, K₀..K_{hd-1}, V₀..V_{hd-1}]
+    ///
+    /// This eliminates 2 of the 3 matmul dispatches for QKV projection — one
+    /// fused matmul with a [3*hd, hd] weight matrix produces the entire QKV
+    /// output, and this method reads Q/K/V at the correct strides.
+    ///
+    /// Always bidirectional (no causal mask) — designed for vision encoders.
+    fn prefill_attention_fused_qkv(
+        &self,
+        qkv: &Self::Tensor,
+        out: &Self::Tensor,
+        chunk_size: u32,
+        num_heads: u32,
+        head_dim: u32,
+        attn_scale: f32,
+    ) {
+        // Default implementation: fall back to separate prefill_attention by
+        // splitting the QKV buffer conceptually. Backends can override with
+        // a dedicated fused kernel for better performance.
+        //
+        // Note: this default ONLY works if the backend can read from the same
+        // buffer at different offsets. Since we pass the same tensor for Q/K/V,
+        // the prefill_attention kernel will read Q from offset 0 with stride 3*hd,
+        // which is WRONG for the non-fused kernel. So backends MUST override this
+        // or use the separate-tensor path.
+        //
+        // The Metal backend provides a dedicated fused kernel.
+        let _ = (qkv, out, chunk_size, num_heads, head_dim, attn_scale);
+        unimplemented!("prefill_attention_fused_qkv requires a dedicated kernel implementation");
+    }
+
     /// Prefill attention on dense Q/K/V tensors.
     ///
     /// When `causal` is true (default for LLM text), applies a causal mask so

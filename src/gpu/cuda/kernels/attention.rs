@@ -382,4 +382,16 @@ impl GpuAttention for CudaBackend {
         }
         .expect("prefill_attention launch failed");
     }
+
+    fn prefill_attention_fused_qkv(
+        &self,
+        _qkv: &CudaTensor,
+        _out: &CudaTensor,
+        _chunk_size: u32,
+        _num_heads: u32,
+        _head_dim: u32,
+        _attn_scale: f32,
+    ) {
+        todo!("prefill_attention_fused_qkv not yet implemented for CUDA backend")
+    }
 }

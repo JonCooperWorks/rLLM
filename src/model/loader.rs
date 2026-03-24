@@ -2746,35 +2746,18 @@ fn load_qwen_vision_block<B: GpuCore>(
     let norm2_weight = tv(&format!("{bp}.norm2.weight"));
     let norm2_bias = tv(&format!("{bp}.norm2.bias"));
 
-    // Fused QKV [3*hd, hd] → split into Q [hd, hd], K [hd, hd], V [hd, hd].
-    // Convert to bf16 first (may be f32 on disk), then split.
+    // Fused QKV [3*hd, hd] — keep as-is (no splitting).
     //
     // LEARNING NOTE: Qwen stores Q, K, V as a single fused weight matrix
-    // [3*hd, hd] for training efficiency (one big matmul instead of three).
-    // We split it at load time so our forward pass can use the same per-head
-    // attention code for both Qwen and Gemma.  The split is a byte-level
-    // slice: rows [0..hd) are Q, [hd..2*hd) are K, [2*hd..3*hd) are V.
-    // The same pattern applies to the fused bias [3*hd] → Q/K/V biases.
+    // [3*hd, hd].  One matmul produces the entire QKV output [N, 3*hd],
+    // and the fused attention kernel (prefill_attention_fused_qkv) reads
+    // Q/K/V at stride offsets within each row.  This eliminates 2 of the
+    // 3 matmul dispatches — a 3× reduction in kernel launch overhead.
     let qkv_view = store.tensor(&format!("{bp}.attn.qkv.weight")).unwrap();
-    let qkv_bf16 = to_bf16_vec(&qkv_view);
-    let row_bytes = hd * 2; // bf16 bytes per row element
-    let q_weight = backend.upload_tensor(&qkv_bf16[..hd * row_bytes], &[hd, hd], TensorDtype::BF16);
-    let k_weight = backend.upload_tensor(&qkv_bf16[hd * row_bytes..2 * hd * row_bytes], &[hd, hd], TensorDtype::BF16);
-    let v_weight = backend.upload_tensor(&qkv_bf16[2 * hd * row_bytes..3 * hd * row_bytes], &[hd, hd], TensorDtype::BF16);
+    let qkv_weight = upload_vision(backend, &qkv_view, &[3 * hd, hd]);
 
-    // QKV bias [3*hd] → split.
-    let qkv_bias_view = store.tensor(&format!("{bp}.attn.qkv.bias")).ok();
-    let (q_bias, k_bias, v_bias) = if let Some(bv) = qkv_bias_view {
-        let bd = to_bf16_vec(&bv);
-        let elem = 2usize; // bf16 bytes
-        (
-            Some(backend.upload_tensor(&bd[..hd * elem], &[hd], TensorDtype::BF16)),
-            Some(backend.upload_tensor(&bd[hd * elem..2 * hd * elem], &[hd], TensorDtype::BF16)),
-            Some(backend.upload_tensor(&bd[2 * hd * elem..3 * hd * elem], &[hd], TensorDtype::BF16)),
-        )
-    } else {
-        (None, None, None)
-    };
+    let qkv_bias = store.tensor(&format!("{bp}.attn.qkv.bias")).ok()
+        .map(|v| upload_vision(backend, &v, &[3 * hd]));
 
     let proj_weight = tv(&format!("{bp}.attn.proj.weight"));
     let proj_bias = tv(&format!("{bp}.attn.proj.bias"));
@@ -2792,8 +2775,7 @@ fn load_qwen_vision_block<B: GpuCore>(
 
     Some(VisionBlockWeights {
         norm1_weight, norm1_bias, norm2_weight, norm2_bias,
-        q_weight, k_weight, v_weight,
-        q_bias, k_bias, v_bias,
+        qkv_weight, qkv_bias,
         proj_weight, proj_bias,
         fc1_weight, fc1_bias,
         up_weight, up_bias,
@@ -2830,12 +2812,28 @@ fn load_gemma_vision_block<B: GpuCore>(
     let norm2_weight = t(&format!("{bp}.layer_norm2.weight"));
     let norm2_bias = t(&format!("{bp}.layer_norm2.bias"));
 
-    let q_weight = t(&format!("{bp}.self_attn.q_proj.weight"));
-    let k_weight = t(&format!("{bp}.self_attn.k_proj.weight"));
-    let v_weight = t(&format!("{bp}.self_attn.v_proj.weight"));
-    let q_bias = tb(&format!("{bp}.self_attn.q_proj.bias"));
-    let k_bias = tb(&format!("{bp}.self_attn.k_proj.bias"));
-    let v_bias = tb(&format!("{bp}.self_attn.v_proj.bias"));
+    // Concatenate separate Q/K/V weights into a single fused [3*hd, hd] tensor
+    // for the fused QKV attention kernel.
+    let q_view = store.tensor(&format!("{bp}.self_attn.q_proj.weight")).unwrap();
+    let k_view = store.tensor(&format!("{bp}.self_attn.k_proj.weight")).unwrap();
+    let v_view = store.tensor(&format!("{bp}.self_attn.v_proj.weight")).unwrap();
+    let mut qkv_data = to_bf16_vec(&q_view);
+    qkv_data.extend_from_slice(&to_bf16_vec(&k_view));
+    qkv_data.extend_from_slice(&to_bf16_vec(&v_view));
+    let qkv_weight = backend.upload_tensor(&qkv_data, &[3 * hd, hd], TensorDtype::BF16);
+
+    // Concatenate Q/K/V biases similarly.
+    let qkv_bias = if let Ok(qb) = store.tensor(&format!("{bp}.self_attn.q_proj.bias")) {
+        let kb = store.tensor(&format!("{bp}.self_attn.k_proj.bias")).unwrap();
+        let vb = store.tensor(&format!("{bp}.self_attn.v_proj.bias")).unwrap();
+        let mut bias_data = to_bf16_vec(&qb);
+        bias_data.extend_from_slice(&to_bf16_vec(&kb));
+        bias_data.extend_from_slice(&to_bf16_vec(&vb));
+        Some(backend.upload_tensor(&bias_data, &[3 * hd], TensorDtype::BF16))
+    } else {
+        None
+    };
+
     let proj_weight = t(&format!("{bp}.self_attn.out_proj.weight"));
     let proj_bias = t(&format!("{bp}.self_attn.out_proj.bias"));
 
@@ -2846,11 +2844,10 @@ fn load_gemma_vision_block<B: GpuCore>(
 
     Some(VisionBlockWeights {
         norm1_weight, norm1_bias, norm2_weight, norm2_bias,
-        q_weight, k_weight, v_weight,
-        q_bias, k_bias, v_bias,
+        qkv_weight, qkv_bias,
         proj_weight, proj_bias,
         fc1_weight, fc1_bias,
-        up_weight: None,  // Gemma uses plain GELU, no gate+up split.
+        up_weight: None,
         up_bias: None,
         fc2_weight, fc2_bias,
     })

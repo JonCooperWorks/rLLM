@@ -6,6 +6,7 @@ Rust LLM inference engine that runs 397B-parameter MoE models on a MacBook via N
 
 - **Expert streaming on Metal and CUDA** — stream hundreds of GB of expert weights from NVMe on demand, with GPU-side LRU caching and async DMA (inspired by [flash-moe](https://github.com/danveloper/flash-moe))
 - **12 architectures** — Llama 3.x, Qwen 2.5/3/3.5, Mistral, Mixtral, Gemma 3, Phi-4, DeepSeek-R1-Distill, GPT-OSS
+- **Vision-language models** — SigLIP ViT encoder for Qwen 3.5 and Gemma 3 VLMs
 - **bf16 and Q4 quantization** — 18-byte block format with bf16 scales; Q4 expert streaming cuts NVMe I/O 3.5×
 - **Multi-GPU tensor parallelism** via NCCL for distributed inference
 - **Continuous batching with paged KV cache** — dynamic block allocation across concurrent sequences
@@ -29,9 +30,10 @@ Platform selection uses OS-conditional compilation (`#[cfg(target_os)]`) — no 
 |---|---|---|
 | Llama 3.x | Dense | Yes |
 | Mistral 7B | Dense | Yes |
-| Gemma 3 | Dense | Yes |
+| Gemma 3 | Dense (+ Vision-Language variant) | Yes |
 | Qwen 2.5 | Dense | No |
 | Qwen 3.5 | Dense (hybrid DeltaNet) | No |
+| Qwen 3.5 VL | Vision-Language (SigLIP ViT) | No |
 | Qwen 3.5 MoE | MoE (hybrid DeltaNet) | No |
 | Qwen3 MoE | MoE | No |
 | Phi-4 | Dense | No |
@@ -222,7 +224,8 @@ Measured via `rllm bench` — 8 requests sharing the same system prompt (~32 cac
 - **Mixture of Experts** — top-k expert routing with per-token dispatch (Mixtral, Qwen3 MoE, GPT-OSS)
 - **SSD expert streaming** — run MoE models larger than GPU memory by streaming experts from NVMe on demand (`--stream-experts`) on both Metal and CUDA; LRU expert cache skips NVMe reads and PCIe transfers on cache hits; fused gate+up+SwiGLU kernel reduces per-expert dispatches. Streaming approach inspired by [flash-moe](https://github.com/danveloper/flash-moe)
 - **MXFP4 dequantization** — microscaling FP4 (E2M1 + E8M0 scales) weight loading for GPT-OSS
-- **API server** — OpenAI and Anthropic compatible HTTP endpoints with SSE streaming
+- **Vision-language models** — SigLIP ViT encoder for Qwen 3.5 VL and Gemma 3 VLMs; fused QKV attention, fused spatial merge + LayerNorm, rayon-parallel image preprocessing
+- **API server** — OpenAI and Anthropic compatible HTTP endpoints with SSE streaming, multimodal image support via base64
 - **Chat templates** — Llama 3, ChatML (Qwen/GPT-OSS), Mistral/Mixtral, Phi, and Gemma instruct formats
 - **Temperature + top-p sampling** — configurable via `--temperature` and `--top-p`
 
@@ -245,6 +248,9 @@ cargo run --release -- run --model models/llama-3.2-3b-instruct --prompt "Write 
 
 # SSD expert streaming (run MoE models larger than GPU memory)
 cargo run --release -- run --model models/qwen3.5-35b-a3b --prompt "Hello" --chat --stream-experts
+
+# Vision model — describe an image (Qwen 3.5 VL or Gemma 3 VL)
+cargo run --release -- run --model models/qwen3.5-vl-3b-instruct --prompt "What's in this image?" --chat --image photo.jpg
 
 # Multi-GPU tensor parallelism (splits model across GPUs via NCCL)
 cargo run --release -- run --model models/llama-3.1-70b-instruct --prompt "Hello" --chat --tp 2
@@ -334,6 +340,17 @@ curl http://localhost:8080/v1/messages \
     "max_tokens": 64,
     "system": "You are a helpful math tutor."
   }'
+
+# Vision — send an image with a question (OpenAI multimodal format)
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": [
+      {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,'"$(base64 < photo.jpg)"'"}},
+      {"type": "text", "text": "Describe this image in detail."}
+    ]}],
+    "max_tokens": 256
+  }'
 ```
 
 </details>
@@ -373,6 +390,7 @@ src/
 │   ├── loader.rs        — Safetensors loading, pre-quantized Q4 detection
 │   ├── tokenizer.rs     — BPE tokenizer with per-model special tokens
 │   ├── chat.rs          — Chat template formatter
+│   ├── vision.rs        — SigLIP ViT encoder, image preprocessing
 │   ├── kv_cache.rs      — Paged KV cache (block pool + per-sequence state + prefix cache)
 │   ├── expert_stream.rs — SSD expert streaming (pread-based on-demand loading)
 │   └── sampler.rs       — Temperature + top-p sampling

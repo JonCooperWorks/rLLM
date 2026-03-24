@@ -142,6 +142,13 @@ impl GpuCore for CpuBackend {
         unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
     }
 
+    fn copy_to_tensor_from_host(&self, src: &[u8], dst: &CpuTensor) {
+        let dst_ptr = dst.data.as_ptr() as *mut u8;
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), dst_ptr, src.len());
+        }
+    }
+
     fn tensor_byte_count(&self, tensor: &CpuTensor) -> usize {
         tensor.data.len()
     }
@@ -1176,6 +1183,60 @@ impl GpuAttention for CpuBackend {
 
         write_bf16(out, &out_data);
     }
+
+    fn prefill_attention_fused_qkv(
+        &self,
+        qkv: &CpuTensor,
+        out: &CpuTensor,
+        chunk_size: u32,
+        num_heads: u32,
+        head_dim: u32,
+        attn_scale: f32,
+    ) {
+        // Read interleaved QKV buffer: each row is [Q, K, V] concatenated.
+        let cs = chunk_size as usize;
+        let nh = num_heads as usize;
+        let hd = head_dim as usize;
+        let total_hd = nh * hd;
+        let qkv_stride = 3 * total_hd;
+        let qkv_data = read_bf16(qkv, cs * qkv_stride);
+        let mut out_data = vec![0.0f32; cs * total_hd];
+        let scale = if attn_scale > 0.0 { attn_scale } else { 1.0 / (hd as f32).sqrt() };
+
+        for qi in 0..cs {
+            for h in 0..nh {
+                let q_off = qi * qkv_stride + h * hd;
+                let q_head = &qkv_data[q_off..q_off + hd];
+
+                // Bidirectional: attend to all positions.
+                let mut scores = vec![0.0f32; cs];
+                let mut max_score = f32::NEG_INFINITY;
+                for pos in 0..cs {
+                    let k_off = pos * qkv_stride + total_hd + h * hd;
+                    let k_head = &qkv_data[k_off..k_off + hd];
+                    let mut dot = 0.0f32;
+                    for d in 0..hd { dot += q_head[d] * k_head[d]; }
+                    scores[pos] = dot * scale;
+                    if scores[pos] > max_score { max_score = scores[pos]; }
+                }
+                let mut sum_exp = 0.0f32;
+                for s in &mut scores {
+                    *s = (*s - max_score).exp();
+                    sum_exp += *s;
+                }
+                for s in &mut scores { *s /= sum_exp; }
+
+                let out_off = qi * total_hd + h * hd;
+                for pos in 0..cs {
+                    let v_off = pos * qkv_stride + 2 * total_hd + h * hd;
+                    for d in 0..hd {
+                        out_data[out_off + d] += scores[pos] * qkv_data[v_off + d];
+                    }
+                }
+            }
+        }
+        write_bf16(out, &out_data);
+    }
 }
 
 // ===========================================================================
@@ -1409,6 +1470,58 @@ impl GpuVision for CpuBackend {
             }
         }
 
+        write_bf16(output, &result);
+    }
+
+    fn spatial_merge_norm(
+        &self,
+        input: &CpuTensor,
+        output: &CpuTensor,
+        weight: &CpuTensor,
+        bias: &CpuTensor,
+        grid_h: u32,
+        grid_w: u32,
+        hidden_dim: u32,
+        merge_size: u32,
+        eps: f32,
+    ) {
+        // Fused: spatial_merge + layer_norm in one pass.
+        let ms = merge_size as usize;
+        let hd = hidden_dim as usize;
+        let gh = grid_h as usize;
+        let gw = grid_w as usize;
+        let out_h = gh / ms;
+        let out_w = gw / ms;
+        let merged_hd = hd * ms * ms;
+
+        let inp = read_bf16(input, gh * gw * hd);
+        let w = read_bf16(weight, merged_hd);
+        let b = read_bf16(bias, merged_hd);
+        let mut result = vec![0.0f32; out_h * out_w * merged_hd];
+
+        for oh in 0..out_h {
+            for ow in 0..out_w {
+                let out_idx = oh * out_w + ow;
+                // Gather + concat.
+                for dy in 0..ms {
+                    for dx in 0..ms {
+                        let src_token = (oh * ms + dy) * gw + (ow * ms + dx);
+                        let sub_token = dy * ms + dx;
+                        for e in 0..hd {
+                            result[out_idx * merged_hd + sub_token * hd + e] = inp[src_token * hd + e];
+                        }
+                    }
+                }
+                // LayerNorm on the merged token.
+                let off = out_idx * merged_hd;
+                let mean: f32 = result[off..off + merged_hd].iter().sum::<f32>() / merged_hd as f32;
+                let var: f32 = result[off..off + merged_hd].iter().map(|v| (v - mean).powi(2)).sum::<f32>() / merged_hd as f32;
+                let scale = 1.0 / (var + eps).sqrt();
+                for i in 0..merged_hd {
+                    result[off + i] = (result[off + i] - mean) * scale * w[i] + b[i];
+                }
+            }
+        }
         write_bf16(output, &result);
     }
 

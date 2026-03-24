@@ -53,6 +53,10 @@ pub(crate) trait GpuCore: Send + Sync {
     /// Copy raw bytes from the host into an existing GPU tensor.
     fn copy_to_tensor(&self, tensor: &Self::Tensor, src: &[u8]);
 
+    /// Copy host data into an existing GPU tensor, avoiding buffer allocation.
+    /// The data length must match the tensor's byte count.
+    fn copy_to_tensor_from_host(&self, src: &[u8], dst: &Self::Tensor);
+
     /// Return the total byte count of a tensor's data.
     fn tensor_byte_count(&self, tensor: &Self::Tensor) -> usize;
 

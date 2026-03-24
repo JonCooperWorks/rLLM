@@ -58,6 +58,49 @@ impl GpuVision for MetalBackend {
         );
     }
 
+    fn spatial_merge_norm(
+        &self,
+        input: &MetalTensor,
+        output: &MetalTensor,
+        weight: &MetalTensor,
+        bias: &MetalTensor,
+        grid_h: u32,
+        grid_w: u32,
+        hidden_dim: u32,
+        merge_size: u32,
+        eps: f32,
+    ) {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct SpatialMergeNormParams {
+            grid_h: u32,
+            grid_w: u32,
+            hidden_dim: u32,
+            merge_size: u32,
+            eps: f32,
+        }
+        let params = SpatialMergeNormParams {
+            grid_h,
+            grid_w,
+            hidden_dim,
+            merge_size,
+            eps,
+        };
+        let num_merged = (grid_h / merge_size) * (grid_w / merge_size);
+        self.dispatch_async(
+            &self.pipeline_spatial_merge_norm,
+            &params,
+            &[
+                (&input.buffer, 1),
+                (&weight.buffer, 2),
+                (&bias.buffer, 3),
+                (&output.buffer, 4),
+            ],
+            MTLSize::new(num_merged as u64 * 256, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+    }
+
     fn scatter_vision_tokens(
         &self,
         text_embeds: &MetalTensor,

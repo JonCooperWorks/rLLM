@@ -972,3 +972,99 @@ kernel void prefill_attention(
     device bfloat* out_ptr = output + qi * q_stride + head_id * head_dim;
     reduce_v_and_write(v_acc, local_max, global_max, total_sum, tid, tg_size, head_dim, shared_reduce, out_ptr);
 }
+
+// ===========================================================================
+// Fused QKV bidirectional attention for vision encoders.
+//
+// Takes a single interleaved QKV buffer [chunk_size, 3 * num_heads * head_dim]
+// where each row contains [Q, K, V] concatenated.  This avoids 3 separate
+// matmul dispatches — one fused matmul with a [3*hd, hd] weight produces
+// the entire QKV output, and this kernel reads Q/K/V at stride 3*hd.
+//
+// Always bidirectional (no causal mask) — every position attends to every
+// other position, as required by vision transformers.
+// ===========================================================================
+
+struct FusedQkvAttentionParams {
+    uint chunk_size;
+    uint num_heads;
+    uint head_dim;
+    float attn_scale;
+};
+
+kernel void prefill_attention_fused_qkv(
+    constant FusedQkvAttentionParams& params [[buffer(0)]],
+    device const bfloat* qkv    [[buffer(1)]],  // [chunk_size, 3 * num_heads * head_dim]
+    device bfloat* output       [[buffer(2)]],  // [chunk_size, num_heads * head_dim]
+    uint tg_id                  [[threadgroup_position_in_grid]],
+    uint tid                    [[thread_position_in_threadgroup]],
+    uint tg_size                [[threads_per_threadgroup]]
+) {
+    const uint chunk_size = params.chunk_size;
+    const uint head_dim = params.head_dim;
+    const uint num_heads = params.num_heads;
+    const uint hd = num_heads * head_dim;
+
+    uint qi      = tg_id / num_heads;
+    uint head_id = tg_id % num_heads;
+
+    if (qi >= chunk_size) return;
+
+    const float scale = (params.attn_scale > 0.0f) ? params.attn_scale : rsqrt(float(head_dim));
+
+    // QKV layout: each row is [Q₀..Q_{hd-1}, K₀..K_{hd-1}, V₀..V_{hd-1}]
+    // Row stride in QKV buffer = 3 * hd (3 concatenated projections).
+    const uint qkv_stride = 3 * hd;
+    const uint out_stride = hd;
+
+    // Q pointer: start of QKV row + head offset (Q is first in the row).
+    device const bfloat* q_ptr = qkv + qi * qkv_stride + head_id * head_dim;
+
+    // Bidirectional: attend to all positions 0..chunk_size-1.
+    const uint attend_len = chunk_size;
+
+    // Load Q into shared memory.
+    threadgroup float q_shared[MAX_HD];
+    if (tid < head_dim) {
+        q_shared[tid] = float(q_ptr[tid]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Online softmax + V accumulation.
+    float4 v_acc[MAX_HD_VEC4] = {};
+    float local_max = -INFINITY;
+    float local_sum_exp = 0.0f;
+    const uint hd4 = head_dim / 4;
+
+    for (uint pos = tid; pos < attend_len; pos += tg_size) {
+        // K pointer: QKV row at pos, offset by hd (K starts after Q).
+        device const bfloat* k_vec = qkv + pos * qkv_stride + hd + head_id * head_dim;
+        float score = dot_q_k(q_shared, k_vec, head_dim) * scale;
+
+        if (score > local_max) {
+            float correction = exp(local_max - score);
+            for (uint i = 0; i < hd4; i++) v_acc[i] *= correction;
+            local_sum_exp = local_sum_exp * correction + 1.0f;
+            local_max = score;
+        } else {
+            local_sum_exp += exp(score - local_max);
+        }
+
+        float weight = exp(score - local_max);
+        // V pointer: QKV row at pos, offset by 2*hd (V starts after Q and K).
+        device const bfloat* v_vec = qkv + pos * qkv_stride + 2 * hd + head_id * head_dim;
+        device const bfloat4* v4 = (device const bfloat4*)v_vec;
+        for (uint i = 0; i < hd4; i++) {
+            v_acc[i] += weight * float4(v4[i]);
+        }
+    }
+
+    // Cross-thread softmax reduction + V write.
+    threadgroup float shared_reduce[NUM_SIMD_GROUPS * MAX_HD];
+    float2 softmax_result = reduce_softmax(local_max, local_sum_exp, tid, tg_size, shared_reduce);
+    float global_max = softmax_result.x;
+    float total_sum = softmax_result.y;
+
+    device bfloat* out_ptr = output + qi * out_stride + head_id * head_dim;
+    reduce_v_and_write(v_acc, local_max, global_max, total_sum, tid, tg_size, head_dim, shared_reduce, out_ptr);
+}

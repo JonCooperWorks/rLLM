@@ -89,18 +89,21 @@
 // ===========================================================================
 
 use half::bf16;
+use rayon::prelude::*;
 
 use super::config::VisionConfig;
-use crate::gpu::{GpuBackend, GpuCore, GpuElementwise, GpuMatmul, GpuNorm, GpuVision, TensorDtype};
+use crate::gpu::{GpuBackend, GpuCore, TensorDtype};
 
 // ---------------------------------------------------------------------------
 // Vision weight structures.
 //
-// Design decision: Q/K/V weights are always stored as SEPARATE tensors,
-// even for Qwen 3.5 which ships fused QKV [3*hidden, hidden] in the
-// checkpoint.  The fused tensor is split during loading (see loader.rs).
-// This keeps the forward pass simple — no sub-tensor slicing needed.
-// Same pattern as how Phi's fused qkv_proj is split on load elsewhere.
+// Design decision: Q/K/V weights are stored as a SINGLE FUSED [3*hd, hd]
+// tensor, not as separate projections.  For Qwen 3.5, this is the native
+// checkpoint format.  For Gemma 3, separate Q/K/V weights are concatenated
+// into a fused tensor during loading (see loader.rs).  A single matmul
+// produces the entire QKV output [N, 3*hd], and the fused attention kernel
+// (prefill_attention_fused_qkv) reads Q/K/V at stride offsets within each
+// row — eliminating 2 of the 3 matmul dispatches per ViT block.
 // ---------------------------------------------------------------------------
 
 /// Weights for a single ViT transformer block.
@@ -121,14 +124,14 @@ pub(crate) struct VisionBlockWeights<B: GpuCore> {
     pub norm2_bias: B::Tensor,   // [hidden_size]
 
     // --- Multi-head self-attention ---
-    // Q/K/V are separate tensors (split on load for Qwen's fused checkpoint).
-    // All are [hidden_size, hidden_size] with bias [hidden_size].
-    pub q_weight: B::Tensor,
-    pub k_weight: B::Tensor,
-    pub v_weight: B::Tensor,
-    pub q_bias: Option<B::Tensor>,
-    pub k_bias: Option<B::Tensor>,
-    pub v_bias: Option<B::Tensor>,
+    //
+    // QKV stored as a FUSED [3*hidden_size, hidden_size] weight tensor so that
+    // a single matmul produces all three projections at once.  Qwen 3.5 stores
+    // fused QKV natively; Gemma's separate Q/K/V are concatenated during loading.
+    // This enables the fused QKV attention kernel (prefill_attention_fused_qkv)
+    // which reads Q/K/V at stride offsets within the interleaved output.
+    pub qkv_weight: B::Tensor,             // [3*hidden_size, hidden_size]
+    pub qkv_bias: Option<B::Tensor>,       // [3*hidden_size]
     pub proj_weight: B::Tensor, // output projection [hidden_size, hidden_size]
     pub proj_bias: B::Tensor,
 
@@ -257,11 +260,56 @@ pub(crate) struct ProcessedImage {
 const CLIP_MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
 const CLIP_STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
 
+/// Smart resize: find the optimal (height, width) for an image.
+///
+/// The target resolution preserves the original aspect ratio while ensuring:
+///   - Total pixels (h × w) is between min_pixels and max_pixels
+///   - Both dimensions are multiples of `factor` (= patch_size × merge_size)
+///
+/// Algorithm (matches HuggingFace Qwen2VLImageProcessor.smart_resize):
+///   1. If h × w < min_pixels: scale up so h × w ≈ min_pixels
+///   2. If h × w > max_pixels: scale down so h × w ≈ max_pixels
+///   3. Round both dimensions to nearest multiple of `factor`
+///   4. Clamp to at least one `factor` in each dimension
+fn smart_resize(
+    orig_h: usize,
+    orig_w: usize,
+    factor: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+) -> (usize, usize) {
+    let mut h = orig_h as f64;
+    let mut w = orig_w as f64;
+    let total = h * w;
+
+    // Scale to fit within pixel constraints while preserving aspect ratio.
+    if total < min_pixels as f64 {
+        let scale = (min_pixels as f64 / total).sqrt();
+        h *= scale;
+        w *= scale;
+    } else if total > max_pixels as f64 {
+        let scale = (max_pixels as f64 / total).sqrt();
+        h *= scale;
+        w *= scale;
+    }
+
+    // Round to nearest multiple of factor, with minimum of 1 factor.
+    let f = factor as f64;
+    let target_h = ((h / f).round() as usize).max(1) * factor;
+    let target_w = ((w / f).round() as usize).max(1) * factor;
+    (target_h, target_w)
+}
+
 /// Preprocess an image for the vision encoder.
 ///
-/// Converts raw image bytes (JPEG/PNG/WebP) into a normalised patch tensor.
-/// Returns a `ProcessedImage` containing the bf16 pixel data, grid dimensions,
-/// and the number of vision tokens the encoder will produce.
+/// Implements Qwen's "smart resize" strategy:
+///   1. Compute the optimal resolution that preserves aspect ratio while
+///      fitting within min_pixels..max_pixels constraints.
+///   2. Snap dimensions to multiples of (patch_size × merge_size).
+///   3. Resize and normalise.
+///
+/// This produces more vision tokens for larger images (better detail) while
+/// respecting the model's trained resolution range.
 pub(crate) fn preprocess_image(
     image_bytes: &[u8],
     config: &VisionConfig,
@@ -272,21 +320,19 @@ pub(crate) fn preprocess_image(
 
     let ps = config.patch_size;
     let ms = config.spatial_merge_size.max(1);
-
-    // Determine target resolution.
-    //
-    // The target dimensions must be multiples of (patch_size × merge_size) so
-    // that the image divides evenly into patches and the spatial merge can
-    // group patches into complete merge_size × merge_size blocks.
-    //
-    // Qwen 3.5: max 448×448 (with merge_size=2, factor=32)
-    // Gemma 3:  max 896×896 (no merge, factor=14)
     let factor = ps * ms;
-    let max_dim: u32 = if config.spatial_merge_size > 0 { 448 } else { 896 };
-    let (orig_w, orig_h) = (img.width(), img.height());
-    let scale = (max_dim as f32 / orig_w.max(orig_h) as f32).min(1.0);
-    let target_w = ((orig_w as f32 * scale) as usize / factor * factor).max(factor);
-    let target_h = ((orig_h as f32 * scale) as usize / factor * factor).max(factor);
+
+    // Smart resize: find optimal (target_h, target_w) that:
+    //   - Preserves aspect ratio
+    //   - Total pixels between min_pixels and max_pixels
+    //   - Both dimensions are multiples of `factor`
+    let (target_h, target_w) = smart_resize(
+        img.height() as usize,
+        img.width() as usize,
+        factor,
+        config.min_pixels,
+        config.max_pixels,
+    );
 
     // Resize with Lanczos3 (high-quality downsampling).
     let resized = img.resize_exact(
@@ -307,25 +353,34 @@ pub(crate) fn preprocess_image(
     // and within each patch, pixels are channel-first (CHW):
     //   patch = [R_00, R_01, ..., R_15_15, G_00, ..., G_15_15, B_00, ..., B_15_15]
     //
-    // This matches ViT's expected input format — the patch embedding weight
-    // is [hidden_size, patch_dim] so each patch is projected via matmul.
+    // Parallelised by patch row: each patch row (`grid_w` patches) spans `ps`
+    // image rows and writes to a contiguous, non-overlapping slice of the output
+    // buffer.  rayon's par_chunks_mut gives each thread one patch row to fill.
     let mut pixels = vec![bf16::ZERO; num_patches * patch_dim];
-    for py in 0..grid_h {
-        for px in 0..grid_w {
-            let patch_idx = py * grid_w + px;
-            for c in 0..config.in_channels {
-                for dy in 0..ps {
-                    for dx in 0..ps {
-                        let pixel = rgb.get_pixel((px * ps + dx) as u32, (py * ps + dy) as u32);
-                        let raw = pixel[c] as f32 / 255.0;
-                        let normalised = (raw - CLIP_MEAN[c]) / CLIP_STD[c];
-                        pixels[patch_idx * patch_dim + c * ps * ps + dy * ps + dx] =
-                            bf16::from_f32(normalised);
-                    }
+    let raw_rgb = rgb.as_raw();
+    let img_stride = target_w * 3; // bytes per image row (3 channels × width)
+    let row_chunk = grid_w * patch_dim; // bf16 elements per patch row
+
+    pixels.par_chunks_mut(row_chunk).enumerate().for_each(|(py, patch_row)| {
+        // Each thread processes one patch row: `ps` image rows → `grid_w` patches.
+        for dy in 0..ps {
+            let img_y = py * ps + dy;
+            let row_start = img_y * img_stride;
+
+            for img_x in 0..target_w {
+                let px = img_x / ps;       // which patch column
+                let dx = img_x % ps;       // x offset within patch
+                let pixel_offset = row_start + img_x * 3;
+
+                for c in 0..3 {
+                    let raw = raw_rgb[pixel_offset + c] as f32 * (1.0 / 255.0);
+                    let normalised = (raw - CLIP_MEAN[c]) / CLIP_STD[c];
+                    patch_row[px * patch_dim + c * ps * ps + dy * ps + dx] =
+                        bf16::from_f32(normalised);
                 }
             }
         }
-    }
+    });
 
     // Compute output token count.
     //
@@ -372,15 +427,14 @@ pub(crate) fn preprocess_image(
 pub(crate) struct VisionBuffers<B: GpuCore> {
     pub hidden: B::Tensor,    // [max_patches, hidden_size] — residual stream
     pub norm_out: B::Tensor,  // [max_patches, hidden_size] — LayerNorm output
-    pub q_buf: B::Tensor,     // [max_patches, hidden_size] — query projection
-    pub k_buf: B::Tensor,     // [max_patches, hidden_size] — key projection
-    pub v_buf: B::Tensor,     // [max_patches, hidden_size] — value projection
+    pub qkv_buf: B::Tensor,  // [max_patches, 3*hidden_size] — fused Q/K/V projection
     pub attn_out: B::Tensor,  // [max_patches, hidden_size] — attention output
     pub ffn_gate: B::Tensor,  // [max_patches, intermediate_size] — FFN fc1 output
     pub ffn_up: B::Tensor,    // [max_patches, intermediate_size] — FFN up (GeGLU only)
     pub ffn_out: B::Tensor,   // [max_patches, hidden_size] — FFN fc2 output
     pub merge_buf: Option<B::Tensor>,  // [max_merged, hidden × merge²] — spatial merge
     pub proj_out: B::Tensor,  // [max_tokens, out_hidden_size] — final output
+    pub pixel_buf: B::Tensor, // [max_patches, patch_dim] — pre-allocated staging buffer
 }
 
 /// Allocate scratch buffers for the vision encoder.
@@ -397,9 +451,7 @@ pub(crate) fn alloc_vision_buffers<B: GpuCore>(
     VisionBuffers {
         hidden: backend.alloc_tensor(&[max_patches, hd], TensorDtype::BF16),
         norm_out: backend.alloc_tensor(&[max_patches, hd], TensorDtype::BF16),
-        q_buf: backend.alloc_tensor(&[max_patches, hd], TensorDtype::BF16),
-        k_buf: backend.alloc_tensor(&[max_patches, hd], TensorDtype::BF16),
-        v_buf: backend.alloc_tensor(&[max_patches, hd], TensorDtype::BF16),
+        qkv_buf: backend.alloc_tensor(&[max_patches, 3 * hd], TensorDtype::BF16),
         attn_out: backend.alloc_tensor(&[max_patches, hd], TensorDtype::BF16),
         ffn_gate: backend.alloc_tensor(&[max_patches, inter], TensorDtype::BF16),
         ffn_up: backend.alloc_tensor(&[max_patches, inter], TensorDtype::BF16),
@@ -410,6 +462,7 @@ pub(crate) fn alloc_vision_buffers<B: GpuCore>(
             None
         },
         proj_out: backend.alloc_tensor(&[max_merged, config.out_hidden_size], TensorDtype::BF16),
+        pixel_buf: backend.alloc_tensor(&[max_patches, config.in_channels * config.patch_size * config.patch_size], TensorDtype::BF16),
     }
 }
 
@@ -436,8 +489,9 @@ pub(crate) fn vision_encode<B: GpuBackend>(
     let patch_dim = config.in_channels * config.patch_size * config.patch_size;
     let eps = 1e-6f32; // LayerNorm epsilon (standard ViT value)
 
-    // Upload pixel data from CPU to GPU.
-    let pixel_tensor = backend.upload_tensor(&processed.pixels, &[n, patch_dim], TensorDtype::BF16);
+    // Copy pixel data into the pre-allocated staging buffer, avoiding
+    // per-image GPU buffer allocation.
+    backend.copy_to_tensor_from_host(&processed.pixels, &bufs.pixel_buf);
 
     // -----------------------------------------------------------------------
     // Stage 1: Patch embedding.
@@ -450,7 +504,7 @@ pub(crate) fn vision_encode<B: GpuBackend>(
     //   patches [N, 768] × weight^T [768, 1152] → embeddings [N, 1152]
     // -----------------------------------------------------------------------
     backend.matmul_batch(
-        &weights.patch_embed_weight, &pixel_tensor, &bufs.hidden,
+        &weights.patch_embed_weight, &bufs.pixel_buf, &bufs.hidden,
         hd as u32, patch_dim as u32, n as u32,
     );
     if let Some(ref bias) = weights.patch_embed_bias {
@@ -497,31 +551,23 @@ pub(crate) fn vision_encode<B: GpuBackend>(
             eps, &bufs.norm_out, n as u32,
         );
 
-        // Q, K, V projections.
-        // Each projects [N, 1152] → [N, 1152] (= [N, 16 heads × 72 dim/head]).
-        backend.matmul_batch(&block.q_weight, &bufs.norm_out, &bufs.q_buf, hd as u32, hd as u32, n as u32);
-        backend.matmul_batch(&block.k_weight, &bufs.norm_out, &bufs.k_buf, hd as u32, hd as u32, n as u32);
-        backend.matmul_batch(&block.v_weight, &bufs.norm_out, &bufs.v_buf, hd as u32, hd as u32, n as u32);
-
-        // Add bias to Q/K/V if present (SigLIP uses bias on all projections).
-        if let Some(ref qb) = block.q_bias {
-            backend.bias_add_batch(&bufs.q_buf, qb, &bufs.q_buf, n as u32, hd as u32);
-        }
-        if let Some(ref kb) = block.k_bias {
-            backend.bias_add_batch(&bufs.k_buf, kb, &bufs.k_buf, n as u32, hd as u32);
-        }
-        if let Some(ref vb) = block.v_bias {
-            backend.bias_add_batch(&bufs.v_buf, vb, &bufs.v_buf, n as u32, hd as u32);
+        // Fused QKV projection: one matmul produces all three projections.
+        // [N, 1152] × [3*1152, 1152]^T → [N, 3*1152] = [N, 3456]
+        // Within each row: [Q₀..Q₁₁₅₁, K₀..K₁₁₅₁, V₀..V₁₁₅₁]
+        let hd3 = 3 * hd;
+        backend.matmul_batch(
+            &block.qkv_weight, &bufs.norm_out, &bufs.qkv_buf,
+            hd3 as u32, hd as u32, n as u32,
+        );
+        if let Some(ref qkv_b) = block.qkv_bias {
+            backend.bias_add_batch(&bufs.qkv_buf, qkv_b, &bufs.qkv_buf, n as u32, hd3 as u32);
         }
 
-        // Bidirectional multi-head self-attention.
-        // causal=false: every patch attends to every other patch (no mask).
-        // This is the key difference from LLM attention — images have no
-        // natural left-to-right ordering, so masking would lose information.
-        backend.prefill_attention(
-            &bufs.q_buf, &bufs.k_buf, &bufs.v_buf, &bufs.attn_out,
-            n as u32, 0, num_heads, num_heads, head_dim, 0, 0.0, None,
-            false, // bidirectional — NOT causal
+        // Fused bidirectional attention on the interleaved QKV buffer.
+        // The kernel reads Q/K/V at stride offsets within each row.
+        backend.prefill_attention_fused_qkv(
+            &bufs.qkv_buf, &bufs.attn_out,
+            n as u32, num_heads, head_dim, 0.0,
         );
 
         // Output projection: [N, 1152] → [N, 1152].
@@ -601,20 +647,29 @@ pub(crate) fn vision_encode<B: GpuBackend>(
         let ms = config.spatial_merge_size as u32;
         let merge_buf = bufs.merge_buf.as_ref().unwrap();
 
-        // Rearrange 2D grid: every 2×2 block → one concatenated token.
-        // E.g., 14×28 grid (392 patches) → 7×14 grid (98 merged tokens).
-        backend.spatial_merge(
-            src_buf, merge_buf,
-            processed.grid_h as u32, processed.grid_w as u32,
-            hd as u32, ms,
-        );
-
         let merged_n = processed.num_vision_tokens;
         let merged_hd = hd * (ms as usize) * (ms as usize);
 
-        // LayerNorm on merged tokens (before the MLP).
+        // Fused spatial merge + LayerNorm: rearrange 2×2 blocks AND normalise
+        // in a single kernel dispatch, avoiding an intermediate global memory
+        // round-trip of the [N/4, 4608] merged buffer.
+        //
+        // E.g., 14×28 grid (392 patches) → 7×14 grid (98 merged tokens),
+        // each normalised in-place before the MLP projection.
         if let (Some(nw), Some(nb)) = (&weights.merger_norm_weight, &weights.merger_norm_bias) {
-            backend.layer_norm_batch(merge_buf, nw, nb, eps, merge_buf, merged_n as u32);
+            backend.spatial_merge_norm(
+                src_buf, merge_buf, nw, nb,
+                processed.grid_h as u32, processed.grid_w as u32,
+                hd as u32, ms, eps,
+            );
+        } else {
+            // Fallback for models without merger LayerNorm (shouldn't happen
+            // for Qwen, but keeps the code defensive).
+            backend.spatial_merge(
+                src_buf, merge_buf,
+                processed.grid_h as u32, processed.grid_w as u32,
+                hd as u32, ms,
+            );
         }
 
         // Merger MLP: fc1 → GELU → fc2 (or just fc1 if single-layer).
@@ -648,4 +703,129 @@ pub(crate) fn vision_encode<B: GpuBackend>(
     // The caller (forward_prefill_paged) will scatter these into the text
     // embedding buffer at <|image_pad|> positions.
     Ok(())
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config(patch_size: usize, merge_size: usize) -> VisionConfig {
+        VisionConfig {
+            patch_size,
+            depth: 27,
+            hidden_size: 1152,
+            num_heads: 16,
+            intermediate_size: 4304,
+            spatial_merge_size: merge_size,
+            out_hidden_size: 5120,
+            in_channels: 3,
+            fused_qkv: true,
+            hidden_act: "gelu".into(),
+            weight_prefix: "visual.".into(),
+            projector_prefix: "visual.merger.".into(),
+            min_pixels: 3136,
+            max_pixels: 401408,
+        }
+    }
+
+    #[test]
+    fn test_smart_resize_preserves_aspect() {
+        // Landscape image within limits — should snap to factor multiples.
+        let (h, w) = smart_resize(480, 640, 32, 3136, 401408);
+        assert_eq!(h % 32, 0);
+        assert_eq!(w % 32, 0);
+        assert!(h * w >= 3136);
+        assert!(h * w <= 401408);
+    }
+
+    #[test]
+    fn test_smart_resize_downscales_large() {
+        // Very large image — must be downscaled.
+        let (h, w) = smart_resize(4000, 6000, 32, 3136, 401408);
+        assert!(h * w <= 401408);
+        assert_eq!(h % 32, 0);
+        assert_eq!(w % 32, 0);
+    }
+
+    #[test]
+    fn test_smart_resize_upscales_tiny() {
+        // Tiny image — must be upscaled to min_pixels.
+        let (h, w) = smart_resize(16, 16, 32, 3136, 401408);
+        assert!(h * w >= 3136);
+        assert_eq!(h % 32, 0);
+        assert_eq!(w % 32, 0);
+    }
+
+    #[test]
+    fn test_preprocess_image_produces_valid_output() {
+        // Create a small test PNG: 64x64 red image.
+        let mut img = image::RgbImage::new(64, 64);
+        for pixel in img.pixels_mut() {
+            *pixel = image::Rgb([255, 0, 0]);
+        }
+        let mut buf = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+
+        let config = test_config(16, 2);
+        let processed = preprocess_image(&buf, &config).unwrap();
+
+        // 64x64 with patch_size=16 → 4x4 patches.
+        // But smart_resize may change dimensions. Check consistency.
+        assert_eq!(processed.grid_h * processed.grid_w * config.in_channels
+            * config.patch_size * config.patch_size * 2, processed.pixels.len());
+        assert!(processed.num_vision_tokens > 0);
+
+        // With merge_size=2: tokens = (grid_h/2) * (grid_w/2).
+        assert_eq!(
+            processed.num_vision_tokens,
+            (processed.grid_h / 2) * (processed.grid_w / 2)
+        );
+    }
+
+    #[test]
+    fn test_preprocess_image_gemma_no_merge() {
+        // Gemma has no spatial merge (merge_size=0).
+        let mut img = image::RgbImage::new(64, 64);
+        for pixel in img.pixels_mut() {
+            *pixel = image::Rgb([0, 128, 255]);
+        }
+        let mut buf = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+
+        let config = test_config(14, 0);
+        let processed = preprocess_image(&buf, &config).unwrap();
+
+        // No merge: tokens = grid_h * grid_w = num_patches.
+        assert_eq!(
+            processed.num_vision_tokens,
+            processed.grid_h * processed.grid_w
+        );
+    }
+
+    #[test]
+    fn test_preprocess_clip_normalization() {
+        // All-black image should produce normalised values = (0 - mean) / std.
+        let img = image::RgbImage::new(32, 32);
+        let mut buf = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+
+        let config = test_config(16, 0);
+        let processed = preprocess_image(&buf, &config).unwrap();
+
+        // Check first pixel's red channel: (0.0 - 0.48145466) / 0.26862954 ≈ -1.7920
+        let pixels: &[bf16] = bytemuck::cast_slice(&processed.pixels);
+        let val = pixels[0].to_f32();
+        let expected = (0.0 - CLIP_MEAN[0]) / CLIP_STD[0];
+        assert!((val - expected).abs() < 0.05, "CLIP norm: got {val}, expected {expected}");
+    }
 }

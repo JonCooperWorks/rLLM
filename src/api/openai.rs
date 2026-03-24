@@ -248,21 +248,7 @@ pub(crate) async fn chat_completions(
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // Preprocess images from the last user message (if any) for vision models.
-    let images = if let Some(vc) = &state.vision_config {
-        messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "user")
-            .and_then(|m| m.images.as_ref())
-            .map(|imgs| {
-                imgs.iter()
-                    .filter_map(|img| crate::model::vision::preprocess_image(&img.data, vc).ok())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let images = super::preprocess_images(&messages, state.vision_config.as_ref());
 
     let (response_tx, response_rx) = tokio::sync::mpsc::channel(64);
 

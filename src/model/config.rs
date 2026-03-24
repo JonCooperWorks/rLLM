@@ -570,6 +570,14 @@ pub(crate) struct VisionConfig {
     /// "multi_modal_projector." for Gemma).  The projector bridges the vision
     /// encoder output to the text model's embedding space.
     pub projector_prefix: String,
+    /// Minimum total pixels for an image (Qwen default: 3136 = 4×28²).
+    /// Images smaller than this are upscaled to ensure enough patches for
+    /// the vision encoder to work with.
+    pub min_pixels: usize,
+    /// Maximum total pixels for a single tile (Qwen default: 401408 = 28²×16²).
+    /// Images larger than this are split into multiple tiles, each processed
+    /// independently through the vision encoder.
+    pub max_pixels: usize,
 }
 
 /// RoPE parameters for models with nested rope configuration (Qwen 3.5).
@@ -852,6 +860,8 @@ impl ModelConfig {
                 } else {
                     "model.visual.merger.".to_string()
                 },
+                min_pixels: vc.get("min_pixels").and_then(|v| v.as_u64()).unwrap_or(3136) as usize,
+                max_pixels: vc.get("max_pixels").and_then(|v| v.as_u64()).unwrap_or(401408) as usize,
             });
             config.image_token_id = raw_image_token_id;
             config.vision_start_token_id = raw_vision_start;

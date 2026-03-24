@@ -72,7 +72,7 @@ pub(crate) mod vision;
 use self::config::{ModelArch, ModelConfig};
 use self::kv_cache::{KvPool, SeqKvState};
 use self::loader::ModelWeights;
-use crate::gpu::{GpuBackend, GpuCore, GpuElementwise, GpuVision, TensorDtype};
+use crate::gpu::{GpuBackend, GpuCore, GpuElementwise, TensorDtype};
 
 /// Maximum sequence length supported by the flat KV cache (legacy mode).
 /// The paged cache mode supports up to 131072 tokens (8192 blocks x 16

@@ -21,6 +21,21 @@ impl GpuVision for CudaBackend {
         todo!("spatial_merge not yet implemented for CUDA backend")
     }
 
+    fn spatial_merge_norm(
+        &self,
+        _input: &CudaTensor,
+        _output: &CudaTensor,
+        _weight: &CudaTensor,
+        _bias: &CudaTensor,
+        _grid_h: u32,
+        _grid_w: u32,
+        _hidden_dim: u32,
+        _merge_size: u32,
+        _eps: f32,
+    ) {
+        todo!("spatial_merge_norm not yet implemented for CUDA backend")
+    }
+
     fn scatter_vision_tokens(
         &self,
         _text_embeds: &CudaTensor,

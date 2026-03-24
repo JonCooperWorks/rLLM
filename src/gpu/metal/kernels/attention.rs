@@ -380,4 +380,38 @@ impl GpuAttention for MetalBackend {
             MTLSize::new(threads_per_group, 1, 1),
         );
     }
+
+    fn prefill_attention_fused_qkv(
+        &self,
+        qkv: &MetalTensor,
+        out: &MetalTensor,
+        chunk_size: u32,
+        num_heads: u32,
+        head_dim: u32,
+        attn_scale: f32,
+    ) {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct FusedQkvAttentionParams {
+            chunk_size: u32,
+            num_heads: u32,
+            head_dim: u32,
+            attn_scale: f32,
+        }
+        let params = FusedQkvAttentionParams {
+            chunk_size,
+            num_heads,
+            head_dim,
+            attn_scale,
+        };
+        let threads_per_group: u64 = 256;
+        let num_threadgroups = chunk_size as u64 * num_heads as u64;
+        self.dispatch_async(
+            &self.pipeline_prefill_attention_fused_qkv,
+            &params,
+            &[(&qkv.buffer, 1), (&out.buffer, 2)],
+            MTLSize::new(num_threadgroups * threads_per_group, 1, 1),
+            MTLSize::new(threads_per_group, 1, 1),
+        );
+    }
 }

@@ -108,12 +108,16 @@ fn load_and_run_single_gpu(
     // Set up vision encoder if VLM weights were loaded.
     if let Some(vw) = vision_weights {
         if let Some(vc) = &config.vision {
-            // Max patches for a 448×448 image with patch_size=16: 28×28 = 784.
-            let max_patches = (448 / vc.patch_size) * (448 / vc.patch_size);
+            // Size buffers for max_pixels from config (e.g. 401408 pixels).
+            // max_patches = max_pixels / (patch_size²)
+            let max_patches = vc.max_pixels / (vc.patch_size * vc.patch_size);
             let bufs = model::vision::alloc_vision_buffers(&backend, vc, max_patches);
             model.vision_weights = Some(vw);
             model.vision_bufs = Some(bufs);
-            eprintln!("vision encoder ready ({} blocks, hidden={})", vc.depth, vc.hidden_size);
+            eprintln!(
+                "vision encoder ready ({} blocks, hidden={}, max {} patches)",
+                vc.depth, vc.hidden_size, max_patches,
+            );
         }
     }
 

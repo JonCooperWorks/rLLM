@@ -52,7 +52,6 @@ use crate::ServeArgs;
 use crate::engine;
 use crate::engine::SeqId;
 use crate::gpu;
-use crate::model::chat::ImageData;
 use crate::model::{config, tokenizer};
 
 // ---------------------------------------------------------------------------
@@ -127,6 +126,31 @@ pub(crate) struct ServerState {
 // ---------------------------------------------------------------------------
 // Helpers.
 // ---------------------------------------------------------------------------
+
+/// Preprocess images from the last user message for vision models.
+///
+/// Extracts images from the most recent user message, decodes and normalises
+/// them on the CPU (handler thread), and returns a flat list of ProcessedImage
+/// ready for GPU upload during prefill.
+pub(crate) fn preprocess_images(
+    messages: &[crate::model::chat::Message],
+    vision_config: Option<&crate::model::config::VisionConfig>,
+) -> Vec<crate::model::vision::ProcessedImage> {
+    let Some(vc) = vision_config else {
+        return Vec::new();
+    };
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .and_then(|m| m.images.as_ref())
+        .map(|imgs| {
+            imgs.iter()
+                .filter_map(|img| crate::model::vision::preprocess_image(&img.data, vc).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 /// Generate a random hex ID for API responses.
 pub(crate) fn generate_id() -> String {

@@ -104,6 +104,13 @@ impl GpuCore for MetalBackend {
         }
     }
 
+    fn copy_to_tensor_from_host(&self, src: &[u8], dst: &MetalTensor) {
+        let dst_ptr = dst.buffer.contents() as *mut u8;
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), dst_ptr, src.len());
+        }
+    }
+
     fn tensor_byte_count(&self, tensor: &MetalTensor) -> usize {
         tensor.byte_count()
     }
