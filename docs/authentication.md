@@ -75,8 +75,10 @@ Hook 3: background(self: Arc<Self>) → ()
 
 ### Data Flow
 
+When enabled (`--auth-config`):
+
 ```
-auth.json (--auth-config)
+auth.json
   → serve() reads "provider" field, dispatches to init()
   → init() fetches JWKs / loads keys / validates config
   → provider stored in Arc<ServerState>
@@ -84,8 +86,17 @@ auth.json (--auth-config)
   → auth_middleware runs authenticate() on every request
   → Allow → AuthUser inserted into request extensions
   → handler extracts AuthUser, attaches to WorkerRequest
-  → worker loop logs user identity in per-sequence metrics
+  → worker loop logs user.sub in per-sequence metrics
 ```
+
+When disabled (no `--auth-config`):
+
+```
+auth_middleware checks is_enabled() → false → passes request through unchanged
+  → no AuthUser in extensions, no identity logged
+```
+
+There is no fallback path.  Auth is either fully on or fully off.
 
 ### Why Enum Dispatch Instead of dyn
 
@@ -126,8 +137,10 @@ provider's `init()` hook.
 
 ### No Auth (Default)
 
-When `--auth-config` is omitted, all requests are allowed and the user
-identity is "anonymous".  No auth headers are required.
+When `--auth-config` is omitted, the auth middleware is a no-op — requests
+pass straight through with no `AuthUser` in the request context.  No auth
+headers are checked, no identity is logged, no token validation happens.
+There is no fallback "anonymous" identity; auth simply doesn't exist.
 
 On localhost (the default bind address), this just works.  On external
 interfaces (`--host 0.0.0.0`), rLLM requires `--dangerous-no-auth` to
