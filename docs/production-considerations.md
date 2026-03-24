@@ -434,6 +434,9 @@ not the orchestration layer.
 
 ## Security Controls
 
+> See [Threat Model](threat-model.md) for the full STRIDE analysis — what rLLM
+> protects against, what it leaves to infrastructure, and why.
+
 Inference servers hold the model weights and produce raw completions — two
 things worth protecting.  The security model treats the inference fleet as a
 high-value, low-surface-area zone: no direct internet, no user identity beyond
@@ -722,3 +725,4 @@ who pays.
 - [Expert Streaming](expert-streaming.md) — SSD-backed MoE, LRU cache, pread I/O
 - [API Server](api-server.md) — HTTP endpoints, worker thread, streaming
 - [Tool Calling](tool-calling.md) — per-architecture formats, parsing, API surface
+- [Threat Model](threat-model.md) — STRIDE analysis, weight theft, customer data, residual risks
