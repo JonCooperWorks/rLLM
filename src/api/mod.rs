@@ -731,7 +731,7 @@ fn run_worker_loop(
                 };
                 // Include user identity in the log line when auth is enabled.
                 let user_label = ctx.user.as_ref().map(|u| {
-                    format!("  {}  |", u.name.as_deref().unwrap_or(&u.sub))
+                    format!("  {}  |", u.sub)
                 }).unwrap_or_default();
                 eprintln!(
                     "  seq {:>3}  |{} {} prompt{} + {} gen  |  TTFT {:.0} ms  |  {:.1} tok/s  |  {:.2}s  |  {}",

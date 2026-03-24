@@ -215,7 +215,7 @@ When auth is enabled, the authenticated user identity is included in the
 per-sequence completion log line:
 
 ```
-seq 123  |  alice@corp.com  |  500 prompt (200 cached) + 150 gen  |  TTFT 45 ms  |  32.1 tok/s  |  4.67s  |  eos
+seq 123  |  user-42  |  500 prompt (200 cached) + 150 gen  |  TTFT 45 ms  |  32.1 tok/s  |  4.67s  |  eos
 ```
 
 Without auth, the user segment is omitted entirely — zero visual noise for
@@ -226,7 +226,8 @@ seq 123  |  500 prompt (200 cached) + 150 gen  |  TTFT 45 ms  |  32.1 tok/s  |  
 ```
 
 This gives inference-side audit logging without additional infrastructure.
-The identity comes from `AuthUser.name` if present, otherwise `AuthUser.sub`.
+The identity always comes from `AuthUser.sub` — the stable subject identifier
+from the JWT.  Display names are unreliable for audit trails.
 
 ---
 

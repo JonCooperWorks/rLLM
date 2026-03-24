@@ -86,8 +86,8 @@ use super::ServerState;
 pub(crate) struct AuthUser {
     /// Subject identifier (OIDC `sub` claim, API key owner, etc.).
     pub sub: String,
-    /// Optional display name or email — used in log output when present,
-    /// falls back to `sub` otherwise.  Not used for access control.
+    /// Optional display name or email — not used for logging or access
+    /// control.  Available for providers that surface it from token claims.
     pub name: Option<String>,
 }
 
