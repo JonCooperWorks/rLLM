@@ -460,6 +460,42 @@ pub(crate) fn format_tool_result_mistral(content: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Tool name validation — filter parsed tool calls against defined tools.
+//
+// The model may hallucinate tool names that don't match any defined tool.
+// This function removes invalid calls so clients only receive calls they
+// can actually execute.
+// ---------------------------------------------------------------------------
+
+/// Filter tool calls to only include those whose function name matches a
+/// defined tool.  Returns the filtered list and logs a warning for each
+/// removed call so operators can diagnose prompt issues.
+pub(crate) fn validate_tool_calls(
+    calls: Vec<ToolCall>,
+    defined_tools: &[ToolDefinition],
+) -> Vec<ToolCall> {
+    if defined_tools.is_empty() {
+        // No tools defined — nothing to validate against.
+        return calls;
+    }
+    calls
+        .into_iter()
+        .filter(|call| {
+            let valid = defined_tools
+                .iter()
+                .any(|t| t.function.name == call.function.name);
+            if !valid {
+                eprintln!(
+                    "  warning: model produced tool call '{}' which is not in the defined tools — skipping",
+                    call.function.name
+                );
+            }
+            valid
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
 
@@ -810,5 +846,77 @@ mod tests {
         let prompt = format_tool_system_prompt(ModelArch::Qwen2, &tools);
         assert!(prompt.contains("mystery"));
         assert!(prompt.contains("No description."));
+    }
+
+    // -- Tool name validation tests --
+
+    #[test]
+    fn test_validate_tool_calls_filters_invalid_names() {
+        let defs = make_tools(); // has "get_weather"
+        let calls = vec![
+            ToolCall {
+                id: "call_1".into(),
+                type_: "function".into(),
+                function: FunctionCall {
+                    name: "get_weather".into(),
+                    arguments: "{}".into(),
+                },
+            },
+            ToolCall {
+                id: "call_2".into(),
+                type_: "function".into(),
+                function: FunctionCall {
+                    name: "hallucinated_tool".into(),
+                    arguments: "{}".into(),
+                },
+            },
+        ];
+        let valid = validate_tool_calls(calls, &defs);
+        assert_eq!(valid.len(), 1);
+        assert_eq!(valid[0].function.name, "get_weather");
+    }
+
+    #[test]
+    fn test_validate_tool_calls_empty_defs_passes_all() {
+        let calls = vec![ToolCall {
+            id: "call_1".into(),
+            type_: "function".into(),
+            function: FunctionCall {
+                name: "anything".into(),
+                arguments: "{}".into(),
+            },
+        }];
+        let valid = validate_tool_calls(calls, &[]);
+        assert_eq!(valid.len(), 1);
+    }
+
+    #[test]
+    fn test_validate_tool_calls_all_valid() {
+        let defs = make_tools();
+        let calls = vec![ToolCall {
+            id: "call_1".into(),
+            type_: "function".into(),
+            function: FunctionCall {
+                name: "get_weather".into(),
+                arguments: "{\"city\":\"NYC\"}".into(),
+            },
+        }];
+        let valid = validate_tool_calls(calls, &defs);
+        assert_eq!(valid.len(), 1);
+    }
+
+    #[test]
+    fn test_validate_tool_calls_all_invalid() {
+        let defs = make_tools();
+        let calls = vec![ToolCall {
+            id: "call_1".into(),
+            type_: "function".into(),
+            function: FunctionCall {
+                name: "nonexistent".into(),
+                arguments: "{}".into(),
+            },
+        }];
+        let valid = validate_tool_calls(calls, &defs);
+        assert!(valid.is_empty());
     }
 }

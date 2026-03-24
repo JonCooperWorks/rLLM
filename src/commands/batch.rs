@@ -93,7 +93,7 @@ pub(crate) fn exec(args: BatchArgs) -> anyhow::Result<()> {
                 let tokens = eng
                     .tokenizer()
                     .encode_prompt(prompt_text, arch, system_ref)?;
-                eng.add_request(tokens, max_tokens, temperature, top_p, Vec::new());
+                eng.add_request(tokens, max_tokens, temperature, top_p, Vec::new(), None);
             }
 
             // Run engine loop.

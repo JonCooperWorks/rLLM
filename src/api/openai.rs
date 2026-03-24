@@ -10,7 +10,7 @@
 //   POST /v1/completions      — Text completions (raw prompt, no chat template)
 //   GET  /v1/models           — List available models
 //
-// Each POST endpoint supports two response modes:
+// Response modes:
 //
 //   1. Non-streaming (default): Collect all generated tokens, return a
 //      single JSON response with the complete text and usage stats.
@@ -19,14 +19,23 @@
 //      event contains one token as a JSON chunk.  The final event is
 //      `data: [DONE]`.  This is how ChatGPT shows text appearing in real-time.
 //
+//   3. Streaming with tools/thinking: When tools or thinking are active,
+//      the full output must be collected to find markers that span tokens.
+//      The response is still SSE, but tokens are buffered internally and
+//      then emitted as structured chunks (tool_calls deltas, reasoning_content).
+//
 // Tool calling (function calling):
-//   Clients can pass `tools` (an array of function definitions) in the
-//   chat completion request.  Tool definitions are injected into the
-//   system prompt using the model's native format (see model/tools.rs).
-//   After generation, the output is parsed for tool call markers.  If
-//   found, the response includes `tool_calls` on the assistant message
-//   and `finish_reason: "tool_calls"`.  The client can then send results
-//   back as messages with `role: "tool"`.
+//   `tools` — array of function definitions injected into the system prompt.
+//   `tool_choice` — "auto" (default), "none" (strip tools), "required"
+//     (force finish_reason to "tool_calls" even without markers).
+//   After generation, tool calls are parsed and validated against the
+//   defined tool names (hallucinated names are filtered out).
+//
+// Additional features:
+//   `seed`           — deterministic sampling via per-sequence seeded RNG
+//   `stop`           — custom stop sequences (string or array)
+//   `stream_options` — `include_usage: true` adds token counts to final chunk
+//   `thinking`       — extended reasoning (chain-of-thought) support
 //
 // OpenAI SSE format:
 //   Each event is: `data: {json}\n\n`
@@ -73,6 +82,8 @@ pub(crate) struct ChatCompletionRequest {
     #[serde(default)]
     pub tools: Option<Vec<ToolDefinition>>,
     /// Controls tool calling behaviour: "auto" (default), "none", or "required".
+    /// "required" forces the response to include tool calls even if the model
+    /// doesn't produce tool markers (finish_reason will be "tool_calls").
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
     /// Enable extended thinking (chain-of-thought reasoning).
@@ -80,6 +91,47 @@ pub(crate) struct ChatCompletionRequest {
     /// The reasoning is returned in the `reasoning_content` field of the response.
     #[serde(default)]
     pub thinking: Option<bool>,
+    /// Seed for deterministic sampling.  When provided, the same prompt + seed
+    /// produces the same output.  Maps to a per-sequence seeded RNG.
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// Stop sequences — generation halts when any of these strings appear in
+    /// the output.  The stop sequence itself is excluded from the response.
+    /// Accepts a single string or an array of strings (OpenAI convention).
+    #[serde(default, deserialize_with = "deserialize_stop")]
+    pub stop: Vec<String>,
+    /// Stream options.  When `stream=true` and `include_usage` is set, token
+    /// counts are included in the final streaming chunk.
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+}
+
+/// Options that control streaming behaviour.
+#[derive(serde::Deserialize)]
+pub(crate) struct StreamOptions {
+    /// When true, the final SSE chunk includes a `usage` field with token counts.
+    #[serde(default)]
+    pub include_usage: bool,
+}
+
+/// Deserialize the OpenAI `stop` field, which can be a single string or an array.
+fn deserialize_stop<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    use serde::Deserialize;
+    let value = Option::<serde_json::Value>::deserialize(d)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::String(s)) => Ok(vec![s]),
+        Some(serde_json::Value::Array(arr)) => {
+            let mut result = Vec::new();
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    result.push(s.to_string());
+                }
+            }
+            Ok(result)
+        }
+        Some(_) => Ok(Vec::new()),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -95,6 +147,12 @@ pub(crate) struct CompletionRequest {
     pub top_p: f32,
     #[serde(default)]
     pub stream: bool,
+    /// Seed for deterministic sampling.
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// Stop sequences (single string or array).
+    #[serde(default, deserialize_with = "deserialize_stop")]
+    pub stop: Vec<String>,
 }
 
 fn default_max_tokens() -> usize {
@@ -236,6 +294,14 @@ pub(crate) async fn chat_completions(
         .and_then(|v| v.as_str())
         .is_some_and(|s| s == "none");
 
+    // Keep a copy of tool definitions for post-generation validation.
+    // validate_tool_calls() filters out hallucinated tool names.
+    let tool_defs: Vec<ToolDefinition> = if has_tools && !tools_disabled {
+        req.tools.as_ref().unwrap().clone()
+    } else {
+        Vec::new()
+    };
+
     // Inject tool definitions into the system message.
     let messages = if has_tools && !tools_disabled {
         inject_tools(req.messages, req.tools.as_ref().unwrap(), state.arch)
@@ -260,6 +326,19 @@ pub(crate) async fn chat_completions(
     const MAX_TOKENS_CAP: usize = 131_072;
     let max_tokens = req.max_tokens.min(MAX_TOKENS_CAP);
 
+    // "required" forces the response to include tool calls regardless of
+    // whether the model produced markers.
+    let tools_required = req
+        .tool_choice
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| s == "required");
+
+    let include_usage = req
+        .stream_options
+        .as_ref()
+        .is_some_and(|o| o.include_usage);
+
     let worker_req = WorkerRequest {
         prompt_tokens,
         max_tokens,
@@ -269,6 +348,8 @@ pub(crate) async fn chat_completions(
         thinking: thinking_requested,
         images,
         user: user.map(|Extension(u)| u),
+        seed: req.seed,
+        stop: req.stop,
     };
 
     state.request_tx.try_send(worker_req).map_err(|e| match e {
@@ -276,22 +357,42 @@ pub(crate) async fn chat_completions(
         std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
     })?;
 
-    // Thinking requires collecting all tokens to parse the thinking block.
-    // Tool calls also require collecting all tokens to find call markers,
-    // but we can still emit the result as SSE events (pseudo-streaming).
+    let check_tools = has_tools && !tools_disabled;
     let thinking_enabled = thinking_requested.is_some_and(|t| t);
-    if req.stream && !thinking_enabled {
-        if has_tools && !tools_disabled {
-            Ok(chat_completions_stream_with_tools(state, response_rx).await)
+
+    // Decide which response path to use:
+    //
+    // Blocking (non-streaming, or streaming that needs full-text post-processing):
+    //   - Non-streaming requests always use blocking.
+    //   - Thinking + streaming: must collect all tokens to parse <think> blocks,
+    //     then emit as SSE (pseudo-streaming).
+    //
+    // Streaming (real-time SSE token events):
+    //   - Plain streaming: tokens emitted as they arrive.
+    //   - Streaming with tools: collect then emit (tool markers span tokens).
+    //   - Streaming with thinking: collect then emit (thinking blocks span tokens).
+    if req.stream {
+        if thinking_enabled && check_tools {
+            Ok(chat_completions_stream_with_thinking_and_tools(
+                state, response_rx, tools_required, tool_defs,
+            )
+            .await)
+        } else if thinking_enabled {
+            Ok(chat_completions_stream_with_thinking(state, response_rx).await)
+        } else if check_tools {
+            Ok(chat_completions_stream_with_tools(state, response_rx, tools_required, tool_defs)
+                .await)
         } else {
-            Ok(chat_completions_stream(state, response_rx).await)
+            Ok(chat_completions_stream(state, response_rx, include_usage).await)
         }
     } else {
         Ok(chat_completions_blocking(
             state,
             response_rx,
-            has_tools && !tools_disabled,
+            check_tools,
             thinking_enabled,
+            tools_required,
+            tool_defs,
         )
         .await)
     }
@@ -299,11 +400,16 @@ pub(crate) async fn chat_completions(
 
 /// Non-streaming: collect all tokens, detect thinking blocks and tool calls,
 /// return complete JSON response.
+///
+/// `tools_required` implements `tool_choice: "required"` — forces finish_reason
+/// to "tool_calls" even if the model didn't produce recognisable tool markers.
 async fn chat_completions_blocking(
     state: Arc<ServerState>,
     mut response_rx: tokio::sync::mpsc::Receiver<InferenceEvent>,
     check_tools: bool,
     check_thinking: bool,
+    tools_required: bool,
+    tool_defs: Vec<ToolDefinition>,
 ) -> Response {
     let mut text = String::new();
     let mut prompt_tokens = 0usize;
@@ -338,9 +444,11 @@ async fn chat_completions_blocking(
         text = result.content;
     }
 
-    // Check for tool calls in the generated text.
+    // Check for tool calls in the generated text, then validate that each
+    // call's function name matches a defined tool (filter hallucinated names).
     let (content, tool_calls) = if check_tools {
         let (cleaned, calls) = tools::parse_tool_calls(state.arch, &text);
+        let calls = tools::validate_tool_calls(calls, &tool_defs);
         if !calls.is_empty() {
             (cleaned, Some(calls))
         } else {
@@ -350,7 +458,10 @@ async fn chat_completions_blocking(
         (text, None)
     };
 
-    let finish_reason = if tool_calls.is_some() {
+    // Determine finish_reason.  tool_choice="required" forces "tool_calls"
+    // even when no tool markers were detected (the model may have produced
+    // the call in a format we didn't recognise).
+    let finish_reason = if tool_calls.is_some() || tools_required {
         StopReason::ToolCalls
     } else {
         stop_reason
@@ -401,6 +512,8 @@ async fn chat_completions_blocking(
 async fn chat_completions_stream_with_tools(
     state: Arc<ServerState>,
     mut response_rx: tokio::sync::mpsc::Receiver<InferenceEvent>,
+    tools_required: bool,
+    tool_defs: Vec<ToolDefinition>,
 ) -> Response {
     let id = format!("chatcmpl-{}", super::generate_id());
     let model = state.model_name.clone();
@@ -435,10 +548,11 @@ async fn chat_completions_stream_with_tools(
             }
         }
 
-        // Parse tool calls from the collected text.
+        // Parse tool calls from the collected text, then validate names.
         let (content, tool_calls) = tools::parse_tool_calls(state.arch, &text);
+        let tool_calls = tools::validate_tool_calls(tool_calls, &tool_defs);
         let has_calls = !tool_calls.is_empty();
-        let final_reason = if has_calls { StopReason::ToolCalls } else { stop_reason };
+        let final_reason = if has_calls || tools_required { StopReason::ToolCalls } else { stop_reason };
 
         // Emit the first chunk with role (OpenAI convention for streaming).
         let first_chunk = serde_json::json!({
@@ -526,9 +640,13 @@ async fn chat_completions_stream_with_tools(
 }
 
 /// Streaming: return SSE events with one token per chunk.
+///
+/// When `include_usage` is true, the final chunk includes a `usage` field
+/// with prompt and completion token counts (OpenAI `stream_options` feature).
 async fn chat_completions_stream(
     state: Arc<ServerState>,
     mut response_rx: tokio::sync::mpsc::Receiver<InferenceEvent>,
+    include_usage: bool,
 ) -> Response {
     let id = format!("chatcmpl-{}", super::generate_id());
     let model = state.model_name.clone();
@@ -552,8 +670,8 @@ async fn chat_completions_stream(
                         format!("data: {}\n\n", chunk)
                     );
                 }
-                InferenceEvent::Done { stop_reason, .. } => {
-                    let chunk = serde_json::json!({
+                InferenceEvent::Done { stop_reason, prompt_tokens, completion_tokens, .. } => {
+                    let mut chunk = serde_json::json!({
                         "id": &id,
                         "object": "chat.completion.chunk",
                         "created": super::unix_timestamp(),
@@ -564,6 +682,15 @@ async fn chat_completions_stream(
                             "finish_reason": finish_reason_str(stop_reason)
                         }]
                     });
+                    // stream_options.include_usage: append token counts to
+                    // the final chunk so streaming clients can track usage.
+                    if include_usage {
+                        chunk["usage"] = serde_json::json!({
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": prompt_tokens + completion_tokens
+                        });
+                    }
                     yield Ok(format!("data: {}\n\n", chunk));
                     yield Ok("data: [DONE]\n\n".to_string());
                 }
@@ -575,6 +702,173 @@ async fn chat_completions_stream(
                 }
             }
         }
+    };
+
+    Response::builder()
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap()
+}
+
+/// Streaming with thinking: collect all tokens, parse `<think>` blocks, then
+/// emit reasoning_content and content as SSE chunks.
+async fn chat_completions_stream_with_thinking(
+    state: Arc<ServerState>,
+    mut response_rx: tokio::sync::mpsc::Receiver<InferenceEvent>,
+) -> Response {
+    let id = format!("chatcmpl-{}", super::generate_id());
+    let model = state.model_name.clone();
+
+    let stream = async_stream::stream! {
+        let mut text = String::new();
+        let mut prompt_tokens = 0usize;
+        let mut completion_tokens = 0usize;
+        let mut stop_reason = StopReason::MaxTokens;
+
+        while let Some(event) = response_rx.recv().await {
+            match event {
+                InferenceEvent::Token { text: t } => text.push_str(&t),
+                InferenceEvent::Done { stop_reason: sr, prompt_tokens: pt, completion_tokens: ct, .. } => {
+                    prompt_tokens = pt;
+                    completion_tokens = ct;
+                    stop_reason = sr;
+                }
+                InferenceEvent::Error(e) => {
+                    let err = serde_json::json!({ "error": { "message": e, "type": "server_error" } });
+                    yield Ok::<_, std::convert::Infallible>(format!("data: {}\n\n", err));
+                    return;
+                }
+            }
+        }
+
+        let result = crate::model::thinking::parse_thinking(state.arch, &text);
+
+        // Emit role chunk.
+        yield Ok(format!("data: {}\n\n", serde_json::json!({
+            "id": &id, "object": "chat.completion.chunk", "created": super::unix_timestamp(),
+            "model": &model,
+            "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": serde_json::Value::Null }]
+        })));
+
+        // Emit reasoning_content if present.
+        if let Some(ref thinking) = result.thinking {
+            yield Ok(format!("data: {}\n\n", serde_json::json!({
+                "id": &id, "object": "chat.completion.chunk", "created": super::unix_timestamp(),
+                "model": &model,
+                "choices": [{ "index": 0, "delta": { "reasoning_content": thinking }, "finish_reason": serde_json::Value::Null }]
+            })));
+        }
+
+        // Emit content.
+        if !result.content.is_empty() {
+            yield Ok(format!("data: {}\n\n", serde_json::json!({
+                "id": &id, "object": "chat.completion.chunk", "created": super::unix_timestamp(),
+                "model": &model,
+                "choices": [{ "index": 0, "delta": { "content": result.content }, "finish_reason": serde_json::Value::Null }]
+            })));
+        }
+
+        // Final chunk.
+        yield Ok(format!("data: {}\n\n", serde_json::json!({
+            "id": &id, "object": "chat.completion.chunk", "created": super::unix_timestamp(),
+            "model": &model,
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason_str(stop_reason) }],
+            "usage": { "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens }
+        })));
+        yield Ok("data: [DONE]\n\n".to_string());
+    };
+
+    Response::builder()
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap()
+}
+
+/// Streaming with both thinking and tool calls: collect all tokens, parse
+/// thinking blocks first, then tool calls from the remaining content, and
+/// emit everything as SSE chunks.
+async fn chat_completions_stream_with_thinking_and_tools(
+    state: Arc<ServerState>,
+    mut response_rx: tokio::sync::mpsc::Receiver<InferenceEvent>,
+    tools_required: bool,
+    tool_defs: Vec<ToolDefinition>,
+) -> Response {
+    let id = format!("chatcmpl-{}", super::generate_id());
+    let model = state.model_name.clone();
+
+    let stream = async_stream::stream! {
+        let mut text = String::new();
+        let mut prompt_tokens = 0usize;
+        let mut completion_tokens = 0usize;
+        let mut stop_reason = StopReason::MaxTokens;
+
+        while let Some(event) = response_rx.recv().await {
+            match event {
+                InferenceEvent::Token { text: t } => text.push_str(&t),
+                InferenceEvent::Done { stop_reason: sr, prompt_tokens: pt, completion_tokens: ct, .. } => {
+                    prompt_tokens = pt;
+                    completion_tokens = ct;
+                    stop_reason = sr;
+                }
+                InferenceEvent::Error(e) => {
+                    let err = serde_json::json!({ "error": { "message": e, "type": "server_error" } });
+                    yield Ok::<_, std::convert::Infallible>(format!("data: {}\n\n", err));
+                    return;
+                }
+            }
+        }
+
+        // Parse thinking, then tool calls from the remaining content.
+        let think_result = crate::model::thinking::parse_thinking(state.arch, &text);
+        let (content, tool_calls) = tools::parse_tool_calls(state.arch, &think_result.content);
+        let tool_calls = tools::validate_tool_calls(tool_calls, &tool_defs);
+        let has_calls = !tool_calls.is_empty();
+        let final_reason = if has_calls || tools_required { StopReason::ToolCalls } else { stop_reason };
+
+        // Role chunk.
+        yield Ok(format!("data: {}\n\n", serde_json::json!({
+            "id": &id, "object": "chat.completion.chunk", "created": super::unix_timestamp(),
+            "model": &model,
+            "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": serde_json::Value::Null }]
+        })));
+
+        // Reasoning content.
+        if let Some(ref thinking) = think_result.thinking {
+            yield Ok(format!("data: {}\n\n", serde_json::json!({
+                "id": &id, "object": "chat.completion.chunk", "created": super::unix_timestamp(),
+                "model": &model,
+                "choices": [{ "index": 0, "delta": { "reasoning_content": thinking }, "finish_reason": serde_json::Value::Null }]
+            })));
+        }
+
+        // Text content.
+        if !content.is_empty() {
+            yield Ok(format!("data: {}\n\n", serde_json::json!({
+                "id": &id, "object": "chat.completion.chunk", "created": super::unix_timestamp(),
+                "model": &model,
+                "choices": [{ "index": 0, "delta": { "content": content }, "finish_reason": serde_json::Value::Null }]
+            })));
+        }
+
+        // Tool call deltas.
+        for (i, call) in tool_calls.iter().enumerate() {
+            yield Ok(format!("data: {}\n\n", serde_json::json!({
+                "id": &id, "object": "chat.completion.chunk", "created": super::unix_timestamp(),
+                "model": &model,
+                "choices": [{ "index": 0, "delta": { "tool_calls": [{ "index": i, "id": &call.id, "type": "function", "function": { "name": &call.function.name, "arguments": &call.function.arguments } }] }, "finish_reason": serde_json::Value::Null }]
+            })));
+        }
+
+        // Final chunk.
+        yield Ok(format!("data: {}\n\n", serde_json::json!({
+            "id": &id, "object": "chat.completion.chunk", "created": super::unix_timestamp(),
+            "model": &model,
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason_str(final_reason) }],
+            "usage": { "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens }
+        })));
+        yield Ok("data: [DONE]\n\n".to_string());
     };
 
     Response::builder()
@@ -614,6 +908,8 @@ pub(crate) async fn completions(
         thinking: None,
         images: Vec::new(), // Text completions don't support images.
         user: user.map(|Extension(u)| u),
+        seed: req.seed,
+        stop: req.stop,
     };
 
     state.request_tx.try_send(worker_req).map_err(|e| match e {
@@ -1238,5 +1534,79 @@ mod tests {
             json["choices"][0]["message"]["content"],
             "The answer is 4."
         );
+    }
+
+    // -- seed, stop, stream_options deserialization tests --
+
+    #[test]
+    fn test_chat_request_with_seed() {
+        let json = r#"{"messages": [{"role": "user", "content": "Hi"}], "seed": 42}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.seed, Some(42));
+    }
+
+    #[test]
+    fn test_chat_request_seed_defaults_to_none() {
+        let json = r#"{"messages": [{"role": "user", "content": "Hi"}]}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.seed, None);
+    }
+
+    #[test]
+    fn test_chat_request_stop_single_string() {
+        let json = r#"{"messages": [{"role": "user", "content": "Hi"}], "stop": "\n"}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.stop, vec!["\n"]);
+    }
+
+    #[test]
+    fn test_chat_request_stop_array() {
+        let json = r#"{"messages": [{"role": "user", "content": "Hi"}], "stop": ["\n", "END"]}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.stop, vec!["\n", "END"]);
+    }
+
+    #[test]
+    fn test_chat_request_stop_null() {
+        let json = r#"{"messages": [{"role": "user", "content": "Hi"}], "stop": null}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(req.stop.is_empty());
+    }
+
+    #[test]
+    fn test_chat_request_stop_defaults_to_empty() {
+        let json = r#"{"messages": [{"role": "user", "content": "Hi"}]}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(req.stop.is_empty());
+    }
+
+    #[test]
+    fn test_chat_request_stream_options() {
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(req.stream_options.unwrap().include_usage);
+    }
+
+    #[test]
+    fn test_chat_request_tool_choice_required() {
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tools": [{"type": "function", "function": {"name": "f"}}],
+            "tool_choice": "required"
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.tool_choice.unwrap().as_str(), Some("required"));
+    }
+
+    #[test]
+    fn test_completion_request_with_seed_and_stop() {
+        let json = r#"{"prompt": "test", "seed": 123, "stop": ["END"]}"#;
+        let req: CompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.seed, Some(123));
+        assert_eq!(req.stop, vec!["END"]);
     }
 }

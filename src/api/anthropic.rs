@@ -29,13 +29,20 @@
 //      "tool_result" content blocks in user messages.  OpenAI uses a
 //      separate "tool_calls" field and "tool" role messages.
 //
-// Anthropic SSE event sequence:
+// Anthropic SSE event sequence (plain streaming):
 //   event: message_start      — metadata (id, model, usage)
 //   event: content_block_start — signals a text block is beginning
 //   event: content_block_delta — one per token (the actual text)
 //   event: content_block_stop  — text block ended
 //   event: message_delta       — final stop reason + output token count
 //   event: message_stop        — stream is done
+//
+// When tools or thinking are active, the full output is buffered to parse
+// markers, then emitted as multiple content blocks (thinking, text, tool_use).
+//
+// Additional features:
+//   stop_sequences — custom stop sequences (array of strings)
+//   thinking       — extended reasoning (chain-of-thought) support
 //
 // Why support both APIs?
 //   Different tools and SDKs speak different API dialects.  The Anthropic
@@ -95,6 +102,10 @@ pub(crate) struct MessagesRequest {
     /// a simplified form: `{"enabled": true}` or just `true` for convenience.
     #[serde(default)]
     pub thinking: Option<ThinkingConfig>,
+    /// Stop sequences — generation halts when any string appears in output.
+    /// Anthropic calls this `stop_sequences` (array of strings).
+    #[serde(default, alias = "stop_sequences")]
+    pub stop: Option<Vec<String>>,
 }
 
 /// Anthropic thinking configuration.
@@ -258,6 +269,8 @@ pub(crate) async fn messages(
         thinking: thinking_requested,
         images,
         user: user.map(|Extension(u)| u),
+        seed: None, // Anthropic API does not expose a seed parameter.
+        stop: req.stop.unwrap_or_default(),
     };
 
     state.request_tx.try_send(worker_req).map_err(|e| match e {
@@ -265,12 +278,15 @@ pub(crate) async fn messages(
         std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
     })?;
 
-    // Thinking requires collecting all tokens to parse blocks.
-    // Tool calls also require buffering, but we can still emit SSE events.
+    // Decide which response path to use.  Thinking and tool calls both
+    // require collecting all tokens (markers span multiple tokens), but
+    // the result can still be emitted as SSE events (pseudo-streaming).
     let thinking_enabled = thinking_requested.is_some_and(|t| t);
-    if req.stream && !thinking_enabled {
-        if has_tools {
-            Ok(messages_stream_with_tools(state, response_rx).await)
+    if req.stream {
+        if thinking_enabled || has_tools {
+            // Both thinking and tools need full-text collection before parsing.
+            // Use the tool-aware streaming handler (it also handles thinking).
+            Ok(messages_stream_with_tools(state, response_rx, thinking_enabled).await)
         } else {
             Ok(messages_stream(state, response_rx).await)
         }
@@ -405,6 +421,7 @@ async fn messages_blocking(
 async fn messages_stream_with_tools(
     state: Arc<ServerState>,
     mut response_rx: tokio::sync::mpsc::Receiver<InferenceEvent>,
+    check_thinking: bool,
 ) -> Response {
     let id = format!("msg_{}", super::generate_id());
     let model = state.model_name.clone();
@@ -442,6 +459,15 @@ async fn messages_stream_with_tools(
             }
         }
 
+        // Parse thinking blocks first (if enabled), then tool calls from
+        // the remaining content.
+        let mut thinking_text = None;
+        if check_thinking {
+            let result = crate::model::thinking::parse_thinking(state.arch, &text);
+            thinking_text = result.thinking;
+            text = result.content;
+        }
+
         // Parse tool calls from the collected text.
         let (content_text, tool_calls) = tools::parse_tool_calls(state.arch, &text);
         let has_calls = !tool_calls.is_empty();
@@ -466,7 +492,32 @@ async fn messages_stream_with_tools(
 
         let mut block_index = 0;
 
-        // 2. Text content block (if any).
+        // 2a. Thinking content block (if present).
+        if let Some(ref thinking) = thinking_text {
+            yield Ok(format!(
+                "event: content_block_start\ndata: {}\n\n",
+                serde_json::json!({
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": { "type": "thinking", "thinking": "" }
+                })
+            ));
+            yield Ok(format!(
+                "event: content_block_delta\ndata: {}\n\n",
+                serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": { "type": "thinking_delta", "thinking": thinking }
+                })
+            ));
+            yield Ok(format!(
+                "event: content_block_stop\ndata: {}\n\n",
+                serde_json::json!({ "type": "content_block_stop", "index": block_index })
+            ));
+            block_index += 1;
+        }
+
+        // 2b. Text content block (if any).
         if !content_text.is_empty() {
             yield Ok(format!(
                 "event: content_block_start\ndata: {}\n\n",
@@ -810,6 +861,38 @@ mod tests {
             converted[0].function.description.as_deref(),
             Some("A test tool")
         );
+    }
+
+    // -- Stop sequences tests --
+
+    #[test]
+    fn test_messages_request_stop_sequences() {
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stop_sequences": ["END", "\n\n"]
+        }"#;
+        let req: MessagesRequest = serde_json::from_str(json).unwrap();
+        let stop = req.stop.unwrap();
+        assert_eq!(stop.len(), 2);
+        assert_eq!(stop[0], "END");
+    }
+
+    #[test]
+    fn test_messages_request_stop_field_alias() {
+        // The "stop" alias should also work.
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stop": ["DONE"]
+        }"#;
+        let req: MessagesRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.stop.unwrap(), vec!["DONE"]);
+    }
+
+    #[test]
+    fn test_messages_request_stop_defaults_to_none() {
+        let json = r#"{"messages": [{"role": "user", "content": "Hi"}]}"#;
+        let req: MessagesRequest = serde_json::from_str(json).unwrap();
+        assert!(req.stop.is_none());
     }
 
     // -- Thinking tests --
