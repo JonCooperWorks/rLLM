@@ -96,12 +96,17 @@ Algorithm: random orthogonal rotation → Max-Lloyd scalar quantization per coor
 Efficiency: Q is pre-rotated once, K dequant is a centroid lookup per position, V inverse
 rotation happens once per query head (not per position).
 
+Both prefill and decode paths quantize K/V into the paged pool.  During prefill, attention
+uses full BF16 Q/K/V directly (no quality loss).  During decode, attention reads from the
+quantized cache with inline dequantization.
+
 ```
 model/turboquant.rs                — KvQuantMode, TurboQuantConfig, rotation matrix, TurboContext
 gpu/ops/turboquant.rs              — GpuTurboQuant trait
 gpu/metal/shaders/turboquant.metal — Metal kernels (quantize, rotate_q, paged_attention)
 gpu/metal/kernels/turboquant.rs    — Metal dispatch
-model/primitives.rs                — paged_kv_and_attention_maybe_quantized()
+model/primitives.rs                — paged_kv_and_attention_maybe_quantized() (decode)
+                                     paged_kv_and_prefill_attention_maybe_quantized() (prefill)
 docs/turboquant.md                 — Full documentation
 ```
 

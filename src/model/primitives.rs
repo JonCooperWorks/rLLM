@@ -900,6 +900,102 @@ pub(crate) fn paged_kv_and_prefill_attention<B: GpuAttention>(
     );
 }
 
+/// Write K/V to paged cache (batched) and compute prefill attention, with
+/// optional TurboQuant.
+///
+/// When TurboQuant is enabled, K/V are rotated and quantized into the paged
+/// pool (which is allocated for quantized format).  Prefill attention still
+/// uses the BF16 Q/K/V directly (full precision for intra-chunk attention).
+///
+/// Without this function, the prefill path would write BF16 data into a
+/// quantized-sized pool, corrupting the data layout and producing garbage
+/// during subsequent decode steps.
+pub(crate) fn paged_kv_and_prefill_attention_maybe_quantized<
+    B: GpuAttention + GpuTurboQuant,
+>(
+    backend: &B,
+    bufs: &PrefillBuffers<B>,
+    pool: &KvPool<B>,
+    seq_state: &SeqKvState<B>,
+    layer_idx: usize,
+    bs: u32,
+    start_pos: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    window_size: u32,
+    attn_scale: f32,
+    sinks: Option<&B::Tensor>,
+    turbo: Option<&crate::model::turboquant::TurboContext<B>>,
+) {
+    if let Some(tc) = turbo {
+        // TurboQuant: rotate + quantize K/V into paged pool.
+        backend.turbo_quantize_to_paged_batch(
+            &bufs.k_buf,
+            &pool.k_pool[layer_idx],
+            &seq_state.block_table_gpu,
+            &bufs.positions,
+            &tc.pi,
+            &tc.centroids,
+            bs,
+            num_kv_heads,
+            head_dim,
+            tc.config.bits,
+            tc.config.bytes_per_head_pos as u32,
+        );
+        backend.turbo_quantize_to_paged_batch(
+            &bufs.v_buf,
+            &pool.v_pool[layer_idx],
+            &seq_state.block_table_gpu,
+            &bufs.positions,
+            &tc.pi,
+            &tc.centroids,
+            bs,
+            num_kv_heads,
+            head_dim,
+            tc.config.bits,
+            tc.config.bytes_per_head_pos as u32,
+        );
+    } else {
+        // BF16: direct copy to paged pool.
+        backend.copy_to_paged_kv_cache_batch(
+            &bufs.k_buf,
+            &pool.k_pool[layer_idx],
+            &seq_state.block_table_gpu,
+            &bufs.positions,
+            bs,
+            num_kv_heads,
+            head_dim,
+        );
+        backend.copy_to_paged_kv_cache_batch(
+            &bufs.v_buf,
+            &pool.v_pool[layer_idx],
+            &seq_state.block_table_gpu,
+            &bufs.positions,
+            bs,
+            num_kv_heads,
+            head_dim,
+        );
+    }
+    // Prefill attention uses BF16 Q/K/V directly — no need for quantized
+    // attention during prefill since we have all tokens in memory.
+    backend.prefill_attention(
+        &bufs.q_buf,
+        &bufs.k_buf,
+        &bufs.v_buf,
+        &bufs.attn_out,
+        bs,
+        start_pos,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        window_size,
+        attn_scale,
+        sinks,
+        true, // causal — LLM text generation
+    );
+}
+
 /// Batched O projection + residual.
 pub(crate) fn o_proj_residual_batch<B: GpuMatmul + GpuElementwise + GpuAllReduce>(
     backend: &B,

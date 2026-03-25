@@ -1,23 +1,52 @@
 // ===========================================================================
 // TurboQuant Metal Kernels — KV cache vector quantization for attention.
 //
-// Implements the TurboQuant algorithm (Zandieh et al., arXiv:2504.19874):
-//   1. turbo_quantize_paged: Rotate + scalar quantize + write to paged pool
+// LEARNING OVERVIEW
+//
+// What this file does:
+//   Implements the GPU kernels for TurboQuant (Zandieh et al., arXiv:2504.19874),
+//   an online vector quantization algorithm that compresses the KV cache by ~4x
+//   at 4-bit with quality-neutral results.  Three kernels work together:
+//
+//   1. turbo_quantize_paged: Rotate + scalar quantize K/V + write to paged pool
 //   2. turbo_rotate_q: Pre-rotate query vector for efficient inner products
-//   3. turbo_paged_attention: Attention with inline dequantization
+//   3. turbo_paged_attention: Decode attention with inline dequantization
+//
+// How quantization works:
+//   For each K or V head vector x ∈ R^d:
+//     - Compute L2 norm ||x||, store as bf16 (2 bytes)
+//     - Normalise and rotate: y = Pi × (x / ||x||)
+//     - Each coordinate y_j is approximately N(0, 1/√d) by concentration
+//       of measure on the unit sphere — this is the key mathematical insight
+//     - Quantise each y_j to the nearest Max-Lloyd centroid (4-16 entries)
+//     - Pack codes into ceil(d × bits / 8) bytes
+//
+// How attention uses quantized data:
+//   - Pre-rotate Q once: q_rot = Pi × q  (avoids per-position rotation)
+//   - For each cached position: score = q_rot · (centroid[code_j] × norm)
+//     Since centroid[code_j] ≈ (Pi × k/||k||)_j, this ≈ q · k (orthogonality)
+//   - V accumulated in rotated space, Pi^T applied once at end
+//
+// Critical implementation detail — code packing:
+//   For sub-byte codes (2-4 bits), multiple codes share a byte.  Concurrent
+//   writes from SIMD lanes to the same byte cause data races on Apple Silicon
+//   (the GPU picks one lane's write, zeroing the other's bits).  We avoid this
+//   by collecting codes in threadgroup shared memory and having each thread
+//   pack one complete byte.  See pack_codes_shared() below.
 //
 // Storage format per KV head per position:
 //   [2 bytes bf16 norm] [ceil(head_dim × bits / 8) bytes packed codes]
 //
-// Pool layout: positions are addressed via block table indirection, same as
-// the BF16 paged cache.  The difference is bytes-per-position is smaller.
+// Pool layout: same paged block structure as BF16, addressed via block table
+// indirection.  The only difference is bytes-per-position is smaller:
 //   pool_offset = (physical_block * BLOCK_SIZE + offset_in_block) * bytes_per_pos
 //                 + kv_head * bytes_per_head_pos
 //
 // Related files:
-//   gpu/ops/turboquant.rs             — GpuTurboQuant trait
-//   gpu/metal/kernels/turboquant.rs   — Rust dispatch code
-//   model/turboquant.rs               — Algorithm and codebook constants
+//   gpu/ops/turboquant.rs             — GpuTurboQuant trait (kernel interface)
+//   gpu/metal/kernels/turboquant.rs   — Rust dispatch code (#[repr(C)] params)
+//   model/turboquant.rs               — Algorithm, codebook constants, TurboContext
+//   model/primitives.rs               — paged_kv_and_attention_maybe_quantized()
 //
 // Paper: "TurboQuant: Online Vector Quantization with Near-optimal Distortion
 //         Rate", Zandieh, Daliri, Hadian, Mirrokni. arXiv:2504.19874, 2025.
@@ -91,24 +120,40 @@ inline uint extract_code(device const uchar* packed, uint idx, uint bits) {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: pack a b-bit code into a byte array at position idx.
+// Helper: pack codes from threadgroup memory into a packed byte array.
+//
+// The original pack_code() had a data race: for 4-bit codes, two threads
+// share the same byte (e.g. thread 0 writes nibble 0 and thread 1 writes
+// nibble 1 of byte 0).  Both do read-modify-write on the same device byte
+// without synchronization.  Apple Silicon resolves the conflict by picking
+// one lane's write, so every odd-indexed code gets zeroed out.
+//
+// Fix: collect all codes in threadgroup shared memory, then have each thread
+// pack one complete byte from the relevant codes.  No concurrent writes to
+// the same device address.  Caller must barrier before calling this.
 // ---------------------------------------------------------------------------
-inline void pack_code(device uchar* packed, uint idx, uint code, uint bits) {
-    uint bit_offset = idx * bits;
-    uint byte_idx = bit_offset / 8;
-    uint bit_within_byte = bit_offset % 8;
+inline void pack_codes_shared(
+    threadgroup const uint* codes,
+    device uchar* packed,
+    uint tid,
+    uint hd,
+    uint bits
+) {
+    uint total_bytes = (hd * bits + 7) / 8;
+    if (tid >= total_bytes) return;
 
-    // Clear and set bits within first byte.
-    uint mask = ((1u << bits) - 1u) << bit_within_byte;
-    packed[byte_idx] = (packed[byte_idx] & ~uchar(mask & 0xFF)) | uchar((code << bit_within_byte) & 0xFF);
-
-    // Handle overflow into next byte.
-    if (bit_within_byte + bits > 8) {
-        uint overflow_bits = bit_within_byte + bits - 8;
-        uint overflow_mask = (1u << overflow_bits) - 1u;
-        uint overflow_val = code >> (bits - overflow_bits);
-        packed[byte_idx + 1] = (packed[byte_idx + 1] & ~uchar(overflow_mask)) | uchar(overflow_val);
+    uchar val = 0;
+    uint byte_bit_start = tid * 8;
+    for (uint b = 0; b < 8; b++) {
+        uint global_bit = byte_bit_start + b;
+        uint code_idx = global_bit / bits;
+        uint bit_in_code = global_bit % bits;
+        if (code_idx < hd) {
+            uint bit_val = (codes[code_idx] >> bit_in_code) & 1u;
+            val |= uchar(bit_val << b);
+        }
     }
+    packed[tid] = val;
 }
 
 // ---------------------------------------------------------------------------
@@ -150,36 +195,14 @@ kernel void turbo_quantize_paged(
     float val = (tid < hd) ? float(x[tid]) : 0.0f;
     shared_x[tid] = val;
 
-    // Parallel sum of squares for L2 norm.
+    // Parallel sum of squares for L2 norm via SIMD + shared memory reduction.
     float sq = val * val;
     sq = simd_sum(sq);
-    if (simd_is_first()) {
-        // Atomic add across SIMD groups.
-        // Use shared memory for cross-SIMD reduction.
-        if (tid == 0) shared_norm[0] = 0.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Simple reduction: lane 0 of each SIMD group atomically adds.
-    if (tid % 32 == 0) {
-        // Use atomic add for cross-SIMD accumulation.
-        atomic_fetch_add_explicit(
-            (threadgroup atomic_uint*)shared_norm,
-            as_type<uint>(sq),
-            memory_order_relaxed
-        );
-    }
-    // NOTE: atomic float add on threadgroup memory is not standard Metal.
-    // Use a simpler reduction approach instead.
-
-    // Actually, let's use a cleaner reduction pattern.
-    // Rewrite norm computation using shared memory array.
     threadgroup float norm_partials[8]; // up to 8 SIMD groups (256/32)
     uint simd_group = tid / 32;
     uint simd_lane = tid % 32;
 
-    // Step 1a: SIMD-level sum of squares.
-    // Already have sq = simd_sum(val^2) from above in lane 0.
     if (simd_lane == 0) {
         norm_partials[simd_group] = sq;
     }
@@ -241,11 +264,12 @@ kernel void turbo_quantize_paged(
         *norm_ptr = norm_bf16;
     }
 
-    // Each thread packs its code.
-    if (tid < hd) {
-        device uchar* codes = head_base + 2; // skip 2-byte norm
-        pack_code(codes, tid, best_idx, params.bits);
-    }
+    // Collect codes in shared memory for race-free packing.
+    threadgroup uint shared_codes[256];
+    shared_codes[tid] = (tid < hd) ? best_idx : 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    pack_codes_shared(shared_codes, head_base + 2, tid, hd, params.bits);
 }
 
 // ---------------------------------------------------------------------------
@@ -334,9 +358,13 @@ kernel void turbo_quantize_paged_batch(
         device bfloat* norm_ptr = (device bfloat*)head_base;
         *norm_ptr = bfloat(shared_norm[0]);
     }
-    if (tid < hd) {
-        pack_code(head_base + 2, tid, best_idx, params.bits);
-    }
+
+    // Collect codes in shared memory for race-free packing.
+    threadgroup uint shared_codes[256];
+    shared_codes[tid] = (tid < hd) ? best_idx : 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    pack_codes_shared(shared_codes, head_base + 2, tid, hd, params.bits);
 }
 
 // ---------------------------------------------------------------------------
@@ -387,10 +415,23 @@ kernel void turbo_rotate_q(
 //   - Block table caching
 //
 // Differences from BF16 version:
-//   - Q is f32 (pre-rotated), not bf16
+//   - Q is f32 (pre-rotated by Pi), not bf16
 //   - K/V are read as packed codes + bf16 norm, dequantized via centroid lookup
-//   - V accumulation happens in rotated space
-//   - After the position loop, Pi^T is applied to the accumulated V (once)
+//   - V accumulation happens in rotated space (all dims per thread, like BF16)
+//   - After the position loop, Pi^T inverse rotation is applied to get back
+//     to original space, fused with the cross-thread V reduction
+//
+// V accumulation design:
+//   Each thread accumulates ALL head_dim V dimensions for the positions it
+//   processes (strided by 256).  This matches the BF16 kernel's approach
+//   where v_acc holds the full V vector.  The alternative — each thread
+//   accumulating only its own dimension — is incorrect: V dimension d would
+//   only get contributions from positions assigned to thread d, missing all
+//   other positions.
+//
+// Register budget: v_acc[256] = 1KB per thread.  Apple Silicon has ~3KB
+// registers per thread, so this fits.  For head_dim < 256, excess entries
+// are zero-initialised and never touched.
 //
 // Dispatch: num_heads threadgroups, 256 threads each.
 // ---------------------------------------------------------------------------
@@ -438,18 +479,24 @@ kernel void turbo_paged_attention(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Per-thread V accumulator in rotated space + online softmax state.
-    // Each thread handles a subset of output dimensions (strided by tg_size).
+    //
+    // CRITICAL: each thread must accumulate ALL V dimensions for the positions
+    // it processes, not just one dimension.  The BF16 attention kernel does
+    // this with float4 v_acc[hd/4].  We do the same with scalar floats since
+    // dequantization is per-coordinate anyway.
+    //
+    // Register budget: 256 floats × 4 bytes = 1024 bytes per thread.
+    // Apple Silicon has ~3KB registers per thread, so this fits with room
+    // for the other variables (score, weight, softmax state, etc.).
     float local_max = -INFINITY;
     float local_sum_exp = 0.0f;
-
-    // V accumulator: each of 256 threads keeps partial sums for strided dims.
-    // Thread t accumulates dims {t, t+256, t+512, ...} of the V vector.
-    // We use a small register array per thread for the V accumulation.
-    // For head_dim=128, each thread handles ceil(128/256) = 1 dim (or 0 for threads ≥ 128).
-    float v_acc[1] = {0.0f}; // Simplified: each thread handles at most 1 V dim for hd≤256
+    float v_acc[256] = {};  // max head_dim; zero-initialised
 
     // Compute bytes_per_pos for the full position (all kv heads).
     uint bytes_per_pos = num_kv_heads * bytes_per_head_pos;
+
+    // Attention scale (compute once outside the loop).
+    float scale = (params.attn_scale != 0.0f) ? params.attn_scale : rsqrt(float(hd));
 
     // Block table caching.
     uint prev_logical_block = ~0u;
@@ -487,15 +534,12 @@ kernel void turbo_paged_attention(
             score += q_shared[j] * k_val;
         }
 
-        // Apply attention scale.
-        float scale = (params.attn_scale != 0.0f) ? params.attn_scale : rsqrt(float(hd));
         score *= scale;
 
-        // Online softmax update.
+        // Online softmax update — rescale ALL V dimensions on new max.
         if (score > local_max) {
             float rescale = exp(local_max - score);
-            // Rescale existing V accumulator.
-            for (uint d = 0; d < 1; d++) v_acc[d] *= rescale;
+            for (uint d = 0; d < hd; d++) v_acc[d] *= rescale;
             local_sum_exp = local_sum_exp * rescale + 1.0f;
             local_max = score;
         } else {
@@ -504,16 +548,14 @@ kernel void turbo_paged_attention(
 
         float weight = exp(score - local_max);
 
-        // Accumulate weighted V in rotated space.
-        // Each thread handles dimension tid (if tid < hd).
+        // Accumulate weighted V in rotated space — ALL dimensions.
         device const uchar* v_pos_base = v_pool + pool_pos * bytes_per_pos + kv_head * bytes_per_head_pos;
         float v_norm = float(*(device const bfloat*)v_pos_base);
         device const uchar* v_codes = v_pos_base + 2;
 
-        if (tid < hd) {
-            uint v_code = extract_code(v_codes, tid, bits);
-            float v_val = shared_centroids[v_code] * v_norm;
-            v_acc[0] += weight * v_val;
+        for (uint d = 0; d < hd; d++) {
+            uint v_code = extract_code(v_codes, d, bits);
+            v_acc[d] += weight * shared_centroids[v_code] * v_norm;
         }
     }
 
@@ -522,7 +564,7 @@ kernel void turbo_paged_attention(
         float sink_score = float(sinks[head_id]);
         if (sink_score > local_max) {
             float rescale = exp(local_max - sink_score);
-            for (uint d = 0; d < 1; d++) v_acc[d] *= rescale;
+            for (uint d = 0; d < hd; d++) v_acc[d] *= rescale;
             local_sum_exp = local_sum_exp * rescale + 1.0f;
             local_max = sink_score;
         } else {
@@ -530,15 +572,20 @@ kernel void turbo_paged_attention(
         }
     }
 
-    // --- Cross-thread softmax reduction. ---
-    // Reduce (local_max, local_sum_exp) across all 256 threads.
+    // --- Cross-thread softmax + V reduction. ---
+    // Each thread has partial softmax state and partial V sums from its
+    // subset of positions.  We need to combine them into a single global
+    // softmax-normalised V output.
+    //
+    // Strategy: reduce (max, sum_exp) across threads, rescale each thread's
+    // V accumulators, then reduce V across threads via shared memory.
     threadgroup float shared_max[8];
     threadgroup float shared_sum[8];
 
     uint simd_group = tid / 32;
     uint simd_lane = tid % 32;
 
-    // SIMD-level reduction of max.
+    // SIMD-level max reduction.
     float group_max = simd_max(local_max);
     if (simd_lane == 0) shared_max[simd_group] = group_max;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -559,7 +606,7 @@ kernel void turbo_paged_attention(
     // Rescale each thread's state to global max.
     float rescale = exp(local_max - global_max);
     local_sum_exp *= rescale;
-    for (uint d = 0; d < 1; d++) v_acc[d] *= rescale;
+    for (uint d = 0; d < hd; d++) v_acc[d] *= rescale;
 
     // SIMD-level sum of exp.
     float group_sum = simd_sum(local_sum_exp);
@@ -576,36 +623,49 @@ kernel void turbo_paged_attention(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     total_sum = shared_sum[0];
 
-    // Normalise V accumulator.
+    // Normalise V accumulators.
     float inv_sum = (total_sum > 0.0f) ? (1.0f / total_sum) : 0.0f;
-    if (tid < hd) {
-        v_acc[0] *= inv_sum;
+    for (uint d = 0; d < hd; d++) v_acc[d] *= inv_sum;
+
+    // --- Cross-thread V reduction + Pi^T inverse rotation. ---
+    //
+    // Mirrors the BF16 kernel's reduce_v_and_write pattern:
+    //   1. SIMD-level reduction: simd_sum() across 32 lanes per SIMD group
+    //   2. Lane 0 of each group writes head_dim partial sums to shared memory
+    //   3. Final reduction: threads 0..head_dim-1 sum across 8 SIMD groups
+    //   4. Apply Pi^T rotation to get from rotated space to original
+    //
+    // Shared memory: 8 SIMD groups × 256 dims = 2048 floats = 8KB.
+    threadgroup float shared_reduce[8 * 256];  // [num_simd_groups × max_head_dim]
+    uint num_groups = (tg_size + 31) / 32;
+
+    // Step 1: SIMD-level reduction of v_acc across 32 lanes.
+    for (uint d = 0; d < hd; d++) {
+        v_acc[d] = simd_sum(v_acc[d]);
     }
 
-    // --- Apply Pi^T to get from rotated space back to original. ---
-    // v_out[i] = sum_j Pi_T[i,j] * v_acc_rotated[j]
-    // Each thread has v_acc[0] for dimension tid (in rotated space).
-    // We need to reduce across threads: v_out[i] = sum_j Pi_T[i,j] * thread_j_v_acc.
-
-    // Store v_acc into shared memory for the mat-vec.
-    threadgroup float shared_v_rot[256];
-    if (tid < hd) {
-        shared_v_rot[tid] = v_acc[0];
-    } else {
-        shared_v_rot[tid] = 0.0f;
+    // Step 2: Lane 0 of each SIMD group writes its partial sums.
+    if (simd_lane == 0) {
+        for (uint d = 0; d < hd; d++) {
+            shared_reduce[simd_group * hd + d] = v_acc[d];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Each thread computes one output dimension of Pi^T × v_rot.
-    float v_out = 0.0f;
+    // Step 3+4: Threads 0..head_dim-1 do final reduction + Pi^T rotation.
+    // For output dimension tid: sum across SIMD groups to get the full
+    // rotated V vector, then multiply by Pi^T row tid.
     if (tid < hd) {
+        // First, reduce the rotated V from shared memory into a local copy.
+        // Then apply Pi^T[tid, :] · v_rot[:].
+        float v_out = 0.0f;
         for (uint j = 0; j < hd; j++) {
-            v_out += pi_t[tid * hd + j] * shared_v_rot[j];
+            float v_rot_j = 0.0f;
+            for (uint g = 0; g < num_groups; g++) {
+                v_rot_j += shared_reduce[g * hd + j];
+            }
+            v_out += pi_t[tid * hd + j] * v_rot_j;
         }
-    }
-
-    // Write bf16 output.
-    if (tid < hd) {
         output[head_id * hd + tid] = bfloat(v_out);
     }
 }

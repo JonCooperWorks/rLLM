@@ -326,7 +326,8 @@ pub(crate) fn forward_prefill_paged<
         + GpuAttention
         + GpuElementwise
         + GpuEmbed
-        + GpuAllReduce,
+        + GpuAllReduce
+        + GpuTurboQuant,
 >(
     m: &Model<'_, B>,
     tokens: &[u32],
@@ -387,7 +388,7 @@ pub(crate) fn forward_prefill_paged<
         );
 
         // KV cache write + prefill attention with sliding window.
-        primitives::paged_kv_and_prefill_attention(
+        primitives::paged_kv_and_prefill_attention_maybe_quantized(
             m.backend,
             bufs,
             pool,
@@ -401,6 +402,7 @@ pub(crate) fn forward_prefill_paged<
             window_size,
             attn_scale,
             None,
+            m.turbo_ctx.as_ref(),
         );
 
         // O projection (batched): O weight [hidden_size, q_dim].

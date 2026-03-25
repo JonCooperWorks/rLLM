@@ -80,9 +80,11 @@ impl Tokenizer {
             // in the same range.
             ModelArch::Qwen3Moe => (None, vec![151643, 151645]),
 
-            // Qwen 3.5: no BOS, eos_token_id=248044 from config.  ChatML format
-            // with <|im_end|> as the primary stop token.  Vocab size is 248320.
-            ModelArch::Qwen3_5 => (None, vec![248044]),
+            // Qwen 3.5: no BOS.  Stop on <|endoftext|> (248044) or <|im_end|>
+            // (248046).  ChatML format uses <|im_end|> to terminate assistant
+            // turns — without it the model loops through repeated <think> blocks.
+            // Vocab size is 248320.
+            ModelArch::Qwen3_5 => (None, vec![248044, 248046]),
 
             // Phi (Microsoft): no BOS.  Stop on <|im_end|> (100265) or
             // <|endoftext|> (100257).  Uses tiktoken-based 100352-token vocab.
@@ -369,6 +371,20 @@ mod tests {
         );
         assert!(tok.is_eos(151643), "Qwen endoftext");
         assert!(tok.is_eos(151645), "Qwen im_end");
+    }
+
+    #[test]
+    fn test_eos_tokens_qwen3_5() {
+        let Some(tok) = load_if_exists("qwen3.5-27b", ModelArch::Qwen3_5) else {
+            return;
+        };
+        let ids = tok.inner.encode("<|im_end|>", true).unwrap();
+        assert!(
+            ids.get_ids().contains(&248046),
+            "Qwen 3.5 <|im_end|> should be 248046"
+        );
+        assert!(tok.is_eos(248044), "Qwen 3.5 endoftext");
+        assert!(tok.is_eos(248046), "Qwen 3.5 im_end");
     }
 
     #[test]

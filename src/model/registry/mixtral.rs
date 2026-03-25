@@ -247,7 +247,8 @@ pub(crate) fn forward_prefill_paged<
         + GpuElementwise
         + GpuEmbed
         + GpuMoe
-        + GpuAllReduce,
+        + GpuAllReduce
+        + GpuTurboQuant,
 >(
     m: &Model<'_, B>,
     tokens: &[u32],
@@ -286,7 +287,7 @@ pub(crate) fn forward_prefill_paged<
             d.num_kv_heads,
             d.head_dim,
         );
-        primitives::paged_kv_and_prefill_attention(
+        primitives::paged_kv_and_prefill_attention_maybe_quantized(
             m.backend,
             bufs,
             pool,
@@ -300,6 +301,7 @@ pub(crate) fn forward_prefill_paged<
             0,
             0.0,
             None,
+            m.turbo_ctx.as_ref(),
         );
         primitives::o_proj_residual_batch(m.backend, layer, bufs, bs, d.hidden_size);
 

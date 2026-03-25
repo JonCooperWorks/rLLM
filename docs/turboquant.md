@@ -57,9 +57,9 @@ a Max-Lloyd codebook optimised for the Gaussian distribution:
 The rotation is folded into the attention computation:
 
 1. **K dot products:** Pre-rotate Q once (q_rot = Pi * Q), then
-   `<q_rot, dequant(Pi*K)> approx <Q, K>`.  No inverse rotation per position.
-2. **V accumulation:** Accumulate dequantized centroids in rotated space,
-   apply Pi^T once per query head at the end.
+   `<q_rot, dequant(Pi*K)> ≈ <Q, K>`.  No inverse rotation per position.
+2. **V accumulation:** Each thread accumulates all head_dim V dimensions
+   in rotated space, then Pi^T is applied once per query head at the end.
 
 Per-position cost is just a codebook table lookup (16 entries for 4-bit).
 Memory bandwidth drops ~4x — the decode bottleneck on Apple Silicon.
@@ -85,6 +85,50 @@ information-theoretic lower bound (Shannon's distortion-rate function).
 For inner product estimation (the operation attention performs on K), the
 paper proves unbiasedness and bounded variance.
 
+## Production Considerations
+
+### Economics
+
+KV cache memory is the primary constraint on concurrent request throughput.
+Each active sequence holds its KV cache for the duration of generation —
+for a 100-token prompt generating 500 tokens, that's 600 positions × num_layers
+× 2 (K+V) × num_kv_heads × head_dim × 2 bytes.
+
+**Concrete example** (Qwen 3.5 9B, 32 layers, 4 KV heads, head_dim=256):
+- BF16: 600 × 32 × 2 × 4 × 256 × 2 = 100 MB per sequence
+- TurboQuant 4-bit: 600 × 32 × 2 × 4 × 130 = 20 MB per sequence (~5x less)
+
+On a 64GB M4 Max after loading 9B weights (~18 GB), ~40 GB remains for KV cache.
+That's **400 concurrent sequences** with TurboQuant vs **~400** with BF16 but
+at much shorter context.  For long-context workloads (8K+ tokens), the savings
+compound — TurboQuant enables sequences that wouldn't fit at all in BF16.
+
+### Prefill vs Decode
+
+During **prefill** (processing the prompt), K/V are quantized into the paged pool
+but attention uses the full BF16 Q/K/V directly.  There is no quality loss during
+prefill — quantization only affects the stored cache.
+
+During **decode** (generating tokens), attention reads from the quantized cache
+using inline dequantization.  The 4-bit mode has been verified to produce
+identical output to BF16 across Llama, Qwen 2.5, and Qwen 3.5 model families.
+
+### Hybrid Architectures
+
+Models with non-standard attention layers (e.g., Qwen 3.5's DeltaNet linear
+attention) are handled correctly: TurboQuant is only applied to standard GQA
+attention layers.  DeltaNet layers maintain their own recurrent state and never
+interact with the quantized KV pool.
+
+### Code Packing
+
+Sub-byte quantization codes (2-4 bits) share device memory bytes across GPU
+threads.  Naive per-thread read-modify-write causes data races on Apple Silicon
+SIMD groups — the GPU deterministically picks one lane's write, silently zeroing
+the other threads' codes.  The `pack_codes_shared()` helper avoids this by
+collecting all codes in threadgroup shared memory and having each thread write
+one complete byte.
+
 ## Architecture
 
 ```
@@ -92,7 +136,8 @@ model/turboquant.rs           — KvQuantMode, TurboQuantConfig, rotation matrix
 gpu/ops/turboquant.rs         — GpuTurboQuant trait (GPU kernel interface)
 gpu/metal/shaders/turboquant.metal — Metal shader kernels
 gpu/metal/kernels/turboquant.rs    — Metal dispatch code (#[repr(C)] params)
-model/primitives.rs           — paged_kv_and_attention_maybe_quantized()
+model/primitives.rs           — paged_kv_and_attention_maybe_quantized() (decode)
+                                paged_kv_and_prefill_attention_maybe_quantized() (prefill)
 model/kv_cache.rs             — KvPool with quantized buffer allocation
 engine/loader.rs              — CLI flag threading, TurboContext creation
 ```
@@ -100,6 +145,13 @@ engine/loader.rs              — CLI flag threading, TurboContext creation
 ### Data Flow
 
 ```
+Forward pass (prefill):
+  QKV projection + RoPE → k_buf, v_buf, q_buf (bf16, batched)
+    ↓
+  turbo_quantize_to_paged_batch(k_buf) → k_pool (for future decode)
+  turbo_quantize_to_paged_batch(v_buf) → v_pool (for future decode)
+  prefill_attention(q_buf, k_buf, v_buf) → attn_out (BF16, full precision)
+
 Forward pass (decode):
   QKV projection + RoPE → k_buf, v_buf, q_buf (bf16)
     ↓
@@ -109,9 +161,10 @@ Forward pass (decode):
     ↓
   turbo_paged_attention(q_rot, k_pool, v_pool)
     → inline dequant: code → centroid lookup → scale by norm
-    → online softmax: Q_rot . K_approx / sqrt(d)
-    → V accumulation in rotated space
-    → Pi^T * v_acc (once per head)
+    → online softmax: Q_rot · K_approx / sqrt(d)
+    → V accumulation in rotated space (all dims per thread)
+    → cross-thread SIMD reduction of V partials
+    → Pi^T × v_rot (once per head, fused with reduction)
     → attn_out (bf16)
 ```
 
@@ -120,6 +173,7 @@ Forward pass (decode):
 | Kernel | Threadgroups | Threads/Group | Purpose |
 |--------|-------------|---------------|---------|
 | turbo_quantize_paged | num_kv_heads | head_dim | Rotate + quantize + pack + write |
+| turbo_quantize_paged_batch | batch × num_kv_heads | head_dim | Batched prefill variant |
 | turbo_rotate_q | num_heads | head_dim | Pre-rotate query |
 | turbo_paged_attention | num_heads | 256 | Attention with inline dequant |
 

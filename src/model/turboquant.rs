@@ -511,6 +511,83 @@ mod tests {
         }
     }
 
+    /// CPU reference: quantize a vector using rotation + nearest centroid.
+    /// Returns (norm, codes).
+    fn cpu_quantize(x: &[f32], pi: &[f32], centroids: &[f32], hd: usize) -> (f32, Vec<usize>) {
+        // L2 norm
+        let norm: f32 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let inv_norm = 1.0 / norm.max(1e-6);
+
+        // Rotate normalized vector: y = Pi * (x / norm)
+        let mut codes = Vec::with_capacity(hd);
+        for j in 0..hd {
+            let mut y = 0.0f32;
+            for i in 0..hd {
+                y += pi[j * hd + i] * (x[i] * inv_norm);
+            }
+            // Nearest centroid
+            let mut best = 0;
+            let mut best_dist = f32::INFINITY;
+            for (c, &cent) in centroids.iter().enumerate() {
+                let d = (y - cent).abs();
+                if d < best_dist {
+                    best_dist = d;
+                    best = c;
+                }
+            }
+            codes.push(best);
+        }
+        (norm, codes)
+    }
+
+    /// CPU reference: compute Q·K score via rotated quantized path.
+    fn cpu_turbo_score(
+        q: &[f32], k: &[f32], pi: &[f32], centroids: &[f32], hd: usize,
+    ) -> f32 {
+        // Rotate Q
+        let mut q_rot = vec![0.0f32; hd];
+        for j in 0..hd {
+            for i in 0..hd {
+                q_rot[j] += pi[j * hd + i] * q[i];
+            }
+        }
+        // Quantize K
+        let (k_norm, k_codes) = cpu_quantize(k, pi, centroids, hd);
+        // Score = q_rot · dequant(k) = sum q_rot[j] * centroid[code_j] * k_norm
+        let mut score = 0.0f32;
+        for j in 0..hd {
+            score += q_rot[j] * centroids[k_codes[j]] * k_norm;
+        }
+        score
+    }
+
+    #[test]
+    fn test_turbo_roundtrip_score_matches_dot_product() {
+        let hd = 64;
+        let pi = generate_rotation_matrix(hd, 42);
+        let config = TurboQuantConfig::new(KvQuantMode::Turbo4, hd);
+
+        // Create random-ish Q and K vectors
+        use rand::{SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(123);
+        let q: Vec<f32> = (0..hd).map(|_| rng.random_normal()).collect();
+        let k: Vec<f32> = (0..hd).map(|_| rng.random_normal()).collect();
+
+        // Direct dot product (ground truth)
+        let direct: f32 = q.iter().zip(k.iter()).map(|(a, b)| a * b).sum();
+
+        // TurboQuant score (rotate, quantize K, dot product with rotated Q)
+        let turbo = cpu_turbo_score(&q, &k, &pi, &config.centroids, hd);
+
+        // Should be close (4-bit quantization introduces small error)
+        let rel_error = ((turbo - direct) / direct.abs().max(1e-6)).abs();
+        assert!(
+            rel_error < 0.15,
+            "TurboQuant score should be close to direct dot product: \
+             direct={direct}, turbo={turbo}, rel_error={rel_error}"
+        );
+    }
+
     #[test]
     fn test_turbo_config_head_dim_scaling() {
         // Centroids should be smaller for larger head_dim (1/sqrt(d) scaling).

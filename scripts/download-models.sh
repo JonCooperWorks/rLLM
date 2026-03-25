@@ -75,11 +75,8 @@ mkdir -p "$DEST"
 # ---- Small tier: 1B–8B, covers head_dim 64/96/128/256 -----------------
 MODELS=(
   # Llama — head_dim=64 (1B/3B), head_dim=128 (8B)
-  "meta-llama/Llama-3.2-1B"
   "meta-llama/Llama-3.2-1B-Instruct"
-  "meta-llama/Llama-3.2-3B"
   "meta-llama/Llama-3.2-3B-Instruct"
-  "meta-llama/Llama-3.1-8B"
   "meta-llama/Llama-3.1-8B-Instruct"
 
   # Qwen 2.5 — head_dim=128
@@ -91,6 +88,8 @@ MODELS=(
 
   # Mistral — head_dim=128, SentencePiece tokenizer
   "mistralai/Mistral-7B-Instruct-v0.3"
+  # Qwen 3.5 9B
+  "Qwen/Qwen3.5-9B"
 )
 
 # ---- Medium tier: add MoE, larger dense, Phi-4 -------------------------
@@ -110,9 +109,6 @@ if [[ "$TIER" == "medium" || "$TIER" == "big" || "$TIER" == "massive" ]]; then
 
     # Qwen 3.5 dense 27B
     "Qwen/Qwen3.5-27B"
-
-    # Qwen 3.5 9B
-    "Qwen/Qwen3.5-9B"
 
     # Qwen3 Coder MoE — 30B total (3.3B active)
     "Qwen/Qwen3-Coder-30B-A3B-Instruct"

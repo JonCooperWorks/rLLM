@@ -326,7 +326,7 @@ pub(crate) fn forward_prefill_paged<
             d.num_kv_heads,
             d.head_dim,
         );
-        primitives::paged_kv_and_prefill_attention(
+        primitives::paged_kv_and_prefill_attention_maybe_quantized(
             m.backend,
             bufs,
             pool,
@@ -340,6 +340,7 @@ pub(crate) fn forward_prefill_paged<
             0,
             0.0,
             None,
+            m.turbo_ctx.as_ref(),
         );
         primitives::o_proj_residual_batch_qdim(m.backend, layer, bufs, bs, d.hidden_size, d.q_dim);
 
