@@ -80,13 +80,19 @@ Q4 quantization (`rllm quantize`) gives ~1.3-3.5x faster decode by reducing memo
 
 **TurboQuant KV cache quantization** (on by default at 4-bit):
 
-| Model | KV (none) | KV (turbo4) | Decode (none) | Decode (turbo4) | Max tokens |
+| Model | Params | KV (none) | KV (turbo4) | Decode (none) | Decode (turbo4) |
 |---|---|---|---|---|---|
-| Qwen3.5 27B Q4 | 6,753 MB | 2,080 MB (3.2×) | 9.3 tok/s | 14.3 tok/s (1.5×) | 131K |
-| Gemma 3 27B Q4 | 27,110 MB | 16,368 MB (1.7×) | 0.3 tok/s | 1.7 tok/s (5.7×) | 131K |
-| Qwen3.5 122B-A10B Q4 ⚡ | 96 MB | 24 MB (3.9×) | — | 8.6 tok/s | 4K |
+| Llama 3.2 1B Instruct | 1.2B | 4,096 MB | 1,088 MB (3.8×) | 134 tok/s | 88 tok/s † |
+| Llama 3.2 3B Instruct | 3.2B | 14,336 MB | 3,696 MB (3.9×) | 50 tok/s | 50 tok/s |
+| Qwen 2.5 3B Instruct | 3.1B | 4,608 MB | 1,188 MB (3.9×) | 51 tok/s | 46 tok/s |
+| Llama 3.1 8B Instruct | 8.0B | 16,384 MB | 4,224 MB (3.9×) | 24 tok/s | 23 tok/s |
+| Qwen3.5 27B Q4 | 27B | 6,753 MB | 2,080 MB (3.2×) | 9.3 tok/s | **14.3 tok/s** (1.5×) |
+| Gemma 3 27B Q4 | 27.4B | 27,110 MB | 16,368 MB (1.7×) | 0.7 tok/s | **7.2 tok/s** (10×) |
+| Qwen3.5 122B-A10B Q4 ⚡ | 122B | 96 MB | 24 MB (3.9×) | — | **8.6 tok/s** |
 
-TurboQuant (Zandieh et al., [arXiv:2504.19874](https://arxiv.org/abs/2504.19874)) compresses the KV cache ~4× by applying a random orthogonal rotation followed by optimal Max-Lloyd scalar quantization per coordinate.  Quality-neutral at 4-bit — the information-theoretic distortion is within 2.7× of optimal.  Override with `--kv-quant none` for debugging.  See [docs/turboquant.md](docs/turboquant.md).
+† 1B models have head_dim=64 where the rotation overhead dominates — TurboQuant is slower and may produce early EOS.  Recommended for models ≥ 3B (head_dim ≥ 128).
+
+TurboQuant (Zandieh et al., [arXiv:2504.19874](https://arxiv.org/abs/2504.19874)) compresses the KV cache ~4× by applying a random orthogonal rotation followed by optimal Max-Lloyd scalar quantization per coordinate.  Quality-neutral at 4-bit for head_dim ≥ 128 — the information-theoretic distortion is within 2.7× of optimal.  Override with `--kv-quant none` for debugging.  The biggest wins are on large models where the KV cache competes with weights for memory bandwidth (Gemma 27B: 10× faster, Qwen3.5 27B: 1.5× faster).  Small models (≤ 8B) see ~4× KV memory savings without decode speed change.  See [docs/turboquant.md](docs/turboquant.md).
 
 </details>
 
