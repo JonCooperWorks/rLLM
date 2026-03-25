@@ -848,7 +848,7 @@ mod tests {
     impl TestDispatch {
         fn new(num_blocks: usize) -> Self {
             let backend = CpuBackend;
-            let pool = KvPool::new(&backend, num_blocks, 4, 1);
+            let pool = KvPool::new(&backend, num_blocks, 4, 1, crate::model::turboquant::KvQuantMode::None, 4);
             Self { pool, backend }
         }
     }
@@ -1474,7 +1474,7 @@ mod tests {
     impl CachingTestDispatch {
         fn new(num_blocks: usize, cache_entries: usize) -> Self {
             let backend = CpuBackend;
-            let pool = KvPool::new(&backend, num_blocks, 4, 1);
+            let pool = KvPool::new(&backend, num_blocks, 4, 1, crate::model::turboquant::KvQuantMode::None, 4);
             Self {
                 pool,
                 backend,

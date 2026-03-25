@@ -32,6 +32,7 @@ use crate::gpu::{self, GpuCore};
 use crate::model;
 use crate::model::config::ModelArch;
 use crate::model::tokenizer::Tokenizer;
+use crate::model::turboquant::KvQuantMode;
 use crate::model::{kv_cache, loader};
 
 use super::InferenceEngine;
@@ -47,18 +48,20 @@ use super::InferenceEngine;
 pub(crate) fn load_and_run(
     model_dir: &Path,
     tp: usize,
+    kv_quant: KvQuantMode,
     max_active: usize,
     on_ready: impl FnOnce(&Tokenizer, ModelArch),
     run: impl FnOnce(&mut dyn InferenceEngine) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    load_and_run_ext(model_dir, false, tp, max_active, on_ready, run)
+    load_and_run_ext(model_dir, false, tp, kv_quant, max_active, on_ready, run)
 }
 
-/// Extended version with expert streaming support.
+/// Extended version with expert streaming and KV quantization support.
 pub(crate) fn load_and_run_ext(
     model_dir: &Path,
     stream_experts: bool,
     tp: usize,
+    kv_quant: KvQuantMode,
     max_active: usize,
     on_ready: impl FnOnce(&Tokenizer, ModelArch),
     run: impl FnOnce(&mut dyn InferenceEngine) -> anyhow::Result<()>,
@@ -66,7 +69,7 @@ pub(crate) fn load_and_run_ext(
     if tp > 1 {
         load_and_run_multi_gpu(model_dir, tp, max_active, on_ready, run)
     } else {
-        load_and_run_single_gpu(model_dir, stream_experts, max_active, on_ready, run)
+        load_and_run_single_gpu(model_dir, stream_experts, kv_quant, max_active, on_ready, run)
     }
 }
 
@@ -74,6 +77,7 @@ pub(crate) fn load_and_run_ext(
 fn load_and_run_single_gpu(
     model_dir: &Path,
     stream_experts: bool,
+    kv_quant: KvQuantMode,
     max_active: usize,
     on_ready: impl FnOnce(&Tokenizer, ModelArch),
     run: impl FnOnce(&mut dyn InferenceEngine) -> anyhow::Result<()>,
@@ -97,6 +101,16 @@ fn load_and_run_single_gpu(
     eprintln!("loaded in {:.2}s", load_secs);
 
     let mut model = model::Model::new(config.clone(), weights, &backend)?;
+
+    // Set up TurboQuant KV cache quantization if enabled.
+    if kv_quant.is_quantized() {
+        model.turbo_ctx = Some(model::turboquant::TurboContext::new(
+            &backend,
+            kv_quant,
+            config.head_dim,
+            config.num_attention_heads,
+        ));
+    }
 
     // Set up expert streamer if SSD streaming was requested.
     if let Some(index) = expert_index {
@@ -124,13 +138,21 @@ fn load_and_run_single_gpu(
     // Dynamic KV cache sizing based on remaining GPU memory.
     let gpu_budget = backend.recommended_max_memory();
     let qpb = |m, k| backend.quantized_weight_bytes(m, k);
-    let num_blocks = config.recommended_kv_blocks(gpu_budget, is_quantized, &qpb);
+    let num_blocks = config.recommended_kv_blocks(gpu_budget, is_quantized, kv_quant, &qpb);
     let kv_dim = config.num_key_value_heads * config.head_dim;
-    let kv_pool = kv_cache::KvPool::new(&backend, num_blocks, kv_dim, config.num_kv_layers());
+    let kv_pool = kv_cache::KvPool::new(
+        &backend, num_blocks, kv_dim, config.num_kv_layers(), kv_quant, config.head_dim,
+    );
 
     let weight_mb = config.estimate_weight_bytes(is_quantized, &qpb) as f64 / (1024.0 * 1024.0);
     let kv_mb = kv_pool.total_memory_bytes() as f64 / (1024.0 * 1024.0);
     let max_tokens = kv_pool.max_tokens();
+    if kv_quant.is_quantized() {
+        eprintln!("kv cache: TurboQuant {}-bit ({:.1}x compression)",
+            kv_quant.bits(),
+            kv_dim as f64 * 2.0 / kv_pool.bytes_per_position() as f64,
+        );
+    }
     eprintln!(
         "memory: {:.0} MB weights, {:.0} MB KV cache ({} blocks, {} max tokens), {:.0} MB GPU budget",
         weight_mb,

@@ -63,6 +63,16 @@ pub(crate) struct RunArgs {
     /// vision models can process it alongside the text prompt.
     #[arg(long, requires = "chat")]
     image: Option<PathBuf>,
+
+    /// KV cache quantization mode.  TurboQuant applies a random orthogonal
+    /// rotation followed by optimal scalar quantization (Max-Lloyd) per
+    /// coordinate, achieving near-optimal distortion rates.
+    /// "turbo4" (default): 4-bit, ~4x compression, quality-neutral.
+    /// "turbo3": 3-bit, ~5x compression, near-lossless.
+    /// "turbo2": 2-bit, ~7.5x compression, marginal quality loss.
+    /// "none": BF16 (no quantization, for debugging/benchmarking).
+    #[arg(long, default_value = "turbo4")]
+    kv_quant: String,
 }
 
 pub(crate) fn exec(mut args: RunArgs) -> anyhow::Result<()> {
@@ -131,10 +141,17 @@ pub(crate) fn exec(mut args: RunArgs) -> anyhow::Result<()> {
     use std::cell::Cell;
     let arch_cell: Cell<Option<ModelArch>> = Cell::new(None);
 
+    let kv_quant = crate::model::turboquant::KvQuantMode::from_str(&args.kv_quant)
+        .unwrap_or_else(|| {
+            eprintln!("error: invalid --kv-quant value '{}', expected: turbo4, turbo3, turbo2, none", args.kv_quant);
+            std::process::exit(1);
+        });
+
     engine::loader::load_and_run_ext(
         &args.model,
         args.stream_experts,
         args.tp,
+        kv_quant,
         1, // single sequence
         |_tok, arch| {
             arch_cell.set(Some(arch));

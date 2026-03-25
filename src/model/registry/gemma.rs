@@ -53,6 +53,7 @@
 
 use crate::gpu::{
     GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
+    GpuTurboQuant,
 };
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives;
@@ -111,7 +112,8 @@ pub(crate) fn forward_single_paged<
         + GpuAttention
         + GpuElementwise
         + GpuEmbed
-        + GpuAllReduce,
+        + GpuAllReduce
+        + GpuTurboQuant,
 >(
     m: &Model<'_, B>,
     token_id: u32,
@@ -186,7 +188,7 @@ pub(crate) fn forward_single_paged<
         );
 
         // Paged KV cache write + attention with sliding window + custom scale.
-        primitives::paged_kv_and_attention(
+        primitives::paged_kv_and_attention_maybe_quantized(
             m.backend,
             &m.k_buf,
             &m.v_buf,
@@ -202,6 +204,7 @@ pub(crate) fn forward_single_paged<
             window_size,
             attn_scale,
             None,
+            m.turbo_ctx.as_ref(),
         );
 
         // O projection into norm_buf (reused as scratch).

@@ -87,6 +87,24 @@ api/
 Tool/function calling lives in `src/model/tools.rs` with architecture-specific prompt formatting
 and output parsing (Llama 3.1, Qwen, Mistral, Anthropic formats).
 
+### TurboQuant KV Cache Quantization (`src/model/turboquant.rs`)
+
+Online vector quantization for the KV cache, based on Zandieh et al. (arXiv:2504.19874).
+**On by default at 4-bit** (~4x KV compression, quality-neutral).  Override with `--kv-quant`.
+
+Algorithm: random orthogonal rotation → Max-Lloyd scalar quantization per coordinate.
+Efficiency: Q is pre-rotated once, K dequant is a centroid lookup per position, V inverse
+rotation happens once per query head (not per position).
+
+```
+model/turboquant.rs                — KvQuantMode, TurboQuantConfig, rotation matrix, TurboContext
+gpu/ops/turboquant.rs              — GpuTurboQuant trait
+gpu/metal/shaders/turboquant.metal — Metal kernels (quantize, rotate_q, paged_attention)
+gpu/metal/kernels/turboquant.rs    — Metal dispatch
+model/primitives.rs                — paged_kv_and_attention_maybe_quantized()
+docs/turboquant.md                 — Full documentation
+```
+
 ### Vision Encoder (`src/model/vision.rs`)
 
 Vision-language models (VLMs) like Qwen 3.5 and Gemma 3 include a SigLIP-based Vision

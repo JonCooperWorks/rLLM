@@ -53,6 +53,12 @@ pub(crate) struct BatchArgs {
     /// Tensor parallelism: number of GPUs to use (default 1).
     #[arg(long, default_value = "1")]
     tp: usize,
+
+    /// KV cache quantization mode.  TurboQuant applies a random orthogonal
+    /// rotation followed by optimal scalar quantization (Max-Lloyd) per
+    /// coordinate.  See `rllm run --help` for details.
+    #[arg(long, default_value = "turbo4")]
+    kv_quant: String,
 }
 
 pub(crate) fn exec(args: BatchArgs) -> anyhow::Result<()> {
@@ -78,9 +84,16 @@ pub(crate) fn exec(args: BatchArgs) -> anyhow::Result<()> {
 
     let arch_cell: Cell<Option<ModelArch>> = Cell::new(None);
 
+    let kv_quant = crate::model::turboquant::KvQuantMode::from_str(&args.kv_quant)
+        .unwrap_or_else(|| {
+            eprintln!("error: invalid --kv-quant value '{}', expected: turbo4, turbo3, turbo2, none", args.kv_quant);
+            std::process::exit(1);
+        });
+
     engine::loader::load_and_run(
         &args.model,
         args.tp,
+        kv_quant,
         max_active,
         |_tok, arch| {
             arch_cell.set(Some(arch));

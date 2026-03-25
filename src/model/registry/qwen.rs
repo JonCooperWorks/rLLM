@@ -23,6 +23,7 @@
 
 use crate::gpu::{
     GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
+    GpuTurboQuant,
 };
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::{Model, PrefillBuffers};
@@ -40,7 +41,8 @@ pub(crate) fn forward_single_paged<
         + GpuAttention
         + GpuElementwise
         + GpuEmbed
-        + GpuAllReduce,
+        + GpuAllReduce
+        + GpuTurboQuant,
 >(
     m: &Model<'_, B>,
     token_id: u32,
@@ -58,7 +60,8 @@ pub(crate) fn forward_prefill_paged<
         + GpuAttention
         + GpuElementwise
         + GpuEmbed
-        + GpuAllReduce,
+        + GpuAllReduce
+        + GpuTurboQuant,
 >(
     m: &Model<'_, B>,
     tokens: &[u32],
@@ -77,7 +80,8 @@ pub(crate) fn forward_decode_batch_paged<
         + GpuAttention
         + GpuElementwise
         + GpuEmbed
-        + GpuAllReduce,
+        + GpuAllReduce
+        + GpuTurboQuant,
 >(
     m: &Model<'_, B>,
     tokens: &[u32],

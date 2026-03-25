@@ -78,6 +78,16 @@ Measured via `rllm run --chat`, single run.
 
 Q4 quantization (`rllm quantize`) gives ~1.3-3.5x faster decode by reducing memory bandwidth.  Q4 uses 18-byte blocks (bf16 scale + 16 packed nibbles per 32 weights) for compact I/O — 10% smaller than f32-scale formats.  Mixtral requires Q4 (bf16 would need ~87 GB). Q4 is strongly recommended for models over ~8B params. Large models (Gemma 3 27B, Phi-4, Qwen3/3.5 MoE) run in bf16 but are slow because the weights consume most of the 64 GB unified memory. Dynamic KV cache sizing automatically adjusts block count based on available GPU memory.
 
+**TurboQuant KV cache quantization** (on by default at 4-bit):
+
+| Model | KV (none) | KV (turbo4) | Decode (none) | Decode (turbo4) | Max tokens |
+|---|---|---|---|---|---|
+| Qwen3.5 27B Q4 | 6,753 MB | 2,080 MB (3.2×) | 9.3 tok/s | 14.3 tok/s (1.5×) | 131K |
+| Gemma 3 27B Q4 | 27,110 MB | 16,368 MB (1.7×) | 0.3 tok/s | 1.7 tok/s (5.7×) | 131K |
+| Qwen3.5 122B-A10B Q4 ⚡ | 96 MB | 24 MB (3.9×) | — | 8.6 tok/s | 4K |
+
+TurboQuant (Zandieh et al., [arXiv:2504.19874](https://arxiv.org/abs/2504.19874)) compresses the KV cache ~4× by applying a random orthogonal rotation followed by optimal Max-Lloyd scalar quantization per coordinate.  Quality-neutral at 4-bit — the information-theoretic distortion is within 2.7× of optimal.  Override with `--kv-quant none` for debugging.  See [docs/turboquant.md](docs/turboquant.md).
+
 </details>
 
 <details>

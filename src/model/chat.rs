@@ -322,8 +322,10 @@ pub(crate) fn format_chat(arch: ModelArch, messages: &[Message]) -> String {
 ///
 /// When `thinking` is Some(true), a thinking prompt tag is appended after
 /// the generation prompt so the model begins reasoning.  When Some(false),
-/// a suppression tag is appended to prevent thinking.  When None, no
-/// thinking control is applied (the model decides on its own).
+/// a suppression tag is appended to prevent thinking.  When None, the
+/// default is used: thinking-capable models (Qwen 3, 3.5) get thinking
+/// enabled automatically, since they were trained to always produce
+/// `<think>...</think>` blocks and loop without the prompt tag.
 ///
 /// See `thinking.rs` for the architecture-specific tags.
 pub(crate) fn format_chat_with_thinking(
@@ -341,19 +343,19 @@ pub(crate) fn format_chat_with_thinking(
         ModelArch::Gemma3 => format_gemma3(messages),
     };
 
-    // Append thinking control tag after the generation prompt.
-    match thinking_enabled {
-        Some(true) => {
-            if let Some(tag) = thinking::thinking_prompt_tag(arch, true) {
-                out.push_str(tag);
-            }
+    // Resolve thinking: explicit preference wins, otherwise default to enabled
+    // for thinking-capable architectures (Qwen 3/3.5 were trained to always
+    // produce <think> blocks — without the prompt tag they loop endlessly).
+    let enabled = thinking_enabled.unwrap_or_else(|| thinking::supports_thinking(arch));
+
+    if enabled {
+        if let Some(tag) = thinking::thinking_prompt_tag(arch, true) {
+            out.push_str(tag);
         }
-        Some(false) => {
-            if let Some(tag) = thinking::thinking_suppress_tag(arch) {
-                out.push_str(tag);
-            }
+    } else if thinking_enabled == Some(false) {
+        if let Some(tag) = thinking::thinking_suppress_tag(arch) {
+            out.push_str(tag);
         }
-        None => {}
     }
 
     out
@@ -628,9 +630,14 @@ mod tests {
         let qwen2 = format_chat(ModelArch::Qwen2, &messages);
         let qwen3_moe = format_chat(ModelArch::Qwen3Moe, &messages);
         let qwen3_5 = format_chat(ModelArch::Qwen3_5, &messages);
-        // All Qwen variants produce ChatML format
-        assert_eq!(qwen2, qwen3_moe);
-        assert_eq!(qwen2, qwen3_5);
+        // Qwen 3 MoE and 3.5 support thinking — they get <think>\n appended.
+        // The base ChatML structure is the same, just with the thinking prompt tag.
+        assert!(qwen3_moe.starts_with(&qwen2[..qwen2.len() - 1]));
+        assert!(qwen3_5.starts_with(&qwen2[..qwen2.len() - 1]));
+        assert!(qwen3_moe.ends_with("<think>\n"));
+        assert!(qwen3_5.ends_with("<think>\n"));
+        // Qwen 2 does not support thinking — no tag.
+        assert!(!qwen2.contains("<think>"));
     }
 
     #[test]
@@ -732,18 +739,41 @@ mod tests {
     fn test_thinking_disabled_qwen3_5() {
         let messages = vec![msg("user", "Solve 2+2")];
         let result = format_chat_with_thinking(ModelArch::Qwen3_5, &messages, Some(false));
-        // When disabled, no thinking tag is added — same as format_chat.
-        let without = format_chat(ModelArch::Qwen3_5, &messages);
-        assert_eq!(result, without);
+        // When explicitly disabled, no thinking tag is added.
+        assert!(!result.ends_with("<think>\n"));
     }
 
     #[test]
-    fn test_thinking_none_no_tag() {
+    fn test_thinking_none_defaults_to_enabled_for_thinking_models() {
+        // Qwen 3.5 supports thinking — None should default to enabled.
         let messages = vec![msg("user", "Hello")];
         let with_none = format_chat_with_thinking(ModelArch::Qwen3_5, &messages, None);
-        let without = format_chat(ModelArch::Qwen3_5, &messages);
-        // None should produce identical output to format_chat
-        assert_eq!(with_none, without);
+        let with_true = format_chat_with_thinking(ModelArch::Qwen3_5, &messages, Some(true));
+        assert_eq!(with_none, with_true, "None should default to thinking enabled for Qwen 3.5");
+        assert!(with_none.ends_with("<think>\n"));
+    }
+
+    #[test]
+    fn test_thinking_none_no_tag_for_non_thinking_models() {
+        // Llama doesn't support thinking — None should not add a tag.
+        let messages = vec![msg("user", "Hello")];
+        let with_none = format_chat_with_thinking(ModelArch::Llama, &messages, None);
+        assert!(!with_none.contains("<think>"));
+    }
+
+    #[test]
+    fn test_format_chat_defaults_thinking_for_qwen() {
+        // format_chat() passes None, which should auto-enable thinking for Qwen 3.5.
+        let messages = vec![msg("user", "Solve 2+2")];
+        let result = format_chat(ModelArch::Qwen3_5, &messages);
+        assert!(result.ends_with("<think>\n"), "format_chat should enable thinking for Qwen 3.5");
+    }
+
+    #[test]
+    fn test_format_chat_no_thinking_for_llama() {
+        let messages = vec![msg("user", "Hello")];
+        let result = format_chat(ModelArch::Llama, &messages);
+        assert!(!result.contains("<think>"), "format_chat should not add thinking for Llama");
     }
 
     #[test]

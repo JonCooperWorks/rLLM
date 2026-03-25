@@ -53,7 +53,7 @@
 
 use crate::gpu::{
     GpuAllReduce, GpuAttention, GpuCore, GpuDeltaNet, GpuElementwise, GpuEmbed, GpuMatmul, GpuMoe,
-    GpuNorm, GpuRope,
+    GpuNorm, GpuRope, GpuTurboQuant,
 };
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives::{self, Dims};
@@ -362,7 +362,8 @@ pub(crate) fn forward_single_paged<
         + GpuEmbed
         + GpuDeltaNet
         + GpuMoe
-        + GpuAllReduce,
+        + GpuAllReduce
+        + GpuTurboQuant,
 >(
     m: &Model<'_, B>,
     token_id: u32,
@@ -427,35 +428,23 @@ pub(crate) fn forward_single_paged<
             }
 
             let kv_idx = m.kv_layer_map[layer_idx].unwrap();
-            m.backend.copy_to_paged_kv_cache(
+            primitives::paged_kv_and_attention_maybe_quantized(
+                m.backend,
                 &m.k_buf,
-                &pool.k_pool[kv_idx],
-                &seq_state.block_table_gpu,
-                pos,
-                d.num_kv_heads,
-                d.head_dim,
-            );
-            m.backend.copy_to_paged_kv_cache(
                 &m.v_buf,
-                &pool.v_pool[kv_idx],
-                &seq_state.block_table_gpu,
-                pos,
-                d.num_kv_heads,
-                d.head_dim,
-            );
-            m.backend.paged_attention(
                 &m.q_buf,
-                &pool.k_pool[kv_idx],
-                &pool.v_pool[kv_idx],
-                &seq_state.block_table_gpu,
                 &m.attn_out,
-                pos + 1,
+                pool,
+                seq_state,
+                kv_idx,
+                pos,
                 d.num_heads,
                 d.num_kv_heads,
                 d.head_dim,
                 0,
                 0.0,
                 None,
+                m.turbo_ctx.as_ref(),
             );
 
             if has_output_gate {
@@ -519,7 +508,8 @@ pub(crate) fn forward_prefill_paged<
         + GpuEmbed
         + GpuDeltaNet
         + GpuMoe
-        + GpuAllReduce,
+        + GpuAllReduce
+        + GpuTurboQuant,
 >(
     m: &Model<'_, B>,
     tokens: &[u32],
@@ -663,24 +653,55 @@ pub(crate) fn forward_prefill_paged<
                 m.backend.copy_to_tensor(&bufs.k_buf, &host_k);
             }
             let kv_idx = m.kv_layer_map[layer_idx].unwrap();
-            m.backend.copy_to_paged_kv_cache_batch(
-                &bufs.k_buf,
-                &pool.k_pool[kv_idx],
-                &seq_state.block_table_gpu,
-                &bufs.positions,
-                bs,
-                d.num_kv_heads,
-                d.head_dim,
-            );
-            m.backend.copy_to_paged_kv_cache_batch(
-                &bufs.v_buf,
-                &pool.v_pool[kv_idx],
-                &seq_state.block_table_gpu,
-                &bufs.positions,
-                bs,
-                d.num_kv_heads,
-                d.head_dim,
-            );
+            if let Some(tc) = &m.turbo_ctx {
+                // TurboQuant: rotate + quantize K/V into paged pool.
+                m.backend.turbo_quantize_to_paged_batch(
+                    &bufs.k_buf,
+                    &pool.k_pool[kv_idx],
+                    &seq_state.block_table_gpu,
+                    &bufs.positions,
+                    &tc.pi,
+                    &tc.centroids,
+                    bs,
+                    d.num_kv_heads,
+                    d.head_dim,
+                    tc.config.bits,
+                    tc.config.bytes_per_head_pos as u32,
+                );
+                m.backend.turbo_quantize_to_paged_batch(
+                    &bufs.v_buf,
+                    &pool.v_pool[kv_idx],
+                    &seq_state.block_table_gpu,
+                    &bufs.positions,
+                    &tc.pi,
+                    &tc.centroids,
+                    bs,
+                    d.num_kv_heads,
+                    d.head_dim,
+                    tc.config.bits,
+                    tc.config.bytes_per_head_pos as u32,
+                );
+            } else {
+                // BF16: direct copy to paged pool.
+                m.backend.copy_to_paged_kv_cache_batch(
+                    &bufs.k_buf,
+                    &pool.k_pool[kv_idx],
+                    &seq_state.block_table_gpu,
+                    &bufs.positions,
+                    bs,
+                    d.num_kv_heads,
+                    d.head_dim,
+                );
+                m.backend.copy_to_paged_kv_cache_batch(
+                    &bufs.v_buf,
+                    &pool.v_pool[kv_idx],
+                    &seq_state.block_table_gpu,
+                    &bufs.positions,
+                    bs,
+                    d.num_kv_heads,
+                    d.head_dim,
+                );
+            }
             m.backend.prefill_attention(
                 &bufs.q_buf,
                 &bufs.k_buf,

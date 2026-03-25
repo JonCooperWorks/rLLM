@@ -73,6 +73,12 @@ pub(crate) struct ServeArgs {
     /// See docs/threat-model.md for config format and deployment guidance.
     #[arg(long)]
     pub auth_config: Option<PathBuf>,
+
+    /// KV cache quantization mode.  TurboQuant applies a random orthogonal
+    /// rotation followed by optimal scalar quantization (Max-Lloyd) per
+    /// coordinate.  See `rllm run --help` for details.
+    #[arg(long, default_value = "turbo4")]
+    pub kv_quant: String,
 }
 
 pub(crate) fn exec(args: ServeArgs) -> anyhow::Result<()> {

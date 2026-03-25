@@ -49,6 +49,7 @@ mod matmul;
 mod moe;
 mod norm;
 mod rope;
+mod turboquant;
 mod vision;
 
 pub(crate) use allreduce::GpuAllReduce;
@@ -61,4 +62,5 @@ pub(crate) use matmul::GpuMatmul;
 pub(crate) use moe::GpuMoe;
 pub(crate) use norm::GpuNorm;
 pub(crate) use rope::GpuRope;
+pub(crate) use turboquant::GpuTurboQuant;
 pub(crate) use vision::GpuVision;

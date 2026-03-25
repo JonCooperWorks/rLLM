@@ -302,12 +302,18 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         eprintln!("  tp        : {} GPUs", tp);
     }
 
+    let kv_quant = crate::model::turboquant::KvQuantMode::from_str(&args.kv_quant)
+        .unwrap_or_else(|| {
+            eprintln!("error: invalid --kv-quant value '{}', expected: turbo4, turbo3, turbo2, none", args.kv_quant);
+            std::process::exit(1);
+        });
+
     let WorkerHandle {
         request_tx,
         tokenizer,
         arch,
         vision_config: _,
-    } = spawn_worker(args.model.clone(), args.stream_experts, tp)?;
+    } = spawn_worker(args.model.clone(), args.stream_experts, tp, kv_quant)?;
 
     // Parse vision config directly from config.json for handler-side image preprocessing.
     let vision_config = config::ModelConfig::from_file(&args.model.join("config.json"))
@@ -480,6 +486,7 @@ fn spawn_worker(
     model_dir: std::path::PathBuf,
     stream_experts: bool,
     tp: usize,
+    kv_quant: crate::model::turboquant::KvQuantMode,
 ) -> anyhow::Result<WorkerHandle> {
     let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
     type ReadyPayload = (Arc<tokenizer::Tokenizer>, config::ModelArch, Option<crate::model::config::VisionConfig>);
@@ -494,6 +501,7 @@ fn spawn_worker(
             &model_dir,
             stream_experts,
             tp,
+            kv_quant,
             max_active,
             |tok, arch| {
                 let _ = ready_tx.send(Ok((Arc::new(tok.clone()), arch, None)));

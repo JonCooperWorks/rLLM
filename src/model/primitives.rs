@@ -17,7 +17,7 @@
 
 use crate::gpu::{
     GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuMoe, GpuNorm,
-    GpuRope,
+    GpuRope, GpuTurboQuant,
 };
 use crate::model::PrefillBuffers;
 use crate::model::config::ModelConfig;
@@ -271,6 +271,64 @@ pub(crate) fn paged_kv_and_attention<B: GpuAttention>(
         attn_scale,
         sinks,
     );
+}
+
+/// Write K/V to paged cache and compute attention, with optional TurboQuant.
+///
+/// When `turbo` is Some, uses TurboQuant quantized KV cache path: rotates Q,
+/// quantizes K/V into packed codes, and runs quantized paged attention with
+/// inline dequantization.  When None, falls through to BF16 paged attention.
+///
+/// This is a drop-in replacement for `paged_kv_and_attention` that all model
+/// families should use — it transparently handles the quantization mode.
+pub(crate) fn paged_kv_and_attention_maybe_quantized<B: GpuAttention + GpuTurboQuant>(
+    backend: &B,
+    k_buf: &B::Tensor,
+    v_buf: &B::Tensor,
+    q_buf: &B::Tensor,
+    attn_out: &B::Tensor,
+    pool: &KvPool<B>,
+    seq_state: &SeqKvState<B>,
+    layer_idx: usize,
+    pos: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    window_size: u32,
+    attn_scale: f32,
+    sinks: Option<&B::Tensor>,
+    turbo: Option<&crate::model::turboquant::TurboContext<B>>,
+) {
+    if let Some(tc) = turbo {
+        backend.turbo_paged_attention_fused(
+            q_buf,
+            k_buf,
+            v_buf,
+            &pool.k_pool[layer_idx],
+            &pool.v_pool[layer_idx],
+            &seq_state.block_table_gpu,
+            &tc.pi,
+            &tc.pi_t,
+            &tc.centroids,
+            &tc.q_rot_buf,
+            attn_out,
+            pos,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            tc.config.bits,
+            tc.config.bytes_per_head_pos as u32,
+            window_size,
+            attn_scale,
+            sinks,
+        );
+    } else {
+        paged_kv_and_attention(
+            backend, k_buf, v_buf, q_buf, attn_out, pool, seq_state,
+            layer_idx, pos, num_heads, num_kv_heads, head_dim,
+            window_size, attn_scale, sinks,
+        );
+    }
 }
 
 /// O projection + residual add.

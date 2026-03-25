@@ -1550,6 +1550,46 @@ impl GpuVision for CpuBackend {
     }
 }
 
+// ---------------------------------------------------------------------------
+// GpuTurboQuant stub — TurboQuant is GPU-only for now.
+// ---------------------------------------------------------------------------
+
+impl GpuTurboQuant for CpuBackend {
+    fn turbo_quantize_to_paged(
+        &self, _src: &CpuTensor, _pool: &CpuTensor, _block_table: &CpuTensor,
+        _pi: &CpuTensor, _centroids: &CpuTensor, _pos: u32, _num_kv_heads: u32,
+        _head_dim: u32, _bits: u32, _bytes_per_head_pos: u32,
+    ) {
+        todo!("TurboQuant not yet implemented for CPU backend")
+    }
+
+    fn turbo_quantize_to_paged_batch(
+        &self, _src: &CpuTensor, _pool: &CpuTensor, _block_table: &CpuTensor,
+        _positions: &CpuTensor, _pi: &CpuTensor, _centroids: &CpuTensor,
+        _batch_size: u32, _num_kv_heads: u32, _head_dim: u32, _bits: u32,
+        _bytes_per_head_pos: u32,
+    ) {
+        todo!("TurboQuant not yet implemented for CPU backend")
+    }
+
+    fn turbo_rotate_q(
+        &self, _q: &CpuTensor, _q_rot: &CpuTensor, _pi: &CpuTensor,
+        _num_heads: u32, _head_dim: u32,
+    ) {
+        todo!("TurboQuant not yet implemented for CPU backend")
+    }
+
+    fn turbo_paged_attention(
+        &self, _q_rot: &CpuTensor, _k_pool: &CpuTensor, _v_pool: &CpuTensor,
+        _block_table: &CpuTensor, _pi_t: &CpuTensor, _centroids: &CpuTensor,
+        _out: &CpuTensor, _seq_len: u32, _num_heads: u32, _num_kv_heads: u32,
+        _head_dim: u32, _bits: u32, _bytes_per_head_pos: u32, _window_size: u32,
+        _attn_scale: f32, _sinks: Option<&CpuTensor>,
+    ) {
+        todo!("TurboQuant not yet implemented for CPU backend")
+    }
+}
+
 // ===========================================================================
 // Tests — GPU kernel correctness via CpuBackend
 // ===========================================================================

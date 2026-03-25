@@ -1033,6 +1033,7 @@ impl ModelConfig {
         &self,
         gpu_budget: u64,
         quantize: bool,
+        kv_quant: crate::model::turboquant::KvQuantMode,
         quantized_proj_bytes: impl Fn(usize, usize) -> usize,
     ) -> usize {
         let weight_bytes = self.estimate_weight_bytes(quantize, quantized_proj_bytes) as u64;
@@ -1040,10 +1041,13 @@ impl ModelConfig {
         let scratch_overhead = 512 * 1024 * 1024u64;
         let available = gpu_budget.saturating_sub(weight_bytes + scratch_overhead);
 
-        let kv_dim = (self.num_key_value_heads * self.head_dim) as u64;
-        // bytes per block = 2 (K+V) × num_layers × BLOCK_SIZE × kv_dim × 2 (bf16)
+        // Bytes per position per pool (K or V).
+        let bytes_per_pos = crate::model::turboquant::bytes_per_kv_position(
+            self.head_dim, self.num_key_value_heads, kv_quant,
+        ) as u64;
+        // bytes per block = 2 (K+V) × num_layers × BLOCK_SIZE × bytes_per_pos
         let bytes_per_block =
-            2 * self.num_hidden_layers as u64 * kv_cache::BLOCK_SIZE as u64 * kv_dim * 2;
+            2 * self.num_hidden_layers as u64 * kv_cache::BLOCK_SIZE as u64 * bytes_per_pos;
 
         if bytes_per_block == 0 {
             return 8192;

@@ -77,6 +77,7 @@ const METAL_SOURCE_EMBED: &str = include_str!("shaders/embed.metal");
 const METAL_SOURCE_DELTANET: &str = include_str!("shaders/deltanet.metal");
 const METAL_SOURCE_MOE: &str = include_str!("shaders/moe.metal");
 const METAL_SOURCE_VISION: &str = include_str!("shaders/vision.metal");
+const METAL_SOURCE_TURBOQUANT: &str = include_str!("shaders/turboquant.metal");
 
 // ---------------------------------------------------------------------------
 // MetalBackend — holds the Metal device, command queue, and all compiled
@@ -160,6 +161,12 @@ pub(crate) struct MetalBackend {
     pub(crate) pipeline_scatter_vision_tokens: metal::ComputePipelineState,
     pub(crate) pipeline_spatial_merge_norm: metal::ComputePipelineState,
     pub(crate) pipeline_prefill_attention_fused_qkv: metal::ComputePipelineState,
+
+    // TurboQuant KV cache quantization kernels (arXiv:2504.19874).
+    pub(crate) pipeline_turbo_quantize_paged: metal::ComputePipelineState,
+    pub(crate) pipeline_turbo_quantize_paged_batch: metal::ComputePipelineState,
+    pub(crate) pipeline_turbo_rotate_q: metal::ComputePipelineState,
+    pub(crate) pipeline_turbo_paged_attention: metal::ComputePipelineState,
 
     // Batched command encoding state.
     //
@@ -447,6 +454,32 @@ impl MetalBackend {
             &compile_opts,
         )?;
 
+        // TurboQuant KV cache quantization pipelines.
+        let pipeline_turbo_quantize_paged = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_TURBOQUANT,
+            "turbo_quantize_paged",
+            &compile_opts,
+        )?;
+        let pipeline_turbo_quantize_paged_batch = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_TURBOQUANT,
+            "turbo_quantize_paged_batch",
+            &compile_opts,
+        )?;
+        let pipeline_turbo_rotate_q = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_TURBOQUANT,
+            "turbo_rotate_q",
+            &compile_opts,
+        )?;
+        let pipeline_turbo_paged_attention = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_TURBOQUANT,
+            "turbo_paged_attention",
+            &compile_opts,
+        )?;
+
         Ok(Self {
             device,
             queue,
@@ -503,6 +536,10 @@ impl MetalBackend {
             pipeline_scatter_vision_tokens,
             pipeline_spatial_merge_norm,
             pipeline_prefill_attention_fused_qkv,
+            pipeline_turbo_quantize_paged,
+            pipeline_turbo_quantize_paged_batch,
+            pipeline_turbo_rotate_q,
+            pipeline_turbo_paged_attention,
             current_cmd: std::sync::Mutex::new(None),
         })
     }

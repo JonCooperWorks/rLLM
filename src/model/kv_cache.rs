@@ -47,6 +47,7 @@
 use std::collections::HashMap;
 
 use crate::gpu::{GpuCore, TensorDtype};
+use crate::model::turboquant::KvQuantMode;
 
 /// Number of token positions stored per KV cache block.
 pub(crate) const BLOCK_SIZE: usize = 16;
@@ -112,7 +113,8 @@ pub(crate) fn blocks_needed_for(token_count: usize) -> usize {
 #[allow(dead_code)]
 pub(crate) struct KvPool<B: GpuCore> {
     /// Physical K cache pool: one buffer per layer.
-    /// Shape per buffer: [num_physical_blocks * BLOCK_SIZE, kv_dim] in bf16.
+    /// For BF16: shape [num_blocks * BLOCK_SIZE, kv_dim] in bf16.
+    /// For TurboQuant: raw byte buffer sized to num_blocks * BLOCK_SIZE * bytes_per_pos.
     pub k_pool: Vec<B::Tensor>,
     /// Physical V cache pool: one buffer per layer.
     pub v_pool: Vec<B::Tensor>,
@@ -128,6 +130,11 @@ pub(crate) struct KvPool<B: GpuCore> {
     kv_dim: usize,
     /// Number of transformer layers.
     num_layers: usize,
+    /// KV cache quantization mode.
+    pub kv_quant: KvQuantMode,
+    /// Bytes per position per pool (K or V).
+    /// For BF16: kv_dim × 2.  For TurboQuant: num_kv_heads × bytes_per_head_pos.
+    bytes_per_pos: usize,
 }
 
 /// Per-sequence KV cache state: a block table and current length.
@@ -371,16 +378,49 @@ impl PrefixCache {
 impl<B: GpuCore> KvPool<B> {
     /// Allocate a KV pool with room for `num_blocks` physical blocks.
     ///
-    /// Total GPU memory = num_blocks * BLOCK_SIZE * kv_dim * 2 bytes * 2 (K+V)
-    ///                     * num_layers.
-    /// For 256 blocks, 16 layers, kv_dim=512: 256 * 16 * 512 * 2 * 2 * 16 = 128 MB.
-    pub fn new(backend: &B, num_blocks: usize, kv_dim: usize, num_layers: usize) -> Self {
+    /// For BF16 (kv_quant=None):
+    ///   Total GPU memory = num_blocks * BLOCK_SIZE * kv_dim * 2 bytes * 2 (K+V) * num_layers.
+    /// For TurboQuant:
+    ///   Total GPU memory = num_blocks * BLOCK_SIZE * bytes_per_pos * 2 (K+V) * num_layers,
+    ///   where bytes_per_pos = num_kv_heads × (2 + ceil(head_dim × bits / 8)).
+    pub fn new(
+        backend: &B,
+        num_blocks: usize,
+        kv_dim: usize,
+        num_layers: usize,
+        kv_quant: KvQuantMode,
+        head_dim: usize,
+    ) -> Self {
         let total_positions = num_blocks * BLOCK_SIZE;
+        let num_kv_heads = if head_dim > 0 { kv_dim / head_dim } else { 0 };
+        let bytes_per_pos = crate::model::turboquant::bytes_per_kv_position(
+            head_dim, num_kv_heads, kv_quant,
+        );
+
         let mut k_pool = Vec::with_capacity(num_layers);
         let mut v_pool = Vec::with_capacity(num_layers);
-        for _ in 0..num_layers {
-            k_pool.push(backend.alloc_tensor(&[total_positions, kv_dim], TensorDtype::BF16));
-            v_pool.push(backend.alloc_tensor(&[total_positions, kv_dim], TensorDtype::BF16));
+
+        if kv_quant.is_quantized() {
+            // Allocate raw byte buffers for quantized KV storage.
+            // We use BF16 tensors with fake dimensions to get the right byte count:
+            // shape [total_positions, bytes_per_pos / 2] because BF16 is 2 bytes each.
+            // If bytes_per_pos is odd, round up to avoid splitting a BF16 element.
+            let bf16_elems_per_pos = (bytes_per_pos + 1) / 2;
+            for _ in 0..num_layers {
+                k_pool.push(backend.alloc_tensor(
+                    &[total_positions, bf16_elems_per_pos],
+                    TensorDtype::BF16,
+                ));
+                v_pool.push(backend.alloc_tensor(
+                    &[total_positions, bf16_elems_per_pos],
+                    TensorDtype::BF16,
+                ));
+            }
+        } else {
+            for _ in 0..num_layers {
+                k_pool.push(backend.alloc_tensor(&[total_positions, kv_dim], TensorDtype::BF16));
+                v_pool.push(backend.alloc_tensor(&[total_positions, kv_dim], TensorDtype::BF16));
+            }
         }
 
         // Initialise free list with all block indices (in reverse so pop gives 0, 1, 2, ...).
@@ -396,6 +436,8 @@ impl<B: GpuCore> KvPool<B> {
             num_physical_blocks: num_blocks,
             kv_dim,
             num_layers,
+            kv_quant,
+            bytes_per_pos,
         }
     }
 
@@ -423,8 +465,13 @@ impl<B: GpuCore> KvPool<B> {
     /// Accounts for K + V pools across all layers.  Used for memory
     /// reporting in commands and the API server.
     pub fn total_memory_bytes(&self) -> usize {
-        // 2 (K+V) × num_layers × num_blocks × BLOCK_SIZE × kv_dim × 2 (bf16)
-        2 * self.num_layers * self.num_physical_blocks * BLOCK_SIZE * self.kv_dim * 2
+        // 2 (K+V) × num_layers × num_blocks × BLOCK_SIZE × bytes_per_pos
+        2 * self.num_layers * self.num_physical_blocks * BLOCK_SIZE * self.bytes_per_pos
+    }
+
+    /// Bytes per position per pool (K or V).  Used for compression ratio reporting.
+    pub fn bytes_per_position(&self) -> usize {
+        self.bytes_per_pos
     }
 
     /// Number of blocks needed to store `token_count` tokens.
@@ -689,7 +736,7 @@ mod tests {
 
     fn make_pool(num_blocks: usize) -> (CpuBackend, KvPool<CpuBackend>) {
         let backend = CpuBackend;
-        let pool = KvPool::new(&backend, num_blocks, 4, 2); // kv_dim=4, 2 layers
+        let pool = KvPool::new(&backend, num_blocks, 4, 2, KvQuantMode::None, 4); // kv_dim=4, 2 layers
         (backend, pool)
     }
 

@@ -67,6 +67,7 @@ pub(crate) mod sampler;
 pub(crate) mod thinking;
 pub(crate) mod tokenizer;
 pub(crate) mod tools;
+pub(crate) mod turboquant;
 pub(crate) mod vision;
 
 use self::config::{ModelArch, ModelConfig};
@@ -205,6 +206,18 @@ pub(crate) struct Model<'a, B: GpuCore> {
     // -----------------------------------------------------------------------
     pub(crate) vision_weights: Option<vision::VisionWeights<B>>,
     pub(crate) vision_bufs: Option<vision::VisionBuffers<B>>,
+
+    // -----------------------------------------------------------------------
+    // TurboQuant KV cache quantization context.
+    //
+    // When present, K/V vectors are quantized before writing to the paged
+    // cache and dequantized inline during attention.  Contains the rotation
+    // matrix Pi, its transpose Pi^T, codebook centroids, and a scratch
+    // buffer for the rotated query vector.
+    //
+    // See model/turboquant.rs and docs/turboquant.md.
+    // -----------------------------------------------------------------------
+    pub(crate) turbo_ctx: Option<turboquant::TurboContext<B>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -251,7 +264,7 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
     ) -> anyhow::Result<Self> {
         let kv_dim = config.num_key_value_heads * config.head_dim;
         let num_kv_layers = config.num_kv_layers();
-        let pool = KvPool::new(backend, num_blocks, kv_dim, num_kv_layers);
+        let pool = KvPool::new(backend, num_blocks, kv_dim, num_kv_layers, turboquant::KvQuantMode::None, config.head_dim);
         let seq_state = pool.new_sequence(backend);
 
         let kv_mode = KvMode::Paged { pool, seq_state };
@@ -447,6 +460,7 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
             expert_streamer: None,
             vision_weights: None,
             vision_bufs: None,
+            turbo_ctx: None,
         })
     }
 
@@ -607,6 +621,7 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
             expert_streamer: None,
             vision_weights: None,
             vision_bufs: None,
+            turbo_ctx: None,
         })
     }
 

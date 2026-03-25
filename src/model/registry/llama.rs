@@ -45,6 +45,7 @@
 
 use crate::gpu::{
     GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
+    GpuTurboQuant,
 };
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives;
@@ -84,7 +85,8 @@ pub(crate) fn forward_single_paged<
         + GpuAttention
         + GpuElementwise
         + GpuEmbed
-        + GpuAllReduce,
+        + GpuAllReduce
+        + GpuTurboQuant,
 >(
     m: &Model<'_, B>,
     token_id: u32,
@@ -102,7 +104,8 @@ pub(crate) fn forward_decode_batch_paged<
         + GpuAttention
         + GpuElementwise
         + GpuEmbed
-        + GpuAllReduce,
+        + GpuAllReduce
+        + GpuTurboQuant,
 >(
     m: &Model<'_, B>,
     tokens: &[u32],
@@ -123,7 +126,8 @@ pub(crate) fn forward_prefill_paged<
         + GpuAttention
         + GpuElementwise
         + GpuEmbed
-        + GpuAllReduce,
+        + GpuAllReduce
+        + GpuTurboQuant,
 >(
     m: &Model<'_, B>,
     tokens: &[u32],
@@ -154,7 +158,8 @@ pub(crate) fn forward_single_impl<
         + GpuAttention
         + GpuElementwise
         + GpuEmbed
-        + GpuAllReduce,
+        + GpuAllReduce
+        + GpuTurboQuant,
 >(
     m: &Model<'_, B>,
     token_id: u32,
@@ -205,7 +210,7 @@ pub(crate) fn forward_single_impl<
             d.num_kv_heads,
             d.head_dim,
         );
-        primitives::paged_kv_and_attention(
+        primitives::paged_kv_and_attention_maybe_quantized(
             m.backend,
             &m.k_buf,
             &m.v_buf,
@@ -221,6 +226,7 @@ pub(crate) fn forward_single_impl<
             0,
             0.0,
             None, // No sliding window, default attention scale, no sinks.
+            m.turbo_ctx.as_ref(),
         );
         primitives::o_proj_residual_qdim(
             m.backend,
@@ -274,7 +280,8 @@ pub(crate) fn forward_prefill_impl<
         + GpuAttention
         + GpuElementwise
         + GpuEmbed
-        + GpuAllReduce,
+        + GpuAllReduce
+        + GpuTurboQuant,
 >(
     m: &Model<'_, B>,
     tokens: &[u32],
@@ -401,7 +408,8 @@ pub(crate) fn forward_decode_batch_impl<
         + GpuAttention
         + GpuElementwise
         + GpuEmbed
-        + GpuAllReduce,
+        + GpuAllReduce
+        + GpuTurboQuant,
 >(
     m: &Model<'_, B>,
     tokens: &[u32],

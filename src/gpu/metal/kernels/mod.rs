@@ -28,4 +28,5 @@ mod matmul;
 mod moe;
 mod norm;
 mod rope;
+mod turboquant;
 mod vision;

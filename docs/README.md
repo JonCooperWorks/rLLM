@@ -15,6 +15,7 @@ big picture, then drill into subsystem docs as needed.
 | [API Server](api-server.md) | HTTP server with OpenAI and Anthropic endpoint compatibility using a worker-thread architecture |
 | [Tool Calling](tool-calling.md) | Tool/function calling with per-architecture prompt formatting, output parsing, and both OpenAI and Anthropic API surfaces |
 | [Quantization](quantization.md) | Q4 symmetric quantization — block format, pre-quantization workflow, GPU kernel dequantization, and performance impact |
+| [TurboQuant](turboquant.md) | KV cache vector quantization (arXiv:2504.19874) — random rotation + Max-Lloyd scalar quantization, ~4x compression at 4-bit, on by default |
 | [Expert Streaming](expert-streaming.md) | SSD-backed MoE inference — stream expert weights from NVMe on demand for models that don't fit in GPU memory |
 | [Vision](vision.md) | SigLIP ViT encoder for vision-language models — image preprocessing, patch embedding, spatial merge, and LLM token scatter |
 | [Prompt Caching](prompt-caching.md) | Reuse prefill KV cache across requests that share a common prefix — system prompt caching, hash-based matching |

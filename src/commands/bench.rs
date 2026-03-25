@@ -82,6 +82,7 @@ pub(crate) fn exec(args: BenchArgs) -> anyhow::Result<()> {
         &args.model,
         args.stream_experts,
         1, // single GPU
+        crate::model::turboquant::KvQuantMode::Turbo4, // default TurboQuant
         1, // one sequence at a time
         |_tok, arch| {
             arch_cell.set(Some(arch));

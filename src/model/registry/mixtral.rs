@@ -38,7 +38,7 @@
 
 use crate::gpu::{
     GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuMoe, GpuNorm,
-    GpuRope,
+    GpuRope, GpuTurboQuant,
 };
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives::{self, Dims};
@@ -117,7 +117,8 @@ pub(crate) fn forward_single_paged<
         + GpuElementwise
         + GpuEmbed
         + GpuMoe
-        + GpuAllReduce,
+        + GpuAllReduce
+        + GpuTurboQuant,
 >(
     m: &Model<'_, B>,
     token_id: u32,
@@ -164,7 +165,7 @@ pub(crate) fn forward_single_paged<
             d.num_kv_heads,
             d.head_dim,
         );
-        primitives::paged_kv_and_attention(
+        primitives::paged_kv_and_attention_maybe_quantized(
             m.backend,
             &m.k_buf,
             &m.v_buf,
@@ -180,6 +181,7 @@ pub(crate) fn forward_single_paged<
             0,
             0.0,
             None,
+            m.turbo_ctx.as_ref(),
         );
         primitives::o_proj_residual(
             m.backend,
