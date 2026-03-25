@@ -15,12 +15,6 @@
 //   auth/         — pluggable auth hooks (init, request, background)
 //   tls.rs        — TLS support (manual certs, Let's Encrypt)
 //
-// Worker loop features:
-//   - Stop sequences:  checked after each token decode; when matched, the
-//     stop string is excluded and a Done(EndOfSequence) is sent.
-//   - Seeded RNG:  when a request includes a seed, the engine creates a
-//     per-sequence SmallRng for deterministic sampling.
-//
 // Architecture:
 //
 //   HTTP clients ←→ [tokio async runtime / axum handlers]
@@ -91,13 +85,6 @@ pub(crate) struct WorkerRequest {
     pub images: Vec<crate::model::vision::ProcessedImage>,
     /// Authenticated user identity (None when auth is disabled).
     pub user: Option<auth::AuthUser>,
-    /// Optional seed for deterministic sampling.
-    /// When provided, the RNG is seeded with this value so the same prompt
-    /// produces the same output (assuming single-sequence batching).
-    pub seed: Option<u64>,
-    /// Stop sequences — generation stops when any of these strings appear
-    /// in the output.  The stop sequence itself is excluded from the response.
-    pub stop: Vec<String>,
 }
 
 /// Events sent from the inference worker back to an HTTP handler.
@@ -552,15 +539,6 @@ struct RequestContext {
     inject_marker: Option<&'static str>,
     /// Authenticated user identity (for per-user logging).
     user: Option<auth::AuthUser>,
-    /// Stop sequences — generation stops when any of these strings appear.
-    /// Checked after each token decode against the accumulated output text.
-    /// When a match is found, the stop sequence itself is excluded: the
-    /// engine is told to abort, and a Done event with EndOfSequence is sent.
-    stop: Vec<String>,
-    /// Accumulated full decoded text for stop-sequence matching.
-    /// Kept separately from the token-by-token SSE output so we can check
-    /// the full string for stop sequence substrings each step.
-    full_text: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -585,55 +563,67 @@ fn run_worker_loop(
 ) -> anyhow::Result<()> {
     let mut registry: HashMap<SeqId, RequestContext> = HashMap::new();
 
-    /// Helper: register a WorkerRequest with the engine and request registry.
-    fn register_request(
-        engine: &mut dyn engine::InferenceEngine,
-        registry: &mut HashMap<SeqId, RequestContext>,
-        req: WorkerRequest,
-    ) {
-        let prompt_token_count = req.prompt_tokens.len();
-        let thinking = req.thinking.unwrap_or(false);
-        let user = req.user;
-        let stop = req.stop;
-        let seq_id = engine.add_request(
-            req.prompt_tokens,
-            req.max_tokens,
-            req.temperature,
-            req.top_p,
-            req.images,
-            req.seed,
-        );
-        registry.insert(
-            seq_id,
-            RequestContext {
-                response_tx: req.response_tx,
-                prompt_token_count,
-                generated_count: 0,
-                cached_tokens: 0,
-                token_ids: Vec::new(),
-                prev_text_len: 0,
-                created_at: Instant::now(),
-                first_token_at: None,
-                thinking,
-                inject_marker: None,
-                user,
-                stop,
-                full_text: String::new(),
-            },
-        );
-    }
-
     loop {
         // 1. Drain all pending requests (non-blocking).
         while let Ok(req) = request_rx.try_recv() {
-            register_request(engine, &mut registry, req);
+            let prompt_token_count = req.prompt_tokens.len();
+            let thinking = req.thinking.unwrap_or(false);
+            let user = req.user;
+            let seq_id = engine.add_request(
+                req.prompt_tokens,
+                req.max_tokens,
+                req.temperature,
+                req.top_p,
+                req.images,
+            );
+            registry.insert(
+                seq_id,
+                RequestContext {
+                    response_tx: req.response_tx,
+                    prompt_token_count,
+                    generated_count: 0,
+                    cached_tokens: 0,
+                    token_ids: Vec::new(),
+                    prev_text_len: 0,
+                    created_at: Instant::now(),
+                    first_token_at: None,
+                    thinking,
+                    inject_marker: None,
+                    user,
+                },
+            );
         }
 
         // 2. If no work, block until a new request arrives.
         if !engine.has_work() {
             match request_rx.recv() {
                 Ok(req) => {
-                    register_request(engine, &mut registry, req);
+                    let prompt_token_count = req.prompt_tokens.len();
+                    let thinking = req.thinking.unwrap_or(false);
+                    let user = req.user;
+                    let seq_id = engine.add_request(
+                        req.prompt_tokens,
+                        req.max_tokens,
+                        req.temperature,
+                        req.top_p,
+                        req.images,
+                    );
+                    registry.insert(
+                        seq_id,
+                        RequestContext {
+                            response_tx: req.response_tx,
+                            prompt_token_count,
+                            generated_count: 0,
+                            cached_tokens: 0,
+                            token_ids: Vec::new(),
+                            prev_text_len: 0,
+                            created_at: Instant::now(),
+                            first_token_at: None,
+                            thinking,
+                            inject_marker: None,
+                            user,
+                        },
+                    );
                 }
                 Err(_) => break, // Channel closed — server shutting down.
             }
@@ -702,53 +692,11 @@ fn run_worker_loop(
                 if ctx.first_token_at.is_none() {
                     ctx.first_token_at = Some(Instant::now());
                 }
-
-                // Accumulate decoded text for stop-sequence matching.
-                ctx.full_text.push_str(&text);
-
-                // Check stop sequences against the accumulated output.
-                // When a match is found, truncate the stop string from the
-                // final token event and signal completion.
-                let mut hit_stop = false;
-                for stop_str in &ctx.stop {
-                    if let Some(pos) = ctx.full_text.find(stop_str.as_str()) {
-                        // The stop string may span this token and previous ones.
-                        // Calculate how much of `text` to keep: everything before
-                        // the stop string's start minus what was already sent.
-                        let already_sent = ctx.full_text.len() - text.len();
-                        if pos >= already_sent {
-                            // Stop string starts within this token's text.
-                            let keep = pos - already_sent;
-                            text.truncate(keep);
-                        } else {
-                            // Stop string started in previously sent text — don't
-                            // emit this token at all.
-                            text.clear();
-                        }
-                        hit_stop = true;
-                        break;
-                    }
-                }
-
-                if !text.is_empty() {
-                    if ctx
-                        .response_tx
-                        .blocking_send(InferenceEvent::Token { text })
-                        .is_err()
-                    {
-                        to_abort.push(seq_id);
-                        continue;
-                    }
-                }
-
-                if hit_stop {
-                    // Send Done with EndOfSequence and abort the engine sequence.
-                    let _ = ctx.response_tx.blocking_send(InferenceEvent::Done {
-                        stop_reason: StopReason::EndOfSequence,
-                        prompt_tokens: ctx.prompt_token_count,
-                        completion_tokens: ctx.generated_count,
-                        cached_tokens: ctx.cached_tokens,
-                    });
+                if ctx
+                    .response_tx
+                    .blocking_send(InferenceEvent::Token { text })
+                    .is_err()
+                {
                     to_abort.push(seq_id);
                 }
             }

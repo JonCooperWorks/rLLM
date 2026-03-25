@@ -29,20 +29,13 @@
 //      "tool_result" content blocks in user messages.  OpenAI uses a
 //      separate "tool_calls" field and "tool" role messages.
 //
-// Anthropic SSE event sequence (plain streaming):
+// Anthropic SSE event sequence:
 //   event: message_start      — metadata (id, model, usage)
 //   event: content_block_start — signals a text block is beginning
 //   event: content_block_delta — one per token (the actual text)
 //   event: content_block_stop  — text block ended
 //   event: message_delta       — final stop reason + output token count
 //   event: message_stop        — stream is done
-//
-// When tools or thinking are active, the full output is buffered to parse
-// markers, then emitted as multiple content blocks (thinking, text, tool_use).
-//
-// Additional features:
-//   stop_sequences — custom stop sequences (array of strings)
-//   thinking       — extended reasoning (chain-of-thought) support
 //
 // Why support both APIs?
 //   Different tools and SDKs speak different API dialects.  The Anthropic
@@ -102,10 +95,6 @@ pub(crate) struct MessagesRequest {
     /// a simplified form: `{"enabled": true}` or just `true` for convenience.
     #[serde(default)]
     pub thinking: Option<ThinkingConfig>,
-    /// Stop sequences — generation halts when any string appears in output.
-    /// Anthropic calls this `stop_sequences` (array of strings).
-    #[serde(default, alias = "stop_sequences")]
-    pub stop: Option<Vec<String>>,
 }
 
 /// Anthropic thinking configuration.
@@ -269,8 +258,6 @@ pub(crate) async fn messages(
         thinking: thinking_requested,
         images,
         user: user.map(|Extension(u)| u),
-        seed: None, // Anthropic API does not expose a seed parameter.
-        stop: req.stop.unwrap_or_default(),
     };
 
     state.request_tx.try_send(worker_req).map_err(|e| match e {
@@ -278,24 +265,16 @@ pub(crate) async fn messages(
         std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
     })?;
 
-    // Decide which response path to use.  Thinking and tool calls both
-    // require collecting all tokens (markers span multiple tokens), but
-    // the result can still be emitted as SSE events (pseudo-streaming).
-    let thinking_enabled = thinking_requested.is_some_and(|t| t);
-    if req.stream {
-        if thinking_enabled || has_tools {
-            // Both thinking and tools need full-text collection before parsing.
-            // Use the tool-aware streaming handler (it also handles thinking).
-            Ok(messages_stream_with_tools(state, response_rx, thinking_enabled).await)
-        } else {
-            Ok(messages_stream(state, response_rx).await)
-        }
+    // When thinking is enabled, we must collect all tokens to parse blocks.
+    let needs_blocking = has_tools || thinking_requested.is_some_and(|t| t);
+    if req.stream && !needs_blocking {
+        Ok(messages_stream(state, response_rx).await)
     } else {
         Ok(messages_blocking(
             state,
             response_rx,
             has_tools,
-            thinking_enabled,
+            thinking_requested.unwrap_or(false),
         )
         .await)
     }
@@ -406,205 +385,6 @@ async fn messages_blocking(
         },
     })
     .into_response()
-}
-
-/// Streaming with tool calls: collect all tokens (tool call markers can span
-/// multiple tokens), then emit Anthropic SSE events for text content followed
-/// by tool_use content blocks.  This gives clients proper SSE format even when
-/// tools are active — the previous behaviour silently returned a non-streaming
-/// JSON response, which broke SSE clients.
-///
-/// The event sequence matches Anthropic's streaming format:
-///   message_start → content_block_start (text) → content_block_delta (text)
-///   → content_block_stop → content_block_start (tool_use) → content_block_delta
-///   (input_json_delta) → content_block_stop → message_delta → message_stop
-async fn messages_stream_with_tools(
-    state: Arc<ServerState>,
-    mut response_rx: tokio::sync::mpsc::Receiver<InferenceEvent>,
-    check_thinking: bool,
-) -> Response {
-    let id = format!("msg_{}", super::generate_id());
-    let model = state.model_name.clone();
-
-    let stream = async_stream::stream! {
-        // Collect all tokens first — we need the full text to find tool call markers.
-        let mut text = String::new();
-        let mut input_tokens = 0usize;
-        let mut output_tokens = 0usize;
-        let mut stop_reason = StopReason::MaxTokens;
-
-        while let Some(event) = response_rx.recv().await {
-            match event {
-                InferenceEvent::Token { text: t } => text.push_str(&t),
-                InferenceEvent::Done {
-                    stop_reason: sr,
-                    prompt_tokens,
-                    completion_tokens,
-                    cached_tokens: _,
-                } => {
-                    input_tokens = prompt_tokens;
-                    output_tokens = completion_tokens;
-                    stop_reason = sr;
-                }
-                InferenceEvent::Error(e) => {
-                    yield Ok::<_, std::convert::Infallible>(format!(
-                        "event: error\ndata: {}\n\n",
-                        serde_json::json!({
-                            "type": "error",
-                            "error": { "type": "server_error", "message": e }
-                        })
-                    ));
-                    return;
-                }
-            }
-        }
-
-        // Parse thinking blocks first (if enabled), then tool calls from
-        // the remaining content.
-        let mut thinking_text = None;
-        if check_thinking {
-            let result = crate::model::thinking::parse_thinking(state.arch, &text);
-            thinking_text = result.thinking;
-            text = result.content;
-        }
-
-        // Parse tool calls from the collected text.
-        let (content_text, tool_calls) = tools::parse_tool_calls(state.arch, &text);
-        let has_calls = !tool_calls.is_empty();
-        let final_reason = if has_calls { StopReason::ToolCalls } else { stop_reason };
-
-        // 1. message_start
-        yield Ok(format!(
-            "event: message_start\ndata: {}\n\n",
-            serde_json::json!({
-                "type": "message_start",
-                "message": {
-                    "id": &id,
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [],
-                    "model": &model,
-                    "stop_reason": serde_json::Value::Null,
-                    "usage": { "input_tokens": input_tokens, "output_tokens": 0 }
-                }
-            })
-        ));
-
-        let mut block_index = 0;
-
-        // 2a. Thinking content block (if present).
-        if let Some(ref thinking) = thinking_text {
-            yield Ok(format!(
-                "event: content_block_start\ndata: {}\n\n",
-                serde_json::json!({
-                    "type": "content_block_start",
-                    "index": block_index,
-                    "content_block": { "type": "thinking", "thinking": "" }
-                })
-            ));
-            yield Ok(format!(
-                "event: content_block_delta\ndata: {}\n\n",
-                serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": block_index,
-                    "delta": { "type": "thinking_delta", "thinking": thinking }
-                })
-            ));
-            yield Ok(format!(
-                "event: content_block_stop\ndata: {}\n\n",
-                serde_json::json!({ "type": "content_block_stop", "index": block_index })
-            ));
-            block_index += 1;
-        }
-
-        // 2b. Text content block (if any).
-        if !content_text.is_empty() {
-            yield Ok(format!(
-                "event: content_block_start\ndata: {}\n\n",
-                serde_json::json!({
-                    "type": "content_block_start",
-                    "index": block_index,
-                    "content_block": { "type": "text", "text": "" }
-                })
-            ));
-
-            yield Ok(format!(
-                "event: content_block_delta\ndata: {}\n\n",
-                serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": block_index,
-                    "delta": { "type": "text_delta", "text": content_text }
-                })
-            ));
-
-            yield Ok(format!(
-                "event: content_block_stop\ndata: {}\n\n",
-                serde_json::json!({ "type": "content_block_stop", "index": block_index })
-            ));
-
-            block_index += 1;
-        }
-
-        // 3. Tool use content blocks.
-        for call in &tool_calls {
-            let input: serde_json::Value = serde_json::from_str(&call.function.arguments)
-                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-
-            yield Ok(format!(
-                "event: content_block_start\ndata: {}\n\n",
-                serde_json::json!({
-                    "type": "content_block_start",
-                    "index": block_index,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": &call.id,
-                        "name": &call.function.name,
-                        "input": {}
-                    }
-                })
-            ));
-
-            yield Ok(format!(
-                "event: content_block_delta\ndata: {}\n\n",
-                serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": block_index,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": input.to_string()
-                    }
-                })
-            ));
-
-            yield Ok(format!(
-                "event: content_block_stop\ndata: {}\n\n",
-                serde_json::json!({ "type": "content_block_stop", "index": block_index })
-            ));
-
-            block_index += 1;
-        }
-
-        // 4. message_delta with stop reason.
-        yield Ok(format!(
-            "event: message_delta\ndata: {}\n\n",
-            serde_json::json!({
-                "type": "message_delta",
-                "delta": { "stop_reason": stop_reason_str(final_reason) },
-                "usage": { "output_tokens": output_tokens }
-            })
-        ));
-
-        // 5. message_stop
-        yield Ok(
-            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string()
-        );
-    };
-
-    Response::builder()
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .body(axum::body::Body::from_stream(stream))
-        .unwrap()
 }
 
 /// Streaming: return SSE events using Anthropic's event protocol.
@@ -863,38 +643,6 @@ mod tests {
         );
     }
 
-    // -- Stop sequences tests --
-
-    #[test]
-    fn test_messages_request_stop_sequences() {
-        let json = r#"{
-            "messages": [{"role": "user", "content": "Hi"}],
-            "stop_sequences": ["END", "\n\n"]
-        }"#;
-        let req: MessagesRequest = serde_json::from_str(json).unwrap();
-        let stop = req.stop.unwrap();
-        assert_eq!(stop.len(), 2);
-        assert_eq!(stop[0], "END");
-    }
-
-    #[test]
-    fn test_messages_request_stop_field_alias() {
-        // The "stop" alias should also work.
-        let json = r#"{
-            "messages": [{"role": "user", "content": "Hi"}],
-            "stop": ["DONE"]
-        }"#;
-        let req: MessagesRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.stop.unwrap(), vec!["DONE"]);
-    }
-
-    #[test]
-    fn test_messages_request_stop_defaults_to_none() {
-        let json = r#"{"messages": [{"role": "user", "content": "Hi"}]}"#;
-        let req: MessagesRequest = serde_json::from_str(json).unwrap();
-        assert!(req.stop.is_none());
-    }
-
     // -- Thinking tests --
 
     #[test]
@@ -932,133 +680,6 @@ mod tests {
         let json = r#"{"messages": [{"role": "user", "content": "Hi"}]}"#;
         let req: MessagesRequest = serde_json::from_str(json).unwrap();
         assert!(req.thinking.is_none());
-    }
-
-    #[test]
-    fn test_messages_response_with_multiple_tool_use() {
-        let response = MessagesResponse {
-            id: "msg_multi".into(),
-            type_: "message",
-            role: "assistant",
-            content: vec![
-                ContentBlock::Text {
-                    text: "Let me check both.".into(),
-                },
-                ContentBlock::ToolUse {
-                    id: "toolu_aaa".into(),
-                    name: "get_weather".into(),
-                    input: serde_json::json!({"city": "SF"}),
-                },
-                ContentBlock::ToolUse {
-                    id: "toolu_bbb".into(),
-                    name: "get_time".into(),
-                    input: serde_json::json!({"tz": "PST"}),
-                },
-            ],
-            model: "test-model".into(),
-            stop_reason: Some("tool_use".into()),
-            usage: AnthropicUsage {
-                input_tokens: 10,
-                output_tokens: 30,
-            },
-        };
-        let json = serde_json::to_value(&response).unwrap();
-        let blocks = json["content"].as_array().unwrap();
-        assert_eq!(blocks.len(), 3);
-        assert_eq!(blocks[0]["type"], "text");
-        assert_eq!(blocks[1]["type"], "tool_use");
-        assert_eq!(blocks[1]["name"], "get_weather");
-        assert_eq!(blocks[2]["type"], "tool_use");
-        assert_eq!(blocks[2]["name"], "get_time");
-    }
-
-    #[test]
-    fn test_messages_response_thinking_plus_tool_use() {
-        let response = MessagesResponse {
-            id: "msg_think_tool".into(),
-            type_: "message",
-            role: "assistant",
-            content: vec![
-                ContentBlock::Thinking {
-                    thinking: "I need to call the weather API.".into(),
-                },
-                ContentBlock::Text {
-                    text: "Let me check.".into(),
-                },
-                ContentBlock::ToolUse {
-                    id: "toolu_123".into(),
-                    name: "get_weather".into(),
-                    input: serde_json::json!({"city": "NYC"}),
-                },
-            ],
-            model: "test-model".into(),
-            stop_reason: Some("tool_use".into()),
-            usage: AnthropicUsage {
-                input_tokens: 10,
-                output_tokens: 40,
-            },
-        };
-        let json = serde_json::to_value(&response).unwrap();
-        let blocks = json["content"].as_array().unwrap();
-        assert_eq!(blocks.len(), 3);
-        assert_eq!(blocks[0]["type"], "thinking");
-        assert_eq!(blocks[1]["type"], "text");
-        assert_eq!(blocks[2]["type"], "tool_use");
-    }
-
-    #[test]
-    fn test_convert_anthropic_tools_no_description() {
-        let tools = vec![AnthropicToolDef {
-            name: "bare".into(),
-            description: None,
-            input_schema: None,
-        }];
-        let converted = convert_anthropic_tools(&tools);
-        assert_eq!(converted.len(), 1);
-        assert_eq!(converted[0].function.name, "bare");
-        assert!(converted[0].function.description.is_none());
-        assert!(converted[0].function.parameters.is_none());
-    }
-
-    #[test]
-    fn test_convert_anthropic_tools_multiple() {
-        let tools = vec![
-            AnthropicToolDef {
-                name: "a".into(),
-                description: Some("first".into()),
-                input_schema: Some(serde_json::json!({"type": "object"})),
-            },
-            AnthropicToolDef {
-                name: "b".into(),
-                description: Some("second".into()),
-                input_schema: Some(serde_json::json!({"type": "object"})),
-            },
-        ];
-        let converted = convert_anthropic_tools(&tools);
-        assert_eq!(converted.len(), 2);
-        assert_eq!(converted[0].function.name, "a");
-        assert_eq!(converted[1].function.name, "b");
-    }
-
-    #[test]
-    fn test_anthropic_sse_event_format() {
-        // Verify the event: + data: format matches Anthropic's SSE spec.
-        let event = format!(
-            "event: content_block_delta\ndata: {}\n\n",
-            serde_json::json!({
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": { "type": "text_delta", "text": "Hello" }
-            })
-        );
-        assert!(event.starts_with("event: content_block_delta\n"));
-        assert!(event.contains("data: "));
-        assert!(event.ends_with("\n\n"));
-        // Parse the data portion.
-        let data_line = event.lines().nth(1).unwrap();
-        let json_str = data_line.strip_prefix("data: ").unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
-        assert_eq!(parsed["delta"]["text"], "Hello");
     }
 
     #[test]
