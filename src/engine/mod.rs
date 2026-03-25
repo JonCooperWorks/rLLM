@@ -76,6 +76,11 @@ use crate::model::{self, Model, PrefillBuffers};
 /// so the API server's worker loop doesn't need to know the GPU topology.
 pub(crate) trait InferenceEngine {
     /// Submit a new completion request.  Returns a sequence ID for tracking.
+    ///
+    /// `seed` enables deterministic sampling: when provided, the per-sequence
+    /// RNG is seeded with this value so the same prompt + seed produces the
+    /// same output (single-sequence only — batched decoding may interleave
+    /// RNG draws across sequences).
     fn add_request(
         &mut self,
         prompt_tokens: Vec<u32>,
@@ -83,6 +88,7 @@ pub(crate) trait InferenceEngine {
         temperature: f32,
         top_p: f32,
         images: Vec<crate::model::vision::ProcessedImage>,
+        seed: Option<u64>,
     ) -> SeqId;
 
     /// Run one engine step: admit → prefill → decode → sample → collect.
@@ -146,6 +152,8 @@ pub(crate) struct SequenceRequest {
     pub top_p: f32,
     /// Preprocessed images for vision models (consumed during first prefill).
     pub images: Vec<crate::model::vision::ProcessedImage>,
+    /// Optional seed for deterministic sampling.
+    pub seed: Option<u64>,
 }
 
 /// State of a single active sequence.
@@ -172,6 +180,11 @@ pub(crate) struct Sequence<S> {
     pub cached_tokens: usize,
     /// Preprocessed images (consumed during first prefill chunk, then empty).
     pub images: Vec<crate::model::vision::ProcessedImage>,
+    /// Per-sequence RNG for deterministic sampling.
+    /// When the client provides a `seed`, this RNG is seeded with that value
+    /// so the same prompt + seed produces the same output.  When None, the
+    /// global RNG in run_step() is used instead.
+    pub seeded_rng: Option<rand::rngs::SmallRng>,
 }
 
 /// Manages the waiting queue and active set for continuous batching.
@@ -224,6 +237,10 @@ impl<S> Scheduler<S> {
             }
 
             let (id, req) = self.waiting.pop_front().unwrap();
+            let seeded_rng = req.seed.map(|s| {
+                use rand::SeedableRng;
+                rand::rngs::SmallRng::seed_from_u64(s)
+            });
             let seq = Sequence {
                 pending_prefill: req.prompt_tokens.into(),
                 kv_state: dispatch.new_seq_state(),
@@ -234,6 +251,7 @@ impl<S> Scheduler<S> {
                 finished: false,
                 cached_tokens: 0,
                 images: req.images,
+                seeded_rng,
             };
             self.active.insert(id, seq);
             admitted.push(id);
@@ -499,15 +517,22 @@ pub(crate) fn run_step<D: Dispatch>(
 ///
 /// Shared by both the prefill and decode phases of run_step() — after each
 /// forward pass, we sample a token, record it, and check stopping conditions.
+///
+/// When the sequence has a seeded RNG (from a client-provided `seed`), that
+/// RNG is used instead of the global one for deterministic output.
 fn sample_and_finish<D: Dispatch>(
     dispatch: &D,
     seq: &mut Sequence<D::SeqState>,
     id: SeqId,
     tokenizer: &Tokenizer,
     step_tokens: &mut Vec<(SeqId, u32)>,
-    rng: &mut impl rand::Rng,
+    global_rng: &mut impl rand::Rng,
 ) -> anyhow::Result<()> {
-    let next_token = dispatch.sample(seq.temperature, seq.top_p, rng)?;
+    let next_token = if let Some(ref mut seq_rng) = seq.seeded_rng {
+        dispatch.sample(seq.temperature, seq.top_p, seq_rng)?
+    } else {
+        dispatch.sample(seq.temperature, seq.top_p, global_rng)?
+    };
     seq.generated_tokens.push(next_token);
     step_tokens.push((id, next_token));
 
@@ -758,6 +783,7 @@ impl<'a, B: GpuBackend> InferenceEngine for Engine<'a, B> {
         temperature: f32,
         top_p: f32,
         images: Vec<crate::model::vision::ProcessedImage>,
+        seed: Option<u64>,
     ) -> SeqId {
         self.scheduler.add_request(SequenceRequest {
             prompt_tokens,
@@ -765,6 +791,7 @@ impl<'a, B: GpuBackend> InferenceEngine for Engine<'a, B> {
             temperature,
             top_p,
             images,
+            seed,
         })
     }
 
@@ -983,6 +1010,7 @@ mod tests {
             temperature: 1.0,
             top_p: 0.9,
             images: Vec::new(),
+            seed: None,
         }
     }
 
@@ -1194,6 +1222,7 @@ mod tests {
             temperature: 0.0,
             top_p: 1.0,
             images: Vec::new(),
+            seed: None,
         });
 
         // Step 1: admit + prefill + decode (2 tokens in one step)
@@ -1228,6 +1257,7 @@ mod tests {
             temperature: 0.0,
             top_p: 1.0,
             images: Vec::new(),
+            seed: None,
         });
 
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1252,6 +1282,7 @@ mod tests {
             temperature: 0.0,
             top_p: 1.0,
             images: Vec::new(),
+            seed: None,
         });
 
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1275,6 +1306,7 @@ mod tests {
             temperature: 0.0,
             top_p: 1.0,
             images: Vec::new(),
+            seed: None,
         });
         scheduler.add_request(SequenceRequest {
             prompt_tokens: vec![3, 4],
@@ -1282,6 +1314,7 @@ mod tests {
             temperature: 0.0,
             top_p: 1.0,
             images: Vec::new(),
+            seed: None,
         });
 
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1302,6 +1335,7 @@ mod tests {
             temperature: 0.0,
             top_p: 1.0,
             images: Vec::new(),
+            seed: None,
         });
 
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1322,6 +1356,7 @@ mod tests {
             temperature: 0.0,
             top_p: 1.0,
             images: Vec::new(),
+            seed: None,
         });
 
         run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1359,6 +1394,7 @@ mod tests {
             temperature: 0.0,
             top_p: 1.0,
             images: Vec::new(),
+            seed: None,
         });
 
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1383,6 +1419,7 @@ mod tests {
             temperature: 0.0,
             top_p: 1.0,
             images: Vec::new(),
+            seed: None,
         });
         scheduler.add_request(SequenceRequest {
             prompt_tokens: vec![2],
@@ -1390,6 +1427,7 @@ mod tests {
             temperature: 0.0,
             top_p: 1.0,
             images: Vec::new(),
+            seed: None,
         });
 
         // Step 1: A admitted + prefilled + finished (max_tokens=1)
@@ -1551,6 +1589,7 @@ mod tests {
             temperature: 0.0,
             top_p: 1.0,
             images: Vec::new(),
+            seed: None,
         });
 
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1575,6 +1614,7 @@ mod tests {
             temperature: 0.0,
             top_p: 1.0,
             images: Vec::new(),
+            seed: None,
         });
 
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1608,6 +1648,7 @@ mod tests {
             temperature: 0.0,
             top_p: 1.0,
             images: Vec::new(),
+            seed: None,
         });
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
         assert_eq!(out.finished.len(), 1);
@@ -1632,6 +1673,7 @@ mod tests {
             temperature: 0.0,
             top_p: 1.0,
             images: Vec::new(),
+            seed: None,
         });
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
         assert_eq!(out.finished.len(), 1);
@@ -1682,6 +1724,7 @@ mod tests {
             temperature: 0.0,
             top_p: 1.0,
             images: Vec::new(),
+            seed: None,
         });
 
         run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1704,6 +1747,7 @@ mod tests {
             temperature: 0.0,
             top_p: 1.0,
             images: Vec::new(),
+            seed: None,
         });
         run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
 
@@ -1716,6 +1760,7 @@ mod tests {
             temperature: 0.0,
             top_p: 1.0,
             images: Vec::new(),
+            seed: None,
         });
 
         // Step: admit + cache hit (32 tokens) + prefill suffix (24 tokens)

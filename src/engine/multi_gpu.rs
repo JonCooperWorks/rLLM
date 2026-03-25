@@ -155,12 +155,15 @@ mod imp {
             max_gen_tokens: usize,
             temperature: f32,
             top_p: f32,
+            seed: Option<u64>,
         ) -> SeqId {
             self.scheduler.add_request(SequenceRequest {
                 prompt_tokens,
                 max_gen_tokens,
                 temperature,
                 top_p,
+                images: Vec::new(),
+                seed,
             })
         }
 
