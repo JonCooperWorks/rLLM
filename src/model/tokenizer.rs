@@ -140,6 +140,15 @@ impl Tokenizer {
         Ok(encoding.get_ids().to_vec())
     }
 
+    /// Number of tokens in the vocabulary (including added/special tokens).
+    ///
+    /// This may be smaller than the model's embedding dimension — some models
+    /// pad the embedding matrix to a multiple of 64/128 for GEMM efficiency.
+    /// The sampler uses this to clamp logits and avoid sampling padding tokens.
+    pub fn vocab_size(&self) -> usize {
+        self.inner.get_vocab_size(true)
+    }
+
     /// Decode token IDs back into text.
     ///
     /// The `true` argument to `decode()` skips special tokens in the output

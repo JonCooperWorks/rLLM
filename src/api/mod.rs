@@ -661,9 +661,10 @@ fn run_worker_loop(
             if let Some(ctx) = registry.get_mut(&seq_id) {
                 // Detect thinking special tokens.  Models like Qwen 3.5 emit
                 // <think> (248068) and </think> (248069) as special tokens that
-                // `decode(skip_special=true)` strips.  We record a pending
-                // marker so we can inject the literal text after decoding.
-                if ctx.thinking && tokenizer.is_think_start(token_id) {
+                // `decode(skip_special=true)` strips.  We always intercept these
+                // so thinking content is visible even when the user didn't
+                // explicitly request thinking — Qwen 3.5 thinks by default.
+                if tokenizer.is_think_start(token_id) {
                     // Flush any pending marker first, then store the new one.
                     if let Some(prev) = ctx.inject_marker.take() {
                         let _ = ctx
@@ -677,7 +678,7 @@ fn run_worker_loop(
                     }
                     continue;
                 }
-                if ctx.thinking && tokenizer.is_think_end(token_id) {
+                if tokenizer.is_think_end(token_id) {
                     if let Some(prev) = ctx.inject_marker.take() {
                         let _ = ctx
                             .response_tx

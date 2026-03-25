@@ -558,6 +558,10 @@ pub(crate) struct SingleGpuDispatch<'a, B: GpuBackend> {
     pub model: Model<'a, B>,
     pub kv_pool: KvPool<B>,
     prefill_bufs: PrefillBuffers<B>,
+    /// Tokenizer vocab size — may be smaller than the model's embedding vocab
+    /// (e.g. Qwen 3.5: 248070 tokenizer vs 248320 embedding).  Used to clamp
+    /// sampling so we never produce token IDs the tokenizer can't decode.
+    pub tokenizer_vocab_size: usize,
     /// Batched logits buffer: [max_active, vocab_size] bf16.
     /// Used by `forward_decode_batch` to produce logits for N sequences at once.
     /// Allocated even when batched decode is unsupported — the memory cost is
@@ -574,6 +578,7 @@ impl<'a, B: GpuBackend> SingleGpuDispatch<'a, B> {
         kv_pool: KvPool<B>,
         backend: &'a B,
         max_active: usize,
+        tokenizer_vocab_size: usize,
     ) -> Self {
         let prefill_bufs = PrefillBuffers::new(backend, model.config(), 1024);
         let logits_batch = backend.alloc_tensor(
@@ -591,6 +596,7 @@ impl<'a, B: GpuBackend> SingleGpuDispatch<'a, B> {
             logits_batch,
             backend,
             prefix_cache,
+            tokenizer_vocab_size,
         }
     }
 }
@@ -666,7 +672,7 @@ impl<'a, B: GpuBackend> Dispatch for SingleGpuDispatch<'a, B> {
         top_p: f32,
         rng: &mut impl rand::Rng,
     ) -> anyhow::Result<u32> {
-        crate::model::sampler::sample(self.backend, self.model.logits(), temperature, top_p, rng)
+        crate::model::sampler::sample(self.backend, self.model.logits(), temperature, top_p, rng, self.tokenizer_vocab_size)
     }
 
     fn prefix_cache_lookup(&mut self, prompt_tokens: &[u32]) -> Option<(Vec<BlockHandle>, usize)> {
@@ -739,6 +745,7 @@ impl<'a, B: GpuBackend> Dispatch for SingleGpuDispatch<'a, B> {
             temperatures,
             top_ps,
             rng,
+            self.tokenizer_vocab_size,
         )
     }
 }
@@ -765,7 +772,8 @@ impl<'a, B: GpuBackend> Engine<'a, B> {
         backend: &'a B,
         max_active: usize,
     ) -> Self {
-        let dispatch = SingleGpuDispatch::new(model, kv_pool, backend, max_active);
+        let tokenizer_vocab_size = tokenizer.vocab_size();
+        let dispatch = SingleGpuDispatch::new(model, kv_pool, backend, max_active, tokenizer_vocab_size);
         let scheduler = Scheduler::new(max_active);
         Self {
             dispatch,

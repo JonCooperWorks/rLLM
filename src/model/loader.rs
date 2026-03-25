@@ -2584,9 +2584,20 @@ pub(crate) fn load_vision_weights<B: GpuCore>(
     } else {
         format!("{}encoder.layers.0.self_attn.q_proj.weight", vp)
     };
-    if store.tensor(&probe).is_err() {
-        eprintln!("vision weights not found ({}), skipping vision encoder", probe);
-        return None;
+    match store.tensor(&probe) {
+        Err(_) => {
+            eprintln!("vision weights not found ({}), skipping vision encoder", probe);
+            return None;
+        }
+        Ok(view) => {
+            // Skip vision if weights are in an unsupported dtype (e.g. U8/int8
+            // quantized vision weights in some Q4 model distributions).
+            let dt = view.dtype();
+            if !matches!(dt, safetensors::Dtype::F32 | safetensors::Dtype::F16 | safetensors::Dtype::BF16) {
+                eprintln!("vision weights have unsupported dtype {:?}, skipping vision encoder", dt);
+                return None;
+            }
+        }
     }
 
     eprintln!("loading vision encoder weights ({} blocks, hidden_size={})", vc.depth, hd);
@@ -2607,8 +2618,16 @@ pub(crate) fn load_vision_weights<B: GpuCore>(
     // is mathematically equivalent to running the 3D conv on T identical
     // frames and taking the mean output — a standard trick for adapting
     // video models to image inputs.
+    // Qwen uses "patch_embed.proj.weight", Gemma uses "embeddings.patch_embedding.weight".
     let patch_embed_name = format!("{}patch_embed.proj.weight", vp);
-    let patch_view = store.tensor(&patch_embed_name).expect("missing patch_embed weight");
+    let patch_embed_alt = format!("{}embeddings.patch_embedding.weight", vp);
+    let patch_view = store
+        .tensor(&patch_embed_name)
+        .or_else(|_| store.tensor(&patch_embed_alt))
+        .unwrap_or_else(|_| panic!(
+            "missing patch_embed weight: tried '{}' and '{}'",
+            patch_embed_name, patch_embed_alt
+        ));
     let patch_shape = patch_view.shape();
     let patch_embed_weight = if patch_shape.len() == 5 {
         // [out_ch, in_ch, temporal, kH, kW] → average over temporal → [out_ch, in_ch*kH*kW]
@@ -2639,7 +2658,10 @@ pub(crate) fn load_vision_weights<B: GpuCore>(
     };
 
     let patch_bias_name = format!("{}patch_embed.proj.bias", vp);
-    let patch_embed_bias = store.tensor(&patch_bias_name).ok()
+    let patch_bias_alt = format!("{}embeddings.patch_embedding.bias", vp);
+    let patch_embed_bias = store.tensor(&patch_bias_name)
+        .or_else(|_| store.tensor(&patch_bias_alt))
+        .ok()
         .map(|v| upload_vision(backend, &v, &[hd]));
 
     // Positional embeddings.

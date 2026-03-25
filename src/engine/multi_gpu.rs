@@ -49,6 +49,7 @@ mod imp {
     /// Multi-GPU dispatch: wraps MultiGpuInference for N-rank fan-out.
     pub(crate) struct MultiGpuDispatch {
         pub multi: MultiGpuInference,
+        pub tokenizer_vocab_size: usize,
     }
 
     impl Dispatch for MultiGpuDispatch {
@@ -119,6 +120,7 @@ mod imp {
                 temperature,
                 top_p,
                 rng,
+                self.tokenizer_vocab_size,
             )
         }
     }
@@ -140,8 +142,9 @@ mod imp {
 
     impl MultiGpuEngine {
         pub fn new(multi: MultiGpuInference, tokenizer: Tokenizer, max_active: usize) -> Self {
+            let tokenizer_vocab_size = tokenizer.vocab_size();
             Self {
-                dispatch: MultiGpuDispatch { multi },
+                dispatch: MultiGpuDispatch { multi, tokenizer_vocab_size },
                 scheduler: Scheduler::new(max_active),
                 tokenizer,
             }

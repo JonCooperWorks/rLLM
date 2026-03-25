@@ -75,11 +75,12 @@ pub(crate) fn sample<B: GpuBackend>(
     temperature: f32,
     top_p: f32,
     rng: &mut impl Rng,
+    vocab_size: usize,
 ) -> anyhow::Result<u32> {
     // Temperature = 0 is the convention for "be greedy / deterministic".
     // Mathematically, lim(T→0) of softmax(logits/T) is a one-hot on the argmax.
     if temperature == 0.0 {
-        return sample_greedy(backend, logits);
+        return sample_greedy(backend, logits, vocab_size);
     }
 
     // --- Step 1: Copy logits from GPU to host ---
@@ -93,7 +94,12 @@ pub(crate) fn sample<B: GpuBackend>(
     // bf16 has only ~3 decimal digits of precision — fine for storing logits,
     // but not enough for stable softmax or cumulative sums.
     let bf16_values: &[bf16] = bytemuck::cast_slice(&buf);
-    let mut logits_f32: Vec<f32> = bf16_values.iter().map(|v| v.to_f32()).collect();
+    // Truncate to tokenizer vocab size — the model embedding may be padded
+    // beyond the tokenizer's vocabulary (e.g. Qwen 3.5: 248320 embedding vs
+    // 248070 tokenizer tokens).  Sampling padding positions produces token IDs
+    // that decode to empty strings.
+    let effective = vocab_size.min(bf16_values.len());
+    let mut logits_f32: Vec<f32> = bf16_values[..effective].iter().map(|v| v.to_f32()).collect();
 
     // --- Step 3: Temperature scaling ---
     // Divide every logit by T.  This is equivalent to raising the softmax
@@ -214,6 +220,7 @@ pub(crate) fn sample_batch<B: GpuBackend>(
     temperatures: &[f32],
     top_ps: &[f32],
     rng: &mut impl Rng,
+    tokenizer_vocab_size: usize,
 ) -> anyhow::Result<Vec<u32>> {
     assert_eq!(temperatures.len(), batch_size);
     assert_eq!(top_ps.len(), batch_size);
@@ -224,10 +231,12 @@ pub(crate) fn sample_batch<B: GpuBackend>(
     backend.copy_to_host(logits_batch, &mut buf);
 
     let row_bytes = vocab_size * 2;
+    // Truncate each row to tokenizer vocab size (see sample() for rationale).
+    let effective_row_bytes = tokenizer_vocab_size.min(vocab_size) * 2;
     let mut results = Vec::with_capacity(batch_size);
 
     for i in 0..batch_size {
-        let row_data = &buf[i * row_bytes..(i + 1) * row_bytes];
+        let row_data = &buf[i * row_bytes..i * row_bytes + effective_row_bytes];
         let token = if temperatures[i] == 0.0 {
             // Greedy: argmax on this row.
             argmax_bf16(row_data)
@@ -312,13 +321,15 @@ fn sample_row(logits_bytes: &[u8], temperature: f32, top_p: f32, rng: &mut impl 
 /// This is the only place where data moves from GPU → CPU during generation.
 /// On Apple Silicon with unified memory, "copy" is just a pointer read —
 /// the data is already in the same physical memory.
-pub(crate) fn sample_greedy<B: GpuBackend>(backend: &B, logits: &B::Tensor) -> anyhow::Result<u32> {
+pub(crate) fn sample_greedy<B: GpuBackend>(backend: &B, logits: &B::Tensor, vocab_size: usize) -> anyhow::Result<u32> {
     // Determine how many bytes the logits tensor occupies.
     let byte_count = backend.tensor_byte_count(logits);
     let mut buf = vec![0u8; byte_count];
     // Copy raw bytes from the GPU tensor into our host buffer.
     backend.copy_to_host(logits, &mut buf);
-    Ok(argmax_bf16(&buf))
+    // Truncate to tokenizer vocab size (see sample() for rationale).
+    let effective_bytes = (vocab_size * 2).min(buf.len());
+    Ok(argmax_bf16(&buf[..effective_bytes]))
 }
 
 /// Find the index of the maximum value in a bf16 byte slice.
