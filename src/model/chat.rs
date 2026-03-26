@@ -417,6 +417,17 @@ fn format_chatml(messages: &[Message]) -> String {
     // Note: no BOS here either — the HF tokenizer adds it automatically
     // when encoding with add_special_tokens=true.
 
+    // Qwen 2.5 models are trained with a mandatory system message.  HuggingFace's
+    // `apply_chat_template()` injects "You are Qwen, created by Alibaba Cloud.
+    // You are a helpful assistant." when no system message is present.  Omitting
+    // it shifts all token positions and degrades output quality — especially at
+    // small model sizes (3B) where greedy decoding falls into repetition loops.
+    let has_system = messages.iter().any(|m| m.role == "system");
+    if !has_system {
+        out.push_str("<|im_start|>system\n");
+        out.push_str("You are a helpful assistant.<|im_end|>\n");
+    }
+
     for msg in messages {
         if msg.role == "tool" {
             out.push_str(&tools::format_tool_result_chatml(&msg.content));
