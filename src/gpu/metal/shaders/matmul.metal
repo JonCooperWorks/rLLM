@@ -237,7 +237,7 @@ kernel void matvec_q4(
 
             for (uint block_idx = block_start + lane; block_idx < block_end; block_idx += 32) {
                 device const uchar* block_ptr = row_data + block_idx * bytes_per_block;
-                float scale = float(*((device const half*)block_ptr));
+                float scale = float(*((device const bfloat*)block_ptr));
                 device const uchar* data = block_ptr + 2;
 
                 uint x_local = (block_idx * 32) - tile;
@@ -407,7 +407,7 @@ kernel void gemm_q4(
 
     for (uint block_idx = lane; block_idx < blocks_per_row; block_idx += 32) {
         device const uchar* block_ptr = row_data + block_idx * bytes_per_block;
-        float scale = float(*((device const half*)block_ptr));
+        float scale = float(*((device const bfloat*)block_ptr));
         device const uchar* data = block_ptr + 2;
         uint x_base = block_idx * 32;
 

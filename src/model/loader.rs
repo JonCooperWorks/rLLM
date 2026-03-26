@@ -2700,18 +2700,38 @@ pub(crate) fn load_vision_weights<B: GpuCore>(
         .map(|v| upload_vision(backend, &v, v.shape()));
 
     // Merger fc1: for Qwen this is the first layer of the 2-layer MLP.
-    // For Gemma this is the single linear projection.
-    let fc1_name = if store.tensor(&format!("{}linear_fc1.weight", pp)).is_ok() {
-        format!("{}linear_fc1.weight", pp)
-    } else {
-        format!("{}linear_1.weight", pp)
+    // For Gemma 3 this is a single linear projection with a different naming
+    // convention (mm_input_projection_weight, no bias).
+    //
+    // Try known names in order: Qwen fused → Qwen split → Gemma 3.
+    let fc1_candidates = [
+        format!("{}linear_fc1.weight", pp),
+        format!("{}linear_1.weight", pp),
+        format!("{}mm_input_projection_weight", pp),
+    ];
+    let fc1_view = fc1_candidates.iter()
+        .find_map(|name| store.tensor(name).ok());
+    let fc1_view = match fc1_view {
+        Some(v) => v,
+        None => {
+            eprintln!(
+                "WARNING: vision projector weight not found under any known name \
+                 (tried: {}), skipping vision encoder",
+                fc1_candidates.join(", ")
+            );
+            return None;
+        }
     };
-    let fc1_view = store.tensor(&fc1_name).expect("missing merger/projector fc1 weight");
     let merger_fc1_weight = upload_vision(backend, &fc1_view, fc1_view.shape());
 
-    let bias1_name = fc1_name.replace(".weight", ".bias");
-    let fc1_bias_view = store.tensor(&bias1_name).expect("missing merger/projector fc1 bias");
-    let merger_fc1_bias = upload_vision(backend, &fc1_bias_view, fc1_bias_view.shape());
+    // Projector bias: Qwen has one, Gemma 3 does not (uses a separate norm
+    // layer instead).  Try the bias name that matches the weight we found.
+    let merger_fc1_bias = fc1_candidates.iter()
+        .find_map(|name| {
+            let bias_name = name.replace(".weight", ".bias");
+            store.tensor(&bias_name).ok()
+        })
+        .map(|v| upload_vision(backend, &v, v.shape()));
 
     // Merger fc2 (Qwen only — 2-layer MLP merger).
     let fc2_name_w = if store.tensor(&format!("{}linear_fc2.weight", pp)).is_ok() {

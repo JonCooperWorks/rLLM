@@ -194,7 +194,7 @@ pub(crate) struct VisionWeights<B: GpuCore> {
     pub merger_norm_weight: Option<B::Tensor>, // LayerNorm before MLP (Qwen only)
     pub merger_norm_bias: Option<B::Tensor>,
     pub merger_fc1_weight: B::Tensor,          // first projection layer
-    pub merger_fc1_bias: B::Tensor,
+    pub merger_fc1_bias: Option<B::Tensor>,    // Gemma 3 has no bias (uses separate norm)
     pub merger_fc2_weight: Option<B::Tensor>,  // second projection layer (Qwen only)
     pub merger_fc2_bias: Option<B::Tensor>,
 }
@@ -679,7 +679,9 @@ pub(crate) fn vision_encode<B: GpuBackend>(
             &weights.merger_fc1_weight, merge_buf, &bufs.proj_out,
             fc1_out_dim as u32, merged_hd as u32, merged_n as u32,
         );
-        backend.bias_add_batch(&bufs.proj_out, &weights.merger_fc1_bias, &bufs.proj_out, merged_n as u32, fc1_out_dim as u32);
+        if let Some(ref fc1_b) = weights.merger_fc1_bias {
+            backend.bias_add_batch(&bufs.proj_out, fc1_b, &bufs.proj_out, merged_n as u32, fc1_out_dim as u32);
+        }
 
         if let Some(ref fc2_w) = weights.merger_fc2_weight {
             backend.gelu(&bufs.proj_out, &bufs.proj_out, (merged_n * fc1_out_dim) as u32);
@@ -697,7 +699,9 @@ pub(crate) fn vision_encode<B: GpuBackend>(
             &weights.merger_fc1_weight, src_buf, &bufs.proj_out,
             config.out_hidden_size as u32, hd as u32, n as u32,
         );
-        backend.bias_add_batch(&bufs.proj_out, &weights.merger_fc1_bias, &bufs.proj_out, n as u32, config.out_hidden_size as u32);
+        if let Some(ref fc1_b) = weights.merger_fc1_bias {
+            backend.bias_add_batch(&bufs.proj_out, fc1_b, &bufs.proj_out, n as u32, config.out_hidden_size as u32);
+        }
     }
 
     // Output is now in bufs.proj_out: [num_vision_tokens, out_hidden_size].
