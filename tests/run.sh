@@ -124,9 +124,15 @@ if [[ "$SKIP_QUANTIZE" == "false" ]]; then
   fi
 fi
 
-# ---- 4. Install Python dependencies ---------------------------------------
+# ---- 4. Install uv if missing, then sync Python dependencies ----------------
+if ! command -v uv &>/dev/null; then
+  echo "=== Installing uv ==="
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
+fi
+
 echo "=== Installing Python dependencies ==="
-pip install -q -r "$SCRIPT_DIR/requirements.txt"
+uv pip install --quiet -r "$SCRIPT_DIR/requirements.txt"
 echo ""
 
 # ---- 5. Run tests or benchmarks --------------------------------------------
@@ -137,8 +143,8 @@ cd "$SCRIPT_DIR"
 
 if [[ "$MODE" == "bench" ]]; then
   echo "=== Running benchmarks ==="
-  exec python bench.py "${BENCH_ARGS[@]}"
+  exec uv run python bench.py "${BENCH_ARGS[@]}"
 else
   echo "=== Running GPU integration tests ==="
-  exec pytest "${PYTEST_ARGS[@]:--v}" .
+  exec uv run pytest "${PYTEST_ARGS[@]:--v}" .
 fi

@@ -56,23 +56,23 @@ tests/run.sh --skip-download --skip-quantize
 Or run pytest directly (assumes binary built and models present):
 
 ```bash
-# Install dependencies.
-pip install -r tests/requirements.txt
+# Install dependencies (uv is used; pip works too).
+uv pip install -r tests/requirements.txt
 
 # Run all tests.
-pytest tests/ -v
+uv run pytest tests/ -v
 
 # Run just one model family.
-pytest tests/ -v -k llama
+uv run pytest tests/ -v -k llama
 
 # Run just turboquant tests.
-pytest tests/ -v -k turboquant
+uv run pytest tests/ -v -k turboquant
 
 # Run just streaming tests.
-pytest tests/ -v -k streaming
+uv run pytest tests/ -v -k streaming
 
 # Stop on first failure (saves GPU time).
-pytest tests/ -v -x
+uv run pytest tests/ -v -x
 ```
 
 ---
@@ -163,7 +163,7 @@ tests/run.sh
   ├── cargo build --release          Build rllm binary
   ├── scripts/download-models.sh     Download model weights from HuggingFace
   ├── scripts/quantize-models.sh     Quantize to Q4 (optional)
-  ├── pip install requirements.txt   Install pytest, requests, langdetect, psutil
+  ├── uv pip install requirements.txt Install pytest, requests, langdetect, psutil
   └── pytest test_model_families.py  Run tests
         │
         ├── conftest.py: ServerManager
@@ -239,8 +239,8 @@ tests/run.sh --bench --skip-build --skip-download --skip-quantize
 Or run the benchmark script directly:
 
 ```bash
-python tests/bench.py --max-tokens 128 --runs 3
-python tests/bench.py --filter qwen --q4-only --output custom.md
+uv run python tests/bench.py --max-tokens 128 --runs 3
+uv run python tests/bench.py --filter qwen --q4-only --output custom.md
 ```
 
 Results are always saved to a file — by default a timestamped markdown file
