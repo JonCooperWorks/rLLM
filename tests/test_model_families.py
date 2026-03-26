@@ -534,13 +534,6 @@ def test_vision(config_index, server_manager, models_dir):
     """
     config = VISION_MODELS[config_index]
 
-    # Gemma3 vision encoder produces incorrect embeddings (model says "unable
-    # to process images").  Config parsing and placeholder expansion are fixed;
-    # the issue is in the SigLIP encoder itself (wrong projector, positional
-    # embeddings, or preprocessing for patch_size=14).
-    if config.family == "Gemma3":
-        pytest.xfail("Gemma3 vision: 2D positional embedding indexing not implemented")
-
     model_dir = _resolve_model_dir(models_dir, config)
     if model_dir is None:
         pytest.skip(f"model not found: {config.model_name}")
@@ -587,8 +580,11 @@ def test_vision_q4(config_index, server_manager, models_dir):
     """Q4-quantized vision model variant describes images correctly."""
     config = VISION_MODELS[config_index]
 
+    # Gemma3 Q4 distributions quantize vision weights to U8 (unsupported).
+    # The loader skips the vision encoder entirely, so the model can't see images.
+    # This is a dataset/distribution issue, not an inference bug.
     if config.family == "Gemma3":
-        pytest.xfail("Gemma3 vision: 2D positional embedding indexing not implemented")
+        pytest.xfail("Gemma3 Q4 vision weights are U8 (unsupported) — vision encoder skipped")
 
     model_dir = _resolve_model_dir(models_dir, config, q4=True)
     if model_dir is None:

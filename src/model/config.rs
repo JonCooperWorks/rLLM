@@ -578,6 +578,14 @@ pub(crate) struct VisionConfig {
     /// Images larger than this are split into multiple tiles, each processed
     /// independently through the vision encoder.
     pub max_pixels: usize,
+    /// Full image size the position embedding table was trained for.
+    ///
+    /// The position embedding table has (image_size / patch_size)² entries —
+    /// one for each possible patch position in a full-resolution image.
+    /// For sub-resolution images, we select a 2D subgrid of positions rather
+    /// than using contiguous indices.  Gemma 3: 896 (64×64 grid = 4096 positions).
+    /// Qwen 3.5: 0 (uses contiguous indices — all images resize to the full grid).
+    pub image_size: usize,
 }
 
 /// RoPE parameters for models with nested rope configuration (Qwen 3.5).
@@ -868,6 +876,7 @@ impl ModelConfig {
                 },
                 min_pixels: vc.get("min_pixels").and_then(|v| v.as_u64()).unwrap_or(3136) as usize,
                 max_pixels: vc.get("max_pixels").and_then(|v| v.as_u64()).unwrap_or(401408) as usize,
+                image_size: vc.get("image_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
             });
             config.image_token_id = raw_image_token_id;
             config.vision_start_token_id = raw_vision_start;
@@ -1351,6 +1360,12 @@ mod tests {
             Some(262144),
             "should parse image_token_index for Gemma 3"
         );
+        // Vision config: Gemma 3 uses 14×14 patches on 896×896 images → 64×64 grid.
+        let vc = config.vision.as_ref().expect("Gemma 3 should have vision config");
+        assert_eq!(vc.patch_size, 14);
+        assert_eq!(vc.image_size, 896);
+        assert_eq!(vc.spatial_merge_size, 0, "Gemma 3 has no spatial merge");
+        assert!(!vc.fused_qkv, "Gemma 3 uses separate Q/K/V");
     }
 
     #[test]

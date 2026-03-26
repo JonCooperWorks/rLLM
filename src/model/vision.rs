@@ -467,6 +467,8 @@ pub(crate) struct VisionBuffers<B: GpuCore> {
     pub merge_buf: Option<B::Tensor>,  // [max_merged, hidden × merge²] — spatial merge
     pub proj_out: B::Tensor,  // [max_tokens, out_hidden_size] — final output
     pub pixel_buf: B::Tensor, // [max_patches, patch_dim] — pre-allocated staging buffer
+    pub pos_ids: Option<B::Tensor>,  // [max_patches] u32 — 2D position indices (Gemma 3)
+    pub pos_gathered: Option<B::Tensor>,  // [max_patches, hidden_size] — gathered pos embeds
 }
 
 /// Allocate scratch buffers for the vision encoder.
@@ -495,6 +497,22 @@ pub(crate) fn alloc_vision_buffers<B: GpuCore>(
         },
         proj_out: backend.alloc_tensor(&[max_merged, config.out_hidden_size], TensorDtype::BF16),
         pixel_buf: backend.alloc_tensor(&[max_patches, config.in_channels * config.patch_size * config.patch_size], TensorDtype::BF16),
+        // 2D positional embedding support (Gemma 3).
+        // When image_size > 0, the position embedding table is a 2D grid
+        // (image_size/patch_size)² and sub-resolution images need non-contiguous
+        // position lookups.  We allocate scratch buffers for the position indices
+        // and gathered embeddings.
+        pos_ids: if config.image_size > 0 {
+            // U32 position indices stored as F32 (same byte size, reinterpreted by shader).
+            Some(backend.alloc_tensor(&[max_patches], TensorDtype::F32))
+        } else {
+            None
+        },
+        pos_gathered: if config.image_size > 0 {
+            Some(backend.alloc_tensor(&[max_patches, hd], TensorDtype::BF16))
+        } else {
+            None
+        },
     }
 }
 
@@ -553,8 +571,48 @@ pub(crate) fn vision_encode<B: GpuBackend>(
     // Unlike RoPE (which encodes position via rotations in the Q/K vectors),
     // absolute embeddings are added directly to the patch embeddings.  This
     // is simpler but less flexible for varying resolutions.
+    //
+    // Two modes:
+    //   - Contiguous (Qwen 3.5): pos_embed has exactly N entries matching the
+    //     patch count.  Simple element-wise add.
+    //   - 2D grid (Gemma 3): pos_embed is a full (image_size/patch_size)² table
+    //     trained at maximum resolution.  For sub-resolution images, we select
+    //     a 2D subgrid: patch at (row, col) maps to position row*grid_full + col
+    //     instead of row*grid_w + col.  This preserves the spatial relationships
+    //     the model learned during training.
     // -----------------------------------------------------------------------
-    backend.add(&bufs.hidden, &weights.pos_embed, &bufs.hidden, (n * hd) as u32);
+    if config.image_size > 0 && bufs.pos_ids.is_some() {
+        // 2D positional embedding indexing (Gemma 3).
+        //
+        // The position table is [grid_full², hidden_size] where grid_full =
+        // image_size / patch_size (e.g. 64 for Gemma 3 at 896px with 14px patches).
+        // For an actual image with grid_h × grid_w patches, we need positions:
+        //   row 0: [0, 1, ..., grid_w-1]
+        //   row 1: [grid_full, grid_full+1, ..., grid_full+grid_w-1]
+        //   ...
+        //   row r: [r*grid_full, r*grid_full+1, ..., r*grid_full+grid_w-1]
+        let grid_full = config.image_size / config.patch_size;
+
+        // Build 2D position index array on CPU.
+        let pos_indices = compute_2d_position_indices(
+            processed.grid_h, processed.grid_w, grid_full,
+        );
+
+        // Upload indices and gather the corresponding position embeddings.
+        let pos_ids = bufs.pos_ids.as_ref().unwrap();
+        let pos_gathered = bufs.pos_gathered.as_ref().unwrap();
+        backend.copy_to_tensor_from_host(bytemuck::cast_slice(&pos_indices), pos_ids);
+        backend.embed_lookup_batch(
+            &weights.pos_embed, pos_ids, pos_gathered,
+            n as u32, hd as u32,
+        );
+
+        // Add gathered position embeddings to patch embeddings.
+        backend.add(&bufs.hidden, pos_gathered, &bufs.hidden, (n * hd) as u32);
+    } else {
+        // Contiguous positional embeddings (Qwen 3.5) — first N positions match patches.
+        backend.add(&bufs.hidden, &weights.pos_embed, &bufs.hidden, (n * hd) as u32);
+    }
 
     // -----------------------------------------------------------------------
     // Stage 3: ViT transformer blocks.
@@ -749,6 +807,44 @@ pub(crate) fn vision_encode<B: GpuBackend>(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// 2D positional embedding index computation.
+//
+// Extracted as a standalone function for testability.  Used by vision_encode()
+// when the model has a 2D position embedding table (image_size > 0).
+// ---------------------------------------------------------------------------
+
+/// Compute 2D position indices for a sub-resolution image grid.
+///
+/// The position embedding table is a flattened 2D grid of size
+/// `grid_full × grid_full` (where `grid_full = image_size / patch_size`).
+/// For an actual image with `grid_h × grid_w` patches (≤ grid_full in each
+/// dimension), we need non-contiguous indices:
+///
+/// ```text
+///   patch (row, col) → position index = row * grid_full + col
+/// ```
+///
+/// Example: grid_full=64, grid_h=3, grid_w=2:
+///   (0,0)→0, (0,1)→1, (1,0)→64, (1,1)→65, (2,0)→128, (2,1)→129
+///
+/// This differs from contiguous indexing (0,1,2,3,4,5) which would select
+/// wrong positions — giving patches in row 1 the embeddings for positions
+/// in row 0's rightward continuation.
+pub(crate) fn compute_2d_position_indices(
+    grid_h: usize,
+    grid_w: usize,
+    grid_full: usize,
+) -> Vec<u32> {
+    let mut indices = Vec::with_capacity(grid_h * grid_w);
+    for row in 0..grid_h {
+        for col in 0..grid_w {
+            indices.push((row * grid_full + col) as u32);
+        }
+    }
+    indices
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -773,6 +869,7 @@ mod tests {
             projector_prefix: "visual.merger.".into(),
             min_pixels: 3136,
             max_pixels: 401408,
+            image_size: 0,
         }
     }
 
@@ -925,5 +1022,63 @@ mod tests {
         let mut tokens = vec![1, 999, 2];
         expand_vision_placeholders(&mut tokens, 999, &[image]);
         assert_eq!(tokens, vec![1, 999, 2], "1 token → no extra insertion");
+    }
+
+    // -- 2D positional embedding index tests --
+
+    #[test]
+    fn test_2d_pos_indices_gemma3_small_image() {
+        // Gemma 3: image_size=896, patch_size=14 → grid_full=64.
+        // A 126×126 image → 9×9 patches.
+        let indices = compute_2d_position_indices(9, 9, 64);
+        assert_eq!(indices.len(), 81);
+
+        // Row 0: positions 0-8 (contiguous).
+        assert_eq!(&indices[0..9], &[0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        // Row 1: positions 64-72 (jump by grid_full).
+        assert_eq!(&indices[9..18], &[64, 65, 66, 67, 68, 69, 70, 71, 72]);
+        // Row 2: positions 128-136.
+        assert_eq!(&indices[18..27], &[128, 129, 130, 131, 132, 133, 134, 135, 136]);
+        // Last row (8): positions 512-520.
+        assert_eq!(&indices[72..81], &[512, 513, 514, 515, 516, 517, 518, 519, 520]);
+    }
+
+    #[test]
+    fn test_2d_pos_indices_full_resolution() {
+        // When the image fills the full grid, 2D indices match contiguous.
+        let indices = compute_2d_position_indices(64, 64, 64);
+        assert_eq!(indices.len(), 4096);
+        // Should be 0, 1, 2, ..., 4095.
+        for (i, &idx) in indices.iter().enumerate() {
+            assert_eq!(idx, i as u32, "at position {i}");
+        }
+    }
+
+    #[test]
+    fn test_2d_pos_indices_rectangular() {
+        // Non-square image: 2×4 patches in a 10-wide grid.
+        let indices = compute_2d_position_indices(2, 4, 10);
+        assert_eq!(indices, vec![0, 1, 2, 3, 10, 11, 12, 13]);
+    }
+
+    #[test]
+    fn test_2d_pos_indices_single_patch() {
+        // Edge case: 1×1 image.
+        let indices = compute_2d_position_indices(1, 1, 64);
+        assert_eq!(indices, vec![0]);
+    }
+
+    #[test]
+    fn test_2d_pos_indices_single_row() {
+        // 1×5 image in a 64-wide grid: only row 0.
+        let indices = compute_2d_position_indices(1, 5, 64);
+        assert_eq!(indices, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_2d_pos_indices_single_column() {
+        // 3×1 image in a 64-wide grid: positions are 0, 64, 128.
+        let indices = compute_2d_position_indices(3, 1, 64);
+        assert_eq!(indices, vec![0, 64, 128]);
     }
 }
