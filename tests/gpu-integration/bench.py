@@ -34,6 +34,7 @@ import platform
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 # Add this directory to path so we can import conftest helpers.
@@ -262,7 +263,11 @@ def main():
     parser.add_argument("--q4-only", action="store_true")
     parser.add_argument("--bf16-only", action="store_true")
     parser.add_argument("--filter", default="", help="Only bench models matching this substring")
-    parser.add_argument("--output", help="Write markdown results to this file")
+    parser.add_argument("--output", nargs="?", const="auto",
+                        help="Write markdown results to file.  Without a path, "
+                        "auto-generates results/bench-TIMESTAMP.md")
+    parser.add_argument("--results-dir", default="results",
+                        help="Directory for auto-named result files (default: results/)")
     args = parser.parse_args()
 
     models_dir = Path(args.models_dir)
@@ -391,14 +396,26 @@ def main():
     finally:
         mgr.stop_all()
 
-    # Print markdown table.
+    # Resolve output path — always save results to a file.
+    if args.output == "auto" or args.output is None:
+        # Auto-generate: results/bench-YYYYMMDD-HHMMSS.md
+        # Use the repo root's results/ dir if we can find it, otherwise cwd.
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        results_dir = repo_root / args.results_dir
+        results_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        output_path = results_dir / f"bench-{timestamp}.md"
+    else:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Print and save markdown table.
     print()
     table = format_markdown_table(results, gpu_name, gpu_count, args)
     print(table)
 
-    if args.output:
-        Path(args.output).write_text(table)
-        print(f"\nResults written to {args.output}")
+    output_path.write_text(table)
+    print(f"Results saved to {output_path}")
 
 
 def format_markdown_table(results: list[dict], gpu_name: str, gpu_count: int, args) -> str:

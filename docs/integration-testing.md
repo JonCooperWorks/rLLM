@@ -238,6 +238,7 @@ actual HTTP endpoint — capturing the full end-to-end latency users experience.
 ```bash
 # Benchmark all models in models/ (bf16 + Q4):
 tests/gpu-integration/run.sh --bench
+# → results/bench-20260326-143022.md
 
 # 3 runs per model, averaged:
 tests/gpu-integration/run.sh --bench --bench-runs 3
@@ -251,8 +252,8 @@ tests/gpu-integration/run.sh --bench --q4-only
 # Only models matching "llama":
 tests/gpu-integration/run.sh --bench --bench-filter llama
 
-# Save markdown results to file:
-tests/gpu-integration/run.sh --bench --bench-output results.md
+# Save to a specific file:
+tests/gpu-integration/run.sh --bench --bench-output my-results.md
 
 # Skip build/download if already ready:
 tests/gpu-integration/run.sh --bench --skip-build --skip-download --skip-quantize
@@ -262,8 +263,12 @@ Or run the benchmark script directly:
 
 ```bash
 python tests/gpu-integration/bench.py --max-tokens 128 --runs 3
-python tests/gpu-integration/bench.py --filter qwen --q4-only --output results.md
+python tests/gpu-integration/bench.py --filter qwen --q4-only --output custom.md
 ```
+
+Results are always saved to a file — by default a timestamped markdown file
+in `results/` (e.g. `results/bench-20260326-143022.md`).  Pass `--output PATH`
+to override the location.
 
 ### What It Measures
 
