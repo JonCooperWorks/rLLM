@@ -205,12 +205,12 @@ prompt hash.
 ## Economics
 
 LLM inference economics come down to one question: how many tokens can you
-extract per GPU-hour, and what do you charge per token?  Three levers —
-batching, quantization, and prompt caching — determine cost per token.
-Hardware selection and tier differentiation determine what you charge.
-Everything connects: cheaper cost per token lets you offer lower prices or
-higher margins, and the pricing structure itself shapes user behaviour in
-ways that improve GPU utilisation.
+extract per GPU-hour, and what do you charge per token?  Four levers —
+batching, weight quantization, KV cache quantization, and prompt caching —
+determine cost per token.  Hardware selection and tier differentiation
+determine what you charge.  Everything connects: cheaper cost per token lets
+you offer lower prices or higher margins, and the pricing structure itself
+shapes user behaviour in ways that improve GPU utilisation.
 
 ### Cost levers
 
@@ -218,12 +218,14 @@ ways that improve GPU utilisation.
 graph LR
     subgraph Levers["Cost per Token"]
         B["Batching<br/>64× more tok/s<br/>same GPU-hour"]
-        Q["Quantization<br/>4× less bandwidth<br/>4× faster decode"]
+        Q["Weight Quantization<br/>4× less bandwidth<br/>4× faster decode"]
+        KV["KV Cache Quantization<br/>~4× less KV memory<br/>more sequences or longer context"]
         C["Prompt Caching<br/>skip prefill compute<br/>for repeated prefixes"]
     end
 
     B --> Low["Lower $/token"]
     Q --> Low
+    KV --> Low
     C --> Low
 ```
 
@@ -232,10 +234,18 @@ sequence produces ~25 tok/s.  Batch 64 sequences from the same GPU-hour:
 ~1600 tok/s.  64× lower cost per token.  Without batching, LLM inference
 APIs don't work economically.
 
-**Quantization is pure margin.**  Q4 vs bf16 gives ~4× more tokens per
-GPU-hour at near-identical quality.  Charge the same price: 4× margin.
+**Weight quantization is pure margin.**  Q4 vs bf16 gives ~4× more tokens
+per GPU-hour at near-identical quality.  Charge the same price: 4× margin.
 Pass savings to users: undercut competitors.  Either way, it's a direct
 multiplier on unit economics.
+
+**[KV cache quantization](turboquant.md) is concurrency multiplication.**
+KV cache is the memory that scales with concurrent users × context length.
+TurboQuant 4-bit compresses it ~4× with no quality loss — same GPU can hold
+~4× more active sequences, or serve ~4× longer contexts, or any mix of
+both.  On a 64 GB M4 Max serving Qwen 3.5 9B, that's ~2,000 concurrent
+sequences vs ~400 at BF16.  For long-context workloads the effect compounds:
+a 32K-token sequence drops from ~5.3 GB to ~1.1 GB.
 
 **Prompt caching is throughput multiplication.**  Prefill (processing the
 prompt) is compute-bound and often the dominant per-request cost.  A
@@ -565,6 +575,7 @@ latency — audit logging at the inference layer for free.
 - [KV Cache](kv-cache.md) — paged allocation, block tables, generational indices
 - [Prompt Caching](prompt-caching.md) — prefix sharing, ref counting, eviction
 - [Quantization](quantization.md) — Q4 format, pre-quantization, kernel dequantization
+- [TurboQuant](turboquant.md) — KV cache vector quantization, ~4× compression, quality-neutral
 - [Expert Streaming](expert-streaming.md) — SSD-backed MoE, LRU cache, pread I/O
 - [API Server](api-server.md) — HTTP endpoints, worker thread, streaming
 - [Tool Calling](tool-calling.md) — per-architecture formats, parsing, API surface
