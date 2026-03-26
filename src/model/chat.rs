@@ -1000,4 +1000,59 @@ mod tests {
         let prefix = vision_prefix(&msg, ModelArch::Qwen2);
         assert!(prefix.is_empty());
     }
+
+    // -- Default ChatML system message tests --
+
+    #[test]
+    fn test_chatml_default_system_when_absent() {
+        // When no system message is provided, ChatML should inject a default.
+        let messages = vec![msg("user", "Hello")];
+        let result = format_chat(ModelArch::Qwen2, &messages);
+        assert!(
+            result.contains("<|im_start|>system\nYou are a helpful assistant.<|im_end|>"),
+            "should inject default system message when absent: {result}"
+        );
+    }
+
+    #[test]
+    fn test_chatml_no_double_system_when_present() {
+        // When user provides a system message, don't add a second one.
+        let messages = vec![
+            msg("system", "You are a pirate."),
+            msg("user", "Hello"),
+        ];
+        let result = format_chat(ModelArch::Qwen2, &messages);
+        // Should have exactly one system block.
+        assert_eq!(
+            result.matches("<|im_start|>system").count(),
+            1,
+            "should not duplicate system message: {result}"
+        );
+        assert!(
+            result.contains("You are a pirate."),
+            "should use user-provided system message: {result}"
+        );
+    }
+
+    // -- Thinking suppression tests --
+
+    #[test]
+    fn test_thinking_suppress_qwen3_5() {
+        // thinking=false should inject closed <think> block for Qwen 3.5.
+        let messages = vec![msg("user", "Hi")];
+        let result = format_chat_with_thinking(ModelArch::Qwen3_5, &messages, Some(false));
+        assert!(
+            result.ends_with("<|im_start|>assistant\n<think>\n</think>\n"),
+            "should inject closed think block to suppress thinking: {result}"
+        );
+    }
+
+    #[test]
+    fn test_thinking_suppress_llama_no_tag() {
+        // thinking=false on non-thinking arch should add nothing.
+        let messages = vec![msg("user", "Hi")];
+        let with_false = format_chat_with_thinking(ModelArch::Llama, &messages, Some(false));
+        let without = format_chat(ModelArch::Llama, &messages);
+        assert_eq!(with_false, without, "Llama shouldn't get any thinking tag");
+    }
 }

@@ -872,4 +872,58 @@ mod tests {
         let expected = (0.0 - CLIP_MEAN[0]) / CLIP_STD[0];
         assert!((val - expected).abs() < 0.05, "CLIP norm: got {val}, expected {expected}");
     }
+
+    // -- Vision placeholder expansion tests --
+
+    #[test]
+    fn test_expand_vision_placeholders_single_image() {
+        let image = ProcessedImage {
+            pixels: vec![],
+            grid_h: 8,
+            grid_w: 8,
+            num_vision_tokens: 16,
+        };
+        let image_pad: u32 = 999;
+        let mut tokens = vec![1, 2, image_pad, 3, 4];
+        expand_vision_placeholders(&mut tokens, image_pad, &[image]);
+        // Single placeholder should become 16 copies.
+        assert_eq!(tokens.len(), 4 + 16); // 2 before + 16 pad + 2 after
+        assert_eq!(tokens[2..18], vec![image_pad; 16]);
+        assert_eq!(tokens[18], 3);
+        assert_eq!(tokens[19], 4);
+    }
+
+    #[test]
+    fn test_expand_vision_placeholders_no_images() {
+        let mut tokens = vec![1, 2, 999, 3];
+        expand_vision_placeholders(&mut tokens, 999, &[]);
+        assert_eq!(tokens, vec![1, 2, 999, 3], "no images → no expansion");
+    }
+
+    #[test]
+    fn test_expand_vision_placeholders_no_placeholder() {
+        let image = ProcessedImage {
+            pixels: vec![],
+            grid_h: 4,
+            grid_w: 4,
+            num_vision_tokens: 4,
+        };
+        let mut tokens = vec![1, 2, 3, 4];
+        expand_vision_placeholders(&mut tokens, 999, &[image]);
+        assert_eq!(tokens, vec![1, 2, 3, 4], "no placeholder → no change");
+    }
+
+    #[test]
+    fn test_expand_vision_placeholders_one_token() {
+        // num_vision_tokens=1 means no expansion needed (already 1 placeholder).
+        let image = ProcessedImage {
+            pixels: vec![],
+            grid_h: 1,
+            grid_w: 1,
+            num_vision_tokens: 1,
+        };
+        let mut tokens = vec![1, 999, 2];
+        expand_vision_placeholders(&mut tokens, 999, &[image]);
+        assert_eq!(tokens, vec![1, 999, 2], "1 token → no extra insertion");
+    }
 }

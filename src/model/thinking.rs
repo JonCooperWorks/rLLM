@@ -278,9 +278,10 @@ mod tests {
 
     #[test]
     fn test_thinking_suppress_tag() {
-        // No suppression tags needed — omitting the <think> prompt tag
-        // is sufficient to prevent thinking output.
-        assert_eq!(thinking_suppress_tag(ModelArch::Qwen3_5), None);
+        // Qwen 3/3.5: inject closed <think> block to suppress thinking.
+        // Other archs: no tag needed (they don't think by default).
+        assert_eq!(thinking_suppress_tag(ModelArch::Qwen3_5), Some("<think>\n</think>\n"));
+        assert_eq!(thinking_suppress_tag(ModelArch::Qwen3Moe), Some("<think>\n</think>\n"));
         assert_eq!(thinking_suppress_tag(ModelArch::Llama), None);
     }
 
@@ -364,5 +365,26 @@ mod tests {
             Some("Let me reason.\nThe answer is 4.")
         );
         assert_eq!(result.content, "2+2 equals **4**.");
+    }
+
+    // -- Thinking suppression tag tests --
+
+    #[test]
+    fn test_suppress_tag_qwen3_5() {
+        let tag = thinking_suppress_tag(ModelArch::Qwen3_5);
+        assert_eq!(tag, Some("<think>\n</think>\n"));
+    }
+
+    #[test]
+    fn test_suppress_tag_qwen3_moe() {
+        let tag = thinking_suppress_tag(ModelArch::Qwen3Moe);
+        assert_eq!(tag, Some("<think>\n</think>\n"));
+    }
+
+    #[test]
+    fn test_suppress_tag_non_thinking_arch() {
+        assert_eq!(thinking_suppress_tag(ModelArch::Llama), None);
+        assert_eq!(thinking_suppress_tag(ModelArch::Qwen2), None);
+        assert_eq!(thinking_suppress_tag(ModelArch::Gemma3), None);
     }
 }

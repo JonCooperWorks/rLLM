@@ -1344,6 +1344,13 @@ mod tests {
         assert!(config.uses_geglu());
         assert!(config.has_sliding_window());
         assert!(!config.is_moe());
+        // Gemma 3 stores image token as `image_token_index` (not `image_token_id`),
+        // and has `"image_token_id": null` — parser must handle both.
+        assert_eq!(
+            config.image_token_id,
+            Some(262144),
+            "should parse image_token_index for Gemma 3"
+        );
     }
 
     #[test]
