@@ -44,8 +44,8 @@
 // ===========================================================================
 
 use crate::gpu::{
-    GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
-    GpuTurboQuant,
+    GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuMoe, GpuNorm,
+    GpuRope, GpuTurboQuant,
 };
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives;
@@ -86,7 +86,8 @@ pub(crate) fn forward_single_paged<
         + GpuElementwise
         + GpuEmbed
         + GpuAllReduce
-        + GpuTurboQuant,
+        + GpuTurboQuant
+        + GpuMoe,
 >(
     m: &Model<'_, B>,
     token_id: u32,
@@ -159,7 +160,8 @@ pub(crate) fn forward_single_impl<
         + GpuElementwise
         + GpuEmbed
         + GpuAllReduce
-        + GpuTurboQuant,
+        + GpuTurboQuant
+        + GpuMoe,
 >(
     m: &Model<'_, B>,
     token_id: u32,

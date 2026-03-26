@@ -49,23 +49,23 @@ All models support bf16 and Q4. Multi-GPU via `--tp N` requires CUDA + NCCL.
 
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
-| Llama 3.2 1B Instruct | 1.2B | 119 tok/s | 183 tok/s | 104 ms | 79 ms |
-| Llama 3.2 3B Instruct | 3.2B | 56 tok/s | 100 tok/s | 348 ms | 264 ms |
-| Qwen 2.5 3B Instruct | 3.1B | 53 tok/s | 91 tok/s | 127 ms | 84 ms |
+| Llama 3.2 1B Instruct | 1.2B | 134 tok/s | 183 tok/s | 100 ms | 79 ms |
+| Llama 3.2 3B Instruct | 3.2B | 52 tok/s | 100 tok/s | 329 ms | 264 ms |
+| Qwen 2.5 3B Instruct | 3.1B | 48 tok/s | 91 tok/s | 275 ms | 84 ms |
 | Qwen 2.5 7B Instruct | 7.6B | 28 tok/s | 63 tok/s | 356 ms | 166 ms |
 | Mistral 7B Instruct | 7.2B | 30 tok/s | 75 tok/s | 535 ms | 311 ms |
-| Llama 3.1 8B Instruct | 8.0B | 27 tok/s | 59 tok/s | 474 ms | 324 ms |
+| Llama 3.1 8B Instruct | 8.0B | 28 tok/s | 59 tok/s | 841 ms | 324 ms |
 | Gemma 3 4B Instruct | 4.3B | 40 tok/s | 62 tok/s | 361 ms | 324 ms |
 | Phi-4 | 14.7B | 6 tok/s | 37 tok/s | 5,300 ms | 638 ms |
-| Gemma 3 27B Instruct | 27.4B | 2 tok/s | 7 tok/s | 50,000 ms | 4,300 ms |
+| Gemma 3 27B Instruct | 27.4B | 2 tok/s | 15 tok/s | 50,000 ms | 993 ms |
 | Qwen3 Coder 30B-A3B | 30.5B (3.3B active) | 2 tok/s | 11 tok/s | 40,000 ms | 2,900 ms |
 | DeepSeek-R1-Distill-Qwen-32B | 32.8B | — | 5 tok/s | — | 4,700 ms |
-| Qwen3.5 9B | ~9B | 19 tok/s | — | 1,400 ms | — |
+| Qwen3.5 9B | ~9B | 25 tok/s | 50 tok/s | 1,300 ms | 638 ms |
 | GPT-OSS 20B | 20.0B (3.6B active) | 6 tok/s | 34 tok/s | 4,800 ms | 425 ms |
 | Mixtral 8x7B Instruct | 46.7B (12.9B active) | — | 12 tok/s | — | 5,400 ms |
 | Qwen3.5 35B-A3B ⚡ | 35.1B (3.3B active) | 3.0 tok/s | — | 2,600 ms | 10,600 ms |
-| Qwen3.5 27B ⚡ | ~27B | 1.7 tok/s | 15.5 tok/s | 52,800 ms | 2,000 ms |
-| Qwen3.5 122B-A10B ⚡ | 122B (10B active) | 1.0 tok/s | 8.0 tok/s | 19,900 ms | 3,300 ms |
+| Qwen3.5 27B ⚡ | ~27B | 7.4 tok/s | 18 tok/s | 19,200 ms | 1,976 ms |
+| Qwen3.5 122B-A10B ⚡ | 122B (10B active) | 1.5 tok/s | 13 tok/s | 19,100 ms | 2,125 ms |
 | Qwen3.5 397B-A17B ⚡ | 397B (17B active) | 0.3 tok/s | 4.4 tok/s | 48,200 ms | 3,200 ms |
 
 ⚡ = SSD expert streaming (`--stream-experts`). The 397B model (751 GB on disk, 213 GB Q4) runs on 64 GB using ~20 GB GPU memory. Q4 is strongly recommended for models over ~8B.
@@ -185,19 +185,19 @@ TurboQuant ([Zandieh et al.](https://arxiv.org/abs/2504.19874)) compresses the K
 
 | Model | Params | KV (none) | KV (turbo4) | Decode (none) | Decode (turbo4) |
 |---|---|---|---|---|---|
-| Llama 3.2 1B Instruct | 1.2B | 4,096 MB | 1,088 MB (3.8×) | 134 tok/s | 88 tok/s † |
-| Llama 3.2 3B Instruct | 3.2B | 14,336 MB | 3,696 MB (3.9×) | 50 tok/s | 50 tok/s |
-| Qwen 2.5 3B Instruct | 3.1B | 4,608 MB | 1,188 MB (3.9×) | 51 tok/s | 46 tok/s |
-| Llama 3.1 8B Instruct | 8.0B | 16,384 MB | 4,224 MB (3.9×) | 24 tok/s | 23 tok/s |
-| Qwen3.5 9B Q4 | ~9B | 4,096 MB | 1,040 MB (3.9×) | 51.5 tok/s | 45.2 tok/s |
-| Qwen3.5 9B | ~9B | 4,096 MB | 1,040 MB (3.9×) | 25.9 tok/s | 24.2 tok/s |
-| Qwen3.5 27B Q4 | ~27B | 6,753 MB | 2,080 MB (3.2×) | 17.9 tok/s | 15.6 tok/s |
-| Qwen3.5 27B | ~27B | 1,147 MB | 1,148 MB (1.0×) | 8.7 tok/s | 7.4 tok/s |
-| Gemma 3 27B Q4 | 27.4B | 27,110 MB | 16,368 MB (1.7×) | 0.7 tok/s | **7.2 tok/s** (10×) |
-| Qwen3.5 122B-A10B ⚡ | 122B | 96 MB | 24 MB (3.9×) | 1.4 tok/s | 1.5 tok/s |
-| Qwen3.5 122B-A10B Q4 ⚡ | 122B | 96 MB | 24 MB (3.9×) | 14.0 tok/s | 13.0 tok/s |
+| Llama 3.2 1B Instruct | 1.2B | 4,096 MB | 1,088 MB (3.8×) | 161 tok/s | 134 tok/s † |
+| Llama 3.2 3B Instruct | 3.2B | 14,336 MB | 3,696 MB (3.9×) | 70 tok/s | 52 tok/s |
+| Qwen 2.5 3B Instruct | 3.1B | 4,608 MB | 1,188 MB (3.9×) | 67 tok/s | 48 tok/s |
+| Llama 3.1 8B Instruct | 8.0B | 16,384 MB | 4,224 MB (3.9×) | 33 tok/s | 28 tok/s |
+| Qwen3.5 9B Q4 | ~9B | 4,096 MB | 1,040 MB (3.9×) | 57.6 tok/s | 49.6 tok/s |
+| Qwen3.5 9B | ~9B | 4,096 MB | 1,040 MB (3.9×) | 26.7 tok/s | 24.8 tok/s |
+| Qwen3.5 27B Q4 | ~27B | 6,753 MB | 2,080 MB (3.2×) | 19.6 tok/s | 18.0 tok/s |
+| Qwen3.5 27B | ~27B | 1,147 MB | 1,148 MB (1.0×) | 8.4 tok/s | 7.4 tok/s |
+| Gemma 3 27B Q4 | 27.4B | 27,110 MB | 16,368 MB (1.7×) | 17.8 tok/s | 14.9 tok/s |
+| Qwen3.5 122B-A10B ⚡ | 122B | 96 MB | 24 MB (3.9×) | 1.5 tok/s | 1.5 tok/s |
+| Qwen3.5 122B-A10B Q4 ⚡ | 122B | 96 MB | 24 MB (3.9×) | 14.0 tok/s | 13.1 tok/s |
 
-† 1B models have head_dim=64 where rotation overhead dominates — TurboQuant is recommended for models ≥ 3B (head_dim ≥ 128). For models ≤ 9B, TurboQuant provides ~4× KV memory savings with minimal decode overhead (~10%). The biggest wins are on large models where the KV cache competes with weights for memory bandwidth (Gemma 27B: 10× faster). Qwen3.5 27B bf16 shows no KV compression because memory pressure already limits the KV pool to ~1 GB. See [docs/turboquant.md](docs/turboquant.md).
+† 1B models have head_dim=64 where rotation overhead dominates — TurboQuant is recommended for models ≥ 3B (head_dim ≥ 128). For models ≤ 9B, TurboQuant provides ~4× KV memory savings with minimal decode overhead (~10–15%). Qwen3.5 27B bf16 shows no KV compression because memory pressure already limits the KV pool to ~1 GB. See [docs/turboquant.md](docs/turboquant.md).
 
 ### Prompt Prefix Caching
 

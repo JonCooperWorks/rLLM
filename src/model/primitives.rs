@@ -369,27 +369,35 @@ pub(crate) fn o_proj_residual_qdim<B: GpuMatmul + GpuElementwise + GpuAllReduce>
 // ===========================================================================
 
 /// Full FFN sub-block: RMSNorm → gate/up projections → SwiGLU → down → residual.
-pub(crate) fn ffn_block<B: GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce>(
+///
+/// Uses the fused gate+up+SwiGLU kernel (same as MoE experts) to combine
+/// three separate operations (gate matmul, up matmul, silu_mul) into one
+/// dispatch.  This reads the input vector once instead of twice and saves
+/// two kernel launch overheads per layer per token (~64 fewer dispatches
+/// across a 32-layer model).
+pub(crate) fn ffn_block<B: GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce + GpuMoe>(
     backend: &B,
     layer: &LayerWeights<B>,
     hidden: &B::Tensor,
     norm_buf: &B::Tensor,
     gate_buf: &B::Tensor,
-    up_buf: &B::Tensor,
+    _up_buf: &B::Tensor,
     eps: f32,
     hidden_size: u32,
     inter_size: u32,
 ) {
     backend.rms_norm(hidden, &layer.post_attention_layernorm, eps, norm_buf);
-    backend.matmul(
+    // Fused gate+up+SwiGLU: one kernel reads norm_buf once, computes both
+    // gate and up projections, applies SiLU activation, and multiplies.
+    // Replaces: matmul(gate) + matmul(up) + silu_mul → 3 dispatches → 1.
+    backend.fused_gate_up_swiglu(
         &layer.gate_proj,
+        &layer.up_proj,
         norm_buf,
         gate_buf,
         inter_size,
         hidden_size,
     );
-    backend.matmul(&layer.up_proj, norm_buf, up_buf, inter_size, hidden_size);
-    backend.silu_mul(gate_buf, up_buf, gate_buf, inter_size);
     backend.matmul(
         &layer.down_proj,
         gate_buf,

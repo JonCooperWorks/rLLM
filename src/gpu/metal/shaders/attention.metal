@@ -974,6 +974,273 @@ kernel void prefill_attention(
 }
 
 // ===========================================================================
+// Flash Attention v2 — Tiled prefill with multi-query K/V sharing.
+//
+// LEARNING OVERVIEW
+//
+// What this kernel does:
+//   Same computation as prefill_attention above, but processes TILE_Q=2
+//   adjacent query positions per threadgroup instead of one.  Each K/V
+//   vector is loaded from device memory ONCE and reused for both queries,
+//   cutting K/V memory traffic in half.
+//
+// Why this is faster (the Flash Attention v2 insight):
+//   Prefill attention's bottleneck is K/V memory bandwidth.  With 1024
+//   tokens (causal), the naive approach loads each K/V position once per
+//   query that attends to it — totalling ~500K K reads + ~500K V reads.
+//   Adjacent queries Q[i] and Q[i+1] attend to almost identical K/V
+//   ranges: Q[i] attends to positions 0..i, Q[i+1] to 0..i+1.  By
+//   grouping them, each K/V position is loaded once for both queries.
+//
+//   This is the "multi-query" dimension of Flash Attention v2 (Dao 2023).
+//   The original paper tiles in three dimensions (Q blocks × K/V blocks ×
+//   heads); here we tile only the Q dimension, which is the simplest
+//   change with the most impact for single-GPU inference.
+//
+// How it works:
+//   1. Load both Q[qi] and Q[qi+1] into threadgroup shared memory.
+//   2. For each K/V position (256 threads strided as before):
+//      a. Load K[pos] ONCE from device memory.
+//      b. Compute Q[qi]·K and Q[qi+1]·K dot products (K data reused).
+//      c. Update online softmax state for both Q's independently.
+//      d. Load V[pos] ONCE from device memory.
+//      e. Accumulate weighted V for both Q's (V data reused).
+//   3. Reduce V accumulators for Q[qi], write output, barrier, then
+//      reduce V accumulators for Q[qi+1] and write its output.
+//
+// Register budget (per thread, head_dim=128, TILE_Q=2):
+//   v_acc_0[32 float4] = 128 floats = 512 bytes  (Q[0] V accumulator)
+//   v_acc_1[32 float4] = 128 floats = 512 bytes  (Q[1] V accumulator)
+//   Softmax state: 4 floats (max_0, sum_0, max_1, sum_1)
+//   Temporaries: ~12 floats (dot accumulators, ki, vi)
+//   Total: ~272 floats ≈ 1088 bytes per thread (~2× non-tiled).
+//   With 256 threads: ~272 KB.  Apple Silicon may spill some to L1-backed
+//   stack, but the 2× bandwidth savings more than compensates.
+//
+// Shared memory budget:
+//   q_shared[2 × MAX_HD] = 2 × 128 × 4 = 1024 bytes (both Q vectors)
+//   shared_reduce[8 × MAX_HD] = 4096 bytes (reused for softmax + V reduce)
+//   Total: 5120 bytes — well within the 32KB threadgroup memory limit.
+//
+// Causal mask:
+//   Q[qi_base] attends to positions 0..qi_base (attend_len = qi_base + 1).
+//   Q[qi_base+1] attends to positions 0..qi_base+1 (one more position).
+//   The loop runs up to Q[1]'s attend length; for the one extra position,
+//   only Q[1] accumulates.  At most 1 wasted position per tile.
+//
+// Dispatch model:
+//   One threadgroup of 256 per (q_block, head).
+//   Grid: ceil(chunk_size / 2) × num_heads × 256 total threads.
+//   When chunk_size is odd, the last block processes only one Q position
+//   (degrades to non-tiled behavior for that block, with unused registers
+//   for Q[1] — negligible overhead since it's at most one block per head).
+//
+// When to use:
+//   chunk_size >= 2 and head_dim <= 128.  For head_dim=256 (Gemma 27B),
+//   the doubled register pressure would cause excessive spilling, so the
+//   non-tiled kernel is used instead.
+//
+// Related files:
+//   Non-tiled version: prefill_attention (above in this file)
+//   Trait contract:    gpu/ops/attention.rs
+//   Metal dispatch:    metal/kernels/attention.rs (selects tiled vs non-tiled)
+// ===========================================================================
+
+constant constexpr uint TILE_Q = 2;  // Query positions per threadgroup.
+
+kernel void prefill_attention_tiled(
+    constant PrefillAttentionParams& params [[buffer(0)]],
+    device const bfloat* q       [[buffer(1)]],  // [chunk_size, num_heads * head_dim]
+    device const bfloat* k       [[buffer(2)]],  // [chunk_size, num_kv_heads * head_dim]
+    device const bfloat* v       [[buffer(3)]],  // [chunk_size, num_kv_heads * head_dim]
+    device bfloat* output        [[buffer(4)]],  // [chunk_size, num_heads * head_dim]
+    device const bfloat* sinks   [[buffer(5)]],  // [num_heads] — attention sink logits
+    uint tg_id                   [[threadgroup_position_in_grid]],
+    uint tid                     [[thread_position_in_threadgroup]],
+    uint tg_size                 [[threads_per_threadgroup]]
+) {
+    const uint chunk_size = params.chunk_size;
+    const uint head_dim = params.head_dim;
+    const uint num_heads = params.num_heads;
+    const uint num_kv_heads = params.num_kv_heads;
+    const uint heads_per_kv = num_heads / num_kv_heads;
+    const uint hd4 = head_dim / 4;
+
+    // Decompose threadgroup ID: (q_block, head).
+    // The grid has ceil(chunk_size / TILE_Q) × num_heads threadgroups.
+    const uint num_q_blocks = (chunk_size + TILE_Q - 1) / TILE_Q;
+    const uint q_block = tg_id / num_heads;
+    const uint head_id = tg_id % num_heads;
+    if (q_block >= num_q_blocks) return;
+
+    const uint kv_head = head_id / heads_per_kv;
+    const float scale = (params.attn_scale > 0.0f) ? params.attn_scale : rsqrt(float(head_dim));
+    const uint q_stride = num_heads * head_dim;
+    const uint kv_stride = num_kv_heads * head_dim;
+
+    // --- Q positions in this tile and their attend ranges ---
+    //
+    // qi_0: first Q position (always valid).
+    // qi_1: second Q position (invalid when chunk_size is odd and this is the last block).
+    const uint qi_0 = q_block * TILE_Q;
+    const uint qi_1 = qi_0 + 1;
+    const bool has_q1 = (qi_1 < chunk_size);
+
+    // Attend lengths: how many K/V positions each Q can see.
+    //   Causal:        Q[i] attends to chunk positions 0..i (attend_len = i + 1).
+    //   Bidirectional: all Q's attend to all positions (attend_len = chunk_size).
+    const uint attend_0 = params.causal ? (qi_0 + 1) : chunk_size;
+    const uint attend_1 = has_q1 ? (params.causal ? (qi_1 + 1) : chunk_size) : 0;
+    const uint max_attend = has_q1 ? max(attend_0, attend_1) : attend_0;
+
+    // Sliding window: per-Q start positions.
+    // Adjacent Q's may have different window starts (differ by at most 1).
+    const uint win = params.window_size;
+    const uint start_0 = (params.causal && win > 0 && attend_0 > win) ? (attend_0 - win) : 0;
+    const uint start_1 = (has_q1 && params.causal && win > 0 && attend_1 > win) ? (attend_1 - win) : 0;
+    const uint loop_start = min(start_0, has_q1 ? start_1 : start_0);
+
+    // --- Load both Q vectors into threadgroup shared memory ---
+    threadgroup float q_shared[TILE_Q * MAX_HD];
+    threadgroup float* q_sh_0 = q_shared;
+    threadgroup float* q_sh_1 = q_shared + MAX_HD;
+
+    if (tid < head_dim) {
+        q_sh_0[tid] = float(q[qi_0 * q_stride + head_id * head_dim + tid]);
+        if (has_q1) {
+            q_sh_1[tid] = float(q[qi_1 * q_stride + head_id * head_dim + tid]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Float4 pointers into Q shared memory for vectorised dot products.
+    threadgroup const float4* q0_4 = (threadgroup const float4*)q_sh_0;
+    threadgroup const float4* q1_4 = (threadgroup const float4*)q_sh_1;
+
+    // --- Per-thread: two sets of V accumulators + online softmax state ---
+    //
+    // Each thread maintains the full head_dim accumulator for BOTH query
+    // positions.  This is the main register cost of tiling (2× non-tiled).
+    float4 v_acc_0[MAX_HD_VEC4] = {};
+    float4 v_acc_1[MAX_HD_VEC4] = {};
+    float max_0 = -INFINITY, sum_0 = 0.0f;
+    float max_1 = -INFINITY, sum_1 = 0.0f;
+
+    // =====================================================================
+    // Main position loop — the core of Flash Attention v2 tiling.
+    //
+    // For each K/V position (256 threads strided across positions):
+    //   1. Load K[pos] ONCE from device memory.
+    //   2. Compute Q[0]·K and Q[1]·K in one pass (K reused from registers).
+    //   3. Update online softmax for both Q's.
+    //   4. Load V[pos] ONCE and accumulate for both Q's.
+    //
+    // K/V bandwidth is halved: each vector is loaded once, used for 2 queries.
+    // =====================================================================
+    for (uint pos = loop_start + tid; pos < max_attend; pos += tg_size) {
+        // --- Load K[pos] once and compute both dot products ---
+        device const bfloat4* k4 = (device const bfloat4*)(k + pos * kv_stride + kv_head * head_dim);
+        float4 dot_0 = float4(0), dot_1 = float4(0);
+        for (uint i = 0; i < hd4; i++) {
+            float4 ki = float4(k4[i]);  // K loaded once, reused for both dot products.
+            dot_0 += q0_4[i] * ki;
+            if (has_q1) dot_1 += q1_4[i] * ki;
+        }
+        float score_0 = (dot_0.x + dot_0.y + dot_0.z + dot_0.w) * scale;
+        float score_1 = (dot_1.x + dot_1.y + dot_1.z + dot_1.w) * scale;
+
+        // Per-Q validity: causal mask + sliding window.
+        bool valid_0 = (pos >= start_0) && (pos < attend_0);
+        bool valid_1 = has_q1 && (pos >= start_1) && (pos < attend_1);
+
+        // --- Online softmax update for both Q's ---
+        // Compute weights first, then share V load for accumulation.
+        float w0 = 0.0f, w1 = 0.0f;
+
+        if (valid_0) {
+            if (score_0 > max_0) {
+                float c = exp(max_0 - score_0);
+                for (uint i = 0; i < hd4; i++) v_acc_0[i] *= c;
+                sum_0 = sum_0 * c + 1.0f;
+                max_0 = score_0;
+                w0 = 1.0f;
+            } else {
+                w0 = exp(score_0 - max_0);
+                sum_0 += w0;
+            }
+        }
+
+        if (valid_1) {
+            if (score_1 > max_1) {
+                float c = exp(max_1 - score_1);
+                for (uint i = 0; i < hd4; i++) v_acc_1[i] *= c;
+                sum_1 = sum_1 * c + 1.0f;
+                max_1 = score_1;
+                w1 = 1.0f;
+            } else {
+                w1 = exp(score_1 - max_1);
+                sum_1 += w1;
+            }
+        }
+
+        // --- Load V[pos] ONCE and accumulate for both Q's ---
+        if (valid_0 || valid_1) {
+            device const bfloat4* v4 = (device const bfloat4*)(v + pos * kv_stride + kv_head * head_dim);
+            for (uint i = 0; i < hd4; i++) {
+                float4 vi = float4(v4[i]);  // V loaded once, reused for both Q's.
+                if (valid_0) v_acc_0[i] += w0 * vi;
+                if (valid_1) v_acc_1[i] += w1 * vi;
+            }
+        }
+    }
+
+    // --- Attention sinks (same as non-tiled, applied per Q) ---
+    if (params.has_sinks && tid == 0) {
+        float sink = float(sinks[head_id]);
+        // Q[0] sink.
+        if (sink > max_0) {
+            float c = exp(max_0 - sink);
+            for (uint i = 0; i < hd4; i++) v_acc_0[i] *= c;
+            sum_0 = sum_0 * c + 1.0f;
+            max_0 = sink;
+        } else {
+            sum_0 += exp(sink - max_0);
+        }
+        // Q[1] sink.
+        if (has_q1) {
+            if (sink > max_1) {
+                float c = exp(max_1 - sink);
+                for (uint i = 0; i < hd4; i++) v_acc_1[i] *= c;
+                sum_1 = sum_1 * c + 1.0f;
+                max_1 = sink;
+            } else {
+                sum_1 += exp(sink - max_1);
+            }
+        }
+    }
+
+    // --- Cross-thread reduction: Q[0] ---
+    // Reduce softmax state across 256 threads, then reduce V accumulators
+    // and write the final bf16 output for Q[qi_0].
+    threadgroup float shared_reduce[NUM_SIMD_GROUPS * MAX_HD];
+    {
+        float2 sr = reduce_softmax(max_0, sum_0, tid, tg_size, shared_reduce);
+        device bfloat* out_0 = output + qi_0 * q_stride + head_id * head_dim;
+        reduce_v_and_write(v_acc_0, max_0, sr.x, sr.y, tid, tg_size, head_dim, shared_reduce, out_0);
+    }
+
+    // --- Cross-thread reduction: Q[1] ---
+    // Barrier required: shared_reduce was used by Q[0]'s reduction.
+    // Must wait for all threads to finish Q[0] before reusing the memory.
+    if (has_q1) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float2 sr = reduce_softmax(max_1, sum_1, tid, tg_size, shared_reduce);
+        device bfloat* out_1 = output + qi_1 * q_stride + head_id * head_dim;
+        reduce_v_and_write(v_acc_1, max_1, sr.x, sr.y, tid, tg_size, head_dim, shared_reduce, out_1);
+    }
+}
+
+// ===========================================================================
 // Fused QKV bidirectional attention for vision encoders.
 //
 // Takes a single interleaved QKV buffer [chunk_size, 3 * num_heads * head_dim]

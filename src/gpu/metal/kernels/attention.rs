@@ -360,11 +360,18 @@ impl GpuAttention for MetalBackend {
         };
         let sinks_buf = sinks.map(|s| &s.buffer).unwrap_or(&out.buffer);
         let threads_per_group: u64 = 256;
-        let num_threadgroups = chunk_size as u64 * num_heads as u64;
-        let pipeline = if head_dim > 128 {
-            &self.pipeline_prefill_attention_hd256
+        // Flash Attention v2 tiled kernel: processes 2 Q positions per threadgroup,
+        // halving K/V memory traffic by sharing each K/V load across both queries.
+        // Used when chunk_size >= 2 and head_dim <= 128 (avoids excessive register
+        // pressure at head_dim=256).  Falls back to non-tiled kernel otherwise.
+        let (pipeline, num_threadgroups) = if chunk_size >= 2 && head_dim <= 128 {
+            let tile_q: u64 = 2;
+            let num_q_blocks = (chunk_size as u64 + tile_q - 1) / tile_q;
+            (&self.pipeline_prefill_attention_tiled, num_q_blocks * num_heads as u64)
+        } else if head_dim > 128 {
+            (&self.pipeline_prefill_attention_hd256, chunk_size as u64 * num_heads as u64)
         } else {
-            &self.pipeline_prefill_attention
+            (&self.pipeline_prefill_attention, chunk_size as u64 * num_heads as u64)
         };
         self.dispatch_async(
             pipeline,

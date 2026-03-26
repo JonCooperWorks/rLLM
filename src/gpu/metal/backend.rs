@@ -129,6 +129,7 @@ pub(crate) struct MetalBackend {
     pub(crate) pipeline_paged_copy_kv_batch: metal::ComputePipelineState,
     pub(crate) pipeline_prefill_attention: metal::ComputePipelineState,
     pub(crate) pipeline_prefill_attention_hd256: metal::ComputePipelineState,
+    pub(crate) pipeline_prefill_attention_tiled: metal::ComputePipelineState,
 
     // MoE routing kernel.
     pub(crate) pipeline_top_k_softmax: metal::ComputePipelineState,
@@ -313,6 +314,12 @@ impl MetalBackend {
             Self::make_pipeline(&device, &attn_src_128, "prefill_attention", &compile_opts)?;
         let pipeline_prefill_attention_hd256 =
             Self::make_pipeline(&device, &attn_src_256, "prefill_attention", &compile_opts)?;
+        // Flash Attention v2: tiled prefill processes 2 Q positions per threadgroup,
+        // halving K/V memory traffic.  Only compiled for head_dim≤128 (the hd=128
+        // source); head_dim=256 models use the non-tiled kernel to avoid excessive
+        // register spilling from doubled V accumulators.
+        let pipeline_prefill_attention_tiled =
+            Self::make_pipeline(&device, &attn_src_128, "prefill_attention_tiled", &compile_opts)?;
         let pipeline_top_k_softmax = Self::make_pipeline(
             &device,
             METAL_SOURCE_ELEMENTWISE,
@@ -514,6 +521,7 @@ impl MetalBackend {
             pipeline_paged_copy_kv_batch,
             pipeline_prefill_attention,
             pipeline_prefill_attention_hd256,
+            pipeline_prefill_attention_tiled,
             pipeline_top_k_softmax,
             pipeline_conv1d_depthwise,
             pipeline_conv1d_shift,
