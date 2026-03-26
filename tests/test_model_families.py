@@ -250,6 +250,11 @@ def test_model_bf16(config_index, server_manager, models_dir):
     """
     config = BASE_MODELS[config_index]
 
+    # BF16 MoE models that require expert streaming are too slow (0.4 tok/s for
+    # 336 MB bf16 experts per token) — skip in favour of the Q4 variant.
+    if config.is_moe and _should_stream_experts(config.bf16_size_gb, is_q4=False):
+        pytest.skip(f"bf16 MoE too large for memory ({config.bf16_size_gb}GB), use Q4")
+
     model_dir = _resolve_model_dir(models_dir, config)
     if model_dir is None:
         pytest.skip(f"model not found: {config.model_name}")
