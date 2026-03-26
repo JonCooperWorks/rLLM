@@ -246,13 +246,22 @@ pub(crate) async fn messages(
     messages.extend(req.messages);
 
     // Tokenize with thinking control.
-    let prompt_tokens = state
+    let mut prompt_tokens = state
         .tokenizer
         .encode_messages_with_thinking(&messages, state.arch, thinking_requested)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // Preprocess images from the last user message for vision models.
     let images = super::preprocess_images(&messages, state.vision_config.as_ref());
+
+    // Expand vision placeholders (1 placeholder → N vision tokens).
+    if !images.is_empty() {
+        if let Some(image_token_id) = state.image_token_id {
+            crate::model::vision::expand_vision_placeholders(
+                &mut prompt_tokens, image_token_id, &images,
+            );
+        }
+    }
 
     let (response_tx, response_rx) = tokio::sync::mpsc::channel(64);
 

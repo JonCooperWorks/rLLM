@@ -150,7 +150,7 @@ pub(crate) struct ModelArgs {
 pub(crate) fn load_model_and_run(
     args: &ModelArgs,
     max_active: usize,
-    run: impl FnOnce(&mut dyn engine::InferenceEngine, ModelArch, &[ProcessedImage]) -> anyhow::Result<()>,
+    run: impl FnOnce(&mut dyn engine::InferenceEngine, ModelArch, &[ProcessedImage], Option<u32>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let mut tp = args.tp;
 
@@ -190,16 +190,17 @@ pub(crate) fn load_model_and_run(
         });
 
     // Read and preprocess image file if provided.
+    let mut image_token_id: Option<u32> = None;
     let processed_images: Vec<ProcessedImage> = if let Some(ref image_path) = args.image {
         let data = std::fs::read(image_path).map_err(|e| {
             anyhow::anyhow!("failed to read image '{}': {e}", image_path.display())
         })?;
         eprintln!("image: {} ({} bytes)", image_path.display(), data.len());
-        let vc = crate::model::config::ModelConfig::from_file(
+        let model_config = crate::model::config::ModelConfig::from_file(
             &args.model.join("config.json"),
-        )?
-        .vision
-        .ok_or_else(|| {
+        )?;
+        image_token_id = model_config.image_token_id;
+        let vc = model_config.vision.ok_or_else(|| {
             anyhow::anyhow!("--image requires a vision model (no vision_config in config.json)")
         })?;
         let processed = crate::model::vision::preprocess_image(&data, &vc)?;
@@ -226,7 +227,7 @@ pub(crate) fn load_model_and_run(
         },
         |eng| {
             let arch = arch_cell.get().unwrap();
-            run(eng, arch, &processed_images)
+            run(eng, arch, &processed_images, image_token_id)
         },
     )
 }
@@ -244,8 +245,10 @@ pub(crate) fn encode_prompt(
     chat: bool,
     system: &str,
     image_data: Option<&[u8]>,
+    image_token_id: Option<u32>,
+    processed_images: &[crate::model::vision::ProcessedImage],
 ) -> anyhow::Result<Vec<u32>> {
-    if chat && image_data.is_some() {
+    let mut tokens = if chat && image_data.is_some() {
         use crate::model::chat::{self, ImageData, Message};
         let messages = vec![
             Message {
@@ -266,9 +269,20 @@ pub(crate) fn encode_prompt(
             },
         ];
         let formatted = chat::format_chat(arch, &messages);
-        eng.tokenizer().encode_chat(&formatted)
+        eng.tokenizer().encode_chat(&formatted)?
     } else {
         let system_ref = chat.then(|| system);
-        eng.tokenizer().encode_prompt(prompt, arch, system_ref)
+        eng.tokenizer().encode_prompt(prompt, arch, system_ref)?
+    };
+
+    // Expand vision placeholders: 1 placeholder → N vision tokens.
+    if let Some(token_id) = image_token_id {
+        if !processed_images.is_empty() {
+            crate::model::vision::expand_vision_placeholders(
+                &mut tokens, token_id, processed_images,
+            );
+        }
     }
+
+    Ok(tokens)
 }

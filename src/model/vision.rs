@@ -94,6 +94,37 @@ use rayon::prelude::*;
 use super::config::VisionConfig;
 use crate::gpu::{GpuBackend, GpuCore, TensorDtype};
 
+/// Expand vision placeholder tokens in a token sequence.
+///
+/// The chat template inserts ONE placeholder token per image (e.g. `<|image_pad|>`
+/// for Qwen, `<image_soft_token>` for Gemma).  The scatter kernel needs N placeholders
+/// (one per vision encoder output token).  This function replaces each single
+/// placeholder with N copies so the scatter has a 1:1 mapping.
+///
+/// Call this after tokenization and before sending tokens to the engine.
+pub(crate) fn expand_vision_placeholders(
+    tokens: &mut Vec<u32>,
+    image_token_id: u32,
+    images: &[ProcessedImage],
+) {
+    let mut img_idx = 0;
+    let mut i = 0;
+    while i < tokens.len() && img_idx < images.len() {
+        if tokens[i] == image_token_id {
+            let n = images[img_idx].num_vision_tokens;
+            // Replace 1 placeholder with N copies.
+            if n > 1 {
+                let extra = n - 1;
+                tokens.splice(i..=i, std::iter::repeat(image_token_id).take(n));
+            }
+            img_idx += 1;
+            i += images[img_idx - 1].num_vision_tokens;
+        } else {
+            i += 1;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Vision weight structures.
 //

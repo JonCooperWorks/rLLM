@@ -59,14 +59,14 @@ pub(crate) fn exec(args: BenchArgs) -> anyhow::Result<()> {
     eprintln!("max_tokens: {}", max_tokens);
     eprintln!();
 
-    super::load_model_and_run(&args.model, 1, |eng, arch, _images| {
+    super::load_model_and_run(&args.model, 1, |eng, arch, _images, _image_token_id| {
         let mut results: Vec<RequestResult> = Vec::new();
 
         eprintln!("--- per-request results ---");
 
         for (i, &user_prompt) in BENCH_PROMPTS[..num_prompts].iter().enumerate() {
             let prompt_tokens =
-                super::encode_prompt(eng, arch, user_prompt, true, &system, None)?;
+                super::encode_prompt(eng, arch, user_prompt, true, &system, None, None, &[])?;
             let prompt_len = prompt_tokens.len();
 
             eng.add_request(prompt_tokens, max_tokens, 0.0, 1.0, Vec::new(), None);

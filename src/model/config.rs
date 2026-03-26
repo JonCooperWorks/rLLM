@@ -668,7 +668,13 @@ impl ModelConfig {
         // we destructure `raw` into text_config.  These fields live at the
         // outer level for both Qwen 3.5 and Gemma 3 VLMs.
         let raw_vision_config = raw.get("vision_config").cloned();
-        let raw_image_token_id = raw.get("image_token_id").and_then(|v| v.as_u64()).map(|v| v as u32);
+        // Qwen uses `image_token_id`, Gemma 3 uses `image_token_index` — check both.
+        // Gemma 3 has `"image_token_id": null` alongside `"image_token_index": 262144`,
+        // so we must filter null values before falling through to the alternative key.
+        let raw_image_token_id = raw.get("image_token_id")
+            .filter(|v| !v.is_null())
+            .or_else(|| raw.get("image_token_index"))
+            .and_then(|v| v.as_u64()).map(|v| v as u32);
         let raw_vision_start = raw.get("vision_start_token_id").and_then(|v| v.as_u64()).map(|v| v as u32);
         let raw_vision_end = raw.get("vision_end_token_id").and_then(|v| v.as_u64()).map(|v| v as u32);
 

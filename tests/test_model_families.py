@@ -51,10 +51,7 @@ class ModelConfig:
 # One model per architecture family — smallest available.
 BASE_MODELS = [
     ModelConfig("llama-1b",    "llama-3.2-1b-instruct",           "Llama",     bf16_size_gb=2),
-    # Qwen2 + TurboQuant KV cache quantization is broken (produces stuttering).
-    # Root cause unknown — all other architectures with head_dim=128 work fine.
-    # Workaround: disable KV quantization with --kv-quant none.
-    ModelConfig("qwen2-3b",    "qwen2.5-3b-instruct",             "Qwen2",     bf16_size_gb=6, extra_args=("--kv-quant", "none")),
+    ModelConfig("qwen2-3b",    "qwen2.5-3b-instruct",             "Qwen2",     bf16_size_gb=6),
     ModelConfig("gemma3-4b",   "gemma-3-4b-it",                   "Gemma3",    bf16_size_gb=8, has_vision=True),
     ModelConfig("mistral-7b",  "mistral-7b-instruct-v0.3",        "Mistral",   bf16_size_gb=14),
     # Qwen3.5 Q4 text generates 0 tokens (thinking mode interaction). bf16 works.
@@ -140,16 +137,23 @@ def _prompt_for_index(index: int) -> str:
 
 
 def _chat_completion(base_url: str, prompt: str, max_tokens: int = MAX_TOKENS,
-                     temperature: float = 0, stream: bool = False) -> requests.Response:
-    """Send an OpenAI-format chat completion request."""
+                     temperature: float = 0, stream: bool = False,
+                     thinking: bool = False) -> requests.Response:
+    """Send an OpenAI-format chat completion request.
+
+    thinking=False (default) disables extended thinking so models like Qwen3.5
+    don't spend their entire token budget on chain-of-thought reasoning.
+    """
+    body = {
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "stream": stream,
+        "thinking": thinking,
+    }
     return requests.post(
         f"{base_url}/v1/chat/completions",
-        json={
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "stream": stream,
-        },
+        json=body,
         timeout=300,
         stream=stream,
     )
@@ -268,10 +272,6 @@ def test_model_q4(config_index, server_manager, models_dir):
     is tested with two distinct prompts across bf16 and Q4.
     """
     config = BASE_MODELS[config_index]
-
-    # Qwen3.5 Q4 produces 0 tokens — thinking mode interaction not yet handled.
-    if config.family == "Qwen3_5":
-        pytest.xfail("Qwen3.5 Q4 thinking mode produces empty response")
 
     model_dir = _resolve_model_dir(models_dir, config, q4=True)
     if model_dir is None:
@@ -534,10 +534,12 @@ def test_vision(config_index, server_manager, models_dir):
     """
     config = VISION_MODELS[config_index]
 
-    # Gemma3 vision pipeline is broken — model receives preprocessed tokens but
-    # doesn't integrate them into embeddings.  Pre-existing issue.
+    # Gemma3 vision encoder produces incorrect embeddings (model says "unable
+    # to process images").  Config parsing and placeholder expansion are fixed;
+    # the issue is in the SigLIP encoder itself (wrong projector, positional
+    # embeddings, or preprocessing for patch_size=14).
     if config.family == "Gemma3":
-        pytest.xfail("Gemma3 vision scatter not working (pre-existing)")
+        pytest.xfail("Gemma3 vision encoder produces incorrect embeddings")
 
     model_dir = _resolve_model_dir(models_dir, config)
     if model_dir is None:
@@ -586,9 +588,7 @@ def test_vision_q4(config_index, server_manager, models_dir):
     config = VISION_MODELS[config_index]
 
     if config.family == "Gemma3":
-        pytest.xfail("Gemma3 vision scatter not working (pre-existing)")
-    if config.family in ("Qwen3_5", "Qwen3_5M"):
-        pytest.xfail("Qwen3.5 Q4 thinking mode produces empty/error response")
+        pytest.xfail("Gemma3 vision encoder produces incorrect embeddings")
 
     model_dir = _resolve_model_dir(models_dir, config, q4=True)
     if model_dir is None:

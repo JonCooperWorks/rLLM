@@ -41,10 +41,10 @@ pub(crate) fn exec(args: BatchArgs) -> anyhow::Result<()> {
     let temperature = args.model.temperature;
     let top_p = args.model.top_p;
 
-    super::load_model_and_run(&args.model, max_active, |eng, arch, _images| {
+    super::load_model_and_run(&args.model, max_active, |eng, arch, _images, _image_token_id| {
         // Submit all prompts.
         for prompt_text in &prompts {
-            let tokens = super::encode_prompt(eng, arch, prompt_text, chat, &system, None)?;
+            let tokens = super::encode_prompt(eng, arch, prompt_text, chat, &system, None, None, &[])?;
             eng.add_request(tokens, max_tokens, temperature, top_p, Vec::new(), None);
         }
 
