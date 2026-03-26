@@ -4,7 +4,7 @@
 # quantize to Q4, and run the GPU integration test suite or benchmarks.
 #
 # Usage:
-#   tests/gpu-integration/run.sh [options]
+#   tests/run.sh [options]
 #
 # Options:
 #   --small       download small tier only (1B–8B, default)
@@ -33,7 +33,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 TIER="small"
 SKIP_DOWNLOAD=false

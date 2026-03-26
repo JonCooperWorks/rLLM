@@ -9,8 +9,8 @@
 #   - The rllm binary hasn't been built
 #   - A model's directory doesn't exist
 #
-# Run:  pytest tests/gpu-integration/ -v
-# Run one family:  pytest tests/gpu-integration/ -v -k llama
+# Run:  pytest tests/ -v
+# Run one family:  pytest tests/ -v -k llama
 #
 # Related: conftest.py (fixtures), coherence.py (validation)
 # ---------------------------------------------------------------------------

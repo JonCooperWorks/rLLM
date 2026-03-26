@@ -41,38 +41,38 @@ These tests fill that gap:
 
 ```bash
 # One command: build, download models, quantize Q4, install deps, run tests.
-tests/gpu-integration/run.sh
+tests/run.sh
 
 # Just the small models (1B–9B, fastest):
-tests/gpu-integration/run.sh --small
+tests/run.sh --small
 
 # Include MoE and larger models:
-tests/gpu-integration/run.sh --medium
+tests/run.sh --medium
 
 # If models are already downloaded:
-tests/gpu-integration/run.sh --skip-download --skip-quantize
+tests/run.sh --skip-download --skip-quantize
 ```
 
 Or run pytest directly (assumes binary built and models present):
 
 ```bash
 # Install dependencies.
-pip install -r tests/gpu-integration/requirements.txt
+pip install -r tests/requirements.txt
 
 # Run all tests.
-pytest tests/gpu-integration/ -v
+pytest tests/ -v
 
 # Run just one model family.
-pytest tests/gpu-integration/ -v -k llama
+pytest tests/ -v -k llama
 
 # Run just turboquant tests.
-pytest tests/gpu-integration/ -v -k turboquant
+pytest tests/ -v -k turboquant
 
 # Run just streaming tests.
-pytest tests/gpu-integration/ -v -k streaming
+pytest tests/ -v -k streaming
 
 # Stop on first failure (saves GPU time).
-pytest tests/gpu-integration/ -v -x
+pytest tests/ -v -x
 ```
 
 ---
@@ -146,7 +146,7 @@ for realistic KV cache pressure.
 
 ## Coherence Validation
 
-Output is validated without an external LLM using three checks:
+Output is validated without an external LLM using four checks:
 
 1. **Language detection** (`langdetect`) — must detect English.
 2. **Minimum length** — at least 20 characters.
@@ -159,7 +159,7 @@ Output is validated without an external LLM using three checks:
 ## How It Works
 
 ```
-run.sh
+tests/run.sh
   ├── cargo build --release          Build rllm binary
   ├── scripts/download-models.sh     Download model weights from HuggingFace
   ├── scripts/quantize-models.sh     Quantize to Q4 (optional)
@@ -202,29 +202,6 @@ On macOS (Metal), single-GPU is used (TP > 1 requires CUDA + NCCL).
 
 ---
 
-## Skip Logic
-
-Tests skip gracefully when prerequisites are missing:
-
-| Condition | Scope | Message |
-|-----------|-------|---------|
-| No GPU detected | All tests | "no GPU detected (need Metal on macOS or CUDA on Linux)" |
-| Binary not built | All tests | "rllm binary not found (build with: cargo build --release)" |
-| Model dir missing | Individual test | "model not found: llama-3.2-1b-instruct" |
-| Q4 not quantized | Individual test | "Q4 model not found: llama-3.2-1b-instruct-q4" |
-
----
-
-## Configuration
-
-| Env Var | Default | Description |
-|---------|---------|-------------|
-| `RLLM_MODELS_DIR` | `models/` | Directory containing model subdirectories |
-| `RLLM_BIN` | `target/release/rllm` | Path to rllm binary |
-| `HF_TOKEN` | — | HuggingFace token for gated model downloads |
-
----
-
 ## Benchmarking
 
 The same infrastructure supports benchmarking every model in the models
@@ -237,33 +214,33 @@ actual HTTP endpoint — capturing the full end-to-end latency users experience.
 
 ```bash
 # Benchmark all models in models/ (bf16 + Q4):
-tests/gpu-integration/run.sh --bench
+tests/run.sh --bench
 # → results/bench-20260326-143022.md
 
 # 3 runs per model, averaged:
-tests/gpu-integration/run.sh --bench --bench-runs 3
+tests/run.sh --bench --bench-runs 3
 
 # Longer generation (512 tokens):
-tests/gpu-integration/run.sh --bench --bench-tokens 512
+tests/run.sh --bench --bench-tokens 512
 
 # Only Q4 variants:
-tests/gpu-integration/run.sh --bench --q4-only
+tests/run.sh --bench --q4-only
 
 # Only models matching "llama":
-tests/gpu-integration/run.sh --bench --bench-filter llama
+tests/run.sh --bench --bench-filter llama
 
 # Save to a specific file:
-tests/gpu-integration/run.sh --bench --bench-output my-results.md
+tests/run.sh --bench --bench-output my-results.md
 
 # Skip build/download if already ready:
-tests/gpu-integration/run.sh --bench --skip-build --skip-download --skip-quantize
+tests/run.sh --bench --skip-build --skip-download --skip-quantize
 ```
 
 Or run the benchmark script directly:
 
 ```bash
-python tests/gpu-integration/bench.py --max-tokens 128 --runs 3
-python tests/gpu-integration/bench.py --filter qwen --q4-only --output custom.md
+python tests/bench.py --max-tokens 128 --runs 3
+python tests/bench.py --filter qwen --q4-only --output custom.md
 ```
 
 Results are always saved to a file — by default a timestamped markdown file
@@ -309,10 +286,34 @@ Max tokens: 128 | Runs: 3
 
 ---
 
+## Skip Logic
+
+Tests skip gracefully when prerequisites are missing:
+
+| Condition | Scope | Message |
+|-----------|-------|---------|
+| No GPU detected | All tests | "no GPU detected (need Metal on macOS or CUDA on Linux)" |
+| Binary not built | All tests | "rllm binary not found (build with: cargo build --release)" |
+| Model dir missing | Individual test | "model not found: llama-3.2-1b-instruct" |
+| Q4 not quantized | Individual test | "Q4 model not found: llama-3.2-1b-instruct-q4" |
+
+---
+
+## Configuration
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `RLLM_MODELS_DIR` | `models/` | Directory containing model subdirectories |
+| `RLLM_BIN` | `target/release/rllm` | Path to rllm binary |
+| `HF_TOKEN` | — | HuggingFace token for gated model downloads |
+
+---
+
 ## Files
 
 ```
-tests/gpu-integration/
+tests/
+├── README.md               — this file
 ├── run.sh                  — one-command wrapper (build, download, quantize, test/bench)
 ├── requirements.txt        — Python dependencies
 ├── conftest.py             — fixtures: server lifecycle, GPU detection, memory

@@ -8,7 +8,7 @@
 # and computes generation tok/s from wall-clock time + usage counts.
 #
 # Usage:
-#   python tests/gpu-integration/bench.py [options]
+#   python tests/bench.py [options]
 #
 # Options:
 #   --models-dir PATH   model directory (default: models/)
@@ -400,7 +400,7 @@ def main():
     if args.output == "auto" or args.output is None:
         # Auto-generate: results/bench-YYYYMMDD-HHMMSS.md
         # Use the repo root's results/ dir if we can find it, otherwise cwd.
-        repo_root = Path(__file__).resolve().parent.parent.parent
+        repo_root = Path(__file__).resolve().parent.parent
         results_dir = repo_root / args.results_dir
         results_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
