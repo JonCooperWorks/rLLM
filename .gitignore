@@ -3,3 +3,4 @@ models/
 test_prompts.txt
 .DS_Store
 *.log
+results/

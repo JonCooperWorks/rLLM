@@ -208,6 +208,7 @@ pub(crate) struct VisionWeights<B: GpuCore> {
 /// Image preprocessing runs on the CPU (handler thread for serve, main thread
 /// for CLI).  The result is a flat bf16 tensor that gets uploaded to GPU
 /// memory as the first step of vision_encode().
+#[derive(Clone)]
 pub(crate) struct ProcessedImage {
     /// Pixel data as raw bytes in bf16 format.
     ///
