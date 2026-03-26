@@ -69,11 +69,32 @@ def _get_free_port() -> int:
         return s.getsockname()[1]
 
 
+def _get_gpu_count() -> int:
+    """Detect the number of available GPUs.
+
+    macOS: always 1 (Metal, unified memory).
+    Linux + CUDA: count via nvidia-smi.
+    """
+    if platform.system() == "Darwin":
+        return 1
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, check=True, timeout=10,
+        )
+        return len([l for l in result.stdout.strip().splitlines() if l.strip()])
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return 1
+
+
 def _get_available_memory_gb() -> float:
-    """Detect available GPU/system memory in GB.
+    """Detect total available GPU/system memory in GB.
 
     macOS (unified memory): total system RAM.
     Linux + CUDA: sum of all GPU memory via nvidia-smi.
+
+    For multi-GPU setups with tensor parallelism, the full aggregate memory
+    is available since rllm shards the model across all GPUs.
     """
     if platform.system() == "Darwin":
         return psutil.virtual_memory().total / (1024 ** 3)
@@ -85,7 +106,8 @@ def _get_available_memory_gb() -> float:
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, check=True, timeout=10,
         )
-        # Sum all GPUs, nvidia-smi reports in MiB.
+        # Sum all GPUs, nvidia-smi reports in MiB.  With tensor parallelism
+        # the model is sharded across all GPUs, so aggregate memory applies.
         total_mib = sum(
             int(line.strip())
             for line in result.stdout.strip().splitlines()
@@ -124,8 +146,9 @@ class ServerManager:
     server config don't pay the model-loading cost twice.
     """
 
-    def __init__(self, binary: Path):
+    def __init__(self, binary: Path, gpu_count: int = 1):
         self.binary = binary
+        self.gpu_count = gpu_count
         self._servers: dict[str, ServerProcess] = {}
 
     def _config_key(self, model_dir: str, extra_args: list[str]) -> str:
@@ -163,6 +186,7 @@ class ServerManager:
             str(self.binary), "serve",
             "--model", model_dir,
             "--port", str(port),
+            "--tp", str(self.gpu_count),
             *extra_args,
         ]
 
@@ -267,8 +291,17 @@ def available_memory_gb():
 
 
 @pytest.fixture(scope="session")
-def server_manager(rllm_binary, gpu_available):
-    """Session-scoped server manager; stops all servers at teardown."""
-    mgr = ServerManager(rllm_binary)
+def gpu_count():
+    """Detect number of available GPUs for tensor parallelism."""
+    return _get_gpu_count()
+
+
+@pytest.fixture(scope="session")
+def server_manager(rllm_binary, gpu_available, gpu_count):
+    """Session-scoped server manager; stops all servers at teardown.
+
+    Automatically passes --tp <gpu_count> to use all available GPUs.
+    """
+    mgr = ServerManager(rllm_binary, gpu_count=gpu_count)
     yield mgr
     mgr.stop_all()
