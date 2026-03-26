@@ -2311,17 +2311,23 @@ fn build_expert_index_from_safetensors(
     // Load safetensors headers to compute tensor file offsets.
     let (mmaps, weight_map) = load_safetensors_files(model_dir)?;
 
-    // Detect pre-quantized model (rllm-q4 metadata).
-    let prequantized = mmaps.iter().any(|m| {
-        if let Ok((_, metadata)) = SafeTensors::read_metadata(m.as_ref()) {
+    // Collect per-tensor Q4 metadata from shard headers.
+    // We need this to determine if expert tensors specifically are Q4
+    // (not just whether the model has ANY Q4 tensors — attention weights
+    // may be Q4 while expert weights remain BF16, as with Mixtral).
+    let mut q4_expert_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for mmap in &mmaps {
+        if let Ok((_, metadata)) = SafeTensors::read_metadata(mmap.as_ref()) {
             if let Some(meta) = metadata.metadata() {
-                return meta.get("quantization").map(|v| v.as_str()) == Some("rllm-q4");
+                for key in meta.keys() {
+                    if let Some(tensor_name) = key.strip_prefix("rllm_q4:") {
+                        if tensor_name.contains("expert") {
+                            q4_expert_names.insert(tensor_name.to_string());
+                        }
+                    }
+                }
             }
         }
-        false
-    });
-    if prequantized {
-        eprintln!("  detected pre-quantized expert data (rllm-q4)");
     }
 
     // Compute data_start for each shard (8 + header_len).
@@ -2385,10 +2391,17 @@ fn build_expert_index_from_safetensors(
             });
         }
 
+        // Check if fused expert tensors are actually Q4 (not just the model overall).
+        let fused_gate_up = format!("{prefix_base}0.mlp.experts.gate_up_proj");
+        let experts_q4 = q4_expert_names.contains(&fused_gate_up);
+        if experts_q4 {
+            eprintln!("  detected pre-quantized expert data (rllm-q4)");
+        }
+
         eprintln!("  built expert index: {} layers × {} experts (fused format)", num_layers, num_experts);
 
         Ok(super::expert_stream::build_fused_expert_index(
-            layer_info, shard_files, hidden, moe_inter, num_experts, prequantized,
+            layer_info, shard_files, hidden, moe_inter, num_experts, experts_q4,
         ))
     } else {
         // Per-expert format (Qwen3-MoE, Mixtral): experts.{j}.gate_proj etc.
@@ -2446,10 +2459,23 @@ fn build_expert_index_from_safetensors(
             layer_info.push(experts);
         }
 
+        // Check if per-expert tensors are actually Q4 (not just the model overall).
+        // Mixtral's expert weights (w1/w2/w3) may remain BF16 even in a Q4 model
+        // because the quantizer only quantizes weight names it recognises.
+        let first_expert_gate = if is_qwen_naming {
+            format!("{test_prefix}.mlp.experts.0.gate_proj.weight")
+        } else {
+            format!("{test_prefix}.block_sparse_moe.experts.0.w1.weight")
+        };
+        let experts_q4 = q4_expert_names.contains(&first_expert_gate);
+        if experts_q4 {
+            eprintln!("  detected pre-quantized expert data (rllm-q4)");
+        }
+
         eprintln!("  built expert index: {} layers × {} experts (per-expert format)", num_layers, num_experts);
 
         Ok(super::expert_stream::build_per_expert_index(
-            layer_info, shard_files, hidden, moe_inter, prequantized,
+            layer_info, shard_files, hidden, moe_inter, experts_q4,
         ))
     }
 }

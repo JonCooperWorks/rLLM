@@ -60,7 +60,9 @@ BASE_MODELS = [
     ModelConfig("mixtral-8x7b","mixtral-8x7b-instruct-v0.1",      "Mixtral",   is_moe=True, bf16_size_gb=93),
     ModelConfig("qwen3moe-30b","qwen3-coder-30b-a3b-instruct",    "Qwen3Moe",  is_moe=True, bf16_size_gb=60),
     ModelConfig("qwen3.5-35b", "qwen3.5-35b-a3b",                 "Qwen3_5M",  is_moe=True, bf16_size_gb=70, has_vision=True),
-    ModelConfig("gpt-oss-20b", "gpt-oss-20b",                     "GptOss",    is_moe=True, bf16_size_gb=40, supports_stream_experts=False),
+    # GPT-OSS Q4 degenerates into self-evaluation loops at temperature=0 due to
+    # reduced logit precision.  temperature=0.1 breaks the loop without hurting coherence.
+    ModelConfig("gpt-oss-20b", "gpt-oss-20b",                     "GptOss",    is_moe=True, bf16_size_gb=40, supports_stream_experts=False, temperature=0.1),
 ]
 
 # TurboQuant variations (tested on Llama 1B — fastest to load).
@@ -286,16 +288,6 @@ def test_model_q4(config_index, server_manager, models_dir):
     is tested with two distinct prompts across bf16 and Q4.
     """
     config = BASE_MODELS[config_index]
-
-    # GPT-OSS-20B Q4 degenerates into repetition — model quality issue at Q4,
-    # not an inference bug (bf16 variant passes).
-    if config.family == "GptOss":
-        pytest.xfail("GPT-OSS-20B Q4 generates degenerate repetition (model quality)")
-
-    # Mixtral Q4 produces word salad with expert streaming — likely a Q4 MoE
-    # expert loading issue specific to the Mixtral quantized checkpoint.
-    if config.family == "Mixtral":
-        pytest.xfail("Mixtral Q4 produces word salad with streamed experts")
 
     model_dir = _resolve_model_dir(models_dir, config, q4=True)
     if model_dir is None:
