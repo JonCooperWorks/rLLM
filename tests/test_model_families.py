@@ -60,9 +60,9 @@ BASE_MODELS = [
     ModelConfig("mixtral-8x7b","mixtral-8x7b-instruct-v0.1",      "Mixtral",   is_moe=True, bf16_size_gb=93),
     ModelConfig("qwen3moe-30b","qwen3-coder-30b-a3b-instruct",    "Qwen3Moe",  is_moe=True, bf16_size_gb=60),
     ModelConfig("qwen3.5-35b", "qwen3.5-35b-a3b",                 "Qwen3_5M",  is_moe=True, bf16_size_gb=70, has_vision=True),
-    # GPT-OSS Q4 degenerates into self-evaluation loops at temperature=0 due to
-    # reduced logit precision.  temperature=0.1 breaks the loop without hurting coherence.
-    ModelConfig("gpt-oss-20b", "gpt-oss-20b",                     "GptOss",    is_moe=True, bf16_size_gb=40, supports_stream_experts=False, temperature=0.1),
+    # GPT-OSS Q4 degenerates into self-evaluation loops at low temperature due to
+    # reduced logit precision.  temperature=0.6 adds enough noise to break the loop.
+    ModelConfig("gpt-oss-20b", "gpt-oss-20b",                     "GptOss",    is_moe=True, bf16_size_gb=40, supports_stream_experts=False, temperature=0.6),
 ]
 
 # TurboQuant variations (tested on Llama 1B — fastest to load).
