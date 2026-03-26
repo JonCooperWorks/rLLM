@@ -1,37 +1,50 @@
 // ===========================================================================
-// Matrix-vector multiply kernel (bf16) — SIMD-cooperative version.
+// Matrix-vector multiply kernels — multi-row SIMD with shared memory caching.
 //
 // LEARNING OVERVIEW
 //
-// What this kernel does:
-//   Computes y = W · x, where W is a weight matrix and x is a vector.
+// What these kernels do:
+//   Compute y = W · x, where W is a weight matrix and x is a vector.
 //   This is the fundamental operation for all linear projections in the
 //   transformer: Q/K/V projections, output projection, gate/up/down FFN
 //   projections, and the final LM head.
 //
-// SIMD-cooperative approach:
-//   Instead of one thread computing an entire dot product (K=2048 multiply-
-//   adds), 32 threads (one SIMD group) cooperate on each output row.
-//   Each thread handles K/32 elements in a strided pattern, then `simd_sum`
-//   reduces across all 32 lanes in a single hardware instruction.
+// Multi-row SIMD (the key optimisation, inspired by llama.cpp):
+//   Each SIMD group of 32 threads computes TWO output rows instead of one.
+//   The input vector x is loaded once per iteration and reused for both rows,
+//   giving the GPU two independent accumulator chains to pipeline:
 //
-//   For K=2048: each thread does 64 multiply-adds (vs 2048 in the naive kernel).
-//   For K=8192: each thread does 256 multiply-adds (vs 8192 in the naive kernel).
+//     for each x chunk:
+//       x_val = x[j]              // loaded once
+//       acc0 += w_row0[j] * x_val // row 0 dot product
+//       acc1 += w_row1[j] * x_val // row 1 dot product (x reused, free ILP)
 //
-// Why this is faster:
-//   1. 32x more parallelism per output row — GPU cores stay busy
-//   2. Strided access across SIMD lanes → coalesced memory reads
-//   3. `simd_sum` is a single-cycle hardware operation (no shared memory)
-//   4. 4x loop unrolling gives the compiler room for ILP (instruction-level
-//      parallelism) — it can interleave loads with multiplies
+//   With 2 rows per SIMD, 8 SIMD groups per threadgroup = 16 rows per
+//   threadgroup (up from 8).  The two accumulations are independent so the
+//   GPU can pipeline loads and FMAs without stalls.
+//
+// Shared memory x caching:
+//   All 256 threads cooperatively load the input vector x into threadgroup
+//   shared memory (bf16 → f32 during load).  This means x is read from
+//   device memory ONCE per threadgroup instead of once per SIMD group —
+//   an 8× reduction in x memory traffic.  Combined with multi-row, each
+//   threadgroup processes 16 rows with a single x load.
+//
+//   For a 4096-dim model, this eliminates ~56 KB of redundant x reads per
+//   threadgroup (7 redundant SIMD groups × 8 KB per x vector).
 //
 // Dispatch model:
-//   grid_size = M × 32 total threads (32 threads per output row).
-//   threadgroup_size = 256 = 8 SIMD groups = 8 output rows per threadgroup.
+//   grid_size = ceil(M / 2) × 32 total threads.
+//   threadgroup_size = 256 = 8 SIMD groups = 16 output rows per threadgroup.
 //
 // Precision:
-//   Inputs (W and x) are bfloat16.  The dot-product accumulator is float32.
-//   The final result is narrowed back to bfloat16 on store.
+//   Inputs (W and x) are bfloat16.  Dot-product accumulators are float32.
+//   Final results are narrowed back to bfloat16 on store.
+//
+// Related files:
+//   Trait contract:  gpu/ops/matmul.rs
+//   Metal dispatch:  metal/kernels/matmul.rs
+//   Fused variant:   metal/shaders/moe.metal (fused_gate_up_swiglu)
 // ===========================================================================
 
 #include <metal_stdlib>
@@ -43,149 +56,62 @@ struct MatvecParams {
     uint K;  // Input dimension (number of columns in W, length of x).
 };
 
+// Number of output rows each SIMD group computes simultaneously.
+// 2 rows per SIMD = 16 rows per 256-thread threadgroup (bf16).
+// Q4 uses 1 row per SIMD to avoid register pressure from dequant.
+// Each thread maintains ROWS_PER_SIMD independent float accumulators.
+constant constexpr uint ROWS_PER_SIMD = 2;
+constant constexpr uint ROWS_PER_SIMD_Q4 = 1;
+
+// Shared memory tile size for input vector caching.  4096 floats = 16 KB,
+// well within Apple Silicon's 32 KB threadgroup memory limit.  Covers
+// K ≤ 4096 in a single tile (all standard hidden sizes).  Larger K
+// is handled by iterating over multiple tiles.
+#define X_TILE 4096
+
 kernel void matvec_bf16(
     constant MatvecParams& params [[buffer(0)]],
-    // buffer(1): weight matrix W [M, K] in bfloat16, row-major.
-    device const bfloat* W        [[buffer(1)]],
-    // buffer(2): input vector x [K] in bfloat16.
-    device const bfloat* x        [[buffer(2)]],
-    // buffer(3): output vector y [M] in bfloat16.
-    device bfloat* y              [[buffer(3)]],
-    uint gid                      [[thread_position_in_grid]]
+    device const bfloat* W        [[buffer(1)]],  // [M, K] row-major
+    device const bfloat* x        [[buffer(2)]],  // [K]
+    device bfloat* y              [[buffer(3)]],  // [M]
+    uint gid                      [[thread_position_in_grid]],
+    uint lid                      [[thread_position_in_threadgroup]]
 ) {
     const uint M = params.M;
     const uint K = params.K;
 
-    // 32 threads (one SIMD group) cooperate on one output row.
-    //   row  = which output element (0..M-1)
-    //   lane = which thread within the SIMD group (0..31)
-    uint row = gid / 32;
+    // 32 threads (one SIMD group) cooperate on ROWS_PER_SIMD output rows.
+    //   simd_idx = which pair of rows this SIMD group handles
+    //   lane     = which thread within the SIMD group (0..31)
+    //   row0     = first output row,  row1 = second output row
+    uint simd_idx = gid / 32;
     uint lane = gid % 32;
 
-    if (row >= M) return;
+    uint row0 = simd_idx * ROWS_PER_SIMD;
+    uint row1 = row0 + 1;
+    bool has_row1 = (row1 < M);
 
-    // Pointer to this row's weights — K consecutive bfloat16 values.
-    device const bfloat* w_row = W + row * K;
-
-    // -----------------------------------------------------------------------
-    // Strided dot product with 4x unrolling.
-    //
-    // Each lane processes elements at indices: lane*4, lane*4+128, lane*4+256, ...
-    // The stride of 128 (= 32 lanes × 4 unroll) ensures all 32 lanes read
-    // consecutive 4-element blocks, maximising memory coalescing.
-    //
-    // For K=2048: each lane does 2048/(32*4) = 16 iterations of 4 multiply-adds.
-    // For K=8192: each lane does 8192/(32*4) = 64 iterations of 4 multiply-adds.
-    //
-    // Learning note: unrolling by 4 helps because the GPU can issue the next
-    // memory load while the previous multiply-add is still in the pipeline.
-    // Without unrolling, the loop has a load→compute→branch dependency chain
-    // that serialises operations.
-    // -----------------------------------------------------------------------
-    float acc = 0.0f;
-    for (uint j = lane * 4; j < K; j += 32 * 4) {
-        acc += float(w_row[j])     * float(x[j]);
-        acc += float(w_row[j + 1]) * float(x[j + 1]);
-        acc += float(w_row[j + 2]) * float(x[j + 2]);
-        acc += float(w_row[j + 3]) * float(x[j + 3]);
-    }
-
-    // -----------------------------------------------------------------------
-    // SIMD reduction: sum across all 32 lanes.
-    //
-    // `simd_sum` is a hardware intrinsic that sums a value across all lanes
-    // of the SIMD group in a single cycle.  No shared memory, no barriers.
-    // After this call, all 32 lanes hold the same total dot product.
-    //
-    // Only lane 0 writes the result — the other 31 lanes discard their copy.
-    // -----------------------------------------------------------------------
-    acc = simd_sum(acc);
-
-    if (lane == 0) {
-        y[row] = bfloat(acc);
-    }
-}
-
-// ===========================================================================
-// Matrix-vector multiply kernel (Q4) — SIMD-cooperative with inline dequant
-// and shared memory input caching (flash-moe pattern).
-//
-// LEARNING OVERVIEW
-//
-// Same SIMD-cooperative structure as matvec_bf16, but the weight matrix is
-// stored in block-wise 4-bit quantisation.  This halves memory bandwidth
-// compared to bf16 (20 bytes per 32 weights vs 64 bytes), giving ~2x speedup
-// for memory-bound matmuls.
-//
-// Shared memory x caching (from flash-moe):
-//   All 256 threads (8 SIMD groups = 8 output rows) cooperatively load the
-//   input vector x into threadgroup shared memory.  This means x is read from
-//   device memory ONCE per 8 rows instead of once per row — an 8x reduction
-//   in x memory traffic.  For expert matmuls [1024, 4096], this reduces total
-//   device bandwidth from ~10.5 MB to ~4.5 MB per matmul (2.3x).
-//
-//   The x vector is loaded in tiles of 4096 elements (16KB).  For K <= 4096,
-//   there's exactly one tile with zero overhead.  For larger K, the kernel
-//   processes multiple tiles, with one barrier per tile boundary.
-//
-// Block layout (18 bytes per block of 32 weights):
-//   bytes  0-1:  bf16 scale factor
-//   bytes  2-17: 16 bytes of packed nibbles (2 weights per byte)
-//
-// Packing: byte[i] = (q[2i] & 0xF) | (q[2i+1] << 4)
-// Dequant: weight = (nibble - 8) * scale
-//   (symmetric quantisation with offset encoding: q ∈ [0,15] → signed [-8,7])
-//
-// Dispatch: same as bf16 — grid_size = M × 32, threadgroup_size = 256.
-// ===========================================================================
-
-// Shared memory tile size for input vector caching.  4096 floats = 16KB,
-// well within Apple Silicon's 32KB threadgroup memory limit.  Covers
-// K <= 4096 in a single tile (all expert matmuls for 397B).  Larger K
-// is handled by iterating over multiple tiles.
-#define X_TILE_Q4 4096
-
-kernel void matvec_q4(
-    constant MatvecParams& params [[buffer(0)]],
-    // buffer(1): packed Q4 weight data [M * blocks_per_row * 18 bytes].
-    device const uchar* W_q4     [[buffer(1)]],
-    // buffer(2): input vector x [K] in bfloat16.
-    device const bfloat* x       [[buffer(2)]],
-    // buffer(3): output vector y [M] in bfloat16.
-    device bfloat* y             [[buffer(3)]],
-    uint gid                     [[thread_position_in_grid]],
-    uint lid                     [[thread_position_in_threadgroup]]
-) {
-    const uint M = params.M;
-    const uint K = params.K;
-
-    uint row = gid / 32;
-    uint lane = gid % 32;
-
-    const uint blocks_per_row = K / 32;
-    const uint bytes_per_block = 18;  // 2 (bf16 scale) + 16 (packed nibbles)
+    device const bfloat* w_row0 = W + row0 * K;
+    device const bfloat* w_row1 = W + row1 * K;
 
     // -----------------------------------------------------------------------
     // Shared memory cache for input vector x.
     //
     // All 256 threads cooperatively load x from device memory (bf16) into
     // shared memory (f32).  The bf16→f32 conversion happens during the load,
-    // so the inner loop reads f32 from shared memory — no per-element
-    // conversion overhead in the hot path.
+    // so the inner loop reads f32 from fast shared memory.
     //
-    // 8 SIMD groups (= 8 output rows) share this cached x, reducing device
-    // memory x traffic 8x compared to each row reading x independently.
+    // Without caching: 8 SIMD groups each read x independently → 8× redundant.
+    // With caching: one cooperative load, 8× less device memory traffic for x.
     //
-    // For K > X_TILE_Q4, we tile: load a chunk of x, process blocks in that
-    // range, barrier, load the next chunk.  For expert matmuls (K=1024-4096),
-    // there's exactly one tile — zero tiling overhead.
+    // For K > X_TILE, we tile: load a chunk, process, barrier, next chunk.
     // -----------------------------------------------------------------------
-    threadgroup float x_shared[X_TILE_Q4];
+    threadgroup float x_shared[X_TILE];
 
-    float acc = 0.0f;
+    float acc0 = 0.0f, acc1 = 0.0f;
 
-    for (uint tile = 0; tile < K; tile += X_TILE_Q4) {
-        uint tile_len = min((uint)X_TILE_Q4, K - tile);
+    for (uint tile = 0; tile < K; tile += X_TILE) {
+        uint tile_len = min((uint)X_TILE, K - tile);
 
         // Cooperative load: 256 threads load tile_len bf16→f32 values.
         // ALL threads participate (even out-of-bounds rows) to ensure the
@@ -195,30 +121,131 @@ kernel void matvec_q4(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Process Q4 blocks whose x indices fall within this tile.
-        // Each block covers 32 consecutive x elements.  Blocks are assigned
-        // to lanes in a strided pattern for coalesced weight reads.
+        // ---------------------------------------------------------------
+        // Multi-row dot product with 4x unrolling.
+        //
+        // Each lane processes elements at indices: lane*4, lane*4+128, ...
+        // For each element, the x value is loaded ONCE from shared memory
+        // and used for both row0 and row1 — the core of multi-row SIMD.
+        //
+        // The two accumulations (acc0, acc1) are independent, so the GPU
+        // can pipeline them: while acc0's FMA is in flight, the GPU issues
+        // acc1's FMA on the same data.  This hides FMA latency.
+        // ---------------------------------------------------------------
+        if (row0 < M) {
+            for (uint j = lane * 4; j < tile_len; j += 32 * 4) {
+                float x0 = x_shared[j];
+                float x1 = x_shared[j + 1];
+                float x2 = x_shared[j + 2];
+                float x3 = x_shared[j + 3];
+
+                uint wj = tile + j;
+                acc0 += float(w_row0[wj])     * x0;
+                acc0 += float(w_row0[wj + 1]) * x1;
+                acc0 += float(w_row0[wj + 2]) * x2;
+                acc0 += float(w_row0[wj + 3]) * x3;
+
+                if (has_row1) {
+                    acc1 += float(w_row1[wj])     * x0;
+                    acc1 += float(w_row1[wj + 1]) * x1;
+                    acc1 += float(w_row1[wj + 2]) * x2;
+                    acc1 += float(w_row1[wj + 3]) * x3;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // SIMD reduction: sum across all 32 lanes.
+    if (row0 < M) {
+        acc0 = simd_sum(acc0);
+        if (lane == 0) y[row0] = bfloat(acc0);
+    }
+    if (has_row1) {
+        acc1 = simd_sum(acc1);
+        if (lane == 0) y[row1] = bfloat(acc1);
+    }
+}
+
+// ===========================================================================
+// Matrix-vector multiply kernel (Q4) — multi-row SIMD with shared memory
+// input caching and inline dequantisation.
+//
+// LEARNING OVERVIEW
+//
+// Same multi-row SIMD + shared memory caching pattern as matvec_bf16, but
+// weights are stored in block-wise 4-bit quantisation.
+//
+// Multi-row benefit for Q4:
+//   Q4 dequantisation is compute-heavy (nibble extract + scale multiply per
+//   weight).  With 2 rows per SIMD, each thread reads weight blocks from
+//   TWO rows but shares x values from shared memory.  The x values are
+//   already loaded and the scale*x products are reusable across rows.
+//   This doubles the useful compute per memory cycle, improving the
+//   compute-to-bandwidth ratio.
+//
+// Block layout (18 bytes per block of 32 weights):
+//   bytes  0-1:  bf16 scale factor
+//   bytes  2-17: 16 bytes of packed nibbles (2 weights per byte)
+//
+// Packing: byte[i] = (q[2i] & 0xF) | (q[2i+1] << 4)
+// Dequant: weight = (nibble - 8) * scale
+//   (symmetric quantisation with offset encoding: q ∈ [0,15] → signed [-8,7])
+//
+// Dispatch: grid_size = ceil(M / 2) × 32, threadgroup_size = 256.
+// ===========================================================================
+
+kernel void matvec_q4(
+    constant MatvecParams& params [[buffer(0)]],
+    device const uchar* W_q4     [[buffer(1)]],  // [M * blocks_per_row * 18 bytes]
+    device const bfloat* x       [[buffer(2)]],  // [K]
+    device bfloat* y             [[buffer(3)]],  // [M]
+    uint gid                     [[thread_position_in_grid]],
+    uint lid                     [[thread_position_in_threadgroup]]
+) {
+    const uint M = params.M;
+    const uint K = params.K;
+
+    uint simd_idx = gid / 32;
+    uint lane = gid % 32;
+
+    uint row = simd_idx;
+
+    const uint blocks_per_row = K / 32;
+    const uint bytes_per_block = 18;  // 2 (bf16 scale) + 16 (packed nibbles)
+
+    device const uchar* row_data = W_q4 + row * blocks_per_row * bytes_per_block;
+
+    // Shared memory cache for input vector x.
+    threadgroup float x_shared[X_TILE];
+
+    float acc = 0.0f;
+
+    for (uint tile = 0; tile < K; tile += X_TILE) {
+        uint tile_len = min((uint)X_TILE, K - tile);
+
+        // Cooperative load: 256 threads load tile_len bf16→f32 values.
+        for (uint i = lid; i < tile_len; i += 256) {
+            x_shared[i] = float(x[tile + i]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
         if (row < M) {
-            device const uchar* row_data = W_q4 + row * blocks_per_row * bytes_per_block;
             uint block_start = tile / 32;
             uint block_end   = (tile + tile_len) / 32;
 
             for (uint block_idx = block_start + lane; block_idx < block_end; block_idx += 32) {
                 device const uchar* block_ptr = row_data + block_idx * bytes_per_block;
-
                 float scale = float(*((device const half*)block_ptr));
                 device const uchar* data = block_ptr + 2;
 
-                // x index relative to tile start.
                 uint x_local = (block_idx * 32) - tile;
 
-                // FMA-optimised dequant (from flash-moe): precompute scale*x,
-                // then fma(nibble, sx, -8*sx) = (nibble - 8) * scale * x.
+                // FMA-optimised dequant: precompute scale*x, then
+                // fma(nibble, sx, -8*sx) = (nibble - 8) * scale * x.
                 for (uint i = 0; i < 16; i += 4) {
-                    uchar b0 = data[i];
-                    uchar b1 = data[i + 1];
-                    uchar b2 = data[i + 2];
-                    uchar b3 = data[i + 3];
+                    uchar b0 = data[i], b1 = data[i+1], b2 = data[i+2], b3 = data[i+3];
 
                     float sx0 = scale * x_shared[x_local + i * 2];
                     float sx1 = scale * x_shared[x_local + i * 2 + 1];
@@ -281,12 +308,6 @@ kernel void matvec_q4(
 //     For B=100: the same weight matrix is loaded once but used for 100
 //     dot products.  The GPU's ALUs are now the bottleneck, not memory.
 //     This is where the 3-10x speedup comes from.
-//
-//   Example numbers (Llama 3.2 1B, Q projection, K=2048, M=2048):
-//     Matvec: 8M FLOPs, 8 MB loaded → intensity 1.0 → 15μs at 546 GB/s
-//     GEMM B=100: 800M FLOPs, 8 MB loaded → intensity 100 → same 15μs memory
-//       but now fully utilising the GPU's 14 TFLOPS compute → 57μs compute
-//     Net: 100 tokens in 57μs vs 100 × 15μs = 1500μs → 26x faster!
 //
 // Dispatch model:
 //   Same SIMD-cooperative pattern as matvec: 32 threads per output element.
@@ -351,8 +372,11 @@ kernel void gemm_bf16(
 //
 // Q4 GEMM compounds TWO bandwidth savings:
 //   1. Batching: weight matrix loaded once for B tokens (B× fewer loads)
-//   2. Quantisation: 20 bytes per 32 weights vs 64 bytes (3.2× smaller)
-//   Combined: for B=100, memory traffic drops ~320× compared to 100 bf16 matvecs.
+//   2. Quantisation: 18 bytes per 32 weights vs 64 bytes (3.6× smaller)
+//   Combined: for B=100, memory traffic drops ~360× compared to 100 bf16 matvecs.
+//
+// Block layout: the Q4 GEMM kernel uses the same 18-byte block format as
+// matvec_q4 (2-byte bf16 scale + 16 bytes packed nibbles).
 // ===========================================================================
 
 kernel void gemm_q4(
@@ -374,7 +398,7 @@ kernel void gemm_q4(
     if (batch >= params.batch_size) return;
 
     const uint blocks_per_row = K / 32;
-    const uint bytes_per_block = 20;
+    const uint bytes_per_block = 18;
 
     device const uchar* row_data = W_q4 + row * blocks_per_row * bytes_per_block;
     device const bfloat* x_vec = X + batch * K;
@@ -383,8 +407,8 @@ kernel void gemm_q4(
 
     for (uint block_idx = lane; block_idx < blocks_per_row; block_idx += 32) {
         device const uchar* block_ptr = row_data + block_idx * bytes_per_block;
-        float scale = *((device const float*)block_ptr);
-        device const uchar* data = block_ptr + 4;
+        float scale = float(*((device const half*)block_ptr));
+        device const uchar* data = block_ptr + 2;
         uint x_base = block_idx * 32;
 
         // FMA-optimised dequant (same as matvec_q4 — see comment there).

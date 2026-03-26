@@ -5,13 +5,16 @@
 // Metal shader:   metal/shaders/matmul.metal
 //
 // Two code paths based on weight dtype:
-//   - BF16: standard SIMD-cooperative matvec (32 threads per output row,
-//     simd_sum reduction, 4x unrolled inner loop)
-//   - Q4: dequantize-on-the-fly from 4-bit blocks (20 bytes per 32 weights)
+//   - BF16: multi-row SIMD matvec with shared memory x caching (2 rows per
+//     SIMD group, 16 rows per threadgroup)
+//   - Q4: multi-row SIMD matvec with shared memory x caching and inline
+//     dequantisation (18 bytes per 32 weights: bf16 scale + packed nibbles)
+//
+// Multi-row dispatch: grid = ceil(M/2) × 32 threads.  Each SIMD group
+// computes 2 output rows, sharing x loads via threadgroup shared memory.
 //
 // Batched variants (gemm) are used during prefill; single-vector (matvec)
-// during token-by-token decode.  Both dispatch 256-thread groups with 32
-// threads collaborating per output row via SIMD shuffle.
+// during token-by-token decode.
 // ---------------------------------------------------------------------------
 
 use metal::MTLSize;
@@ -36,18 +39,27 @@ struct GemmParams {
     k: u32,
 }
 
+/// Number of output rows per SIMD group in bf16 matvec kernel.
+/// Must match ROWS_PER_SIMD in matmul.metal.
+const ROWS_PER_SIMD_BF16: u64 = 2;
+
 impl GpuMatmul for MetalBackend {
     fn matmul(&self, weight: &MetalTensor, input: &MetalTensor, out: &MetalTensor, m: u32, k: u32) {
         let params = MatvecParams { m, k };
-        let pipeline = match weight.dtype {
-            TensorDtype::Q4 => &self.pipeline_matvec_q4,
-            _ => &self.pipeline_matvec,
+        let (pipeline, rows_per_simd) = match weight.dtype {
+            // Q4: single-row SIMD (1 row per SIMD group) — dequant is heavy
+            // enough that multi-row would cause register spilling.
+            TensorDtype::Q4 => (&self.pipeline_matvec_q4, 1u64),
+            // BF16: multi-row SIMD (2 rows per SIMD group) — x loaded once,
+            // used for both rows, giving free ILP via independent accumulators.
+            _ => (&self.pipeline_matvec, ROWS_PER_SIMD_BF16),
         };
+        let num_simd_groups = (m as u64 + rows_per_simd - 1) / rows_per_simd;
         self.dispatch_async(
             pipeline,
             &params,
             &[(&weight.buffer, 1), (&input.buffer, 2), (&out.buffer, 3)],
-            MTLSize::new(m as u64 * 32, 1, 1),
+            MTLSize::new(num_simd_groups * 32, 1, 1),
             MTLSize::new(256, 1, 1),
         );
     }
