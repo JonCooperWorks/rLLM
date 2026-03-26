@@ -89,45 +89,45 @@ paper proves unbiasedness and bounded variance.
 
 ### Economics
 
-KV cache is the dominant memory cost during serving.  Each active sequence
-holds its cache for the entire generation lifetime, so KV memory directly
-limits either the number of concurrent users or the context length you can
-offer — the two dimensions that determine revenue per GPU.
+KV cache memory is the primary constraint on concurrent request throughput.
+Each active sequence holds its KV cache for the duration of generation —
+for a 100-token prompt generating 500 tokens, that's 600 positions × num_layers
+× 2 (K+V) × num_kv_heads × head_dim × 2 bytes.
 
-TurboQuant 4-bit cuts KV memory ~4x with no quality loss.  That means
-~4x more concurrent sequences at the same context length, or ~4x longer
-contexts at the same concurrency, or any point in between.
+**Concrete example** (Qwen 3.5 9B, 32 layers, 4 KV heads, head_dim=256):
+- BF16: 600 × 32 × 2 × 4 × 256 × 2 = 100 MB per sequence
+- TurboQuant 4-bit: 600 × 32 × 2 × 4 × 130 = 20 MB per sequence (~5x less)
 
-**Concrete example** (Qwen 3.5 9B, 32 layers, 4 KV heads, head_dim=256,
-64 GB M4 Max, ~40 GB available after weights):
-
-| Mode | Per-sequence (600 pos) | Max concurrent | 8K-context sequences |
-|------|----------------------|----------------|---------------------|
-| BF16 | 100 MB | ~400 | ~30 |
-| TurboQuant 4-bit | 20 MB | ~2,000 | ~150 |
-
-For long-context workloads the savings compound — at 32K tokens a single
-BF16 sequence would consume ~5.3 GB, while TurboQuant keeps it under 1.1 GB.
+On a 64GB M4 Max after loading 9B weights (~18 GB), ~40 GB remains for KV cache.
+That's **400 concurrent sequences** with TurboQuant vs **~400** with BF16 but
+at much shorter context.  For long-context workloads (8K+ tokens), the savings
+compound — TurboQuant enables sequences that wouldn't fit at all in BF16.
 
 ### Prefill vs Decode
 
-Prefill uses full BF16 Q/K/V for attention — zero quality loss.  K/V are
-quantized into the paged pool only for future decode reads.  Decode reads
-from the quantized cache with inline dequantization.  4-bit output has been
-verified identical to BF16 across Llama, Qwen 2.5, and Qwen 3.5 families.
+During **prefill** (processing the prompt), K/V are quantized into the paged pool
+but attention uses the full BF16 Q/K/V directly.  There is no quality loss during
+prefill — quantization only affects the stored cache.
+
+During **decode** (generating tokens), attention reads from the quantized cache
+using inline dequantization.  The 4-bit mode has been verified to produce
+identical output to BF16 across Llama, Qwen 2.5, and Qwen 3.5 model families.
 
 ### Hybrid Architectures
 
-TurboQuant applies only to standard GQA attention layers.  Non-standard layers
-(e.g., Qwen 3.5's DeltaNet linear attention) maintain their own recurrent state
-and never interact with the quantized KV pool.
+Models with non-standard attention layers (e.g., Qwen 3.5's DeltaNet linear
+attention) are handled correctly: TurboQuant is only applied to standard GQA
+attention layers.  DeltaNet layers maintain their own recurrent state and never
+interact with the quantized KV pool.
 
 ### Code Packing
 
-Sub-byte codes (2-4 bits) share device memory bytes across GPU threads.  Naive
-read-modify-write causes silent data races on Apple Silicon SIMD groups.  The
-`pack_codes_shared()` helper avoids this by collecting codes in threadgroup
-shared memory and having each thread write one complete byte.
+Sub-byte quantization codes (2-4 bits) share device memory bytes across GPU
+threads.  Naive per-thread read-modify-write causes data races on Apple Silicon
+SIMD groups — the GPU deterministically picks one lane's write, silently zeroing
+the other threads' codes.  The `pack_codes_shared()` helper avoids this by
+collecting all codes in threadgroup shared memory and having each thread write
+one complete byte.
 
 ## Architecture
 
