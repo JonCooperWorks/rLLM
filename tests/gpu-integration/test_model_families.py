@@ -65,9 +65,45 @@ TURBOQUANT_CONFIGS = [
     ModelConfig("no-kv-quant-llama", "llama-3.2-1b-instruct", "Llama", extra_args=("--kv-quant", "none")),
 ]
 
-# The prompt used for all inference tests.  Factual, short, easy for any model.
-PROMPT = "Explain what a hash table is in two sentences."
-MAX_TOKENS = 128
+# Varied prompts that exercise different generation patterns.  Each model
+# family test uses a different prompt so we're not just testing one pattern.
+# All are factual / instructional — any instruction-tuned model should handle
+# them, and the output is easy to validate for English coherence.
+PROMPTS = [
+    # Short factual — tests basic instruction following.
+    "Explain what a hash table is in two sentences.",
+    # Longer expository — tests sustained multi-paragraph generation.
+    "Write a short paragraph explaining how the internet works, from typing "
+    "a URL in a browser to seeing the webpage.  Include DNS, TCP, and HTTP.",
+    # Enumeration / structured — tests list generation and formatting.
+    "List five common sorting algorithms and give a one-sentence description "
+    "of how each one works.",
+    # Reasoning / comparison — tests coherent argumentation.
+    "Compare and contrast Python and Rust.  What are the strengths and "
+    "weaknesses of each language?  Give concrete examples.",
+    # Creative but bounded — tests fluency without drifting into gibberish.
+    "Write a short story in exactly three sentences about a robot that "
+    "discovers it can dream.",
+    # Technical explanation — tests domain vocabulary coherence.
+    "Explain how public-key cryptography works.  Include the roles of the "
+    "public key, private key, and why it is difficult to reverse.",
+    # Step-by-step — tests sequential reasoning.
+    "Walk me through the steps to deploy a web application to a cloud "
+    "provider.  Cover DNS setup, containerisation, and monitoring.",
+    # Concise summary — tests compression and accuracy.
+    "Summarise the key ideas behind MapReduce in a few sentences.",
+    # Multi-part question — tests handling compound prompts.
+    "What is gradient descent?  Why is the learning rate important?  "
+    "What happens if it is set too high or too low?",
+    # Opinion / analysis — tests balanced generation.
+    "What are the trade-offs between microservices and monolithic "
+    "architectures?  When would you choose one over the other?",
+]
+
+# Realistic max_tokens — long enough to exercise sustained generation and
+# KV cache behavior (prefill + many decode steps), but not so long that
+# tests take forever.  512 tokens is ~400 words, a solid paragraph or two.
+MAX_TOKENS = 512
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +126,11 @@ def _build_extra_args(config: ModelConfig, is_q4: bool) -> list[str]:
     return args
 
 
+def _prompt_for_index(index: int) -> str:
+    """Return a prompt from the PROMPTS list, cycling if index exceeds length."""
+    return PROMPTS[index % len(PROMPTS)]
+
+
 def _chat_completion(base_url: str, prompt: str, max_tokens: int = MAX_TOKENS,
                      temperature: float = 0, stream: bool = False) -> requests.Response:
     """Send an OpenAI-format chat completion request."""
@@ -101,7 +142,7 @@ def _chat_completion(base_url: str, prompt: str, max_tokens: int = MAX_TOKENS,
             "temperature": temperature,
             "stream": stream,
         },
-        timeout=120,
+        timeout=300,
         stream=stream,
     )
 
@@ -117,7 +158,7 @@ def _anthropic_message(base_url: str, prompt: str, max_tokens: int = MAX_TOKENS,
             "temperature": temperature,
             "stream": stream,
         },
-        timeout=120,
+        timeout=300,
         stream=stream,
     )
 
@@ -170,9 +211,17 @@ def _collect_anthropic_sse_content(response: requests.Response) -> tuple[str, in
 # ---------------------------------------------------------------------------
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("config", BASE_MODELS, ids=lambda c: c.test_id)
-def test_model_bf16(config, server_manager, models_dir):
-    """Each model family produces coherent English via the OpenAI API."""
+@pytest.mark.parametrize(
+    "config_index", range(len(BASE_MODELS)),
+    ids=[c.test_id for c in BASE_MODELS],
+)
+def test_model_bf16(config_index, server_manager, models_dir):
+    """Each model family produces coherent English via the OpenAI API.
+
+    Each model gets a different prompt from the PROMPTS list so we exercise
+    varied generation patterns across the suite.
+    """
+    config = BASE_MODELS[config_index]
     model_dir = _resolve_model_dir(models_dir, config)
     if model_dir is None:
         pytest.skip(f"model not found: {config.model_name}")
@@ -180,7 +229,8 @@ def test_model_bf16(config, server_manager, models_dir):
     extra_args = _build_extra_args(config, is_q4=False)
     base_url = server_manager.get_or_start(str(model_dir), extra_args)
 
-    resp = _chat_completion(base_url, PROMPT)
+    prompt = _prompt_for_index(config_index)
+    resp = _chat_completion(base_url, prompt)
     assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text[:500]}"
 
     body = resp.json()
@@ -191,13 +241,24 @@ def test_model_bf16(config, server_manager, models_dir):
     assert len(content.strip()) > 0, "empty response"
 
     ok, reason = check_coherence(content)
-    assert ok, f"coherence check failed for {config.test_id}: {reason}\nOutput: {content[:500]}"
+    assert ok, (
+        f"coherence check failed for {config.test_id}: {reason}\n"
+        f"Prompt: {prompt}\nOutput: {content[:500]}"
+    )
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("config", BASE_MODELS, ids=lambda c: f"{c.test_id}-q4")
-def test_model_q4(config, server_manager, models_dir):
-    """Q4-quantized variant of each model family (skipped if not quantized)."""
+@pytest.mark.parametrize(
+    "config_index", range(len(BASE_MODELS)),
+    ids=[f"{c.test_id}-q4" for c in BASE_MODELS],
+)
+def test_model_q4(config_index, server_manager, models_dir):
+    """Q4-quantized variant of each model family (skipped if not quantized).
+
+    Uses a different prompt than the bf16 test (offset by 5) so each model
+    is tested with two distinct prompts across bf16 and Q4.
+    """
+    config = BASE_MODELS[config_index]
     model_dir = _resolve_model_dir(models_dir, config, q4=True)
     if model_dir is None:
         pytest.skip(f"Q4 model not found: {config.model_name}-q4")
@@ -205,7 +266,8 @@ def test_model_q4(config, server_manager, models_dir):
     extra_args = _build_extra_args(config, is_q4=True)
     base_url = server_manager.get_or_start(str(model_dir), extra_args)
 
-    resp = _chat_completion(base_url, PROMPT)
+    prompt = _prompt_for_index(config_index + 5)
+    resp = _chat_completion(base_url, prompt)
     assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text[:500]}"
 
     body = resp.json()
@@ -215,7 +277,10 @@ def test_model_q4(config, server_manager, models_dir):
     assert usage.get("completion_tokens", 0) > 0, "no tokens generated"
 
     ok, reason = check_coherence(content)
-    assert ok, f"coherence check failed for {config.test_id}-q4: {reason}\nOutput: {content[:500]}"
+    assert ok, (
+        f"coherence check failed for {config.test_id}-q4: {reason}\n"
+        f"Prompt: {prompt}\nOutput: {content[:500]}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -223,23 +288,36 @@ def test_model_q4(config, server_manager, models_dir):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("config", TURBOQUANT_CONFIGS, ids=lambda c: c.test_id)
-def test_turboquant(config, server_manager, models_dir):
-    """Different KV cache quantization modes produce coherent output."""
+@pytest.mark.parametrize(
+    "config_index", range(len(TURBOQUANT_CONFIGS)),
+    ids=[c.test_id for c in TURBOQUANT_CONFIGS],
+)
+def test_turboquant(config_index, server_manager, models_dir):
+    """Different KV cache quantization modes produce coherent output.
+
+    Tests turbo4 (default 4-bit), turbo2 (aggressive 2-bit), and none
+    (BF16 baseline) on the same model with different prompts.  512 tokens
+    exercises the KV cache across many decode steps.
+    """
+    config = TURBOQUANT_CONFIGS[config_index]
     model_dir = _resolve_model_dir(models_dir, config)
     if model_dir is None:
         pytest.skip(f"model not found: {config.model_name}")
 
     base_url = server_manager.get_or_start(str(model_dir), list(config.extra_args))
 
-    resp = _chat_completion(base_url, PROMPT)
+    prompt = _prompt_for_index(config_index + 3)
+    resp = _chat_completion(base_url, prompt)
     assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text[:500]}"
 
     body = resp.json()
     content = body["choices"][0]["message"]["content"]
 
     ok, reason = check_coherence(content)
-    assert ok, f"coherence check failed for {config.test_id}: {reason}\nOutput: {content[:500]}"
+    assert ok, (
+        f"coherence check failed for {config.test_id}: {reason}\n"
+        f"Prompt: {prompt}\nOutput: {content[:500]}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -248,14 +326,19 @@ def test_turboquant(config, server_manager, models_dir):
 
 @pytest.mark.gpu
 def test_openai_streaming(server_manager, models_dir):
-    """OpenAI-format SSE streaming returns incremental chunks of coherent text."""
+    """OpenAI-format SSE streaming returns incremental chunks of coherent text.
+
+    Uses the expository internet prompt at 512 tokens to exercise sustained
+    streaming over many decode steps.
+    """
     model_dir = _resolve_model_dir(models_dir, BASE_MODELS[0])  # Llama 1B
     if model_dir is None:
         pytest.skip("llama-3.2-1b-instruct not found")
 
     base_url = server_manager.get_or_start(str(model_dir), [])
 
-    resp = _chat_completion(base_url, PROMPT, stream=True)
+    prompt = PROMPTS[1]  # Internet / DNS / TCP / HTTP — longer response expected.
+    resp = _chat_completion(base_url, prompt, stream=True)
     assert resp.status_code == 200
 
     content, chunk_count = _collect_sse_content(resp)
@@ -269,14 +352,18 @@ def test_openai_streaming(server_manager, models_dir):
 
 @pytest.mark.gpu
 def test_anthropic_streaming(server_manager, models_dir):
-    """Anthropic-format SSE streaming returns incremental chunks."""
+    """Anthropic-format SSE streaming returns incremental chunks.
+
+    Uses the sorting algorithms prompt to exercise list-style generation.
+    """
     model_dir = _resolve_model_dir(models_dir, BASE_MODELS[0])  # Llama 1B
     if model_dir is None:
         pytest.skip("llama-3.2-1b-instruct not found")
 
     base_url = server_manager.get_or_start(str(model_dir), [])
 
-    resp = _anthropic_message(base_url, PROMPT, stream=True)
+    prompt = PROMPTS[2]  # Sorting algorithms enumeration.
+    resp = _anthropic_message(base_url, prompt, stream=True)
     assert resp.status_code == 200
 
     content, chunk_count = _collect_anthropic_sse_content(resp)
@@ -294,14 +381,19 @@ def test_anthropic_streaming(server_manager, models_dir):
 
 @pytest.mark.gpu
 def test_anthropic_api(server_manager, models_dir):
-    """Anthropic /v1/messages endpoint returns coherent response."""
+    """Anthropic /v1/messages endpoint returns coherent response.
+
+    Uses the public-key cryptography prompt — a technical explanation that
+    any model should handle coherently at 512 tokens.
+    """
     model_dir = _resolve_model_dir(models_dir, BASE_MODELS[0])  # Llama 1B
     if model_dir is None:
         pytest.skip("llama-3.2-1b-instruct not found")
 
     base_url = server_manager.get_or_start(str(model_dir), [])
 
-    resp = _anthropic_message(base_url, PROMPT)
+    prompt = PROMPTS[5]  # Public-key cryptography.
+    resp = _anthropic_message(base_url, prompt)
     assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text[:500]}"
 
     body = resp.json()
