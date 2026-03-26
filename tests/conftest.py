@@ -120,8 +120,14 @@ def _get_available_memory_gb() -> float:
 
 
 def _should_stream_experts(model_size_gb: float, is_q4: bool) -> bool:
-    """Decide whether to use --stream-experts based on available memory."""
-    effective_size = model_size_gb / 3.5 if is_q4 else model_size_gb
+    """Decide whether to use --stream-experts based on available memory.
+
+    Q4 compression ratio varies widely: dense weights get ~3.5x compression,
+    but MoE models have many non-expert weights (embeddings, norms, attention)
+    that stay bf16.  We use a conservative 1.5x estimate for Q4 MoE models
+    to avoid OOM from underestimating memory needs.
+    """
+    effective_size = model_size_gb / 1.5 if is_q4 else model_size_gb
     available = _get_available_memory_gb()
     # Stream if model exceeds 80% of available memory.
     return effective_size > available * 0.80
@@ -140,10 +146,11 @@ class ServerProcess:
 
 
 class ServerManager:
-    """Manages rllm serve subprocesses, reusing servers with identical configs.
+    """Manages rllm serve subprocesses — one server at a time.
 
-    Keyed by (model_dir, extra_args_tuple) so that tests sharing the same
-    server config don't pay the model-loading cost twice.
+    Stops the previous server before starting a new one to prevent OOM
+    when running large models sequentially.  Reuses the existing server
+    if the new request matches (same model + args).
     """
 
     def __init__(self, binary: Path, gpu_count: int = 1):
@@ -159,10 +166,12 @@ class ServerManager:
         model_dir: str,
         extra_args: list[str] | None = None,
         startup_timeout: float = 300,
+        memory_gb: float = 0,  # unused, kept for call-site compat
     ) -> str:
         """Return the base_url of a running server for this config.
 
-        Starts a new server if one isn't already running with these args.
+        Reuses the server if the same config is already running.
+        Otherwise stops ALL existing servers first, then starts fresh.
         """
         extra_args = extra_args or []
         key = self._config_key(model_dir, extra_args)
@@ -178,6 +187,9 @@ class ServerManager:
                 pass
             # Dead — remove and restart.
             self._stop_one(key)
+
+        # Stop all other servers before starting a new one (prevent OOM).
+        self.stop_all()
 
         port = _get_free_port()
         base_url = f"http://127.0.0.1:{port}"

@@ -1287,25 +1287,43 @@ fn load_fused_qkv_attention<B: GpuCore>(
     Option<B::Tensor>, // linear_norm, attn_z_proj
 )> {
     let fused_dim = q_dim + 2 * kv_dim;
-    let view = store.tensor(&format!("{prefix}.self_attn.qkv_proj.weight"))?;
+    let qkv_name = format!("{prefix}.self_attn.qkv_proj.weight");
+    let view = store.tensor(&qkv_name)?;
     let raw = view.data();
-    anyhow::ensure!(
-        view.shape() == [fused_dim, hidden],
-        "qkv_proj shape mismatch: expected [{}, {}], got {:?}",
-        fused_dim,
-        hidden,
-        view.shape()
-    );
-    let row_bytes = hidden * 2; // bf16
+
+    // Handle both BF16 and pre-quantized Q4 formats.
+    // Q4 tensors are stored as flat U8 byte arrays in safetensors, so shape
+    // check must use the logical shape from the Q4 map, not view.shape().
+    let is_q4 = store.q4_shape(&qkv_name).is_some();
+    if is_q4 {
+        let expected_bytes = crate::gpu::q4_byte_count(fused_dim, hidden);
+        anyhow::ensure!(
+            raw.len() == expected_bytes,
+            "qkv_proj Q4 byte count mismatch: expected {expected_bytes}, got {}",
+            raw.len()
+        );
+    } else {
+        anyhow::ensure!(
+            view.shape() == [fused_dim, hidden],
+            "qkv_proj shape mismatch: expected [{}, {}], got {:?}",
+            fused_dim,
+            hidden,
+            view.shape()
+        );
+    }
+
+    // Row byte stride: Q4 blocks are 18 bytes per 32 weights.
+    let row_bytes = if is_q4 { (hidden / 32) * 18 } else { hidden * 2 };
     let q_bytes = q_dim * row_bytes;
     let kv_bytes = kv_dim * row_bytes;
     let q_raw = &raw[..q_bytes];
     let k_raw = &raw[q_bytes..q_bytes + kv_bytes];
     let v_raw = &raw[q_bytes + kv_bytes..q_bytes + 2 * kv_bytes];
 
-    let qp = upload_raw_bf16(backend, q_raw, &[q_dim, hidden]);
-    let kp = upload_raw_bf16(backend, k_raw, &[kv_dim, hidden]);
-    let vp = upload_raw_bf16(backend, v_raw, &[kv_dim, hidden]);
+    let dtype = if is_q4 { TensorDtype::Q4 } else { TensorDtype::BF16 };
+    let qp = backend.upload_tensor(q_raw, &[q_dim, hidden], dtype);
+    let kp = backend.upload_tensor(k_raw, &[kv_dim, hidden], dtype);
+    let vp = backend.upload_tensor(v_raw, &[kv_dim, hidden], dtype);
     let op = upload_tensor(
         store,
         backend,
@@ -1489,22 +1507,34 @@ fn load_ffn_weights<B: GpuCore>(
         // kernel launch vs two separate matmuls.  We split on load instead so
         // our forward pass stays architecture-generic.
         // -----------------------------------------------------------------
-        let view = store.tensor(&format!("{prefix}.mlp.gate_up_proj.weight"))?;
+        let gate_up_name = format!("{prefix}.mlp.gate_up_proj.weight");
+        let view = store.tensor(&gate_up_name)?;
         let raw = view.data();
-        anyhow::ensure!(
-            view.shape() == [2 * inter, hidden],
-            "gate_up_proj shape mismatch: expected [{}, {}], got {:?}",
-            2 * inter,
-            hidden,
-            view.shape()
-        );
-        let row_bytes = hidden * 2; // bf16
+        let is_q4 = store.q4_shape(&gate_up_name).is_some();
+        if is_q4 {
+            let expected_bytes = crate::gpu::q4_byte_count(2 * inter, hidden);
+            anyhow::ensure!(
+                raw.len() == expected_bytes,
+                "gate_up_proj Q4 byte count mismatch: expected {expected_bytes}, got {}",
+                raw.len()
+            );
+        } else {
+            anyhow::ensure!(
+                view.shape() == [2 * inter, hidden],
+                "gate_up_proj shape mismatch: expected [{}, {}], got {:?}",
+                2 * inter,
+                hidden,
+                view.shape()
+            );
+        }
+        let row_bytes = if is_q4 { (hidden / 32) * 18 } else { hidden * 2 };
         let half = inter * row_bytes;
         let gate_raw = &raw[..half];
         let up_raw = &raw[half..2 * half];
 
-        let gate = upload_raw_bf16(backend, gate_raw, &[inter, hidden]);
-        let up = upload_raw_bf16(backend, up_raw, &[inter, hidden]);
+        let dtype = if is_q4 { TensorDtype::Q4 } else { TensorDtype::BF16 };
+        let gate = backend.upload_tensor(gate_raw, &[inter, hidden], dtype);
+        let up = backend.upload_tensor(up_raw, &[inter, hidden], dtype);
         let down = upload_tensor(
             store,
             backend,
