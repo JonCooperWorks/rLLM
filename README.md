@@ -375,7 +375,6 @@ rLLM can run MoE models that far exceed GPU memory by streaming expert weights f
 | `scripts/install-rust.sh` | Install Rust via rustup |
 | `scripts/download-models.sh` | Download model weights from HuggingFace |
 | `scripts/benchmark.sh` | Benchmark all downloaded models (bf16 + Q4) |
-| `scripts/bench-turboquant.sh` | TurboQuant A/B benchmark (turbo4 vs none) |
 
 ```bash
 # Quick setup on a fresh machine
