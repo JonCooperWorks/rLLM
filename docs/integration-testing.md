@@ -225,14 +225,94 @@ Tests skip gracefully when prerequisites are missing:
 
 ---
 
+## Benchmarking
+
+The same infrastructure supports benchmarking every model in the models
+directory, measuring time-to-first-token (TTFT) and generation throughput
+(tok/s) via the HTTP API.  Unlike `scripts/benchmark.sh` which uses
+`rllm run` (CLI), this benchmark uses `rllm serve` and measures through the
+actual HTTP endpoint — capturing the full end-to-end latency users experience.
+
+### Quick Start
+
+```bash
+# Benchmark all models in models/ (bf16 + Q4):
+tests/gpu-integration/run.sh --bench
+
+# 3 runs per model, averaged:
+tests/gpu-integration/run.sh --bench --bench-runs 3
+
+# Longer generation (512 tokens):
+tests/gpu-integration/run.sh --bench --bench-tokens 512
+
+# Only Q4 variants:
+tests/gpu-integration/run.sh --bench --q4-only
+
+# Only models matching "llama":
+tests/gpu-integration/run.sh --bench --bench-filter llama
+
+# Save markdown results to file:
+tests/gpu-integration/run.sh --bench --bench-output results.md
+
+# Skip build/download if already ready:
+tests/gpu-integration/run.sh --bench --skip-build --skip-download --skip-quantize
+```
+
+Or run the benchmark script directly:
+
+```bash
+python tests/gpu-integration/bench.py --max-tokens 128 --runs 3
+python tests/gpu-integration/bench.py --filter qwen --q4-only --output results.md
+```
+
+### What It Measures
+
+| Metric | How |
+|--------|-----|
+| **TTFT** (ms) | Wall-clock time from HTTP request to first SSE content chunk |
+| **tok/s** | `completion_tokens / (last_chunk_time - first_chunk_time)` |
+
+Both use SSE streaming (`stream: true`) so TTFT reflects actual
+time-to-first-token through the full stack (tokenization → prefill → first
+decode → HTTP response).
+
+### Output Format
+
+Markdown table matching the style of `scripts/benchmark.sh`:
+
+```
+## Benchmark Results — Apple M4 Max
+Max tokens: 128 | Runs: 3
+
+| Model | Family | tok/s | TTFT |
+|---|---|---|---|
+| llama-3.2-1b-instruct | Llama | 142.3 tok/s | 45 ms |
+| llama-3.2-1b-instruct-q4 | Llama | 148.1 tok/s | 38 ms |
+| qwen2.5-3b-instruct | Qwen2 | 98.7 tok/s | 82 ms |
+| ...
+```
+
+### Benchmark vs Tests
+
+| | Tests (`run.sh`) | Benchmark (`run.sh --bench`) |
+|---|---|---|
+| **Purpose** | Correctness — is output coherent? | Performance — how fast? |
+| **Models** | One per family (smallest) | Every model found in models/ |
+| **Checks** | Coherence, usage, API format | TTFT, tok/s |
+| **Max tokens** | 512 | 128 (configurable) |
+| **Temperature** | 0 (deterministic) | 0 (deterministic) |
+
+---
+
 ## Files
 
 ```
 tests/gpu-integration/
-├── run.sh                  — one-command wrapper (build, download, quantize, test)
+├── run.sh                  — one-command wrapper (build, download, quantize, test/bench)
 ├── requirements.txt        — Python dependencies
 ├── conftest.py             — fixtures: server lifecycle, GPU detection, memory
 ├── coherence.py            — English coherence validation (langdetect + heuristics)
+├── bench.py                — benchmark script (TTFT + tok/s via HTTP API)
 └── test_model_families.py  — parametrized tests for all families and features
 ```
 
@@ -241,8 +321,9 @@ tests/gpu-integration/
 ## Adding a New Model Family
 
 1. Add a `ModelConfig` entry to `BASE_MODELS` in `test_model_families.py`.
-2. Add the model to `scripts/download-models.sh` in the appropriate tier.
-3. Run the tests — if the model supports chat, it should work with no other changes.
+2. Add the model to `KNOWN_MODELS` in `bench.py` with size/family info.
+3. Add the model to `scripts/download-models.sh` in the appropriate tier.
+4. Run the tests — if the model supports chat, it should work with no other changes.
 
 ---
 

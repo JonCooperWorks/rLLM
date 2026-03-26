@@ -1,7 +1,7 @@
 #!/bin/bash
 # ---------------------------------------------------------------------------
 # run.sh — convenience script to build rLLM, download models, optionally
-# quantize to Q4, and run the GPU integration test suite.
+# quantize to Q4, and run the GPU integration test suite or benchmarks.
 #
 # Usage:
 #   tests/gpu-integration/run.sh [options]
@@ -12,6 +12,11 @@
 #   --skip-download  skip model download (assume models already present)
 #   --skip-quantize  skip Q4 quantization step
 #   --skip-build     skip cargo build step
+#   --bench          run benchmarks instead of tests (all models)
+#   --bench-runs N   number of benchmark runs per model (default: 1)
+#   --bench-tokens N max tokens for benchmark (default: 128)
+#   --bench-output F write benchmark markdown to file
+#   --bench-filter P only benchmark models matching pattern
 #   -k EXPR       pass pytest -k filter (e.g., -k llama)
 #   -v            verbose pytest output
 #   --            remaining args passed directly to pytest
@@ -21,7 +26,8 @@
 #   RLLM_BIN          path to rllm binary (default: target/release/rllm)
 #   HF_TOKEN          HuggingFace token for gated model downloads
 #
-# Related: conftest.py, test_model_families.py, scripts/download-models.sh
+# Related: conftest.py, test_model_families.py, bench.py,
+#          scripts/download-models.sh
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -33,6 +39,8 @@ TIER="small"
 SKIP_DOWNLOAD=false
 SKIP_QUANTIZE=false
 SKIP_BUILD=false
+MODE="test"
+BENCH_ARGS=()
 PYTEST_ARGS=()
 
 # Parse arguments.
@@ -43,6 +51,13 @@ while [[ $# -gt 0 ]]; do
     --skip-download)  SKIP_DOWNLOAD=true; shift ;;
     --skip-quantize)  SKIP_QUANTIZE=true; shift ;;
     --skip-build)     SKIP_BUILD=true; shift ;;
+    --bench)          MODE="bench"; shift ;;
+    --bench-runs)     BENCH_ARGS+=("--runs" "$2"); shift 2 ;;
+    --bench-tokens)   BENCH_ARGS+=("--max-tokens" "$2"); shift 2 ;;
+    --bench-output)   BENCH_ARGS+=("--output" "$2"); shift 2 ;;
+    --bench-filter)   BENCH_ARGS+=("--filter" "$2"); shift 2 ;;
+    --q4-only)        BENCH_ARGS+=("--q4-only"); shift ;;
+    --bf16-only)      BENCH_ARGS+=("--bf16-only"); shift ;;
     -k)               PYTEST_ARGS+=("-k" "$2"); shift 2 ;;
     -v|--verbose)     PYTEST_ARGS+=("-v"); shift ;;
     --)               shift; PYTEST_ARGS+=("$@"); break ;;
@@ -114,10 +129,16 @@ echo "=== Installing Python dependencies ==="
 pip install -q -r "$SCRIPT_DIR/requirements.txt"
 echo ""
 
-# ---- 5. Run tests ----------------------------------------------------------
-echo "=== Running GPU integration tests ==="
+# ---- 5. Run tests or benchmarks --------------------------------------------
 export RLLM_MODELS_DIR="$MODELS_DIR"
 export RLLM_BIN="$RLLM_BIN"
 
 cd "$SCRIPT_DIR"
-exec pytest "${PYTEST_ARGS[@]:--v}" .
+
+if [[ "$MODE" == "bench" ]]; then
+  echo "=== Running benchmarks ==="
+  exec python bench.py "${BENCH_ARGS[@]}"
+else
+  echo "=== Running GPU integration tests ==="
+  exec pytest "${PYTEST_ARGS[@]:--v}" .
+fi
