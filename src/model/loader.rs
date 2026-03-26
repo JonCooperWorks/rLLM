@@ -2694,9 +2694,12 @@ pub(crate) fn load_vision_weights<B: GpuCore>(
 
     // Merger / projector.
     let pp = &vc.projector_prefix;
+    // Merger LayerNorm: Qwen uses "norm.weight", Gemma 3 uses "mm_soft_emb_norm.weight".
     let merger_norm_w = store.tensor(&format!("{}norm.weight", pp)).ok()
+        .or_else(|| store.tensor(&format!("{}mm_soft_emb_norm.weight", pp)).ok())
         .map(|v| upload_vision(backend, &v, v.shape()));
     let merger_norm_b = store.tensor(&format!("{}norm.bias", pp)).ok()
+        .or_else(|| store.tensor(&format!("{}mm_soft_emb_norm.bias", pp)).ok())
         .map(|v| upload_vision(backend, &v, v.shape()));
 
     // Merger fc1: for Qwen this is the first layer of the 2-layer MLP.
@@ -2722,7 +2725,30 @@ pub(crate) fn load_vision_weights<B: GpuCore>(
             return None;
         }
     };
-    let merger_fc1_weight = upload_vision(backend, &fc1_view, fc1_view.shape());
+
+    // Gemma 3's mm_input_projection_weight is stored as [in_dim, out_dim] = [1152, 2560],
+    // but our matmul expects [out_dim, in_dim] = [2560, 1152].  Transpose if needed.
+    let fc1_shape = fc1_view.shape();
+    // Gemma 3's mm_input_projection_weight is [in, out] — detect by checking
+    // if the first dim (1152) < second dim (2560).  Qwen's fc1 is square or [out, in].
+    let merger_fc1_weight = if fc1_shape.len() == 2 && fc1_shape[0] < fc1_shape[1] {
+        // Weight is [in, out] — transpose to [out, in] for matmul.
+        let (rows, cols) = (fc1_shape[0], fc1_shape[1]);
+        let src_data = fc1_view.data();
+        let mut transposed = vec![0u8; src_data.len()];
+        let elem_size = 2; // bf16
+        for r in 0..rows {
+            for c in 0..cols {
+                let src_off = (r * cols + c) * elem_size;
+                let dst_off = (c * rows + r) * elem_size;
+                transposed[dst_off..dst_off + elem_size]
+                    .copy_from_slice(&src_data[src_off..src_off + elem_size]);
+            }
+        }
+        backend.upload_tensor(&transposed, &[cols, rows], crate::gpu::TensorDtype::BF16)
+    } else {
+        upload_vision(backend, &fc1_view, fc1_shape)
+    };
 
     // Projector bias: Qwen has one, Gemma 3 does not (uses a separate norm
     // layer instead).  Try the bias name that matches the weight we found.

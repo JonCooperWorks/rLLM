@@ -539,7 +539,7 @@ def test_vision(config_index, server_manager, models_dir):
     # the issue is in the SigLIP encoder itself (wrong projector, positional
     # embeddings, or preprocessing for patch_size=14).
     if config.family == "Gemma3":
-        pytest.xfail("Gemma3 vision encoder produces incorrect embeddings")
+        pytest.xfail("Gemma3 vision: 2D positional embedding indexing not implemented")
 
     model_dir = _resolve_model_dir(models_dir, config)
     if model_dir is None:
@@ -588,7 +588,7 @@ def test_vision_q4(config_index, server_manager, models_dir):
     config = VISION_MODELS[config_index]
 
     if config.family == "Gemma3":
-        pytest.xfail("Gemma3 vision encoder produces incorrect embeddings")
+        pytest.xfail("Gemma3 vision: 2D positional embedding indexing not implemented")
 
     model_dir = _resolve_model_dir(models_dir, config, q4=True)
     if model_dir is None:

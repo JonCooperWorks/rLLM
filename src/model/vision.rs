@@ -725,7 +725,15 @@ pub(crate) fn vision_encode<B: GpuBackend>(
             }
         }
     } else {
-        // Gemma: simple linear projection [N, 1152] → [N, hidden_size].
+        // Gemma 3: normalize (mm_soft_emb_norm) → linear projection.
+        // The norm is applied to the raw ViT output before the single-layer
+        // projector, unlike Qwen which fuses norm into the spatial merge.
+        // Gemma 3's mm_soft_emb_norm has weight only (no bias) — use RMSNorm.
+        if let Some(ref nw) = weights.merger_norm_weight {
+            backend.rms_norm_batch(src_buf, nw, 1e-6, src_buf, n as u32);
+        }
+
+        // Linear projection [N, 1152] → [N, hidden_size].
         backend.matmul_batch(
             &weights.merger_fc1_weight, src_buf, &bufs.proj_out,
             config.out_hidden_size as u32, hd as u32, n as u32,
