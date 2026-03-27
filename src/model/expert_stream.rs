@@ -96,8 +96,13 @@ unsafe impl Sync for SendPtr {}
 
 #[derive(Clone)]
 pub(crate) struct ExpertLocation {
-    /// Shard index for gate_up_proj tensor (into shard_files vec).
+    /// Shard index for gate projection (into shard_files vec).
     pub shard_gate_up: usize,
+    /// Shard index for up projection (may differ from gate for per-expert models).
+    ///
+    /// Mixtral Q4 occasionally splits gate and up across shards at shard
+    /// boundaries (e.g. layer 14 expert 1: w1 in shard 1, w3 in shard 2).
+    pub shard_up: usize,
     /// Shard index for down_proj tensor.
     pub shard_down: usize,
     /// File byte offset of this expert's gate projection data.
@@ -118,10 +123,11 @@ impl ExpertLocation {
     /// Whether gate and up projections are contiguous on disk.
     ///
     /// True for Qwen3.5's fused gate_up_proj format, where gate and up are
-    /// stacked along dim 0 within a single tensor.  When contiguous, we can
-    /// read both in a single pread() instead of two — halving NVMe commands.
+    /// stacked along dim 0 within a single tensor.  When contiguous AND in
+    /// the same shard, we can read both in a single pread() instead of two.
     fn gate_up_contiguous(&self) -> bool {
-        self.up_offset == self.gate_offset + self.gate_bytes as u64
+        self.shard_gate_up == self.shard_up
+            && self.up_offset == self.gate_offset + self.gate_bytes as u64
     }
 }
 
@@ -488,7 +494,7 @@ impl<B: GpuCore> ExpertStreamer<B> {
                             loc.gate_offset,
                         )?;
                         pread_exact(
-                            &shard_files[loc.shard_gate_up],
+                            &shard_files[loc.shard_up],
                             &mut gate_up[loc.gate_bytes..loc.gate_bytes + loc.up_bytes],
                             loc.up_offset,
                         )?;
@@ -633,6 +639,7 @@ pub(crate) fn build_fused_expert_index(
 
                     ExpertLocation {
                         shard_gate_up: info.shard_gate_up,
+                        shard_up: info.shard_gate_up, // fused: same tensor → same shard
                         shard_down: info.shard_down,
                         gate_offset: gu_base,
                         up_offset: gu_base + gate_bytes as u64,
@@ -684,6 +691,7 @@ pub(crate) fn build_per_expert_index(
                 .iter()
                 .map(|info| ExpertLocation {
                     shard_gate_up: info.shard_gate,
+                    shard_up: info.shard_up,
                     shard_down: info.shard_down,
                     gate_offset: info.gate_file_offset,
                     up_offset: info.up_file_offset,

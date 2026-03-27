@@ -139,6 +139,8 @@ pub(crate) struct ServerState {
     pub arch: config::ModelArch,
     /// Vision config for image preprocessing (None for text-only models).
     pub vision_config: Option<crate::model::config::VisionConfig>,
+    /// Image placeholder token ID for vision scatter (e.g., <|image_pad|> for Qwen).
+    pub image_token_id: Option<u32>,
     /// Auth provider (None variant when auth is disabled).
     pub auth: auth::AuthProviderKind,
 }
@@ -315,10 +317,10 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         vision_config: _,
     } = spawn_worker(args.model.clone(), args.stream_experts, tp, kv_quant)?;
 
-    // Parse vision config directly from config.json for handler-side image preprocessing.
-    let vision_config = config::ModelConfig::from_file(&args.model.join("config.json"))
-        .ok()
-        .and_then(|c| c.vision);
+    // Parse vision config + image token ID from config.json for handler-side preprocessing.
+    let parsed_config = config::ModelConfig::from_file(&args.model.join("config.json")).ok();
+    let vision_config = parsed_config.as_ref().and_then(|c| c.vision.clone());
+    let image_token_id = parsed_config.as_ref().and_then(|c| c.image_token_id);
 
     // ------------------------------------------------------------------
     // 3. Start HTTP server.
@@ -407,6 +409,7 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         tokenizer,
         arch,
         vision_config,
+        image_token_id,
         auth: auth_provider,
     });
 

@@ -311,13 +311,23 @@ pub(crate) async fn chat_completions(
 
     // Tokenize on the async handler thread (CPU-only, doesn't block GPU).
     // Use thinking-aware encoding if thinking was requested.
-    let prompt_tokens = state
+    let mut prompt_tokens = state
         .tokenizer
         .encode_messages_with_thinking(&messages, state.arch, thinking_requested)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // Preprocess images from the last user message (if any) for vision models.
     let images = super::preprocess_images(&messages, state.vision_config.as_ref());
+
+    // Expand vision placeholders: the chat template inserts ONE placeholder per image,
+    // but the scatter kernel needs N (one per vision encoder output token).
+    if !images.is_empty() {
+        if let Some(image_token_id) = state.image_token_id {
+            crate::model::vision::expand_vision_placeholders(
+                &mut prompt_tokens, image_token_id, &images,
+            );
+        }
+    }
 
     let (response_tx, response_rx) = tokio::sync::mpsc::channel(64);
 

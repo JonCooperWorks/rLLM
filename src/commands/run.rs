@@ -36,7 +36,7 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
         .map(|p| std::fs::read(p))
         .transpose()?;
 
-    super::load_model_and_run(&args.model, 1, |eng, arch, processed_images| {
+    super::load_model_and_run(&args.model, 1, |eng, arch, processed_images, image_token_id| {
         let tokens = super::encode_prompt(
             eng,
             arch,
@@ -44,6 +44,8 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
             chat,
             &system,
             image_data.as_deref(),
+            image_token_id,
+            processed_images,
         )?;
         if chat {
             eprintln!("chat template applied ({:?})", arch);

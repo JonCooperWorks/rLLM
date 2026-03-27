@@ -156,11 +156,11 @@ kernel void fused_gate_up_swiglu_q4(
 
             for (uint block_idx = block_start + lane; block_idx < block_end; block_idx += 32) {
                 device const uchar* g_ptr = gate_row + block_idx * bytes_per_block;
-                float g_scale = float(*((device const half*)g_ptr));
+                float g_scale = float(*((device const bfloat*)g_ptr));
                 device const uchar* g_data = g_ptr + 2;
 
                 device const uchar* u_ptr = up_row + block_idx * bytes_per_block;
-                float u_scale = float(*((device const half*)u_ptr));
+                float u_scale = float(*((device const bfloat*)u_ptr));
                 device const uchar* u_data = u_ptr + 2;
 
                 uint x_local = (block_idx * 32) - tile;

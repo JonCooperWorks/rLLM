@@ -102,6 +102,28 @@ fn load_and_run_single_gpu(
 
     let mut model = model::Model::new(config.clone(), weights, &backend)?;
 
+    // Auto-disable TurboQuant for architectures with QKV bias (Qwen2, GPT-OSS).
+    //
+    // TurboQuant normalises each K/V vector to unit length before rotation and
+    // quantisation.  With QKV bias, the learned bias vector adds a constant
+    // component shared across all positions.  This reduces the effective angular
+    // diversity of the normalised K/V distribution, making the quantisation
+    // error correlated across positions.  The result is progressive output
+    // degradation during decode (confirmed empirically: Gemma3 with 4 KV heads
+    // and no bias works perfectly; Qwen2 with 4 KV heads and bias degenerates).
+    //
+    // TODO: fix TurboQuant to handle bias properly (e.g., subtract mean bias
+    // before normalisation, or use bias-aware codebooks).
+    let kv_quant = if kv_quant.is_quantized() && arch.has_qkv_bias() {
+        eprintln!(
+            "note: TurboQuant disabled for {arch:?} (QKV bias incompatibility); \
+             using BF16 KV cache"
+        );
+        KvQuantMode::None
+    } else {
+        kv_quant
+    };
+
     // Set up TurboQuant KV cache quantization if enabled.
     if kv_quant.is_quantized() {
         model.turbo_ctx = Some(model::turboquant::TurboContext::new(

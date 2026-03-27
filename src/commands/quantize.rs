@@ -243,6 +243,8 @@ fn should_quantize(name: &str, shape: &[usize], dtype: safetensors::Dtype) -> bo
             let proj_names = [
                 "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",
                 "in_proj", "out_proj", "lm_head",
+                // Mixtral MoE expert weights (w1=gate, w2=down, w3=up).
+                "w1", "w2", "w3",
             ];
             proj_names.iter().any(|p| name.contains(p))
         }

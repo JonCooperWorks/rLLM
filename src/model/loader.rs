@@ -1287,25 +1287,43 @@ fn load_fused_qkv_attention<B: GpuCore>(
     Option<B::Tensor>, // linear_norm, attn_z_proj
 )> {
     let fused_dim = q_dim + 2 * kv_dim;
-    let view = store.tensor(&format!("{prefix}.self_attn.qkv_proj.weight"))?;
+    let qkv_name = format!("{prefix}.self_attn.qkv_proj.weight");
+    let view = store.tensor(&qkv_name)?;
     let raw = view.data();
-    anyhow::ensure!(
-        view.shape() == [fused_dim, hidden],
-        "qkv_proj shape mismatch: expected [{}, {}], got {:?}",
-        fused_dim,
-        hidden,
-        view.shape()
-    );
-    let row_bytes = hidden * 2; // bf16
+
+    // Handle both BF16 and pre-quantized Q4 formats.
+    // Q4 tensors are stored as flat U8 byte arrays in safetensors, so shape
+    // check must use the logical shape from the Q4 map, not view.shape().
+    let is_q4 = store.q4_shape(&qkv_name).is_some();
+    if is_q4 {
+        let expected_bytes = crate::gpu::q4_byte_count(fused_dim, hidden);
+        anyhow::ensure!(
+            raw.len() == expected_bytes,
+            "qkv_proj Q4 byte count mismatch: expected {expected_bytes}, got {}",
+            raw.len()
+        );
+    } else {
+        anyhow::ensure!(
+            view.shape() == [fused_dim, hidden],
+            "qkv_proj shape mismatch: expected [{}, {}], got {:?}",
+            fused_dim,
+            hidden,
+            view.shape()
+        );
+    }
+
+    // Row byte stride: Q4 blocks are 18 bytes per 32 weights.
+    let row_bytes = if is_q4 { (hidden / 32) * 18 } else { hidden * 2 };
     let q_bytes = q_dim * row_bytes;
     let kv_bytes = kv_dim * row_bytes;
     let q_raw = &raw[..q_bytes];
     let k_raw = &raw[q_bytes..q_bytes + kv_bytes];
     let v_raw = &raw[q_bytes + kv_bytes..q_bytes + 2 * kv_bytes];
 
-    let qp = upload_raw_bf16(backend, q_raw, &[q_dim, hidden]);
-    let kp = upload_raw_bf16(backend, k_raw, &[kv_dim, hidden]);
-    let vp = upload_raw_bf16(backend, v_raw, &[kv_dim, hidden]);
+    let dtype = if is_q4 { TensorDtype::Q4 } else { TensorDtype::BF16 };
+    let qp = backend.upload_tensor(q_raw, &[q_dim, hidden], dtype);
+    let kp = backend.upload_tensor(k_raw, &[kv_dim, hidden], dtype);
+    let vp = backend.upload_tensor(v_raw, &[kv_dim, hidden], dtype);
     let op = upload_tensor(
         store,
         backend,
@@ -1489,22 +1507,34 @@ fn load_ffn_weights<B: GpuCore>(
         // kernel launch vs two separate matmuls.  We split on load instead so
         // our forward pass stays architecture-generic.
         // -----------------------------------------------------------------
-        let view = store.tensor(&format!("{prefix}.mlp.gate_up_proj.weight"))?;
+        let gate_up_name = format!("{prefix}.mlp.gate_up_proj.weight");
+        let view = store.tensor(&gate_up_name)?;
         let raw = view.data();
-        anyhow::ensure!(
-            view.shape() == [2 * inter, hidden],
-            "gate_up_proj shape mismatch: expected [{}, {}], got {:?}",
-            2 * inter,
-            hidden,
-            view.shape()
-        );
-        let row_bytes = hidden * 2; // bf16
+        let is_q4 = store.q4_shape(&gate_up_name).is_some();
+        if is_q4 {
+            let expected_bytes = crate::gpu::q4_byte_count(2 * inter, hidden);
+            anyhow::ensure!(
+                raw.len() == expected_bytes,
+                "gate_up_proj Q4 byte count mismatch: expected {expected_bytes}, got {}",
+                raw.len()
+            );
+        } else {
+            anyhow::ensure!(
+                view.shape() == [2 * inter, hidden],
+                "gate_up_proj shape mismatch: expected [{}, {}], got {:?}",
+                2 * inter,
+                hidden,
+                view.shape()
+            );
+        }
+        let row_bytes = if is_q4 { (hidden / 32) * 18 } else { hidden * 2 };
         let half = inter * row_bytes;
         let gate_raw = &raw[..half];
         let up_raw = &raw[half..2 * half];
 
-        let gate = upload_raw_bf16(backend, gate_raw, &[inter, hidden]);
-        let up = upload_raw_bf16(backend, up_raw, &[inter, hidden]);
+        let dtype = if is_q4 { TensorDtype::Q4 } else { TensorDtype::BF16 };
+        let gate = backend.upload_tensor(gate_raw, &[inter, hidden], dtype);
+        let up = backend.upload_tensor(up_raw, &[inter, hidden], dtype);
         let down = upload_tensor(
             store,
             backend,
@@ -2281,17 +2311,23 @@ fn build_expert_index_from_safetensors(
     // Load safetensors headers to compute tensor file offsets.
     let (mmaps, weight_map) = load_safetensors_files(model_dir)?;
 
-    // Detect pre-quantized model (rllm-q4 metadata).
-    let prequantized = mmaps.iter().any(|m| {
-        if let Ok((_, metadata)) = SafeTensors::read_metadata(m.as_ref()) {
+    // Collect per-tensor Q4 metadata from shard headers.
+    // We need this to determine if expert tensors specifically are Q4
+    // (not just whether the model has ANY Q4 tensors — attention weights
+    // may be Q4 while expert weights remain BF16, as with Mixtral).
+    let mut q4_expert_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for mmap in &mmaps {
+        if let Ok((_, metadata)) = SafeTensors::read_metadata(mmap.as_ref()) {
             if let Some(meta) = metadata.metadata() {
-                return meta.get("quantization").map(|v| v.as_str()) == Some("rllm-q4");
+                for key in meta.keys() {
+                    if let Some(tensor_name) = key.strip_prefix("rllm_q4:") {
+                        if tensor_name.contains("expert") {
+                            q4_expert_names.insert(tensor_name.to_string());
+                        }
+                    }
+                }
             }
         }
-        false
-    });
-    if prequantized {
-        eprintln!("  detected pre-quantized expert data (rllm-q4)");
     }
 
     // Compute data_start for each shard (8 + header_len).
@@ -2355,10 +2391,17 @@ fn build_expert_index_from_safetensors(
             });
         }
 
+        // Check if fused expert tensors are actually Q4 (not just the model overall).
+        let fused_gate_up = format!("{prefix_base}0.mlp.experts.gate_up_proj");
+        let experts_q4 = q4_expert_names.contains(&fused_gate_up);
+        if experts_q4 {
+            eprintln!("  detected pre-quantized expert data (rllm-q4)");
+        }
+
         eprintln!("  built expert index: {} layers × {} experts (fused format)", num_layers, num_experts);
 
         Ok(super::expert_stream::build_fused_expert_index(
-            layer_info, shard_files, hidden, moe_inter, num_experts, prequantized,
+            layer_info, shard_files, hidden, moe_inter, num_experts, experts_q4,
         ))
     } else {
         // Per-expert format (Qwen3-MoE, Mixtral): experts.{j}.gate_proj etc.
@@ -2416,10 +2459,23 @@ fn build_expert_index_from_safetensors(
             layer_info.push(experts);
         }
 
+        // Check if per-expert tensors are actually Q4 (not just the model overall).
+        // Mixtral's expert weights (w1/w2/w3) may remain BF16 even in a Q4 model
+        // because the quantizer only quantizes weight names it recognises.
+        let first_expert_gate = if is_qwen_naming {
+            format!("{test_prefix}.mlp.experts.0.gate_proj.weight")
+        } else {
+            format!("{test_prefix}.block_sparse_moe.experts.0.w1.weight")
+        };
+        let experts_q4 = q4_expert_names.contains(&first_expert_gate);
+        if experts_q4 {
+            eprintln!("  detected pre-quantized expert data (rllm-q4)");
+        }
+
         eprintln!("  built expert index: {} layers × {} experts (per-expert format)", num_layers, num_experts);
 
         Ok(super::expert_stream::build_per_expert_index(
-            layer_info, shard_files, hidden, moe_inter, prequantized,
+            layer_info, shard_files, hidden, moe_inter, experts_q4,
         ))
     }
 }
@@ -2694,24 +2750,70 @@ pub(crate) fn load_vision_weights<B: GpuCore>(
 
     // Merger / projector.
     let pp = &vc.projector_prefix;
+    // Merger LayerNorm: Qwen uses "norm.weight", Gemma 3 uses "mm_soft_emb_norm.weight".
     let merger_norm_w = store.tensor(&format!("{}norm.weight", pp)).ok()
+        .or_else(|| store.tensor(&format!("{}mm_soft_emb_norm.weight", pp)).ok())
         .map(|v| upload_vision(backend, &v, v.shape()));
     let merger_norm_b = store.tensor(&format!("{}norm.bias", pp)).ok()
+        .or_else(|| store.tensor(&format!("{}mm_soft_emb_norm.bias", pp)).ok())
         .map(|v| upload_vision(backend, &v, v.shape()));
 
     // Merger fc1: for Qwen this is the first layer of the 2-layer MLP.
-    // For Gemma this is the single linear projection.
-    let fc1_name = if store.tensor(&format!("{}linear_fc1.weight", pp)).is_ok() {
-        format!("{}linear_fc1.weight", pp)
-    } else {
-        format!("{}linear_1.weight", pp)
+    // For Gemma 3 this is a single linear projection with a different naming
+    // convention (mm_input_projection_weight, no bias).
+    //
+    // Try known names in order: Qwen fused → Qwen split → Gemma 3.
+    let fc1_candidates = [
+        format!("{}linear_fc1.weight", pp),
+        format!("{}linear_1.weight", pp),
+        format!("{}mm_input_projection_weight", pp),
+    ];
+    let fc1_view = fc1_candidates.iter()
+        .find_map(|name| store.tensor(name).ok());
+    let fc1_view = match fc1_view {
+        Some(v) => v,
+        None => {
+            eprintln!(
+                "WARNING: vision projector weight not found under any known name \
+                 (tried: {}), skipping vision encoder",
+                fc1_candidates.join(", ")
+            );
+            return None;
+        }
     };
-    let fc1_view = store.tensor(&fc1_name).expect("missing merger/projector fc1 weight");
-    let merger_fc1_weight = upload_vision(backend, &fc1_view, fc1_view.shape());
 
-    let bias1_name = fc1_name.replace(".weight", ".bias");
-    let fc1_bias_view = store.tensor(&bias1_name).expect("missing merger/projector fc1 bias");
-    let merger_fc1_bias = upload_vision(backend, &fc1_bias_view, fc1_bias_view.shape());
+    // Gemma 3's mm_input_projection_weight is stored as [in_dim, out_dim] = [1152, 2560],
+    // but our matmul expects [out_dim, in_dim] = [2560, 1152].  Transpose if needed.
+    let fc1_shape = fc1_view.shape();
+    // Gemma 3's mm_input_projection_weight is [in, out] — detect by checking
+    // if the first dim (1152) < second dim (2560).  Qwen's fc1 is square or [out, in].
+    let merger_fc1_weight = if fc1_shape.len() == 2 && fc1_shape[0] < fc1_shape[1] {
+        // Weight is [in, out] — transpose to [out, in] for matmul.
+        let (rows, cols) = (fc1_shape[0], fc1_shape[1]);
+        let src_data = fc1_view.data();
+        let mut transposed = vec![0u8; src_data.len()];
+        let elem_size = 2; // bf16
+        for r in 0..rows {
+            for c in 0..cols {
+                let src_off = (r * cols + c) * elem_size;
+                let dst_off = (c * rows + r) * elem_size;
+                transposed[dst_off..dst_off + elem_size]
+                    .copy_from_slice(&src_data[src_off..src_off + elem_size]);
+            }
+        }
+        backend.upload_tensor(&transposed, &[cols, rows], crate::gpu::TensorDtype::BF16)
+    } else {
+        upload_vision(backend, &fc1_view, fc1_shape)
+    };
+
+    // Projector bias: Qwen has one, Gemma 3 does not (uses a separate norm
+    // layer instead).  Try the bias name that matches the weight we found.
+    let merger_fc1_bias = fc1_candidates.iter()
+        .find_map(|name| {
+            let bias_name = name.replace(".weight", ".bias");
+            store.tensor(&bias_name).ok()
+        })
+        .map(|v| upload_vision(backend, &v, v.shape()));
 
     // Merger fc2 (Qwen only — 2-layer MLP merger).
     let fc2_name_w = if store.tensor(&format!("{}linear_fc2.weight", pp)).is_ok() {
