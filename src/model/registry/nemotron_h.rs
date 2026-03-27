@@ -488,18 +488,210 @@ pub(crate) fn forward_prefill_paged<
     seq_state: &SeqKvState<B>,
     bufs: &PrefillBuffers<B>,
 ) -> anyhow::Result<()> {
-    let _d = NemotronDims::from_config(&m.config);
-    let _n = tokens.len();
+    let d = NemotronDims::from_config(&m.config);
+    let bs = tokens.len() as u32;
+    let start_pos = seq_state.seq_len as u32;
+    let hidden_byte_size = m.config.hidden_size * crate::gpu::TensorDtype::BF16.byte_size();
 
-    // TODO: Implement prefill path.
-    // For now, fall back to single-token decode one at a time.
-    // This is correct but slower than batched prefill for attention layers.
-    for (i, &token_id) in tokens.iter().enumerate() {
-        // Temporarily advance seq_state for position tracking.
-        // The engine handles this externally, so we just need to pass the right pos.
-        let _ = (i, bufs); // suppress unused warnings
-        forward_single_paged(m, token_id, pool, seq_state)?;
+    for layer_idx in 0..m.config.num_hidden_layers {
+        let layer = &m.weights.layers[layer_idx];
+        let layer_type = m.config.layer_types[layer_idx].as_str();
+
+        match layer_type {
+            // -----------------------------------------------------------------
+            // Mamba-2 and MoE layers: token-by-token through host memory.
+            //
+            // These layers are inherently sequential — Mamba-2 because each
+            // token's state depends on the previous, MoE because per-token
+            // routing selects different experts.  We round-trip through host
+            // memory: copy batch → extract one token → run single-token forward
+            // → write back → repeat.
+            //
+            // This is the same pattern Qwen 3.5 uses for DeltaNet layers and
+            // MoE FFN during prefill.
+            // -----------------------------------------------------------------
+            "mamba2" | "moe" => {
+                let full_bytes = m.backend.tensor_byte_count(&bufs.hidden);
+                let mut host_hidden = vec![0u8; full_bytes];
+                m.backend.copy_to_host(&bufs.hidden, &mut host_hidden);
+
+                for t in 0..tokens.len() {
+                    let offset = t * hidden_byte_size;
+                    m.backend.copy_to_tensor(
+                        &m.hidden,
+                        &host_hidden[offset..offset + hidden_byte_size],
+                    );
+
+                    if layer_type == "mamba2" {
+                        mamba2_block(m, layer_idx, &d);
+                    } else {
+                        moe_block(m, layer_idx, &d);
+                    }
+
+                    let mut token_hidden = vec![0u8; hidden_byte_size];
+                    m.backend.copy_to_host(&m.hidden, &mut token_hidden);
+                    host_hidden[offset..offset + hidden_byte_size]
+                        .copy_from_slice(&token_hidden);
+                }
+
+                m.backend.copy_to_tensor(&bufs.hidden, &host_hidden);
+            }
+
+            // -----------------------------------------------------------------
+            // Attention layers: fully batched (GEMM + prefill attention).
+            //
+            // Only 6 of 52 layers are attention, but batching them is important
+            // for prefill throughput — GEMM is much faster than N mat-vecs.
+            // -----------------------------------------------------------------
+            "attention" => {
+                // Batched RMSNorm.
+                m.backend.rms_norm_batch(
+                    &bufs.hidden,
+                    &layer.input_layernorm,
+                    d.eps,
+                    &bufs.norm_buf,
+                    bs,
+                );
+
+                // Prenorm scaling (batched).
+                if d.prenorm_scale != 1.0 {
+                    m.backend.scalar_mul(
+                        &bufs.norm_buf,
+                        &bufs.norm_buf,
+                        d.prenorm_scale,
+                        bs * d.hidden_size,
+                    );
+                }
+
+                // Batched QKV projections.
+                m.backend.matmul_batch(
+                    &layer.q_proj, &bufs.norm_buf, &bufs.q_buf,
+                    bs, d.q_dim, d.hidden_size,
+                );
+                m.backend.matmul_batch(
+                    &layer.k_proj, &bufs.norm_buf, &bufs.k_buf,
+                    bs, d.kv_dim, d.hidden_size,
+                );
+                m.backend.matmul_batch(
+                    &layer.v_proj, &bufs.norm_buf, &bufs.v_buf,
+                    bs, d.kv_dim, d.hidden_size,
+                );
+
+                // RoPE: per-token positions, done token-by-token via host round-trip.
+                // (Nemotron-H uses full rotation, no partial RoPE.)
+                {
+                    let q_row_bytes = d.q_dim as usize * 2; // bf16
+                    let k_row_bytes = d.kv_dim as usize * 2;
+                    let q_bytes = m.backend.tensor_byte_count(&bufs.q_buf);
+                    let k_bytes = m.backend.tensor_byte_count(&bufs.k_buf);
+                    let mut host_q = vec![0u8; q_bytes];
+                    let mut host_k = vec![0u8; k_bytes];
+                    m.backend.copy_to_host(&bufs.q_buf, &mut host_q);
+                    m.backend.copy_to_host(&bufs.k_buf, &mut host_k);
+
+                    let q_tensor_bytes = m.backend.tensor_byte_count(&m.q_buf);
+                    let k_tensor_bytes = m.backend.tensor_byte_count(&m.k_buf);
+
+                    for t in 0..tokens.len() {
+                        let token_pos = start_pos + t as u32;
+                        let mut q_upload = vec![0u8; q_tensor_bytes];
+                        let mut k_upload = vec![0u8; k_tensor_bytes];
+                        q_upload[..q_row_bytes].copy_from_slice(
+                            &host_q[t * q_row_bytes..(t + 1) * q_row_bytes],
+                        );
+                        k_upload[..k_row_bytes].copy_from_slice(
+                            &host_k[t * k_row_bytes..(t + 1) * k_row_bytes],
+                        );
+                        m.backend.copy_to_tensor(&m.q_buf, &q_upload);
+                        m.backend.copy_to_tensor(&m.k_buf, &k_upload);
+
+                        m.backend.rope(
+                            &m.q_buf, &m.k_buf,
+                            token_pos,
+                            m.config.rope_theta as f32,
+                            d.num_heads, d.num_kv_heads, d.head_dim,
+                        );
+
+                        let mut q_out = vec![0u8; q_tensor_bytes];
+                        let mut k_out = vec![0u8; k_tensor_bytes];
+                        m.backend.copy_to_host(&m.q_buf, &mut q_out);
+                        m.backend.copy_to_host(&m.k_buf, &mut k_out);
+                        host_q[t * q_row_bytes..(t + 1) * q_row_bytes]
+                            .copy_from_slice(&q_out[..q_row_bytes]);
+                        host_k[t * k_row_bytes..(t + 1) * k_row_bytes]
+                            .copy_from_slice(&k_out[..k_row_bytes]);
+                    }
+
+                    m.backend.copy_to_tensor(&bufs.q_buf, &host_q);
+                    m.backend.copy_to_tensor(&bufs.k_buf, &host_k);
+                }
+
+                // Paged KV cache write (batched).
+                let kv_idx = m.kv_layer_map[layer_idx].unwrap();
+                if let Some(tc) = &m.turbo_ctx {
+                    m.backend.turbo_quantize_to_paged_batch(
+                        &bufs.k_buf, &pool.k_pool[kv_idx],
+                        &seq_state.block_table_gpu, &bufs.positions,
+                        &tc.pi, &tc.centroids,
+                        bs, d.num_kv_heads, d.head_dim,
+                        tc.config.bits, tc.config.bytes_per_head_pos as u32,
+                    );
+                    m.backend.turbo_quantize_to_paged_batch(
+                        &bufs.v_buf, &pool.v_pool[kv_idx],
+                        &seq_state.block_table_gpu, &bufs.positions,
+                        &tc.pi, &tc.centroids,
+                        bs, d.num_kv_heads, d.head_dim,
+                        tc.config.bits, tc.config.bytes_per_head_pos as u32,
+                    );
+                } else {
+                    m.backend.copy_to_paged_kv_cache_batch(
+                        &bufs.k_buf, &pool.k_pool[kv_idx],
+                        &seq_state.block_table_gpu, &bufs.positions,
+                        bs, d.num_kv_heads, d.head_dim,
+                    );
+                    m.backend.copy_to_paged_kv_cache_batch(
+                        &bufs.v_buf, &pool.v_pool[kv_idx],
+                        &seq_state.block_table_gpu, &bufs.positions,
+                        bs, d.num_kv_heads, d.head_dim,
+                    );
+                }
+
+                // Prefill attention (causal, full context — no sliding window).
+                m.backend.prefill_attention(
+                    &bufs.q_buf, &bufs.k_buf, &bufs.v_buf, &bufs.attn_out,
+                    bs, start_pos,
+                    d.num_heads, d.num_kv_heads, d.head_dim,
+                    0, 0.0, None, true,
+                );
+
+                // O projection + all-reduce + residual (batched).
+                m.backend.matmul_batch(
+                    &layer.o_proj, &bufs.attn_out, &bufs.norm_buf,
+                    bs, d.hidden_size, d.q_dim,
+                );
+                m.backend.all_reduce_sum(&bufs.norm_buf, bs * d.hidden_size);
+                m.backend.add(
+                    &bufs.hidden, &bufs.norm_buf, &bufs.hidden,
+                    bs * d.hidden_size,
+                );
+            }
+
+            _ => unreachable!("invalid layer type at {layer_idx}: {layer_type}"),
+        }
     }
+
+    // Final norm + lm_head (only last token's logits needed).
+    primitives::final_norm_and_lm_head_prefill(
+        m.backend,
+        &m.weights,
+        bufs,
+        &m.norm_buf,
+        &m.logits_buf,
+        d.eps,
+        bs,
+        m.config.hidden_size,
+        m.config.vocab_size as u32,
+    );
 
     Ok(())
 }
