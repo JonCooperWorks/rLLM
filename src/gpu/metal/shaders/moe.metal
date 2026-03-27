@@ -223,6 +223,100 @@ kernel void fused_gate_up_swiglu_q4(
 }
 
 // ---------------------------------------------------------------------------
+// Fused gate+up+SwiGLU with Q8 weights.
+//
+// Same structure as the Q4 variant but with simpler 8-bit dequantisation:
+// each weight is a signed int8 byte, dequant = float(byte) * scale.
+//
+// Block layout (34 bytes per block of 32 weights):
+//   bytes 0-1:   bf16 scale factor
+//   bytes 2-33:  32 signed int8 values
+//
+// Dispatch: grid = M * 32, threadgroup = 256.
+// ---------------------------------------------------------------------------
+
+kernel void fused_gate_up_swiglu_q8(
+    constant FusedGateUpParams& params [[buffer(0)]],
+    device const uchar* W_gate_q8      [[buffer(1)]],  // [M * blocks_per_row * 34]
+    device const uchar* W_up_q8        [[buffer(2)]],  // [M * blocks_per_row * 34]
+    device const bfloat* x             [[buffer(3)]],   // [K]
+    device bfloat* output              [[buffer(4)]],   // [M]
+    uint gid                           [[thread_position_in_grid]],
+    uint lid                           [[thread_position_in_threadgroup]]
+) {
+    const uint M = params.M;
+    const uint K = params.K;
+
+    uint row = gid / 32;
+    uint lane = gid % 32;
+
+    const uint blocks_per_row = K / 32;
+    const uint bytes_per_block = 34;
+
+    threadgroup float x_shared[4096];
+
+    float acc_gate = 0.0f;
+    float acc_up   = 0.0f;
+
+    for (uint tile = 0; tile < K; tile += 4096) {
+        uint tile_len = min((uint)4096, K - tile);
+
+        for (uint i = lid; i < tile_len; i += 256) {
+            x_shared[i] = float(x[tile + i]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (row < M) {
+            device const uchar* gate_row = W_gate_q8 + row * blocks_per_row * bytes_per_block;
+            device const uchar* up_row   = W_up_q8   + row * blocks_per_row * bytes_per_block;
+
+            uint block_start = tile / 32;
+            uint block_end   = (tile + tile_len) / 32;
+
+            for (uint block_idx = block_start + lane; block_idx < block_end; block_idx += 32) {
+                device const uchar* g_ptr = gate_row + block_idx * bytes_per_block;
+                float g_scale = float(*((device const bfloat*)g_ptr));
+                device const char* g_data = (device const char*)(g_ptr + 2);
+
+                device const uchar* u_ptr = up_row + block_idx * bytes_per_block;
+                float u_scale = float(*((device const bfloat*)u_ptr));
+                device const char* u_data = (device const char*)(u_ptr + 2);
+
+                uint x_local = (block_idx * 32) - tile;
+
+                // Process 32 signed int8 weights in chunks of 4.
+                for (uint i = 0; i < 32; i += 4) {
+                    float x0 = x_shared[x_local + i];
+                    float x1 = x_shared[x_local + i + 1];
+                    float x2 = x_shared[x_local + i + 2];
+                    float x3 = x_shared[x_local + i + 3];
+
+                    acc_gate = fma(float(g_data[i])     * g_scale, x0, acc_gate);
+                    acc_gate = fma(float(g_data[i + 1]) * g_scale, x1, acc_gate);
+                    acc_gate = fma(float(g_data[i + 2]) * g_scale, x2, acc_gate);
+                    acc_gate = fma(float(g_data[i + 3]) * g_scale, x3, acc_gate);
+
+                    acc_up = fma(float(u_data[i])     * u_scale, x0, acc_up);
+                    acc_up = fma(float(u_data[i + 1]) * u_scale, x1, acc_up);
+                    acc_up = fma(float(u_data[i + 2]) * u_scale, x2, acc_up);
+                    acc_up = fma(float(u_data[i + 3]) * u_scale, x3, acc_up);
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    acc_gate = simd_sum(acc_gate);
+    acc_up   = simd_sum(acc_up);
+
+    if (lane == 0) {
+        float silu = acc_gate / (1.0f + exp(-acc_gate));
+        output[row] = bfloat(silu * acc_up);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Fused MoE combine + residual add.
 //
 // Combines k expert outputs with routing weights and adds the residual in

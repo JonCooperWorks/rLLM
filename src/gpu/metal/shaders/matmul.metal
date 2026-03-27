@@ -62,6 +62,7 @@ struct MatvecParams {
 // Each thread maintains ROWS_PER_SIMD independent float accumulators.
 constant constexpr uint ROWS_PER_SIMD = 2;
 constant constexpr uint ROWS_PER_SIMD_Q4 = 2;
+constant constexpr uint ROWS_PER_SIMD_Q8 = 2;
 
 // Shared memory tile size for input vector caching.  4096 floats = 16 KB,
 // well within Apple Silicon's 32 KB threadgroup memory limit.  Covers
@@ -616,6 +617,361 @@ kernel void gemm_q4(
             acc_b = fma(fma(float((pk >> 20) & 0xF), scale, neg8s), x5, acc_b);
             acc_b = fma(fma(float((pk >> 24) & 0xF), scale, neg8s), x6, acc_b);
             acc_b = fma(fma(float((pk >> 28)),        scale, neg8s), x7, acc_b);
+        }
+    }
+
+    float acc = acc_a + acc_b;
+    acc = simd_sum(acc);
+    if (lane == 0) {
+        Y[batch * M + row] = bfloat(acc);
+    }
+}
+
+// ===========================================================================
+// Matrix-vector multiply — Q8 (8-bit) weights with shared memory x caching.
+//
+// Same multi-row SIMD structure as matvec_q4 but simpler dequantisation:
+// each weight is a signed int8 byte, so dequant is just float(byte) * scale
+// with no nibble extraction or offset.
+//
+// Block layout (34 bytes per block of 32 weights):
+//   bytes 0-1:   bf16 scale factor
+//   bytes 2-33:  32 signed int8 values
+//
+// Dequant: weight = float((device const char*)data)[i] * scale
+//
+// Dispatch: grid_size = ceil(M / 2) × 32, threadgroup_size = 256.
+// ===========================================================================
+
+kernel void matvec_q8(
+    constant MatvecParams& params [[buffer(0)]],
+    device const uchar* W_q8     [[buffer(1)]],  // [M * blocks_per_row * 34 bytes]
+    device const bfloat* x       [[buffer(2)]],  // [K]
+    device bfloat* y             [[buffer(3)]],  // [M]
+    uint gid                     [[thread_position_in_grid]],
+    uint lid                     [[thread_position_in_threadgroup]]
+) {
+    const uint M = params.M;
+    const uint K = params.K;
+
+    uint simd_idx = gid / 32;
+    uint lane = gid % 32;
+
+    // Multi-row: each SIMD group computes 2 output rows.
+    uint row0 = simd_idx * ROWS_PER_SIMD_Q8;
+    uint row1 = row0 + 1;
+    bool has_row1 = (row1 < M);
+
+    const uint blocks_per_row = K / 32;
+    const uint bytes_per_block = 34;  // 2 (bf16 scale) + 32 (int8 values)
+
+    device const uchar* row0_data = W_q8 + row0 * blocks_per_row * bytes_per_block;
+    device const uchar* row1_data = W_q8 + row1 * blocks_per_row * bytes_per_block;
+
+    // Shared memory cache for input vector x.
+    threadgroup float x_shared[X_TILE];
+
+    // Split accumulators: acc_a for weights 0-15, acc_b for 16-31.
+    float acc0_a = 0.0f, acc0_b = 0.0f;
+    float acc1_a = 0.0f, acc1_b = 0.0f;
+
+    for (uint tile = 0; tile < K; tile += X_TILE) {
+        uint tile_len = min((uint)X_TILE, K - tile);
+
+        // Cooperative load: 256 threads load tile_len bf16→f32 values.
+        for (uint i = lid; i < tile_len; i += 256) {
+            x_shared[i] = float(x[tile + i]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (row0 < M) {
+            uint block_start = tile / 32;
+            uint block_end   = (tile + tile_len) / 32;
+
+            for (uint block_idx = block_start + lane; block_idx < block_end; block_idx += 32) {
+                // Row 0 block header.
+                device const uchar* bp0 = row0_data + block_idx * bytes_per_block;
+                float scale0 = float(*((device const bfloat*)bp0));
+                device const char* d0 = (device const char*)(bp0 + 2);
+
+                // Row 1 block header (conditional).
+                float scale1;
+                device const char* d1;
+                if (has_row1) {
+                    device const uchar* bp1 = row1_data + block_idx * bytes_per_block;
+                    scale1 = float(*((device const bfloat*)bp1));
+                    d1 = (device const char*)(bp1 + 2);
+                }
+
+                uint xb = (block_idx * 32) - tile;
+
+                // --- Chunk 0: weights 0-3 → acc_a ---
+                {
+                    float x0 = x_shared[xb],     x1 = x_shared[xb + 1];
+                    float x2 = x_shared[xb + 2], x3 = x_shared[xb + 3];
+                    acc0_a = fma(float(d0[0]) * scale0, x0, acc0_a);
+                    acc0_a = fma(float(d0[1]) * scale0, x1, acc0_a);
+                    acc0_a = fma(float(d0[2]) * scale0, x2, acc0_a);
+                    acc0_a = fma(float(d0[3]) * scale0, x3, acc0_a);
+                    if (has_row1) {
+                        acc1_a = fma(float(d1[0]) * scale1, x0, acc1_a);
+                        acc1_a = fma(float(d1[1]) * scale1, x1, acc1_a);
+                        acc1_a = fma(float(d1[2]) * scale1, x2, acc1_a);
+                        acc1_a = fma(float(d1[3]) * scale1, x3, acc1_a);
+                    }
+                }
+
+                // --- Chunk 1: weights 4-7 → acc_a ---
+                {
+                    float x0 = x_shared[xb + 4], x1 = x_shared[xb + 5];
+                    float x2 = x_shared[xb + 6], x3 = x_shared[xb + 7];
+                    acc0_a = fma(float(d0[4]) * scale0, x0, acc0_a);
+                    acc0_a = fma(float(d0[5]) * scale0, x1, acc0_a);
+                    acc0_a = fma(float(d0[6]) * scale0, x2, acc0_a);
+                    acc0_a = fma(float(d0[7]) * scale0, x3, acc0_a);
+                    if (has_row1) {
+                        acc1_a = fma(float(d1[4]) * scale1, x0, acc1_a);
+                        acc1_a = fma(float(d1[5]) * scale1, x1, acc1_a);
+                        acc1_a = fma(float(d1[6]) * scale1, x2, acc1_a);
+                        acc1_a = fma(float(d1[7]) * scale1, x3, acc1_a);
+                    }
+                }
+
+                // --- Chunk 2: weights 8-11 → acc_a ---
+                {
+                    float x0 = x_shared[xb + 8],  x1 = x_shared[xb + 9];
+                    float x2 = x_shared[xb + 10], x3 = x_shared[xb + 11];
+                    acc0_a = fma(float(d0[8])  * scale0, x0, acc0_a);
+                    acc0_a = fma(float(d0[9])  * scale0, x1, acc0_a);
+                    acc0_a = fma(float(d0[10]) * scale0, x2, acc0_a);
+                    acc0_a = fma(float(d0[11]) * scale0, x3, acc0_a);
+                    if (has_row1) {
+                        acc1_a = fma(float(d1[8])  * scale1, x0, acc1_a);
+                        acc1_a = fma(float(d1[9])  * scale1, x1, acc1_a);
+                        acc1_a = fma(float(d1[10]) * scale1, x2, acc1_a);
+                        acc1_a = fma(float(d1[11]) * scale1, x3, acc1_a);
+                    }
+                }
+
+                // --- Chunk 3: weights 12-15 → acc_a ---
+                {
+                    float x0 = x_shared[xb + 12], x1 = x_shared[xb + 13];
+                    float x2 = x_shared[xb + 14], x3 = x_shared[xb + 15];
+                    acc0_a = fma(float(d0[12]) * scale0, x0, acc0_a);
+                    acc0_a = fma(float(d0[13]) * scale0, x1, acc0_a);
+                    acc0_a = fma(float(d0[14]) * scale0, x2, acc0_a);
+                    acc0_a = fma(float(d0[15]) * scale0, x3, acc0_a);
+                    if (has_row1) {
+                        acc1_a = fma(float(d1[12]) * scale1, x0, acc1_a);
+                        acc1_a = fma(float(d1[13]) * scale1, x1, acc1_a);
+                        acc1_a = fma(float(d1[14]) * scale1, x2, acc1_a);
+                        acc1_a = fma(float(d1[15]) * scale1, x3, acc1_a);
+                    }
+                }
+
+                // --- Chunk 4: weights 16-19 → acc_b ---
+                {
+                    float x0 = x_shared[xb + 16], x1 = x_shared[xb + 17];
+                    float x2 = x_shared[xb + 18], x3 = x_shared[xb + 19];
+                    acc0_b = fma(float(d0[16]) * scale0, x0, acc0_b);
+                    acc0_b = fma(float(d0[17]) * scale0, x1, acc0_b);
+                    acc0_b = fma(float(d0[18]) * scale0, x2, acc0_b);
+                    acc0_b = fma(float(d0[19]) * scale0, x3, acc0_b);
+                    if (has_row1) {
+                        acc1_b = fma(float(d1[16]) * scale1, x0, acc1_b);
+                        acc1_b = fma(float(d1[17]) * scale1, x1, acc1_b);
+                        acc1_b = fma(float(d1[18]) * scale1, x2, acc1_b);
+                        acc1_b = fma(float(d1[19]) * scale1, x3, acc1_b);
+                    }
+                }
+
+                // --- Chunk 5: weights 20-23 → acc_b ---
+                {
+                    float x0 = x_shared[xb + 20], x1 = x_shared[xb + 21];
+                    float x2 = x_shared[xb + 22], x3 = x_shared[xb + 23];
+                    acc0_b = fma(float(d0[20]) * scale0, x0, acc0_b);
+                    acc0_b = fma(float(d0[21]) * scale0, x1, acc0_b);
+                    acc0_b = fma(float(d0[22]) * scale0, x2, acc0_b);
+                    acc0_b = fma(float(d0[23]) * scale0, x3, acc0_b);
+                    if (has_row1) {
+                        acc1_b = fma(float(d1[20]) * scale1, x0, acc1_b);
+                        acc1_b = fma(float(d1[21]) * scale1, x1, acc1_b);
+                        acc1_b = fma(float(d1[22]) * scale1, x2, acc1_b);
+                        acc1_b = fma(float(d1[23]) * scale1, x3, acc1_b);
+                    }
+                }
+
+                // --- Chunk 6: weights 24-27 → acc_b ---
+                {
+                    float x0 = x_shared[xb + 24], x1 = x_shared[xb + 25];
+                    float x2 = x_shared[xb + 26], x3 = x_shared[xb + 27];
+                    acc0_b = fma(float(d0[24]) * scale0, x0, acc0_b);
+                    acc0_b = fma(float(d0[25]) * scale0, x1, acc0_b);
+                    acc0_b = fma(float(d0[26]) * scale0, x2, acc0_b);
+                    acc0_b = fma(float(d0[27]) * scale0, x3, acc0_b);
+                    if (has_row1) {
+                        acc1_b = fma(float(d1[24]) * scale1, x0, acc1_b);
+                        acc1_b = fma(float(d1[25]) * scale1, x1, acc1_b);
+                        acc1_b = fma(float(d1[26]) * scale1, x2, acc1_b);
+                        acc1_b = fma(float(d1[27]) * scale1, x3, acc1_b);
+                    }
+                }
+
+                // --- Chunk 7: weights 28-31 → acc_b ---
+                {
+                    float x0 = x_shared[xb + 28], x1 = x_shared[xb + 29];
+                    float x2 = x_shared[xb + 30], x3 = x_shared[xb + 31];
+                    acc0_b = fma(float(d0[28]) * scale0, x0, acc0_b);
+                    acc0_b = fma(float(d0[29]) * scale0, x1, acc0_b);
+                    acc0_b = fma(float(d0[30]) * scale0, x2, acc0_b);
+                    acc0_b = fma(float(d0[31]) * scale0, x3, acc0_b);
+                    if (has_row1) {
+                        acc1_b = fma(float(d1[28]) * scale1, x0, acc1_b);
+                        acc1_b = fma(float(d1[29]) * scale1, x1, acc1_b);
+                        acc1_b = fma(float(d1[30]) * scale1, x2, acc1_b);
+                        acc1_b = fma(float(d1[31]) * scale1, x3, acc1_b);
+                    }
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Merge split accumulators, then SIMD reduce.
+    if (row0 < M) {
+        float acc0 = acc0_a + acc0_b;
+        acc0 = simd_sum(acc0);
+        if (lane == 0) y[row0] = bfloat(acc0);
+    }
+    if (has_row1) {
+        float acc1 = acc1_a + acc1_b;
+        acc1 = simd_sum(acc1);
+        if (lane == 0) y[row1] = bfloat(acc1);
+    }
+}
+
+// ===========================================================================
+// Batched matrix multiply (GEMM) — Q8 weights.
+//
+// Same structure as gemm_q4 but with simpler 8-bit dequantisation.
+// Each weight is a signed int8 byte: dequant = float(byte) * scale.
+//
+// Block layout (34 bytes per block of 32 weights):
+//   bytes 0-1:   bf16 scale factor
+//   bytes 2-33:  32 signed int8 values
+// ===========================================================================
+
+kernel void gemm_q8(
+    constant GemmParams& params  [[buffer(0)]],
+    device const uchar* W_q8     [[buffer(1)]],  // [M * blocks_per_row * 34 bytes]
+    device const bfloat* X       [[buffer(2)]],  // [batch_size, K]
+    device bfloat* Y             [[buffer(3)]],  // [batch_size, M]
+    uint gid                     [[thread_position_in_grid]]
+) {
+    const uint M = params.M;
+    const uint K = params.K;
+
+    uint elem = gid / 32;
+    uint lane = gid % 32;
+
+    uint batch = elem / M;
+    uint row   = elem % M;
+
+    if (batch >= params.batch_size) return;
+
+    const uint blocks_per_row = K / 32;
+    const uint bytes_per_block = 34;
+
+    device const uchar* row_data = W_q8 + row * blocks_per_row * bytes_per_block;
+    device const bfloat* x_vec = X + batch * K;
+
+    float acc_a = 0.0f, acc_b = 0.0f;
+
+    for (uint block_idx = lane; block_idx < blocks_per_row; block_idx += 32) {
+        device const uchar* block_ptr = row_data + block_idx * bytes_per_block;
+        float scale = float(*((device const bfloat*)block_ptr));
+        device const char* data = (device const char*)(block_ptr + 2);
+        uint xb = block_idx * 32;
+
+        // Chunk 0: weights 0-3 → acc_a.
+        {
+            float x0 = float(x_vec[xb]),     x1 = float(x_vec[xb + 1]);
+            float x2 = float(x_vec[xb + 2]), x3 = float(x_vec[xb + 3]);
+            acc_a = fma(float(data[0]) * scale, x0, acc_a);
+            acc_a = fma(float(data[1]) * scale, x1, acc_a);
+            acc_a = fma(float(data[2]) * scale, x2, acc_a);
+            acc_a = fma(float(data[3]) * scale, x3, acc_a);
+        }
+
+        // Chunk 1: weights 4-7 → acc_a.
+        {
+            float x0 = float(x_vec[xb + 4]), x1 = float(x_vec[xb + 5]);
+            float x2 = float(x_vec[xb + 6]), x3 = float(x_vec[xb + 7]);
+            acc_a = fma(float(data[4]) * scale, x0, acc_a);
+            acc_a = fma(float(data[5]) * scale, x1, acc_a);
+            acc_a = fma(float(data[6]) * scale, x2, acc_a);
+            acc_a = fma(float(data[7]) * scale, x3, acc_a);
+        }
+
+        // Chunk 2: weights 8-11 → acc_a.
+        {
+            float x0 = float(x_vec[xb + 8]),  x1 = float(x_vec[xb + 9]);
+            float x2 = float(x_vec[xb + 10]), x3 = float(x_vec[xb + 11]);
+            acc_a = fma(float(data[8])  * scale, x0, acc_a);
+            acc_a = fma(float(data[9])  * scale, x1, acc_a);
+            acc_a = fma(float(data[10]) * scale, x2, acc_a);
+            acc_a = fma(float(data[11]) * scale, x3, acc_a);
+        }
+
+        // Chunk 3: weights 12-15 → acc_a.
+        {
+            float x0 = float(x_vec[xb + 12]), x1 = float(x_vec[xb + 13]);
+            float x2 = float(x_vec[xb + 14]), x3 = float(x_vec[xb + 15]);
+            acc_a = fma(float(data[12]) * scale, x0, acc_a);
+            acc_a = fma(float(data[13]) * scale, x1, acc_a);
+            acc_a = fma(float(data[14]) * scale, x2, acc_a);
+            acc_a = fma(float(data[15]) * scale, x3, acc_a);
+        }
+
+        // Chunk 4: weights 16-19 → acc_b.
+        {
+            float x0 = float(x_vec[xb + 16]), x1 = float(x_vec[xb + 17]);
+            float x2 = float(x_vec[xb + 18]), x3 = float(x_vec[xb + 19]);
+            acc_b = fma(float(data[16]) * scale, x0, acc_b);
+            acc_b = fma(float(data[17]) * scale, x1, acc_b);
+            acc_b = fma(float(data[18]) * scale, x2, acc_b);
+            acc_b = fma(float(data[19]) * scale, x3, acc_b);
+        }
+
+        // Chunk 5: weights 20-23 → acc_b.
+        {
+            float x0 = float(x_vec[xb + 20]), x1 = float(x_vec[xb + 21]);
+            float x2 = float(x_vec[xb + 22]), x3 = float(x_vec[xb + 23]);
+            acc_b = fma(float(data[20]) * scale, x0, acc_b);
+            acc_b = fma(float(data[21]) * scale, x1, acc_b);
+            acc_b = fma(float(data[22]) * scale, x2, acc_b);
+            acc_b = fma(float(data[23]) * scale, x3, acc_b);
+        }
+
+        // Chunk 6: weights 24-27 → acc_b.
+        {
+            float x0 = float(x_vec[xb + 24]), x1 = float(x_vec[xb + 25]);
+            float x2 = float(x_vec[xb + 26]), x3 = float(x_vec[xb + 27]);
+            acc_b = fma(float(data[24]) * scale, x0, acc_b);
+            acc_b = fma(float(data[25]) * scale, x1, acc_b);
+            acc_b = fma(float(data[26]) * scale, x2, acc_b);
+            acc_b = fma(float(data[27]) * scale, x3, acc_b);
+        }
+
+        // Chunk 7: weights 28-31 → acc_b.
+        {
+            float x0 = float(x_vec[xb + 28]), x1 = float(x_vec[xb + 29]);
+            float x2 = float(x_vec[xb + 30]), x3 = float(x_vec[xb + 31]);
+            acc_b = fma(float(data[28]) * scale, x0, acc_b);
+            acc_b = fma(float(data[29]) * scale, x1, acc_b);
+            acc_b = fma(float(data[30]) * scale, x2, acc_b);
+            acc_b = fma(float(data[31]) * scale, x3, acc_b);
         }
     }
 

@@ -49,6 +49,10 @@ impl GpuCore for CudaBackend {
                 assert!(shape.len() == 2, "Q4 tensors must be 2D [m, k]");
                 crate::gpu::q4_byte_count(shape[0], shape[1])
             }
+            TensorDtype::Q8 => {
+                assert!(shape.len() == 2, "Q8 tensors must be 2D [m, k]");
+                crate::gpu::q8_byte_count(shape[0], shape[1])
+            }
             _ => shape.iter().product::<usize>() * dtype.byte_size(),
         };
         let buf = self
@@ -67,6 +71,10 @@ impl GpuCore for CudaBackend {
             TensorDtype::Q4 => {
                 assert!(shape.len() == 2, "Q4 tensors must be 2D [m, k]");
                 crate::gpu::q4_byte_count(shape[0], shape[1])
+            }
+            TensorDtype::Q8 => {
+                assert!(shape.len() == 2, "Q8 tensors must be 2D [m, k]");
+                crate::gpu::q8_byte_count(shape[0], shape[1])
             }
             _ => shape.iter().product::<usize>() * dtype.byte_size(),
         };

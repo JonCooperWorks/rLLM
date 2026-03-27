@@ -54,6 +54,7 @@ impl GpuMoe for CudaBackend {
         // Dispatch Q4 or bf16 variant based on weight dtype (same as matmul).
         let func = match w_gate.dtype {
             TensorDtype::Q4 => &self.fn_fused_gate_up_swiglu_q4,
+            TensorDtype::Q8 => todo!("Q8 CUDA kernels not yet implemented"),
             _ => &self.fn_fused_gate_up_swiglu_bf16,
         };
         // M rows × 32 threads per row = M*32 total threads.

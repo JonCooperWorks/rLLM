@@ -20,6 +20,11 @@
 //         scale = max(|w|) / 7, q = clamp(round(w/scale), -8, 7) + 8
 //         GPU kernels: matvec_q4, gemm_q4, fused_gate_up_swiglu_q4
 //
+//   Q8 — 8-bit symmetric, 34 bytes per block of 32 weights.
+//         Block: [bf16 scale | 32 signed int8 values]
+//         scale = max(|w|) / 127, q = clamp(round(w/scale), -128, 127)
+//         GPU kernels: matvec_q8, gemm_q8, fused_gate_up_swiglu_q8
+//
 // ADDING A NEW FORMAT
 //
 //   1. Add a variant to QuantFormat (below)
@@ -52,11 +57,15 @@ use super::super::TensorDtype;
 /// Each variant corresponds to a `WeightQuantiser` implementation and a
 /// `TensorDtype` variant.  The mapping is:
 ///   Q4 → TensorDtype::Q4 (18 bytes per block of 32 weights)
+///   Q8 → TensorDtype::Q8 (34 bytes per block of 32 weights)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QuantFormat {
     /// Block-wise 4-bit symmetric quantisation.
     /// 32 weights per block, 18 bytes per block (2-byte bf16 scale + 16 packed nibbles).
     Q4,
+    /// Block-wise 8-bit symmetric quantisation.
+    /// 32 weights per block, 34 bytes per block (2-byte bf16 scale + 32 signed int8 values).
+    Q8,
 }
 
 impl QuantFormat {
@@ -64,6 +73,7 @@ impl QuantFormat {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "q4" | "Q4" => Some(Self::Q4),
+            "q8" | "Q8" => Some(Self::Q8),
             _ => None,
         }
     }
@@ -72,6 +82,7 @@ impl QuantFormat {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Q4 => "q4",
+            Self::Q8 => "q8",
         }
     }
 
@@ -79,6 +90,7 @@ impl QuantFormat {
     pub fn dtype(&self) -> TensorDtype {
         match self {
             Self::Q4 => TensorDtype::Q4,
+            Self::Q8 => TensorDtype::Q8,
         }
     }
 
@@ -86,6 +98,7 @@ impl QuantFormat {
     pub fn metadata_tag(&self) -> &'static str {
         match self {
             Self::Q4 => "rllm-q4",
+            Self::Q8 => "rllm-q8",
         }
     }
 
@@ -93,6 +106,7 @@ impl QuantFormat {
     pub fn metadata_prefix(&self) -> &'static str {
         match self {
             Self::Q4 => "rllm_q4:",
+            Self::Q8 => "rllm_q8:",
         }
     }
 
@@ -100,6 +114,7 @@ impl QuantFormat {
     pub fn from_metadata_tag(tag: &str) -> Option<Self> {
         match tag {
             "rllm-q4" => Some(Self::Q4),
+            "rllm-q8" => Some(Self::Q8),
             _ => None,
         }
     }
@@ -193,6 +208,30 @@ impl WeightQuantiser for Q4Quantiser {
 }
 
 // ---------------------------------------------------------------------------
+// Q8 quantiser — delegates to quantize_bf16_to_q8().
+// ---------------------------------------------------------------------------
+
+pub(crate) struct Q8Quantiser;
+
+impl WeightQuantiser for Q8Quantiser {
+    fn format(&self) -> QuantFormat {
+        QuantFormat::Q8
+    }
+
+    fn block_size(&self) -> usize {
+        32
+    }
+
+    fn bytes_per_block(&self) -> usize {
+        34
+    }
+
+    fn quantise(&self, bf16_data: &[u8], m: usize, k: usize) -> Vec<u8> {
+        super::super::quantize_bf16_to_q8(bf16_data, m, k)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Factory — get the quantiser for a given format.
 // ---------------------------------------------------------------------------
 
@@ -200,6 +239,7 @@ impl WeightQuantiser for Q4Quantiser {
 pub(crate) fn quantiser(format: QuantFormat) -> &'static dyn WeightQuantiser {
     match format {
         QuantFormat::Q4 => &Q4Quantiser,
+        QuantFormat::Q8 => &Q8Quantiser,
     }
 }
 
@@ -241,7 +281,77 @@ mod tests {
     fn test_format_from_name_case_insensitive() {
         assert!(QuantFormat::from_name("Q4").is_some());
         assert!(QuantFormat::from_name("q4").is_some());
-        assert!(QuantFormat::from_name("q8").is_none());
+        assert!(QuantFormat::from_name("Q8").is_some());
+        assert!(QuantFormat::from_name("q8").is_some());
+        assert!(QuantFormat::from_name("q16").is_none());
+    }
+
+    #[test]
+    fn test_q8_byte_count_matches_legacy() {
+        let q = quantiser(QuantFormat::Q8);
+        assert_eq!(q.byte_count(1, 32), crate::gpu::q8_byte_count(1, 32));
+        assert_eq!(q.byte_count(1, 64), crate::gpu::q8_byte_count(1, 64));
+        assert_eq!(q.byte_count(4, 64), crate::gpu::q8_byte_count(4, 64));
+        assert_eq!(q.byte_count(2048, 2048), crate::gpu::q8_byte_count(2048, 2048));
+    }
+
+    #[test]
+    fn test_q8_row_bytes() {
+        let q = quantiser(QuantFormat::Q8);
+        // 32 weights / 32 per block = 1 block * 34 bytes = 34
+        assert_eq!(q.row_bytes(32), 34);
+        // 2048 weights / 32 per block = 64 blocks * 34 bytes = 2176
+        assert_eq!(q.row_bytes(2048), 64 * 34);
+    }
+
+    #[test]
+    fn test_q8_format_round_trip() {
+        let fmt = QuantFormat::from_name("q8").unwrap();
+        assert_eq!(fmt.name(), "q8");
+        assert_eq!(fmt.dtype(), TensorDtype::Q8);
+        assert_eq!(fmt.metadata_tag(), "rllm-q8");
+
+        let fmt2 = QuantFormat::from_metadata_tag("rllm-q8").unwrap();
+        assert_eq!(fmt, fmt2);
+    }
+
+    #[test]
+    fn test_q8_quantise_round_trip_accuracy() {
+        use half::bf16;
+
+        let m = 2;
+        let k = 64;
+        let values: Vec<bf16> = (0..m * k)
+            .map(|i| bf16::from_f32((i % 17) as f32 * 0.1 - 0.8))
+            .collect();
+        let bf16_bytes: &[u8] = bytemuck::cast_slice(&values);
+
+        let q = quantiser(QuantFormat::Q8);
+        let q8_data = q.quantise(bf16_bytes, m, k);
+        assert_eq!(q8_data.len(), q.byte_count(m, k));
+
+        // Dequantize on CPU and check max error is within one quantisation step.
+        let blocks_per_row = k / 32;
+        let mut max_err: f32 = 0.0;
+        for row in 0..m {
+            for block in 0..blocks_per_row {
+                let offset = (row * blocks_per_row + block) * 34;
+                let scale_bits = u16::from_le_bytes([q8_data[offset], q8_data[offset + 1]]);
+                let scale = bf16::from_bits(scale_bits).to_f32();
+                for i in 0..32 {
+                    let q_val = q8_data[offset + 2 + i] as i8;
+                    let dequant = q_val as f32 * scale;
+                    let orig = values[row * k + block * 32 + i].to_f32();
+                    let err = (orig - dequant).abs();
+                    if err > max_err {
+                        max_err = err;
+                    }
+                }
+            }
+        }
+        // Max error should be at most one quantisation step (scale).
+        // The largest scale in our test data is about 0.8/127 ≈ 0.0063.
+        assert!(max_err < 0.02, "max Q8 round-trip error {max_err} too large");
     }
 
     #[test]

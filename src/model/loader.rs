@@ -106,6 +106,8 @@ struct TensorStore<'a> {
     /// Populated from safetensors metadata when loading a model quantized
     /// by `rllm quantize`.  Empty for normal bf16 models.
     q4_map: HashMap<String, (usize, usize)>,
+    /// Pre-quantized Q8 tensors: name → original (m, k) shape.
+    q8_map: HashMap<String, (usize, usize)>,
 }
 
 impl<'a> TensorStore<'a> {
@@ -126,9 +128,25 @@ impl<'a> TensorStore<'a> {
     fn q4_shape(&self, name: &str) -> Option<(usize, usize)> {
         self.q4_map.get(name).copied()
     }
+
+    /// Check if a tensor is pre-quantized Q8, returning its original shape.
+    fn q8_shape(&self, name: &str) -> Option<(usize, usize)> {
+        self.q8_map.get(name).copied()
+    }
+
+    /// Check if a tensor is pre-quantized (Q4 or Q8), returning (m, k, dtype).
+    fn quant_shape(&self, name: &str) -> Option<(usize, usize, crate::gpu::TensorDtype)> {
+        if let Some((m, k)) = self.q4_shape(name) {
+            Some((m, k, crate::gpu::TensorDtype::Q4))
+        } else if let Some((m, k)) = self.q8_shape(name) {
+            Some((m, k, crate::gpu::TensorDtype::Q8))
+        } else {
+            None
+        }
+    }
 }
 
-/// Quick check if a model directory contains pre-quantized (rllm-q4) safetensors.
+/// Quick check if a model directory contains pre-quantized (rllm-q4 or rllm-q8) safetensors.
 /// Only reads the first shard's metadata header — no full mmap needed.
 pub(crate) fn is_prequantized_model(model_dir: &Path) -> bool {
     let first_shard = if model_dir.join("model.safetensors").exists() {
@@ -153,7 +171,9 @@ pub(crate) fn is_prequantized_model(model_dir: &Path) -> bool {
     let Ok(mmap) = (unsafe { Mmap::map(&file) }) else { return false };
     if let Ok((_, metadata)) = SafeTensors::read_metadata(mmap.as_ref()) {
         if let Some(meta) = metadata.metadata() {
-            return meta.get("quantization").map(|v| v.as_str()) == Some("rllm-q4");
+            if let Some(tag) = meta.get("quantization").map(|v| v.as_str()) {
+                return crate::gpu::QuantFormat::from_metadata_tag(tag).is_some();
+            }
         }
     }
     false
@@ -624,21 +644,32 @@ fn load_weights_inner<B: GpuCore>(
         .map_err(|e| anyhow::anyhow!("failed to parse safetensors: {e}"))?;
 
     // Detect pre-quantized models (produced by `rllm quantize`).
-    // Each shard's metadata may contain "rllm_q4:<name>" = "m,k" entries.
-    // We parse metadata from each mmap via read_metadata() since the
+    // Each shard's metadata may contain "rllm_q4:<name>" or "rllm_q8:<name>" = "m,k"
+    // entries.  We parse metadata from each mmap via read_metadata() since the
     // SafeTensors struct doesn't expose the __metadata__ dict directly.
     let mut q4_map: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut q8_map: HashMap<String, (usize, usize)> = HashMap::new();
     let mut is_prequantized = false;
     for mmap in &mmaps {
         if let Ok((_, metadata)) = SafeTensors::read_metadata(mmap.as_ref()) {
             if let Some(meta) = metadata.metadata() {
-                if meta.get("quantization").map(|v| v.as_str()) == Some("rllm-q4") {
-                    is_prequantized = true;
-                    for (key, val) in meta {
-                        if let Some(tensor_name) = key.strip_prefix("rllm_q4:") {
-                            if let Some((m_str, k_str)) = val.split_once(',') {
-                                if let (Ok(m), Ok(k)) = (m_str.parse(), k_str.parse()) {
-                                    q4_map.insert(tensor_name.to_string(), (m, k));
+                if let Some(tag) = meta.get("quantization").map(|v| v.as_str()) {
+                    if crate::gpu::QuantFormat::from_metadata_tag(tag).is_some() {
+                        is_prequantized = true;
+                        for (key, val) in meta {
+                            // Parse shape entries for each format.
+                            let target_map = if let Some(name) = key.strip_prefix("rllm_q4:") {
+                                Some((&mut q4_map, name))
+                            } else if let Some(name) = key.strip_prefix("rllm_q8:") {
+                                Some((&mut q8_map, name))
+                            } else {
+                                None
+                            };
+                            if let Some((map, tensor_name)) = target_map {
+                                if let Some((m_str, k_str)) = val.split_once(',') {
+                                    if let (Ok(m), Ok(k)) = (m_str.parse(), k_str.parse()) {
+                                        map.insert(tensor_name.to_string(), (m, k));
+                                    }
                                 }
                             }
                         }
@@ -648,9 +679,12 @@ fn load_weights_inner<B: GpuCore>(
         }
     }
     if is_prequantized {
+        let q4_count = q4_map.len();
+        let q8_count = q8_map.len();
+        let fmt = if q8_count > 0 { "Q8" } else { "Q4" };
         eprintln!(
-            "detected pre-quantized model ({} Q4 tensors), skipping on-load quantization",
-            q4_map.len()
+            "detected pre-quantized model ({} {} tensors), skipping on-load quantization",
+            q4_count + q8_count, fmt
         );
     }
 
@@ -658,6 +692,7 @@ fn load_weights_inner<B: GpuCore>(
         shards,
         weight_map,
         q4_map,
+        q8_map,
     };
 
     let hidden = config.hidden_size;
@@ -1291,16 +1326,16 @@ fn load_fused_qkv_attention<B: GpuCore>(
     let view = store.tensor(&qkv_name)?;
     let raw = view.data();
 
-    // Handle both BF16 and pre-quantized Q4 formats.
-    // Q4 tensors are stored as flat U8 byte arrays in safetensors, so shape
-    // check must use the logical shape from the Q4 map, not view.shape().
-    let is_q4 = store.q4_shape(&qkv_name).is_some();
-    if is_q4 {
-        let expected_bytes = crate::gpu::q4_byte_count(fused_dim, hidden);
+    // Handle BF16, pre-quantized Q4, and pre-quantized Q8 formats.
+    // Quantized tensors are stored as flat U8 byte arrays in safetensors, so
+    // shape check must use the logical shape from the quant map, not view.shape().
+    let quant_dtype = store.quant_shape(&qkv_name).map(|(_, _, dt)| dt);
+    if let Some(dt) = quant_dtype {
+        let expected_bytes = quant_byte_count(dt, fused_dim, hidden);
         anyhow::ensure!(
             raw.len() == expected_bytes,
-            "qkv_proj Q4 byte count mismatch: expected {expected_bytes}, got {}",
-            raw.len()
+            "qkv_proj {} byte count mismatch: expected {expected_bytes}, got {}",
+            quant_dtype_name(dt), raw.len()
         );
     } else {
         anyhow::ensure!(
@@ -1312,15 +1347,14 @@ fn load_fused_qkv_attention<B: GpuCore>(
         );
     }
 
-    // Row byte stride: Q4 blocks are 18 bytes per 32 weights.
-    let row_bytes = if is_q4 { (hidden / 32) * 18 } else { hidden * 2 };
+    let row_bytes = quant_row_bytes(quant_dtype, hidden);
     let q_bytes = q_dim * row_bytes;
     let kv_bytes = kv_dim * row_bytes;
     let q_raw = &raw[..q_bytes];
     let k_raw = &raw[q_bytes..q_bytes + kv_bytes];
     let v_raw = &raw[q_bytes + kv_bytes..q_bytes + 2 * kv_bytes];
 
-    let dtype = if is_q4 { TensorDtype::Q4 } else { TensorDtype::BF16 };
+    let dtype = quant_dtype.unwrap_or(TensorDtype::BF16);
     let qp = backend.upload_tensor(q_raw, &[q_dim, hidden], dtype);
     let kp = backend.upload_tensor(k_raw, &[kv_dim, hidden], dtype);
     let vp = backend.upload_tensor(v_raw, &[kv_dim, hidden], dtype);
@@ -1383,20 +1417,18 @@ fn load_standard_attention<B: GpuCore>(
         let fused_q_dim = q_dim * 2;
         let num_heads = config.num_attention_heads;
 
-        // Pre-quantized Q4 tensors are stored as 1D U8 — use q4_map for logical shape.
-        // Q4 is per-row, so we can deinterleave Q4 rows the same way as bf16 rows,
+        // Pre-quantized tensors are stored as 1D U8 — use quant_shape for logical shape.
+        // Quantization is per-row, so we can deinterleave rows the same way as bf16,
         // just with a different bytes_per_row stride.
-        let is_q4 = store.q4_shape(&q_proj_name).is_some();
-        let row_bytes = if is_q4 {
-            (hidden / 32) * 18 // Q4: blocks_per_row * 18 bytes
-        } else {
+        let quant_dtype = store.quant_shape(&q_proj_name).map(|(_, _, dt)| dt);
+        if quant_dtype.is_none() {
             anyhow::ensure!(
                 view.shape() == [fused_q_dim, hidden],
                 "q_proj fused shape mismatch: expected [{}, {}], got {:?}",
                 fused_q_dim, hidden, view.shape()
             );
-            hidden * 2 // bf16
-        };
+        }
+        let row_bytes = quant_row_bytes(quant_dtype, hidden);
         let hd_bytes = head_dim * row_bytes;
 
         // For TP, only deinterleave this rank's heads.
@@ -1410,8 +1442,8 @@ fn load_standard_attention<B: GpuCore>(
         let shard_q_dim = shard_heads * head_dim;
 
         // Deinterleave: for each head, first head_dim rows are Q,
-        // next head_dim rows are gate.  Works identically for bf16 and Q4
-        // because Q4 quantization is per-row (rows are independent).
+        // next head_dim rows are gate.  Works identically for bf16 and quantized
+        // because quantization is per-row (rows are independent).
         let mut q_raw = Vec::with_capacity(shard_q_dim * row_bytes);
         let mut z_raw = Vec::with_capacity(shard_q_dim * row_bytes);
         for h in start_head..end_head {
@@ -1420,10 +1452,9 @@ fn load_standard_attention<B: GpuCore>(
             z_raw.extend_from_slice(&raw[base + hd_bytes..base + 2 * hd_bytes]);
         }
 
-        if is_q4 {
-            // Already Q4 — upload directly.
-            let q_tensor = backend.upload_tensor(&q_raw, &[shard_q_dim, hidden], crate::gpu::TensorDtype::Q4);
-            let z_tensor = backend.upload_tensor(&z_raw, &[shard_q_dim, hidden], crate::gpu::TensorDtype::Q4);
+        if let Some(dt) = quant_dtype {
+            let q_tensor = backend.upload_tensor(&q_raw, &[shard_q_dim, hidden], dt);
+            let z_tensor = backend.upload_tensor(&z_raw, &[shard_q_dim, hidden], dt);
             (q_tensor, Some(z_tensor))
         } else {
             let q_tensor = upload_raw_bf16(backend, &q_raw, &[shard_q_dim, hidden]);
@@ -1510,13 +1541,13 @@ fn load_ffn_weights<B: GpuCore>(
         let gate_up_name = format!("{prefix}.mlp.gate_up_proj.weight");
         let view = store.tensor(&gate_up_name)?;
         let raw = view.data();
-        let is_q4 = store.q4_shape(&gate_up_name).is_some();
-        if is_q4 {
-            let expected_bytes = crate::gpu::q4_byte_count(2 * inter, hidden);
+        let quant_dtype = store.quant_shape(&gate_up_name).map(|(_, _, dt)| dt);
+        if let Some(dt) = quant_dtype {
+            let expected_bytes = quant_byte_count(dt, 2 * inter, hidden);
             anyhow::ensure!(
                 raw.len() == expected_bytes,
-                "gate_up_proj Q4 byte count mismatch: expected {expected_bytes}, got {}",
-                raw.len()
+                "gate_up_proj {} byte count mismatch: expected {expected_bytes}, got {}",
+                quant_dtype_name(dt), raw.len()
             );
         } else {
             anyhow::ensure!(
@@ -1527,12 +1558,12 @@ fn load_ffn_weights<B: GpuCore>(
                 view.shape()
             );
         }
-        let row_bytes = if is_q4 { (hidden / 32) * 18 } else { hidden * 2 };
+        let row_bytes = quant_row_bytes(quant_dtype, hidden);
         let half = inter * row_bytes;
         let gate_raw = &raw[..half];
         let up_raw = &raw[half..2 * half];
 
-        let dtype = if is_q4 { TensorDtype::Q4 } else { TensorDtype::BF16 };
+        let dtype = quant_dtype.unwrap_or(TensorDtype::BF16);
         let gate = backend.upload_tensor(gate_raw, &[inter, hidden], dtype);
         let up = backend.upload_tensor(up_raw, &[inter, hidden], dtype);
         let down = upload_tensor(
@@ -1974,9 +2005,9 @@ fn load_fused_experts<B: GpuCore>(
 
     // Pre-quantized Q4 tensors are stored as 1D U8 — use q4_map for logical shape.
     // Q4 is per-row so we can split experts using Q4 byte strides.
-    let is_q4 = store.q4_shape(&fused_name).is_some();
+    let quant_dtype = store.quant_shape(&fused_name).map(|(_, _, dt)| dt);
 
-    if !is_q4 {
+    if quant_dtype.is_none() {
         anyhow::ensure!(
             gate_up_view.shape() == [num_experts, moe_inter * 2, hidden],
             "fused gate_up_proj shape mismatch: expected [{}, {}, {}], got {:?}",
@@ -1992,11 +2023,11 @@ fn load_fused_experts<B: GpuCore>(
     let gate_up_data = gate_up_view.data();
     let down_data = down_view.data();
 
-    let (gate_up_expert_bytes, gate_bytes, down_expert_bytes) = if is_q4 {
+    let (gate_up_expert_bytes, gate_bytes, down_expert_bytes) = if let Some(dt) = quant_dtype {
         (
-            crate::gpu::q4_byte_count(moe_inter * 2, hidden),
-            crate::gpu::q4_byte_count(moe_inter, hidden),
-            crate::gpu::q4_byte_count(hidden, moe_inter),
+            quant_byte_count(dt, moe_inter * 2, hidden),
+            quant_byte_count(dt, moe_inter, hidden),
+            quant_byte_count(dt, hidden, moe_inter),
         )
     } else {
         (
@@ -2014,12 +2045,11 @@ fn load_fused_experts<B: GpuCore>(
         let d_offset = j * down_expert_bytes;
         let down_raw = &down_data[d_offset..d_offset + down_expert_bytes];
 
-        let (gate_t, up_t, down_t) = if is_q4 {
-            // Already Q4 — upload directly.
+        let (gate_t, up_t, down_t) = if let Some(dt) = quant_dtype {
             (
-                backend.upload_tensor(gate_raw, &[moe_inter, hidden], crate::gpu::TensorDtype::Q4),
-                backend.upload_tensor(up_raw, &[moe_inter, hidden], crate::gpu::TensorDtype::Q4),
-                backend.upload_tensor(down_raw, &[hidden, moe_inter], crate::gpu::TensorDtype::Q4),
+                backend.upload_tensor(gate_raw, &[moe_inter, hidden], dt),
+                backend.upload_tensor(up_raw, &[moe_inter, hidden], dt),
+                backend.upload_tensor(down_raw, &[hidden, moe_inter], dt),
             )
         } else {
             (
@@ -2045,26 +2075,59 @@ fn load_fused_experts<B: GpuCore>(
 // Tensor upload helpers.
 // ---------------------------------------------------------------------------
 
-/// Upload a single tensor from the store to GPU memory (bf16 or f32).
+/// Compute total byte count for a quantized [m, k] tensor.
+fn quant_byte_count(dtype: TensorDtype, m: usize, k: usize) -> usize {
+    match dtype {
+        TensorDtype::Q4 => crate::gpu::q4_byte_count(m, k),
+        TensorDtype::Q8 => crate::gpu::q8_byte_count(m, k),
+        _ => panic!("quant_byte_count called for non-quantized dtype {dtype:?}"),
+    }
+}
+
+/// Compute row byte stride for a weight dimension, given an optional quant dtype.
+/// Returns bf16 row bytes (k * 2) when dtype is None.
+fn quant_row_bytes(dtype: Option<TensorDtype>, k: usize) -> usize {
+    match dtype {
+        Some(TensorDtype::Q4) => (k / 32) * 18,
+        Some(TensorDtype::Q8) => (k / 32) * 34,
+        None => k * 2, // bf16
+        _ => panic!("quant_row_bytes called for unsupported dtype {dtype:?}"),
+    }
+}
+
+/// Short name for a quant dtype (for error messages).
+fn quant_dtype_name(dtype: TensorDtype) -> &'static str {
+    match dtype {
+        TensorDtype::Q4 => "Q4",
+        TensorDtype::Q8 => "Q8",
+        _ => "bf16",
+    }
+}
+
+/// Upload a single tensor from the store to GPU memory (bf16, f32, Q4, or Q8).
 ///
-/// If the tensor is in the store's Q4 map (pre-quantized by `rllm quantize`),
-/// uploads the raw Q4 bytes directly with the original logical shape.
+/// If the tensor is in the store's quant map (pre-quantized by `rllm quantize`),
+/// uploads the raw quantized bytes directly with the original logical shape.
 fn upload_tensor<B: GpuCore>(
     store: &TensorStore,
     backend: &B,
     name: &str,
     expected_shape: &[usize],
 ) -> anyhow::Result<B::Tensor> {
-    // Pre-quantized Q4: raw U8 bytes, upload directly as Q4.
-    if let Some((m, k)) = store.q4_shape(name) {
+    // Pre-quantized Q4/Q8: raw U8 bytes, upload directly.
+    if let Some((m, k, dtype)) = store.quant_shape(name) {
         let view = store.tensor(name)?;
-        let expected_bytes = crate::gpu::q4_byte_count(m, k);
+        let expected_bytes = match dtype {
+            TensorDtype::Q4 => crate::gpu::q4_byte_count(m, k),
+            TensorDtype::Q8 => crate::gpu::q8_byte_count(m, k),
+            _ => unreachable!(),
+        };
         anyhow::ensure!(
             view.data().len() == expected_bytes,
             "pre-quantized tensor '{name}' byte count mismatch: expected {expected_bytes}, got {}",
             view.data().len()
         );
-        return Ok(backend.upload_tensor(view.data(), &[m, k], TensorDtype::Q4));
+        return Ok(backend.upload_tensor(view.data(), &[m, k], dtype));
     }
 
     let view = store.tensor(name)?;
@@ -2228,7 +2291,7 @@ pub(crate) fn load_model<B: GpuCore>(
     )?;
     eprintln!(
         "weights loaded{}{}",
-        if is_quantized { " (Q4 pre-quantized)" } else { "" },
+        if is_quantized { " (pre-quantized)" } else { "" },
         if expert_index.is_some() { " (experts streaming from SSD)" } else { "" },
     );
 
@@ -2244,6 +2307,7 @@ pub(crate) fn load_model<B: GpuCore>(
             shards,
             weight_map,
             q4_map: HashMap::new(),
+            q8_map: HashMap::new(),
         };
         load_vision_weights(backend, &store, &config)
     } else {
@@ -2343,6 +2407,7 @@ fn build_expert_index_from_safetensors(
         shards,
         weight_map: weight_map.clone(),
         q4_map: HashMap::new(),
+        q8_map: HashMap::new(),
     };
 
     // Determine the layer prefix pattern.

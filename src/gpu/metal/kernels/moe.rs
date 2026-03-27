@@ -47,6 +47,7 @@ impl GpuMoe for MetalBackend {
         // Dispatch Q4 or bf16 variant based on weight dtype (same as matmul).
         let pipeline = match w_gate.dtype {
             TensorDtype::Q4 => &self.pipeline_fused_gate_up_swiglu_q4,
+            TensorDtype::Q8 => &self.pipeline_fused_gate_up_swiglu_q8,
             _ => &self.pipeline_fused_gate_up_swiglu,
         };
         // Same dispatch geometry as matvec: 32 threads per output row.

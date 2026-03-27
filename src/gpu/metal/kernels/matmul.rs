@@ -48,6 +48,7 @@ impl GpuMatmul for MetalBackend {
             // Q4: multi-row SIMD (2 rows per SIMD group) — fused dequant
             // reduces register pressure enough to match bf16.
             TensorDtype::Q4 => (&self.pipeline_matvec_q4, 2u64),
+            TensorDtype::Q8 => (&self.pipeline_matvec_q8, 2u64),
             // BF16: multi-row SIMD (2 rows per SIMD group) — x loaded once,
             // used for both rows, giving free ILP via independent accumulators.
             _ => (&self.pipeline_matvec, ROWS_PER_SIMD_BF16),
@@ -74,6 +75,7 @@ impl GpuMatmul for MetalBackend {
         let params = GemmParams { batch_size, m, k };
         let pipeline = match weight.dtype {
             TensorDtype::Q4 => &self.pipeline_gemm_q4,
+            TensorDtype::Q8 => &self.pipeline_gemm_q8,
             _ => &self.pipeline_gemm_bf16,
         };
         self.dispatch_async(

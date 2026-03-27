@@ -7,7 +7,7 @@
 // access via `cuMemcpyDtoH` / `cuMemcpyHtoD`.
 //
 // The buffer is stored as `CudaSlice<u8>` (byte-typed) because tensors may
-// hold bf16, f32, or Q4 data — the kernel dispatch layer reinterprets the
+// hold bf16, f32, Q4, or Q8 data — the kernel dispatch layer reinterprets the
 // raw bytes based on `dtype`.
 // ---------------------------------------------------------------------------
 
@@ -26,6 +26,10 @@ impl CudaTensor {
             TensorDtype::Q4 => {
                 assert!(self.shape.len() == 2, "Q4 tensors must be 2D [m, k]");
                 crate::gpu::q4_byte_count(self.shape[0], self.shape[1])
+            }
+            TensorDtype::Q8 => {
+                assert!(self.shape.len() == 2, "Q8 tensors must be 2D [m, k]");
+                crate::gpu::q8_byte_count(self.shape[0], self.shape[1])
             }
             _ => self.shape.iter().product::<usize>() * self.dtype.byte_size(),
         }

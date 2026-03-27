@@ -1,22 +1,24 @@
 // ===========================================================================
 // `rllm quantize` — Offline weight quantization.
 //
-// Pre-quantizes bf16 safetensors weights to Q4 format on disk, so that
+// Pre-quantizes bf16 safetensors weights to Q4 or Q8 format on disk, so that
 // subsequent loads (`rllm run`, `rllm serve`) skip the on-load quantization
 // step entirely.  This is a pure-CPU operation — no GPU backend needed.
 //
 // Output format:
-//   Standard safetensors files with Q4 blocks stored as Dtype::U8 tensors.
+//   Standard safetensors files with quantized blocks stored as Dtype::U8 tensors.
 //   File-level metadata marks the file as quantized:
-//     "quantization" = "rllm-q4"
-//     "rllm_q4:<tensor_name>" = "m,k"   (original logical shape)
+//     "quantization" = "rllm-q4" | "rllm-q8"
+//     "rllm_q4:<tensor_name>" = "m,k"   (Q4 original logical shape)
+//     "rllm_q8:<tensor_name>" = "m,k"   (Q8 original logical shape)
 //
 //   Non-quantizable tensors (norms, embeddings, biases) pass through as bf16.
 //   The output directory is self-contained: includes config.json, tokenizer
 //   files, and the quantized safetensors.
 //
 // Related files:
-//   gpu/mod.rs          — quantize_bf16_to_q4(), q4_byte_count()
+//   gpu/mod.rs          — quantize_bf16_to_q4(), quantize_bf16_to_q8()
+//   gpu/ops/quant.rs    — WeightQuantiser trait, QuantFormat enum
 //   model/loader.rs     — load_safetensors_files(), pre-quantized detection
 //   model/config.rs     — ModelConfig parsing
 // ===========================================================================
@@ -27,7 +29,7 @@ use std::path::PathBuf;
 use safetensors::tensor::TensorView;
 use safetensors::SafeTensors;
 
-use crate::gpu::{q4_byte_count, quantize_bf16_to_q4};
+use crate::gpu::ops::quant::{QuantFormat, quantiser};
 
 #[derive(clap::Args)]
 pub(crate) struct QuantizeArgs {
@@ -38,6 +40,10 @@ pub(crate) struct QuantizeArgs {
     /// Path to output directory for quantized model.
     #[arg(long)]
     output: PathBuf,
+
+    /// Quantization format: "q4" (4-bit, default) or "q8" (8-bit).
+    #[arg(long, default_value = "q4")]
+    format: String,
 }
 
 /// Maximum bytes per output shard (5 GB).  Keeps files manageable and
@@ -47,6 +53,14 @@ const SHARD_LIMIT: usize = 5 * 1024 * 1024 * 1024;
 pub(crate) fn exec(args: QuantizeArgs) -> anyhow::Result<()> {
     let input_dir = &args.model;
     let output_dir = &args.output;
+
+    let format = QuantFormat::from_name(&args.format).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown quantization format '{}' (supported: q4, q8)",
+            args.format
+        )
+    })?;
+    let quant = quantiser(format);
 
     // Validate input directory.
     anyhow::ensure!(
@@ -101,26 +115,26 @@ pub(crate) fn exec(args: QuantizeArgs) -> anyhow::Result<()> {
             } else {
                 (shape[0], shape[1])
             };
-            let q4_data = quantize_bf16_to_q4(data, m, k);
+            let quant_data = quant.quantise(data, m, k);
 
             original_bytes += data.len() as u64;
-            quantized_bytes += q4_data.len() as u64;
+            quantized_bytes += quant_data.len() as u64;
             quantized_count += 1;
 
-            if tensor_idx % 10 == 0 || q4_data.len() > 100_000_000 {
+            if tensor_idx % 10 == 0 || quant_data.len() > 100_000_000 {
                 eprintln!(
                     "  [{}/{}] quantized {} ({:.0} MB → {:.0} MB)",
                     tensor_idx + 1, num_tensors, name,
-                    data.len() as f64 / 1e6, q4_data.len() as f64 / 1e6,
+                    data.len() as f64 / 1e6, quant_data.len() as f64 / 1e6,
                 );
             }
 
             OutputTensor {
                 name: name.clone(),
-                data: TensorData::Owned(q4_data),
+                data: TensorData::Owned(quant_data),
                 dtype: safetensors::Dtype::U8,
-                shape: vec![q4_byte_count(m, k)],
-                q4_original_shape: Some((m, k)),
+                shape: vec![quant.byte_count(m, k)],
+                quant_original_shape: Some((m, k)),
             }
         } else {
             original_bytes += data.len() as u64;
@@ -131,7 +145,7 @@ pub(crate) fn exec(args: QuantizeArgs) -> anyhow::Result<()> {
                 data: TensorData::Borrowed(data),
                 dtype: view.dtype(),
                 shape: shape.to_vec(),
-                q4_original_shape: None,
+                quant_original_shape: None,
             }
         };
 
@@ -139,7 +153,7 @@ pub(crate) fn exec(args: QuantizeArgs) -> anyhow::Result<()> {
 
         // Flush current shard if adding this tensor would exceed the limit.
         if current_shard_size > 0 && current_shard_size + tensor_size > SHARD_LIMIT {
-            write_single_shard(&current_shard, output_dir, output_shard_count, &mut index_weight_map)?;
+            write_single_shard(&current_shard, output_dir, output_shard_count, &mut index_weight_map, format)?;
             output_shard_count += 1;
             current_shard.clear();
             current_shard_size = 0;
@@ -151,7 +165,7 @@ pub(crate) fn exec(args: QuantizeArgs) -> anyhow::Result<()> {
 
     // Flush the final shard.
     if !current_shard.is_empty() {
-        write_single_shard(&current_shard, output_dir, output_shard_count, &mut index_weight_map)?;
+        write_single_shard(&current_shard, output_dir, output_shard_count, &mut index_weight_map, format)?;
         output_shard_count += 1;
     }
 
@@ -288,7 +302,7 @@ struct OutputTensor<'a> {
     dtype: safetensors::Dtype,
     shape: Vec<usize>,
     /// If Some, this tensor was quantized from a [m, k] bf16 weight.
-    q4_original_shape: Option<(usize, usize)>,
+    quant_original_shape: Option<(usize, usize)>,
 }
 
 /// Write one shard of tensors to disk.  Called incrementally as the shard fills.
@@ -300,15 +314,16 @@ fn write_single_shard(
     output_dir: &std::path::Path,
     shard_idx: usize,
     index_weight_map: &mut Vec<(String, usize)>,
+    format: QuantFormat,
 ) -> anyhow::Result<()> {
     let mut metadata: HashMap<String, String> = HashMap::new();
-    metadata.insert("quantization".to_string(), "rllm-q4".to_string());
+    metadata.insert("quantization".to_string(), format.metadata_tag().to_string());
 
     let mut views: Vec<(String, TensorView)> = Vec::with_capacity(tensors.len());
 
     for t in tensors {
-        if let Some((m, k)) = t.q4_original_shape {
-            metadata.insert(format!("rllm_q4:{}", t.name), format!("{m},{k}"));
+        if let Some((m, k)) = t.quant_original_shape {
+            metadata.insert(format!("{}{}", format.metadata_prefix(), t.name), format!("{m},{k}"));
         }
 
         let view = TensorView::new(t.dtype, t.shape.clone(), t.data.as_slice())
@@ -529,6 +544,7 @@ mod tests {
         exec(QuantizeArgs {
             model: input_dir.path().to_path_buf(),
             output: output_dir.path().to_path_buf(),
+            format: "q4".to_string(),
         })
         .unwrap();
 
@@ -602,6 +618,7 @@ mod tests {
         exec(QuantizeArgs {
             model: input_dir.path().to_path_buf(),
             output: output_dir.path().to_path_buf(),
+            format: "q4".to_string(),
         })
         .unwrap();
 
@@ -643,6 +660,7 @@ mod tests {
         exec(QuantizeArgs {
             model: input_dir.path().to_path_buf(),
             output: output_dir.path().to_path_buf(),
+            format: "q4".to_string(),
         })
         .unwrap();
 
@@ -667,5 +685,94 @@ mod tests {
             .tensor("model.layers.0.mlp.gate_proj.weight")
             .unwrap();
         assert_eq!(gate.dtype(), safetensors::Dtype::U8);
+    }
+
+    #[test]
+    fn test_end_to_end_quantize_q8_produces_valid_output() {
+        let input_dir = tempfile::tempdir().unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+
+        let m = 4;
+        let k = 64;
+        setup_test_model(
+            input_dir.path(),
+            &[
+                ("model.layers.0.self_attn.q_proj.weight", vec![m, k]),
+                ("model.layers.0.input_layernorm.weight", vec![64]),
+            ],
+        );
+
+        exec(QuantizeArgs {
+            model: input_dir.path().to_path_buf(),
+            output: output_dir.path().to_path_buf(),
+            format: "q8".to_string(),
+        })
+        .unwrap();
+
+        let output_st = output_dir.path().join("model.safetensors");
+        let data = std::fs::read(&output_st).unwrap();
+        let (_, metadata) = SafeTensors::read_metadata(&data).unwrap();
+        let meta = metadata.metadata().as_ref().unwrap();
+
+        assert_eq!(meta.get("quantization").unwrap(), "rllm-q8");
+        assert_eq!(
+            meta.get("rllm_q8:model.layers.0.self_attn.q_proj.weight")
+                .unwrap(),
+            &format!("{m},{k}")
+        );
+        // No Q4 metadata should be present.
+        assert!(
+            meta.get("rllm_q4:model.layers.0.self_attn.q_proj.weight")
+                .is_none()
+        );
+
+        let st = SafeTensors::deserialize(&data).unwrap();
+        let q_proj = st
+            .tensor("model.layers.0.self_attn.q_proj.weight")
+            .unwrap();
+        assert_eq!(q_proj.dtype(), safetensors::Dtype::U8);
+        let expected_bytes = crate::gpu::q8_byte_count(m, k);
+        assert_eq!(q_proj.data().len(), expected_bytes);
+    }
+
+    #[test]
+    fn test_end_to_end_quantize_q8_matches_on_load() {
+        use half::bf16;
+
+        let m = 2;
+        let k = 32;
+        let values: Vec<bf16> = (0..m * k)
+            .map(|i| bf16::from_f32((i % 17) as f32 * 0.1 - 0.8))
+            .collect();
+        let bf16_bytes: &[u8] = bytemuck::cast_slice(&values);
+
+        let on_load_q8 = crate::gpu::quantize_bf16_to_q8(bf16_bytes, m, k);
+
+        let input_dir = tempfile::tempdir().unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+
+        setup_test_model(
+            input_dir.path(),
+            &[("model.layers.0.self_attn.q_proj.weight", vec![m, k])],
+        );
+
+        exec(QuantizeArgs {
+            model: input_dir.path().to_path_buf(),
+            output: output_dir.path().to_path_buf(),
+            format: "q8".to_string(),
+        })
+        .unwrap();
+
+        let data = std::fs::read(output_dir.path().join("model.safetensors")).unwrap();
+        let st = SafeTensors::deserialize(&data).unwrap();
+        let offline_q8 = st
+            .tensor("model.layers.0.self_attn.q_proj.weight")
+            .unwrap();
+
+        assert_eq!(
+            offline_q8.data(),
+            on_load_q8.as_slice(),
+            "offline and on-load quantization must produce identical Q8 bytes"
+        );
     }
 }

@@ -97,6 +97,7 @@ pub(crate) struct MetalBackend {
     pub(crate) pipeline_rms_norm: metal::ComputePipelineState,
     pub(crate) pipeline_matvec: metal::ComputePipelineState,
     pub(crate) pipeline_matvec_q4: metal::ComputePipelineState,
+    pub(crate) pipeline_matvec_q8: metal::ComputePipelineState,
     pub(crate) pipeline_rope: metal::ComputePipelineState,
     #[allow(dead_code)]
     pub(crate) pipeline_attention: metal::ComputePipelineState,
@@ -122,6 +123,7 @@ pub(crate) struct MetalBackend {
     // Phase 3: batched prefill pipelines.
     pub(crate) pipeline_gemm_bf16: metal::ComputePipelineState,
     pub(crate) pipeline_gemm_q4: metal::ComputePipelineState,
+    pub(crate) pipeline_gemm_q8: metal::ComputePipelineState,
     pub(crate) pipeline_rms_norm_batch: metal::ComputePipelineState,
     pub(crate) pipeline_layer_norm_batch: metal::ComputePipelineState,
     pub(crate) pipeline_embed_lookup_batch: metal::ComputePipelineState,
@@ -149,6 +151,7 @@ pub(crate) struct MetalBackend {
     // Fused MoE kernels (flash-moe inspired).
     pub(crate) pipeline_fused_gate_up_swiglu: metal::ComputePipelineState,
     pub(crate) pipeline_fused_gate_up_swiglu_q4: metal::ComputePipelineState,
+    pub(crate) pipeline_fused_gate_up_swiglu_q8: metal::ComputePipelineState,
     pub(crate) pipeline_moe_combine_residual: metal::ComputePipelineState,
 
     // GPT-OSS kernels.
@@ -197,6 +200,8 @@ impl MetalBackend {
             Self::make_pipeline(&device, METAL_SOURCE_MATMUL, "matvec_bf16", &compile_opts)?;
         let pipeline_matvec_q4 =
             Self::make_pipeline(&device, METAL_SOURCE_MATMUL, "matvec_q4", &compile_opts)?;
+        let pipeline_matvec_q8 =
+            Self::make_pipeline(&device, METAL_SOURCE_MATMUL, "matvec_q8", &compile_opts)?;
         let pipeline_rope = Self::make_pipeline(
             &device,
             METAL_SOURCE_ROPE,
@@ -280,6 +285,8 @@ impl MetalBackend {
             Self::make_pipeline(&device, METAL_SOURCE_MATMUL, "gemm_bf16", &compile_opts)?;
         let pipeline_gemm_q4 =
             Self::make_pipeline(&device, METAL_SOURCE_MATMUL, "gemm_q4", &compile_opts)?;
+        let pipeline_gemm_q8 =
+            Self::make_pipeline(&device, METAL_SOURCE_MATMUL, "gemm_q8", &compile_opts)?;
         let pipeline_rms_norm_batch = Self::make_pipeline(
             &device,
             METAL_SOURCE_RMS_NORM,
@@ -402,6 +409,12 @@ impl MetalBackend {
             "fused_gate_up_swiglu_q4",
             &compile_opts,
         )?;
+        let pipeline_fused_gate_up_swiglu_q8 = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_MOE,
+            "fused_gate_up_swiglu_q8",
+            &compile_opts,
+        )?;
         let pipeline_moe_combine_residual = Self::make_pipeline(
             &device,
             METAL_SOURCE_MOE,
@@ -494,6 +507,7 @@ impl MetalBackend {
             pipeline_rms_norm,
             pipeline_matvec,
             pipeline_matvec_q4,
+            pipeline_matvec_q8,
             pipeline_rope,
             pipeline_attention,
             pipeline_attention_hd256,
@@ -514,6 +528,7 @@ impl MetalBackend {
             pipeline_paged_attention_fused_hd256,
             pipeline_gemm_bf16,
             pipeline_gemm_q4,
+            pipeline_gemm_q8,
             pipeline_rms_norm_batch,
             pipeline_layer_norm_batch,
             pipeline_embed_lookup_batch,
@@ -535,6 +550,7 @@ impl MetalBackend {
             pipeline_rope_partial,
             pipeline_fused_gate_up_swiglu,
             pipeline_fused_gate_up_swiglu_q4,
+            pipeline_fused_gate_up_swiglu_q8,
             pipeline_moe_combine_residual,
             pipeline_silu_mul_clamp,
             pipeline_gpt_oss_gated_act,

@@ -123,6 +123,9 @@ pub(crate) enum TensorDtype {
     /// Block-wise 4-bit quantization: 32 weights per block, each block is
     /// 18 bytes (2-byte bf16 scale + 16 bytes of packed nibbles).
     Q4,
+    /// Block-wise 8-bit quantization: 32 weights per block, each block is
+    /// 34 bytes (2-byte bf16 scale + 32 signed int8 values).
+    Q8,
 }
 
 impl TensorDtype {
@@ -132,6 +135,7 @@ impl TensorDtype {
             TensorDtype::BF16 => 2,
             TensorDtype::F32 => 4,
             TensorDtype::Q4 => panic!("Q4 has variable byte size; use q4_byte_count()"),
+            TensorDtype::Q8 => panic!("Q8 has variable byte size; use q8_byte_count()"),
         }
     }
 }
@@ -145,6 +149,17 @@ pub(crate) fn q4_byte_count(m: usize, k: usize) -> usize {
     m.checked_mul(blocks_per_row)
         .and_then(|v| v.checked_mul(18))
         .expect("q4_byte_count overflow: tensor dimensions too large")
+}
+
+/// Compute total byte count for a Q8 weight tensor [m, k].
+///
+/// Same block size as Q4 (32 weights) but 34 bytes per block:
+/// 2-byte bf16 scale + 32 signed int8 values.
+pub(crate) fn q8_byte_count(m: usize, k: usize) -> usize {
+    let blocks_per_row = k / 32;
+    m.checked_mul(blocks_per_row)
+        .and_then(|v| v.checked_mul(34))
+        .expect("q8_byte_count overflow: tensor dimensions too large")
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +234,75 @@ pub(crate) fn quantize_bf16_to_q4(bf16_data: &[u8], m: usize, k: usize) -> Vec<u
                 let q1 = ((v1 * inv_scale).round() as i32).clamp(-8, 7) + 8;
 
                 out[dst_offset + 2 + i] = (q0 as u8) | ((q1 as u8) << 4);
+            }
+        }
+    }
+
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Q8 quantisation — 8-bit symmetric, higher fidelity than Q4.
+//
+// Same block structure as Q4 (32 weights per block) but each weight gets a
+// full signed byte instead of a nibble.  Block layout (34 bytes):
+//   [0..2]:  bf16 scale (little-endian)
+//   [2..34]: 32 × signed int8 values
+//
+// scale = max(|w_i|) / 127.0
+// q_i = clamp(round(w_i / scale), -128, 127)
+// GPU dequant: w_i = float(q_i) * scale  (signed char, no offset)
+// ---------------------------------------------------------------------------
+
+/// Quantise a bf16 weight matrix [m, k] to block-wise Q8.
+pub(crate) fn quantize_bf16_to_q8(bf16_data: &[u8], m: usize, k: usize) -> Vec<u8> {
+    use half::bf16;
+
+    assert_eq!(bf16_data.len(), m * k * 2);
+
+    // Try zero-copy cast first; fall back to a copy if the mmap slice
+    // isn't 2-byte aligned (can happen with some safetensors packing).
+    let owned_buf: Vec<bf16>;
+    let values: &[bf16] = match bytemuck::try_cast_slice(bf16_data) {
+        Ok(v) => v,
+        Err(_) => {
+            owned_buf = bf16_data
+                .chunks_exact(2)
+                .map(|c| bf16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            &owned_buf
+        }
+    };
+    assert_eq!(values.len(), m * k);
+
+    let blocks_per_row = k / 32;
+    let mut out = vec![0u8; q8_byte_count(m, k)];
+
+    for row in 0..m {
+        for block in 0..blocks_per_row {
+            let src_offset = row * k + block * 32;
+            let dst_offset = (row * blocks_per_row + block) * 34;
+
+            // Find max absolute value in the block for scale computation.
+            let mut max_abs: f32 = 0.0;
+            for i in 0..32 {
+                let v = values[src_offset + i].to_f32().abs();
+                if v > max_abs {
+                    max_abs = v;
+                }
+            }
+            let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
+            let inv_scale = 1.0 / scale;
+
+            // Write scale as bf16 (2 bytes).
+            let scale_bf16 = (scale.to_bits() >> 16) as u16;
+            out[dst_offset..dst_offset + 2].copy_from_slice(&scale_bf16.to_le_bytes());
+
+            // Quantise each weight to a signed byte.
+            for i in 0..32 {
+                let v = values[src_offset + i].to_f32();
+                let q = ((v * inv_scale).round() as i32).clamp(-128, 127);
+                out[dst_offset + 2 + i] = q as i8 as u8;
             }
         }
     }

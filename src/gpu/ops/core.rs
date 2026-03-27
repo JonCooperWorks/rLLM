@@ -78,6 +78,19 @@ pub(crate) trait GpuCore: Send + Sync {
         self.upload_tensor(&q4_data, shape, TensorDtype::Q4)
     }
 
+    /// Quantise bf16 weight data to Q8 and upload to the GPU.
+    ///
+    /// Same as `quantize_upload` but produces Q8 (8-bit) blocks instead of Q4.
+    /// Used when loading Q8-quantized models.
+    fn quantize_upload_q8(&self, bf16_data: &[u8], shape: &[usize]) -> Self::Tensor {
+        assert!(
+            shape.len() == 2 && shape[1] % 32 == 0,
+            "quantize_upload_q8 requires 2D shape with K divisible by 32, got {shape:?}"
+        );
+        let q8_data = super::super::quantize_bf16_to_q8(bf16_data, shape[0], shape[1]);
+        self.upload_tensor(&q8_data, shape, TensorDtype::Q8)
+    }
+
     /// Copy a contiguous region of bytes between two GPU tensors.
     ///
     /// This is the primitive that enables batched decode: when we have a
