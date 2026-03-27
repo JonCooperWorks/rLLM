@@ -1502,7 +1502,8 @@ impl GpuMamba2 for CpuBackend {
         &self,
         state: &CpuTensor,
         x: &CpuTensor,
-        bcdt_buf: &CpuTensor,
+        bc_buf: &CpuTensor,
+        dt_buf: &CpuTensor,
         a_log: &CpuTensor,
         d_skip: &CpuTensor,
         dt_bias: &CpuTensor,
@@ -1527,12 +1528,11 @@ impl GpuMamba2 for CpuBackend {
         let c_off = c_offset as usize;
         let dt_off = dt_offset as usize;
 
-        // Read inputs — B, C, dt all come from the unified bcdt_buf at specified offsets.
+        // Read inputs — B/C come from bc_buf, dt from dt_buf (separate buffers).
         let x_data = read_bf16(x, nh * hd);
-        // Read enough of bcdt_buf to cover all three regions.
-        let max_needed = [b_off + ng * ss, c_off + ng * ss, dt_off + nh]
-            .into_iter().max().unwrap();
-        let bcdt_data = read_bf16(bcdt_buf, max_needed);
+        let bc_max = [b_off + ng * ss, c_off + ng * ss].into_iter().max().unwrap();
+        let bc_data = read_bf16(bc_buf, bc_max);
+        let dt_data = read_bf16(dt_buf, dt_off + nh);
         let a_log_data = read_f32(a_log, nh);
         let d_skip_data = read_f32(d_skip, nh);
         let dt_bias_data = read_f32(dt_bias, nh);
@@ -1547,7 +1547,7 @@ impl GpuMamba2 for CpuBackend {
             let g = h / heads_per_group;
 
             // 1. Discretize: dt_h = softplus(dt_raw + dt_bias)
-            let dt_raw = bcdt_data[dt_off + h] + dt_bias_data[h];
+            let dt_raw = dt_data[dt_off + h] + dt_bias_data[h];
             let dt_h = (1.0 + dt_raw.exp()).ln(); // softplus
 
             // dA = exp(dt * (-exp(A_log)))
@@ -1558,7 +1558,7 @@ impl GpuMamba2 for CpuBackend {
                 for si in 0..ss {
                     let idx = h * hd * ss + di * ss + si;
                     let x_val = x_data[h * hd + di];
-                    let b_val = bcdt_data[b_off + g * ss + si];
+                    let b_val = bc_data[b_off + g * ss + si];
                     st[idx] = da * st[idx] + dt_h * x_val * b_val;
                 }
             }
@@ -1567,7 +1567,7 @@ impl GpuMamba2 for CpuBackend {
             for di in 0..hd {
                 let mut dot = 0.0f32;
                 for si in 0..ss {
-                    dot += st[h * hd * ss + di * ss + si] * bcdt_data[c_off + g * ss + si];
+                    dot += st[h * hd * ss + di * ss + si] * bc_data[c_off + g * ss + si];
                 }
                 y[h * hd + di] = dot + d_skip_data[h] * x_data[h * hd + di];
             }
@@ -1576,16 +1576,52 @@ impl GpuMamba2 for CpuBackend {
         // Write updated state back
         write_f32(state, &st);
 
-        // 4. RMSNorm with learned per-element weight over all heads
-        let total = nh * hd;
-        let mut sum_sq = 0.0f32;
-        for i in 0..total {
-            sum_sq += y[i] * y[i];
-        }
-        let rms = (sum_sq / total as f32 + eps).sqrt();
-        let mut result = vec![0.0f32; total];
-        for i in 0..total {
-            result[i] = (y[i] / rms) * nw_data[i];
+        // Write raw output (no norm — gated norm happens outside this function).
+        write_bf16(out, &y);
+    }
+
+    fn mamba2_gated_rms_norm(
+        &self,
+        y: &CpuTensor,
+        z_buf: &CpuTensor,
+        weight: &CpuTensor,
+        out: &CpuTensor,
+        d_inner: u32,
+        group_size: u32,
+        z_offset: u32,
+        eps: f32,
+    ) {
+        let di = d_inner as usize;
+        let gs = group_size as usize;
+        let zo = z_offset as usize;
+
+        let y_data = read_bf16(y, di);
+        let z_data = read_bf16(z_buf, zo + di);
+        let w_data = read_bf16(weight, di);
+
+        let mut result = vec![0.0f32; di];
+        let num_groups = (di + gs - 1) / gs;
+
+        for g in 0..num_groups {
+            let base = g * gs;
+            let end = (base + gs).min(di);
+            let len = end - base;
+
+            // Gate + sum of squares
+            let mut sum_sq = 0.0f32;
+            for i in 0..len {
+                let z_val = z_data[zo + base + i];
+                let gate = z_val / (1.0 + (-z_val).exp()); // silu
+                let gated = y_data[base + i] * gate;
+                result[base + i] = gated;
+                sum_sq += gated * gated;
+            }
+
+            // Normalize
+            let rms = (sum_sq / len as f32 + eps).sqrt();
+            for i in 0..len {
+                result[base + i] = (result[base + i] / rms) * w_data[base + i];
+            }
         }
 
         write_bf16(out, &result);

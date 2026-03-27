@@ -775,6 +775,12 @@ impl ModelConfig {
     /// as hidden_size / num_attention_heads.
     pub fn from_file(path: &std::path::Path) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
+        // Some HuggingFace configs use JavaScript-style `Infinity` / `-Infinity`
+        // literals (e.g. Nemotron-H's time_step_limit), which aren't valid JSON.
+        // Replace them with large finite values that serde_json can parse.
+        // The literal can appear after ": " or standalone on a line (in arrays).
+        let contents = contents
+            .replace("Infinity", "1e308");
         let raw: Value = serde_json::from_str(&contents)?;
 
         // Extract vision config and token IDs from the top-level JSON before
@@ -793,7 +799,7 @@ impl ModelConfig {
 
         // Detect nested VLM config: if `text_config` exists, extract it and
         // merge top-level fields (like `tie_word_embeddings`) into it.
-        let (config_value, weight_prefix) = if let Some(text_config) = raw.get("text_config") {
+        let (mut config_value, weight_prefix) = if let Some(text_config) = raw.get("text_config") {
             let mut merged = text_config.clone();
             // Promote top-level `tie_word_embeddings` into text_config if not already set.
             if let Some(tie) = raw.get("tie_word_embeddings") {
@@ -852,6 +858,15 @@ impl ModelConfig {
         } else {
             (raw, "model.".to_string())
         };
+
+        // Nemotron-H has both `norm_eps` and `layer_norm_epsilon` in config.json.
+        // Both are serde aliases for `rms_norm_eps`, so having both causes a
+        // "duplicate field" error.  Drop `layer_norm_epsilon` when `norm_eps` exists.
+        if let Some(obj) = config_value.as_object_mut() {
+            if obj.contains_key("norm_eps") {
+                obj.remove("layer_norm_epsilon");
+            }
+        }
 
         let mut config: Self = serde_json::from_value(config_value)?;
         config.weight_prefix = weight_prefix;
@@ -1346,6 +1361,15 @@ impl ModelConfig {
     pub fn mamba2_in_proj_dim(&self) -> usize {
         let d_inner = self.mamba2_d_inner();
         2 * d_inner + 2 * self.mamba_n_groups * self.ssm_state_size + self.mamba_num_heads
+    }
+
+    /// Mamba-2 conv1d dimension: d_inner + 2 × n_groups × state_size.
+    ///
+    /// The conv1d operates on the concatenation of [x, B, C] — not just x.
+    /// This is because the SSM's B and C parameters also benefit from the
+    /// causal convolution (temporal smoothing before the state update).
+    pub fn mamba2_conv_dim(&self) -> usize {
+        self.mamba2_d_inner() + 2 * self.mamba_n_groups * self.ssm_state_size
     }
 }
 

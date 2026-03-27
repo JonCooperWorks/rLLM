@@ -170,6 +170,7 @@ pub(crate) struct MetalBackend {
     // Mamba-2 kernels (Nemotron-H selective SSM).
     pub(crate) pipeline_mamba2_conv1d_silu: metal::ComputePipelineState,
     pub(crate) pipeline_mamba2_ssm_step: metal::ComputePipelineState,
+    pub(crate) pipeline_mamba2_gated_rms_norm: metal::ComputePipelineState,
 
     // Nemotron-H elementwise kernels.
     pub(crate) pipeline_relu_squared: metal::ComputePipelineState,
@@ -496,6 +497,12 @@ impl MetalBackend {
             "mamba2_ssm_step",
             &compile_opts,
         )?;
+        let pipeline_mamba2_gated_rms_norm = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_MAMBA2,
+            "mamba2_gated_rms_norm",
+            &compile_opts,
+        )?;
 
         // Nemotron-H elementwise kernels.
         let pipeline_relu_squared = Self::make_pipeline(
@@ -599,6 +606,7 @@ impl MetalBackend {
             pipeline_prefill_attention_fused_qkv,
             pipeline_mamba2_conv1d_silu,
             pipeline_mamba2_ssm_step,
+            pipeline_mamba2_gated_rms_norm,
             pipeline_relu_squared,
             pipeline_top_k_sigmoid,
             pipeline_turbo_quantize_paged,

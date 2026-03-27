@@ -39,7 +39,44 @@ struct Mamba2SsmStepParams {
     eps: f32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MambaGatedNormParams {
+    d_inner: u32,
+    group_size: u32,
+    z_offset: u32,
+    eps: f32,
+}
+
 impl GpuMamba2 for MetalBackend {
+    fn mamba2_gated_rms_norm(
+        &self,
+        y: &MetalTensor,
+        z_buf: &MetalTensor,
+        weight: &MetalTensor,
+        out: &MetalTensor,
+        d_inner: u32,
+        group_size: u32,
+        z_offset: u32,
+        eps: f32,
+    ) {
+        let params = MambaGatedNormParams { d_inner, group_size, z_offset, eps };
+        let num_groups = (d_inner + group_size - 1) / group_size;
+        let threads_per_group: u64 = 256;
+        self.dispatch_async(
+            &self.pipeline_mamba2_gated_rms_norm,
+            &params,
+            &[
+                (&y.buffer, 1),
+                (&z_buf.buffer, 2),
+                (&weight.buffer, 3),
+                (&out.buffer, 4),
+            ],
+            MTLSize::new(num_groups as u64 * threads_per_group, 1, 1),
+            MTLSize::new(threads_per_group, 1, 1),
+        );
+    }
+
     fn mamba2_conv1d_silu(
         &self,
         input: &MetalTensor,
@@ -71,7 +108,8 @@ impl GpuMamba2 for MetalBackend {
         &self,
         state: &MetalTensor,
         x: &MetalTensor,
-        bcdt_buf: &MetalTensor,
+        bc_buf: &MetalTensor,
+        dt_buf: &MetalTensor,
         a_log: &MetalTensor,
         d_skip: &MetalTensor,
         dt_bias: &MetalTensor,
@@ -103,12 +141,13 @@ impl GpuMamba2 for MetalBackend {
             &[
                 (&state.buffer, 1),
                 (&x.buffer, 2),
-                (&bcdt_buf.buffer, 3),
-                (&a_log.buffer, 4),
-                (&d_skip.buffer, 5),
-                (&dt_bias.buffer, 6),
-                (&norm_weight.buffer, 7),
-                (&out.buffer, 8),
+                (&bc_buf.buffer, 3),
+                (&dt_buf.buffer, 4),
+                (&a_log.buffer, 5),
+                (&d_skip.buffer, 6),
+                (&dt_bias.buffer, 7),
+                (&norm_weight.buffer, 8),
+                (&out.buffer, 9),
             ],
             MTLSize::new(num_heads as u64 * threads_per_group, 1, 1),
             MTLSize::new(threads_per_group, 1, 1),

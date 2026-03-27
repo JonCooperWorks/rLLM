@@ -24,6 +24,20 @@ use super::super::tensor::CudaTensor;
 use crate::gpu::ops::GpuMamba2;
 
 impl GpuMamba2 for CudaBackend {
+    fn mamba2_gated_rms_norm(
+        &self,
+        _y: &CudaTensor,
+        _z_buf: &CudaTensor,
+        _weight: &CudaTensor,
+        _out: &CudaTensor,
+        _d_inner: u32,
+        _group_size: u32,
+        _z_offset: u32,
+        _eps: f32,
+    ) {
+        unimplemented!("Mamba2 gated RMSNorm CUDA kernel not yet implemented")
+    }
+
     fn mamba2_conv1d_silu(
         &self,
         _input: &CudaTensor,
@@ -42,7 +56,8 @@ impl GpuMamba2 for CudaBackend {
         &self,
         _state: &CudaTensor,
         _x: &CudaTensor,
-        _bcdt_buf: &CudaTensor,
+        _bc_buf: &CudaTensor,
+        _dt_buf: &CudaTensor,
         _a_log: &CudaTensor,
         _d_skip: &CudaTensor,
         _dt_bias: &CudaTensor,

@@ -204,7 +204,7 @@ pub(crate) struct Model<'a, B: GpuCore> {
 
     // Mamba-2 scratch buffers (reused every forward pass).
     pub(crate) m2_in_proj_buf: Option<B::Tensor>,  // [in_proj_dim] bf16
-    pub(crate) m2_conv_out: Option<B::Tensor>,      // [d_inner] bf16
+    pub(crate) m2_conv_out: Option<B::Tensor>,      // [conv_dim] bf16 (holds [x, B, C] after conv1d)
     pub(crate) m2_ssm_out: Option<B::Tensor>,       // [d_inner] bf16
 
     // KV layer mapping: layer_idx → kv_pool_idx (None for DeltaNet/Mamba/MoE layers).
@@ -450,6 +450,7 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
         let (mamba2_states, mamba2_conv_history, m2_in_proj_buf, m2_conv_out, m2_ssm_out) =
             if is_mamba2 {
                 let d_inner = config.mamba2_d_inner();
+                let conv_dim = config.mamba2_conv_dim(); // d_inner + 2*n_groups*state_size
                 let in_proj_dim = config.mamba2_in_proj_dim();
                 let ks = config.mamba_conv_kernel;
                 let n_heads = config.mamba_num_heads;
@@ -466,8 +467,10 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
                 let mut conv_histories = Vec::with_capacity(num_m2_layers);
                 for _ in 0..num_m2_layers {
                     states.push(backend.alloc_tensor(&[state_size], TensorDtype::F32));
+                    // Conv history is [(ks-1) * conv_dim] because conv1d operates
+                    // on the full [x, B, C] concatenation, not just x.
                     conv_histories.push(
-                        backend.alloc_tensor(&[(ks - 1) * d_inner], TensorDtype::BF16),
+                        backend.alloc_tensor(&[(ks - 1) * conv_dim], TensorDtype::BF16),
                     );
                 }
                 // Zero-initialise states and conv histories.
@@ -475,14 +478,15 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
                     backend.fill_zero(s, state_size as u32);
                 }
                 for h in &conv_histories {
-                    backend.fill_zero(h, ((ks - 1) * d_inner) as u32);
+                    backend.fill_zero(h, ((ks - 1) * conv_dim) as u32);
                 }
 
                 (
                     Some(states),
                     Some(conv_histories),
                     Some(backend.alloc_tensor(&[in_proj_dim], TensorDtype::BF16)),
-                    Some(backend.alloc_tensor(&[d_inner], TensorDtype::BF16)),
+                    // conv_out needs conv_dim (not d_inner) — it holds [x, B, C] post-conv.
+                    Some(backend.alloc_tensor(&[conv_dim], TensorDtype::BF16)),
                     Some(backend.alloc_tensor(&[d_inner], TensorDtype::BF16)),
                 )
             } else {

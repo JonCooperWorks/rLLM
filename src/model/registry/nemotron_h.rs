@@ -67,14 +67,17 @@ use crate::model::{Model, PrefillBuffers};
 
 /// Shared dimension struct to avoid recomputing sizes on every layer.
 ///
-/// Note: rescale_prenorm_residual is NOT applied here — it's baked into the
-/// RMSNorm weights at load time (see loader.rs load_nemotron_h_layer).
-/// This eliminates 52 separate scalar_mul dispatches per token.
+/// Note: rescale_prenorm_residual is a training-time initialization flag, not
+/// a runtime scaling.  The out_proj weights were already trained with the
+/// 1/sqrt(2*N) scaling baked in, so no runtime adjustment is needed.
 struct NemotronDims {
     hidden_size: u32,
     q_dim: u32,
     kv_dim: u32,
     d_inner: u32,
+    /// Conv1d operates on [x, B, C] concatenated, not just x.
+    /// conv_dim = d_inner + 2 × n_groups × state_size.
+    conv_dim: u32,
     num_heads: u32,
     num_kv_heads: u32,
     head_dim: u32,
@@ -110,6 +113,7 @@ impl NemotronDims {
             q_dim: (config.num_attention_heads * config.head_dim) as u32,
             kv_dim: (config.num_key_value_heads * config.head_dim) as u32,
             d_inner: config.mamba2_d_inner() as u32,
+            conv_dim: config.mamba2_conv_dim() as u32,
             num_heads: config.num_attention_heads as u32,
             num_kv_heads: config.num_key_value_heads as u32,
             head_dim: config.head_dim as u32,
@@ -235,36 +239,44 @@ fn mamba2_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuDeltaNet 
     // 2. in_proj: [in_proj_dim, hidden_size] × norm_buf → in_proj_buf.
     m.backend.matmul(in_proj, &m.norm_buf, in_proj_buf, in_proj_dim, d.hidden_size);
 
-    // 4. Conv1d + SiLU on x portion (offset d_inner..2*d_inner in in_proj_buf).
-    // The mamba2_conv1d_silu kernel accepts input_offset to read x at the
-    // correct position within the concatenated in_proj_buf.
+    // 4. Conv1d + SiLU on the [x, B, C] portion of in_proj_buf.
+    //
+    // in_proj output layout: [z(d_inner), xBC(conv_dim), dt(num_heads)]
+    // The conv1d operates on ALL of xBC (not just x) — this is how Mamba-2
+    // applies causal convolution to the SSM's B/C parameters too.
+    // After conv, conv_out contains [x(d_inner), B(ngs), C(ngs)] with SiLU applied.
     m.backend.mamba2_conv1d_silu(
         in_proj_buf,
         history,
         conv_w,
         conv_b,
         conv_out,
-        d.d_inner,
+        d.conv_dim,
         m.config.mamba_conv_kernel as u32,
-        d.d_inner, // input_offset: x starts at element d_inner
+        d.d_inner, // input_offset: xBC starts at element d_inner in in_proj_buf
     );
 
-    // 5. Shift conv history: append the current x (at offset d_inner) to the FIFO.
+    // 5. Shift conv history: append the current xBC to the FIFO.
     m.backend.conv1d_shift_history(
         history,
         in_proj_buf,
-        d.d_inner,
+        d.conv_dim,
         m.config.mamba_conv_kernel as u32,
-        d.d_inner, // input_offset: x starts at element d_inner
+        d.d_inner, // input_offset: xBC starts at element d_inner
     );
 
     // 6. SSM step: state update + output + RMSNorm.
-    // B is at offset 2*d_inner, C at 2*d_inner + n_groups*state_size,
-    // dt at 2*d_inner + 2*n_groups*state_size in in_proj_buf.
+    //
+    // After conv1d, conv_out contains [x(d_inner), B(ngs), C(ngs)].
+    // dt is in in_proj_buf at offset d_inner + conv_dim (not convolved).
+    // The SSM kernel reads x from conv_out[0..d_inner], B/C from
+    // conv_out[d_inner..], and dt from in_proj_buf[d_inner+conv_dim..].
+    let ngs = d.n_groups * d.state_size;
     m.backend.mamba2_ssm_step(
         state,
-        conv_out,
-        in_proj_buf,  // unified B/C/dt buffer with offsets below
+        conv_out,                  // x at offset 0
+        conv_out,                  // bc_buf: B/C also in conv_out
+        in_proj_buf,               // dt_buf: dt lives in in_proj_buf
         a_log,
         d_skip,
         dt_bias,
@@ -274,16 +286,30 @@ fn mamba2_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuDeltaNet 
         d.mamba_head_dim,
         d.state_size,
         d.n_groups,
-        2 * d.d_inner,                                // b_offset
-        2 * d.d_inner + d.n_groups * d.state_size,     // c_offset
-        2 * d.d_inner + 2 * d.n_groups * d.state_size, // dt_offset
+        d.d_inner,                 // b_offset: B starts after x in conv_out
+        d.d_inner + ngs,           // c_offset: C starts after B in conv_out
+        d.d_inner + d.conv_dim,    // dt_offset: dt in in_proj_buf, after z + xBC
         d.eps,
     );
 
-    // 7. Output gate: ssm_out = ssm_out × silu(z).
+    // 7. Gated grouped RMSNorm: out = rmsnorm(ssm_out × silu(z)) × weight.
+    //
+    // The Mamba-2 architecture applies the gate (silu(z)) BEFORE normalization,
+    // then normalizes in groups of (d_inner / n_groups) elements.  This is
+    // the MambaRMSNormGated with norm_before_gate=False.
+    //
     // z is the first d_inner elements of in_proj_buf.
-    m.backend.silu(in_proj_buf, in_proj_buf, d.d_inner);
-    m.backend.mul(ssm_out, in_proj_buf, ssm_out, d.d_inner);
+    let group_size = d.d_inner / d.n_groups;
+    m.backend.mamba2_gated_rms_norm(
+        ssm_out,        // y: raw SSM output
+        in_proj_buf,    // z_buf: z is at offset 0
+        norm_w,         // weight
+        ssm_out,        // out (can reuse since kernel reads y first)
+        d.d_inner,
+        group_size,
+        0,              // z_offset: z starts at beginning of in_proj_buf
+        d.eps,
+    );
 
     // 8. out_proj + all-reduce (TP) + residual: hidden += out_proj × ssm_out.
     m.backend.matmul(out_proj, ssm_out, &m.norm_buf, d.hidden_size, d.d_inner);
@@ -712,23 +738,10 @@ pub(crate) fn load_layer<B: GpuCore>(
     // All Nemotron-H layers have a pre-layer RMSNorm.
     let input_layernorm = upload_tensor(store, backend, &format!("{prefix}.norm.weight"), &[hidden])?;
 
-    // Bake rescale_prenorm_residual into the norm weights at load time.
-    // This is a constant 1/sqrt(2 * num_layers) scale factor that would otherwise
-    // require a separate scalar_mul dispatch on every layer of every token.
-    // By folding it into the norm weights, we get it for free: the RMSNorm
-    // output becomes `normalized(x) * (weight * scale)` instead of needing
-    // a separate `scalar_mul(output, scale)` afterwards.
-    if config.rescale_prenorm_residual {
-        let scale = 1.0 / ((2.0 * config.num_hidden_layers as f64).sqrt()) as f32;
-        let byte_count = backend.tensor_byte_count(&input_layernorm);
-        let mut buf = vec![0u8; byte_count];
-        backend.copy_to_host(&input_layernorm, &mut buf);
-        let bf16_slice: &mut [half::bf16] = bytemuck::cast_slice_mut(&mut buf);
-        for v in bf16_slice.iter_mut() {
-            *v = half::bf16::from_f32(v.to_f32() * scale);
-        }
-        backend.copy_to_tensor(&input_layernorm, &buf);
-    }
+    // NOTE: rescale_prenorm_residual is an INITIALIZATION-time optimization
+    // (GPT-2 style), not a runtime one.  The model's out_proj weights were
+    // already scaled by 1/sqrt(2*num_layers) during training.  We do NOT
+    // apply any additional scaling during inference.
 
     // Nemotron-H has only one norm per layer (no post-attention norm).
     let dummy_norm = backend.alloc_tensor(&[1], TensorDtype::BF16);
@@ -760,6 +773,7 @@ pub(crate) fn load_layer<B: GpuCore>(
     match layer_type {
         "mamba2" => {
             let d_inner = config.mamba2_d_inner();
+            let conv_dim = config.mamba2_conv_dim(); // d_inner + 2*n_groups*state_size
             let in_proj_dim = config.mamba2_in_proj_dim();
             let ks = config.mamba_conv_kernel;
             let n_heads = config.mamba_num_heads;
@@ -767,24 +781,46 @@ pub(crate) fn load_layer<B: GpuCore>(
             lw.mamba_in_proj = Some(upload_tensor(
                 store, backend, &format!("{prefix}.mixer.in_proj.weight"), &[in_proj_dim, hidden],
             )?);
-            lw.mamba_conv1d_weight = Some(upload_tensor(
-                store, backend, &format!("{prefix}.mixer.conv1d.weight"), &[d_inner, ks],
+
+            // conv1d weight is stored as [conv_dim, 1, kernel_size] (PyTorch Conv1d format).
+            // We reshape to [conv_dim, kernel_size] — same contiguous data, just dropping
+            // the middle dimension.  upload_tensor does strict shape checks, so we load
+            // the raw tensor and upload with our desired 2D shape.
+            let conv_w_view = store.tensor(&format!("{prefix}.mixer.conv1d.weight"))?;
+            lw.mamba_conv1d_weight = Some(backend.upload_tensor(
+                conv_w_view.data(), &[conv_dim, ks], TensorDtype::BF16,
+            ));
+            // conv1d bias is bf16 in the checkpoint — upload as bf16.
+            lw.mamba_conv1d_bias = Some(upload_tensor(
+                store, backend, &format!("{prefix}.mixer.conv1d.bias"), &[conv_dim],
             )?);
-            let conv_b_view = store.tensor(&format!("{prefix}.mixer.conv1d.bias"))?;
-            lw.mamba_conv1d_bias = Some(backend.upload_tensor(conv_b_view.data(), &[d_inner], TensorDtype::F32));
 
             lw.mamba_out_proj = Some(upload_tensor(
                 store, backend, &format!("{prefix}.mixer.out_proj.weight"), &[hidden, d_inner],
             )?);
 
+            // A_log, D, dt_bias are stored as bf16 but the SSM kernel needs f32
+            // for numerical precision (exp/softplus on small values).
             let a_log_view = store.tensor(&format!("{prefix}.mixer.A_log"))?;
-            lw.mamba_a_log = Some(backend.upload_tensor(a_log_view.data(), &[n_heads], TensorDtype::F32));
+            let a_log_f32: Vec<f32> = bytemuck::cast_slice::<u8, half::bf16>(a_log_view.data())
+                .iter().map(|v| v.to_f32()).collect();
+            lw.mamba_a_log = Some(backend.upload_tensor(
+                bytemuck::cast_slice(&a_log_f32), &[n_heads], TensorDtype::F32,
+            ));
 
             let d_view = store.tensor(&format!("{prefix}.mixer.D"))?;
-            lw.mamba_d = Some(backend.upload_tensor(d_view.data(), &[n_heads], TensorDtype::F32));
+            let d_f32: Vec<f32> = bytemuck::cast_slice::<u8, half::bf16>(d_view.data())
+                .iter().map(|v| v.to_f32()).collect();
+            lw.mamba_d = Some(backend.upload_tensor(
+                bytemuck::cast_slice(&d_f32), &[n_heads], TensorDtype::F32,
+            ));
 
             let dt_bias_view = store.tensor(&format!("{prefix}.mixer.dt_bias"))?;
-            lw.mamba_dt_bias = Some(backend.upload_tensor(dt_bias_view.data(), &[n_heads], TensorDtype::F32));
+            let dt_bias_f32: Vec<f32> = bytemuck::cast_slice::<u8, half::bf16>(dt_bias_view.data())
+                .iter().map(|v| v.to_f32()).collect();
+            lw.mamba_dt_bias = Some(backend.upload_tensor(
+                bytemuck::cast_slice(&dt_bias_f32), &[n_heads], TensorDtype::F32,
+            ));
 
             lw.mamba_norm = Some(upload_tensor(
                 store, backend, &format!("{prefix}.mixer.norm.weight"), &[d_inner],
@@ -792,8 +828,8 @@ pub(crate) fn load_layer<B: GpuCore>(
 
             if layer_idx == 0 {
                 eprintln!(
-                    "  mamba2: d_inner={d_inner}, in_proj={in_proj_dim}, conv_k={ks}, \
-                     state={}, groups={}, heads={n_heads}",
+                    "  mamba2: d_inner={d_inner}, conv_dim={conv_dim}, in_proj={in_proj_dim}, \
+                     conv_k={ks}, state={}, groups={}, heads={n_heads}",
                     config.ssm_state_size, config.mamba_n_groups
                 );
             }

@@ -873,10 +873,10 @@ fn load_weights_inner<B: GpuCore>(
     let hints = LoaderHints::new(arch, config);
 
     // Load the embedding table.
-    // Nemotron-H uses "embeddings.weight" at the top level (no prefix);
+    // Nemotron-H uses "{prefix}embeddings.weight" (backbone.embeddings.weight);
     // all other models use "{prefix}embed_tokens.weight".
     let embed_name = match arch {
-        ModelArch::NemotronH => "embeddings.weight".to_string(),
+        ModelArch::NemotronH => format!("{wp}embeddings.weight"),
         _ => format!("{wp}embed_tokens.weight"),
     };
     let embed_tokens = upload_tensor(
@@ -941,10 +941,15 @@ fn load_weights_inner<B: GpuCore>(
     }
 
     // Final RMSNorm weight (applied after all layers, before lm_head).
+    // Nemotron-H names this `norm_f.weight` instead of `norm.weight`.
+    let norm_name = match arch {
+        ModelArch::NemotronH => format!("{wp}norm_f.weight"),
+        _ => format!("{wp}norm.weight"),
+    };
     let norm_weight = if hints.residual_norm {
-        upload_norm_residual(&store, backend, &format!("{wp}norm.weight"), &[hidden])?
+        upload_norm_residual(&store, backend, &norm_name, &[hidden])?
     } else {
-        upload_tensor(&store, backend, &format!("{wp}norm.weight"), &[hidden])?
+        upload_tensor(&store, backend, &norm_name, &[hidden])?
     };
 
     eprintln!("loaded {} layers", layers.len());

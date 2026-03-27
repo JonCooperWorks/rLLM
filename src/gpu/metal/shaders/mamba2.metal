@@ -56,15 +56,15 @@ kernel void mamba2_conv1d_silu(
     device const bfloat* input         [[buffer(1)]],
     device const bfloat* history       [[buffer(2)]],
     device const bfloat* weight        [[buffer(3)]],
-    device const float* bias           [[buffer(4)]],
+    device const bfloat* bias           [[buffer(4)]],
     device bfloat* out                 [[buffer(5)]],
     uint gid                           [[thread_position_in_grid]]
 ) {
     if (gid >= params.dim) return;
 
     // Start with bias — the key difference from DeltaNet's conv1d.
-    // Bias is f32 (loaded as f32 by the weight loader), no cast needed.
-    float acc = bias[gid];
+    // Bias is bf16 in the Nemotron-H checkpoint.
+    float acc = float(bias[gid]);
 
     // Convolve over the history buffer (kernel_size - 1 prior tokens).
     // History layout: [time_step, dim] — each row is one prior token's
@@ -120,12 +120,13 @@ kernel void mamba2_ssm_step(
     constant Mamba2SsmStepParams& params [[buffer(0)]],
     device float* state                  [[buffer(1)]],
     device const bfloat* x               [[buffer(2)]],
-    device const bfloat* bcdt            [[buffer(3)]],
-    device const float* a_log            [[buffer(4)]],
-    device const float* d_skip           [[buffer(5)]],
-    device const float* dt_bias          [[buffer(6)]],
-    device const bfloat* norm_weight     [[buffer(7)]],
-    device bfloat* out                   [[buffer(8)]],
+    device const bfloat* bc_buf           [[buffer(3)]],
+    device const bfloat* dt_buf          [[buffer(4)]],
+    device const float* a_log            [[buffer(5)]],
+    device const float* d_skip           [[buffer(6)]],
+    device const float* dt_bias          [[buffer(7)]],
+    device const bfloat* norm_weight     [[buffer(8)]],
+    device bfloat* out                   [[buffer(9)]],
     uint tgid                            [[threadgroup_position_in_grid]],
     uint tid                             [[thread_index_in_threadgroup]],
     uint tg_size                         [[threads_per_threadgroup]]
@@ -150,7 +151,7 @@ kernel void mamba2_ssm_step(
 
     if (tid == 0) {
         // Softplus: log(1 + exp(x)).  dt_bias is in f32 (learned parameter).
-        float dt_raw = float(bcdt[params.dt_offset + h]) + dt_bias[h];
+        float dt_raw = float(dt_buf[params.dt_offset + h]) + dt_bias[h];
         float dt_val = log(1.0f + exp(dt_raw));
 
         // Discretised decay: dA = exp(dt * (-exp(A_log))).
@@ -191,14 +192,14 @@ kernel void mamba2_ssm_step(
 
         for (uint s = 0; s < ss; s++) {
             uint idx = state_base + s;
-            float b_val = float(bcdt[params.b_offset + g * ss + s]);
+            float b_val = float(bc_buf[params.b_offset + g * ss + s]);
 
             // State update: state[h,i,s] = dA * state[h,i,s] + dt * x[i] * B[g,s]
             // The outer(x, B) term is rank-1: each element is x[i] * B[s].
             state[idx] = dA * state[idx] + dt_val * x_val * b_val;
 
             // Accumulate output: y[i] += state[h,i,s] * C[g,s]
-            float c_val = float(bcdt[params.c_offset + g * ss + s]);
+            float c_val = float(bc_buf[params.c_offset + g * ss + s]);
             y_val += state[idx] * c_val;
         }
 
@@ -210,25 +211,70 @@ kernel void mamba2_ssm_step(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // --- Step 3: RMSNorm on y[0..head_dim] ---
-    // RMSNorm(y) = y / sqrt(mean(y²) + eps) * weight
-    //
-    // Cooperative reduction: each thread sums squares for its assigned rows,
-    // then we reduce across threads.
-
-    // Sum of squares — each thread accumulates its rows.
-    float local_ss = 0.0f;
+    // --- Step 3: Write raw output (no norm — norm happens after gating) ---
+    // The gated RMSNorm (y * silu(z), then norm) is done outside this kernel,
+    // because the normalization group_size (d_inner / n_groups = 512) doesn't
+    // align with per-head processing (head_dim = 64).
     for (uint i = tid; i < hd; i += tg_size) {
-        float v = y_shared[i];
-        local_ss += v * v;
+        out[h * hd + i] = bfloat(y_shared[i]);
+    }
+}
+
+// ===========================================================================
+// Gated grouped RMSNorm for Mamba-2 output.
+//
+// Computes: out[i] = rmsnorm_grouped(y[i] * silu(z[i])) * weight[i]
+//
+// The normalization is applied independently to each group of `group_size`
+// elements.  For Nemotron-H: d_inner=4096, n_groups=8, group_size=512.
+// Each group of 512 elements (spanning 8 heads × 64 head_dim) is normalized
+// independently.
+//
+// One threadgroup per group.  Each threadgroup of 256 threads cooperatively
+// computes: gate → multiply → reduction → normalize.
+// ===========================================================================
+
+struct MambaGatedNormParams {
+    uint d_inner;      // Total dimension (e.g., 4096)
+    uint group_size;   // Elements per group (e.g., 512)
+    uint z_offset;     // Offset into z_buf where z starts
+    float eps;         // RMSNorm epsilon
+};
+
+kernel void mamba2_gated_rms_norm(
+    constant MambaGatedNormParams& params [[buffer(0)]],
+    device const bfloat* y               [[buffer(1)]],  // [d_inner] — raw SSM output
+    device const bfloat* z_buf           [[buffer(2)]],  // buffer containing z at z_offset
+    device const bfloat* weight          [[buffer(3)]],  // [d_inner] — norm weight
+    device bfloat* out                   [[buffer(4)]],  // [d_inner] — output
+    uint tgid                            [[threadgroup_position_in_grid]],
+    uint tid                             [[thread_index_in_threadgroup]],
+    uint tg_size                         [[threads_per_threadgroup]]
+) {
+    uint g = tgid;
+    uint gs = params.group_size;
+    uint base = g * gs;
+    if (base >= params.d_inner) return;
+
+    // Phase 1: Compute gated values and accumulate sum-of-squares.
+    threadgroup float shared_vals[512];  // Max group_size we'll see.
+    float local_ss = 0.0f;
+
+    for (uint i = tid; i < gs; i += tg_size) {
+        float y_val = float(y[base + i]);
+        float z_val = float(z_buf[params.z_offset + base + i]);
+        // silu(z) = z / (1 + exp(-z))
+        float gate = z_val / (1.0f + exp(-z_val));
+        float gated = y_val * gate;
+        shared_vals[i] = gated;
+        local_ss += gated * gated;
     }
 
-    // Reduction across threadgroup using shared memory.
+    // Phase 2: Reduce sum-of-squares across threadgroup.
     threadgroup float reduce_buf[256];
     reduce_buf[tid] = local_ss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Tree reduction.
     for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
             reduce_buf[tid] += reduce_buf[tid + stride];
@@ -236,12 +282,12 @@ kernel void mamba2_ssm_step(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    float rms = rsqrt(reduce_buf[0] / float(hd) + params.eps);
+    float rms = rsqrt(reduce_buf[0] / float(gs) + params.eps);
 
-    // Normalize and write output.
-    for (uint i = tid; i < hd; i += tg_size) {
-        float normed = y_shared[i] * rms;
-        float w = float(norm_weight[h * hd + i]);
-        out[h * hd + i] = bfloat(normed * w);
+    // Phase 3: Normalize and write.
+    for (uint i = tid; i < gs; i += tg_size) {
+        float normed = shared_vals[i] * rms;
+        float w = float(weight[base + i]);
+        out[base + i] = bfloat(normed * w);
     }
 }

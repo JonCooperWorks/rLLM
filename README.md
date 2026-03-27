@@ -5,7 +5,7 @@ Rust LLM inference engine. Runs models up to 397B parameters on a MacBook via NV
 ### Highlights
 
 - **Expert streaming** — stream hundreds of GB of expert weights from NVMe on demand with GPU-side LRU caching, on both Metal and CUDA
-- **12 architectures** — Llama 3.x, Qwen 2.5/3/3.5, Mistral, Mixtral, Gemma 3, Phi-4, DeepSeek-R1-Distill, GPT-OSS
+- **13 architectures** — Llama 3.x, Qwen 2.5/3/3.5, Mistral, Mixtral, Gemma 3, Phi-4, DeepSeek-R1-Distill, GPT-OSS, Nemotron-H
 - **Vision-language models** — SigLIP ViT encoder for Qwen 3.5 VL and Gemma 3 VLMs
 - **TurboQuant KV cache** — ~4× KV compression via random orthogonal rotation + Max-Lloyd quantization, quality-neutral at 4-bit
 - **bf16 and Q4 weights** — 18-byte block format with bf16 scales; Q4 expert streaming cuts NVMe I/O 3.5×
@@ -39,6 +39,7 @@ Platform selection uses OS-conditional compilation (`#[cfg(target_os)]`). Model 
 | DeepSeek-R1-Distill | Dense | No |
 | Mixtral 8x7B | MoE | No |
 | GPT-OSS | MoE | No |
+| Nemotron-H | Hybrid (Mamba-2 + MoE + GQA) | No |
 
 All models support bf16 and Q4. Multi-GPU via `--tp N` requires CUDA + NCCL.
 
@@ -59,6 +60,7 @@ All models support bf16 and Q4. Multi-GPU via `--tp N` requires CUDA + NCCL.
 | Qwen3.5 9B | ~9B | 23 tok/s | 47 tok/s | 1,404 ms | 736 ms |
 | Phi-4 | 14.7B | 13 tok/s | 32 tok/s | 9,152 ms | 288 ms |
 | GPT-OSS 20B | 20.0B (3.6B active) | 31 tok/s | 37 tok/s | 3,483 ms | 2,214 ms |
+| Nemotron-H 30B | 31.6B (3.6B active) | 2.8 tok/s | — | 38,202 ms | — |
 | Gemma 3 27B Instruct | 27.4B | — | 16 tok/s | — | 548 ms |
 | Mixtral 8x7B Instruct ⚡ | 46.7B (12.9B active) | 0.4 tok/s | 28 tok/s | 19,445 ms | 1,572 ms |
 | Qwen3.5 27B ⚡ | ~27B | 7.8 tok/s | 18 tok/s | 50,239 ms | 1,973 ms |
