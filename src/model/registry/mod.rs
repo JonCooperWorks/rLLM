@@ -24,5 +24,6 @@ pub(crate) mod mistral;
 pub(crate) mod mixtral;
 pub(crate) mod phi;
 pub(crate) mod qwen;
+pub(crate) mod nemotron_h;
 pub(crate) mod qwen3_5;
 pub(crate) mod qwen3_moe;

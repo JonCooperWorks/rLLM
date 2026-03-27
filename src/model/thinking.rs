@@ -75,7 +75,8 @@ pub(crate) fn supports_thinking(arch: ModelArch) -> bool {
         | ModelArch::Mixtral
         | ModelArch::Phi
         | ModelArch::Gemma3
-        | ModelArch::GptOss => false,
+        | ModelArch::GptOss
+        | ModelArch::NemotronH => false,
     }
 }
 
@@ -145,7 +146,8 @@ pub(crate) fn parse_thinking(arch: ModelArch, text: &str) -> ThinkingResult {
         | ModelArch::Mixtral
         | ModelArch::Phi
         | ModelArch::Gemma3
-        | ModelArch::GptOss => ThinkingResult {
+        | ModelArch::GptOss
+        | ModelArch::NemotronH => ThinkingResult {
             content: text.to_string(),
             thinking: None,
         },

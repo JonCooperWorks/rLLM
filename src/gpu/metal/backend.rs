@@ -77,6 +77,7 @@ const METAL_SOURCE_EMBED: &str = include_str!("shaders/embed.metal");
 const METAL_SOURCE_DELTANET: &str = include_str!("shaders/deltanet.metal");
 const METAL_SOURCE_MOE: &str = include_str!("shaders/moe.metal");
 const METAL_SOURCE_VISION: &str = include_str!("shaders/vision.metal");
+const METAL_SOURCE_MAMBA2: &str = include_str!("shaders/mamba2.metal");
 const METAL_SOURCE_TURBOQUANT: &str = include_str!("shaders/turboquant.metal");
 
 // ---------------------------------------------------------------------------
@@ -165,6 +166,14 @@ pub(crate) struct MetalBackend {
     pub(crate) pipeline_scatter_vision_tokens: metal::ComputePipelineState,
     pub(crate) pipeline_spatial_merge_norm: metal::ComputePipelineState,
     pub(crate) pipeline_prefill_attention_fused_qkv: metal::ComputePipelineState,
+
+    // Mamba-2 kernels (Nemotron-H selective SSM).
+    pub(crate) pipeline_mamba2_conv1d_silu: metal::ComputePipelineState,
+    pub(crate) pipeline_mamba2_ssm_step: metal::ComputePipelineState,
+
+    // Nemotron-H elementwise kernels.
+    pub(crate) pipeline_relu_squared: metal::ComputePipelineState,
+    pub(crate) pipeline_top_k_sigmoid: metal::ComputePipelineState,
 
     // TurboQuant KV cache quantization kernels (arXiv:2504.19874).
     pub(crate) pipeline_turbo_quantize_paged: metal::ComputePipelineState,
@@ -474,6 +483,34 @@ impl MetalBackend {
             &compile_opts,
         )?;
 
+        // Mamba-2 kernels (Nemotron-H selective SSM).
+        let pipeline_mamba2_conv1d_silu = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_MAMBA2,
+            "mamba2_conv1d_silu",
+            &compile_opts,
+        )?;
+        let pipeline_mamba2_ssm_step = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_MAMBA2,
+            "mamba2_ssm_step",
+            &compile_opts,
+        )?;
+
+        // Nemotron-H elementwise kernels.
+        let pipeline_relu_squared = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_ELEMENTWISE,
+            "relu_squared",
+            &compile_opts,
+        )?;
+        let pipeline_top_k_sigmoid = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_ELEMENTWISE,
+            "top_k_sigmoid",
+            &compile_opts,
+        )?;
+
         // TurboQuant KV cache quantization pipelines.
         let pipeline_turbo_quantize_paged = Self::make_pipeline(
             &device,
@@ -560,6 +597,10 @@ impl MetalBackend {
             pipeline_scatter_vision_tokens,
             pipeline_spatial_merge_norm,
             pipeline_prefill_attention_fused_qkv,
+            pipeline_mamba2_conv1d_silu,
+            pipeline_mamba2_ssm_step,
+            pipeline_relu_squared,
+            pipeline_top_k_sigmoid,
             pipeline_turbo_quantize_paged,
             pipeline_turbo_quantize_paged_batch,
             pipeline_turbo_rotate_q,

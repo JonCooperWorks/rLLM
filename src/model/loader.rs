@@ -401,6 +401,35 @@ pub(crate) struct LayerWeights<B: GpuCore> {
     pub shared_expert_up_proj: Option<B::Tensor>,   // [shared_inter, hidden_size]
     pub shared_expert_down_proj: Option<B::Tensor>, // [hidden_size, shared_inter]
     pub shared_expert_gate: Option<B::Tensor>,      // [1, hidden_size] — scalar gate weight
+
+    // --- Mamba-2 SSM (Nemotron-H Mamba layers only) ---
+    //
+    // Learning note: Mamba-2 layers replace the attention+FFN pair with a single
+    // selective state space model block.  The in_proj maps hidden_size to a
+    // concatenated [z, x, B, C, dt] output (see config.rs for size calculation).
+    // The SSM processes x through conv1d and the recurrent state update, while
+    // z provides an output gate (gated by silu(z)).
+    //
+    // A_log and D are per-head f32 parameters (not weight matrices):
+    //   A_log: log of the diagonal decay rate — controls how fast old state decays
+    //   D: skip connection scalar — adds a fraction of input directly to output
+    //   dt_bias: learned bias for the time step — controls discretization speed
+    pub mamba_in_proj: Option<B::Tensor>,      // [in_proj_dim, hidden_size] bf16
+    pub mamba_conv1d_weight: Option<B::Tensor>, // [d_inner, kernel_size] bf16
+    pub mamba_conv1d_bias: Option<B::Tensor>,   // [d_inner] f32
+    pub mamba_out_proj: Option<B::Tensor>,      // [hidden_size, d_inner] bf16
+    pub mamba_a_log: Option<B::Tensor>,         // [num_heads] f32
+    pub mamba_d: Option<B::Tensor>,             // [num_heads] f32
+    pub mamba_dt_bias: Option<B::Tensor>,       // [num_heads] f32
+    pub mamba_norm: Option<B::Tensor>,          // [d_inner] bf16 — RMSNorm before output gate
+
+    // --- MoE routing correction bias (Nemotron-H, DeepSeek-V3 style) ---
+    //
+    // Learning note: this bias is added to sigmoid routing scores ONLY for
+    // expert selection (which top-k to pick), NOT for computing routing weights.
+    // This cleverly decouples load balancing (via bias) from the actual expert
+    // weighting (via raw sigmoid scores).
+    pub e_score_correction_bias: Option<B::Tensor>, // [num_experts] f32
 }
 
 // ---------------------------------------------------------------------------
@@ -523,6 +552,8 @@ struct LoaderHints {
     is_mixtral: bool,
     /// Hybrid DeltaNet + GQA model (Qwen 3.5).
     is_hybrid: bool,
+    /// Nemotron-H: three-way hybrid (Mamba-2 + MoE + attention).
+    is_nemotron_h: bool,
 }
 
 impl LoaderHints {
@@ -539,6 +570,7 @@ impl LoaderHints {
             is_gpt_oss: matches!(arch, ModelArch::GptOss),
             is_mixtral: matches!(arch, ModelArch::Mixtral),
             is_hybrid: config.is_hybrid_deltanet(),
+            is_nemotron_h: matches!(arch, ModelArch::NemotronH),
         }
     }
 }
@@ -696,13 +728,24 @@ fn load_weights_inner<B: GpuCore>(
     };
 
     let hidden = config.hidden_size;
-    let wp = &config.weight_prefix; // "model." or "model.language_model."
+    let wp = &config.weight_prefix; // "model." or "backbone."
+
+    // Compute architecture-specific loading hints once up front.
+    let arch = config.arch()?;
+    let hints = LoaderHints::new(arch, config);
 
     // Load the embedding table.
+    // Nemotron-H uses "embeddings.weight" at the top level (no prefix);
+    // all other models use "{prefix}embed_tokens.weight".
+    let embed_name = if hints.is_nemotron_h {
+        "embeddings.weight".to_string()
+    } else {
+        format!("{wp}embed_tokens.weight")
+    };
     let embed_tokens = upload_tensor(
         &store,
         backend,
-        &format!("{wp}embed_tokens.weight"),
+        &embed_name,
         &[config.vocab_size, hidden],
     )?;
 
@@ -720,14 +763,22 @@ fn load_weights_inner<B: GpuCore>(
         None
     };
 
-    // Compute architecture-specific loading hints once up front.
-    let arch = config.arch()?;
-    let hints = LoaderHints::new(arch, config);
-
     // Load per-layer weights via focused helpers.
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for i in 0..config.num_hidden_layers {
         let prefix = format!("{wp}layers.{i}");
+
+        // Nemotron-H: each layer is purely one type (Mamba-2, MoE, or attention).
+        // The weight structure is different from standard models (uses "mixer"
+        // subkey instead of "self_attn"/"mlp", and each layer has only ONE set
+        // of weights for its type).
+        if hints.is_nemotron_h {
+            layers.push(load_nemotron_h_layer(
+                &store, backend, &prefix, config, i, sharding, skip_experts,
+            )?);
+            continue;
+        }
+
         let is_deltanet_layer = hints.is_hybrid && config.is_linear_attention_layer(i);
 
         let norms = load_layer_norms(&store, backend, &prefix, config, &hints)?;
@@ -782,6 +833,15 @@ fn load_weights_inner<B: GpuCore>(
             shared_expert_up_proj: ffn.shared_expert_up_proj,
             shared_expert_down_proj: ffn.shared_expert_down_proj,
             shared_expert_gate: ffn.shared_expert_gate,
+            mamba_in_proj: None,
+            mamba_conv1d_weight: None,
+            mamba_conv1d_bias: None,
+            mamba_out_proj: None,
+            mamba_a_log: None,
+            mamba_d: None,
+            mamba_dt_bias: None,
+            mamba_norm: None,
+            e_score_correction_bias: None,
         });
     }
 
@@ -2102,6 +2162,195 @@ fn quant_dtype_name(dtype: TensorDtype) -> &'static str {
         TensorDtype::Q8 => "Q8",
         _ => "bf16",
     }
+}
+
+// ---------------------------------------------------------------------------
+// Nemotron-H layer loading.
+//
+// Each Nemotron-H layer is purely one of three types: Mamba-2 SSM, MoE FFN,
+// or self-attention.  This loader dispatches based on the layer type and
+// loads only the relevant weights for that type.
+//
+// Weight naming convention (different from standard models):
+//   backbone.layers.{i}.norm.weight           — pre-layer RMSNorm (all types)
+//   backbone.layers.{i}.mixer.in_proj.weight  — Mamba-2 input projection
+//   backbone.layers.{i}.mixer.q_proj.weight   — attention Q projection
+//   backbone.layers.{i}.mixer.experts.{j}.*   — MoE expert weights
+//   backbone.layers.{i}.mixer.gate.weight     — MoE router
+// ---------------------------------------------------------------------------
+
+fn load_nemotron_h_layer<B: GpuCore>(
+    store: &TensorStore,
+    backend: &B,
+    prefix: &str,
+    config: &ModelConfig,
+    layer_idx: usize,
+    _sharding: Option<&crate::gpu::parallel::ShardingPlan>,
+    skip_experts: bool,
+) -> anyhow::Result<LayerWeights<B>> {
+    let hidden = config.hidden_size;
+
+    // All Nemotron-H layers have a pre-layer RMSNorm.
+    let input_layernorm = upload_tensor(store, backend, &format!("{prefix}.norm.weight"), &[hidden])?;
+    // Nemotron-H has only one norm per layer (no post-attention norm).
+    // Create a dummy for the required post_attention_layernorm field.
+    let dummy_norm = backend.alloc_tensor(&[1], TensorDtype::BF16);
+
+    let layer_type = config.layer_types.get(layer_idx).map(|s| s.as_str()).unwrap_or("");
+
+    // Dummy tensors for unused projection fields in LayerWeights.
+    let dummy = || backend.alloc_tensor(&[1], TensorDtype::BF16);
+
+    // Fields we'll populate based on layer type.
+    let mut lw = LayerWeights {
+        input_layernorm,
+        post_attention_layernorm: dummy_norm,
+        pre_feedforward_layernorm: None,
+        post_feedforward_layernorm: None,
+        q_proj: dummy(), k_proj: dummy(), v_proj: dummy(), o_proj: dummy(),
+        q_bias: None, k_bias: None, v_bias: None, o_proj_bias: None,
+        sinks: None, q_norm: None, k_norm: None, attn_z_proj: None,
+        in_proj_qkv: None, in_proj_a: None, in_proj_b: None, in_proj_z: None,
+        conv1d_weight: None, linear_out_proj: None, a_log: None, dt_bias: None,
+        linear_norm: None,
+        gate_proj: dummy(), up_proj: dummy(), down_proj: dummy(),
+        router_gate: None, router_bias: None, experts: None,
+        shared_expert_gate_proj: None, shared_expert_up_proj: None,
+        shared_expert_down_proj: None, shared_expert_gate: None,
+        mamba_in_proj: None, mamba_conv1d_weight: None, mamba_conv1d_bias: None,
+        mamba_out_proj: None, mamba_a_log: None, mamba_d: None,
+        mamba_dt_bias: None, mamba_norm: None,
+        e_score_correction_bias: None,
+    };
+
+    match layer_type {
+        "mamba2" => {
+            // --- Mamba-2 SSM layer ---
+            let d_inner = config.mamba2_d_inner();
+            let in_proj_dim = config.mamba2_in_proj_dim();
+            let ks = config.mamba_conv_kernel;
+            let n_heads = config.mamba_num_heads;
+
+            lw.mamba_in_proj = Some(upload_tensor(
+                store, backend, &format!("{prefix}.mixer.in_proj.weight"), &[in_proj_dim, hidden],
+            )?);
+            // Conv1d weight: safetensors shape [d_inner, 1, kernel_size] → load as [d_inner, ks].
+            lw.mamba_conv1d_weight = Some(upload_tensor(
+                store, backend, &format!("{prefix}.mixer.conv1d.weight"), &[d_inner, ks],
+            )?);
+            // Conv1d bias: f32 in the checkpoint.
+            let conv_b_view = store.tensor(&format!("{prefix}.mixer.conv1d.bias"))?;
+            lw.mamba_conv1d_bias = Some(backend.upload_tensor(conv_b_view.data(), &[d_inner], TensorDtype::F32));
+
+            lw.mamba_out_proj = Some(upload_tensor(
+                store, backend, &format!("{prefix}.mixer.out_proj.weight"), &[hidden, d_inner],
+            )?);
+
+            // A_log, D, dt_bias are bare f32 tensors (no .weight suffix).
+            let a_log_view = store.tensor(&format!("{prefix}.mixer.A_log"))?;
+            lw.mamba_a_log = Some(backend.upload_tensor(a_log_view.data(), &[n_heads], TensorDtype::F32));
+
+            let d_view = store.tensor(&format!("{prefix}.mixer.D"))?;
+            lw.mamba_d = Some(backend.upload_tensor(d_view.data(), &[n_heads], TensorDtype::F32));
+
+            let dt_bias_view = store.tensor(&format!("{prefix}.mixer.dt_bias"))?;
+            lw.mamba_dt_bias = Some(backend.upload_tensor(dt_bias_view.data(), &[n_heads], TensorDtype::F32));
+
+            lw.mamba_norm = Some(upload_tensor(
+                store, backend, &format!("{prefix}.mixer.norm.weight"), &[d_inner],
+            )?);
+
+            if layer_idx == 0 {
+                eprintln!(
+                    "  mamba2: d_inner={d_inner}, in_proj={in_proj_dim}, conv_k={ks}, \
+                     state={}, groups={}, heads={n_heads}",
+                    config.ssm_state_size, config.mamba_n_groups
+                );
+            }
+        }
+        "moe" => {
+            // --- MoE FFN layer ---
+            // Nemotron-H experts use relu²: only up_proj + down_proj (NO gate_proj).
+            let n_experts = config.num_experts;
+            let moe_inter = config.moe_intermediate_size;
+            let shared_inter = config.shared_expert_intermediate_size;
+
+            // Router gate.
+            lw.router_gate = Some(upload_tensor(
+                store, backend, &format!("{prefix}.mixer.gate.weight"), &[n_experts, hidden],
+            )?);
+
+            // DeepSeek-V3 style correction bias for load balancing.
+            let e_bias_name = format!("{prefix}.mixer.gate.e_score_correction_bias");
+            if let Ok(view) = store.tensor(&e_bias_name) {
+                lw.e_score_correction_bias = Some(
+                    backend.upload_tensor(view.data(), &[n_experts], TensorDtype::F32),
+                );
+            }
+
+            // Per-expert weights (up_proj + down_proj, no gate_proj for relu²).
+            if !skip_experts {
+                let mut expert_vec = Vec::with_capacity(n_experts);
+                for j in 0..n_experts {
+                    let ep = format!("{prefix}.mixer.experts.{j}");
+                    let up = upload_tensor(store, backend, &format!("{ep}.up_proj.weight"), &[moe_inter, hidden])?;
+                    let down = upload_tensor(store, backend, &format!("{ep}.down_proj.weight"), &[hidden, moe_inter])?;
+                    expert_vec.push(ExpertWeights {
+                        gate_proj: dummy(), // unused for relu² — no gate projection
+                        up_proj: up,
+                        down_proj: down,
+                        gate_bias: None,
+                        up_bias: None,
+                        down_bias: None,
+                    });
+                }
+                lw.experts = Some(expert_vec);
+            }
+
+            // Shared expert (also relu², up_proj + down_proj).
+            if shared_inter > 0 {
+                lw.shared_expert_up_proj = Some(upload_tensor(
+                    store, backend,
+                    &format!("{prefix}.mixer.shared_experts.up_proj.weight"),
+                    &[shared_inter, hidden],
+                )?);
+                lw.shared_expert_down_proj = Some(upload_tensor(
+                    store, backend,
+                    &format!("{prefix}.mixer.shared_experts.down_proj.weight"),
+                    &[hidden, shared_inter],
+                )?);
+            }
+
+            if layer_idx <= 1 {
+                eprintln!(
+                    "  moe: {n_experts} experts × inter={moe_inter}, shared={shared_inter}, \
+                     top_k={}, scale={:.1}",
+                    config.num_experts_per_tok, config.routed_scaling_factor
+                );
+            }
+        }
+        "attention" => {
+            // --- Self-attention layer (GQA) ---
+            let q_dim = config.num_attention_heads * config.head_dim;
+            let kv_dim = config.num_key_value_heads * config.head_dim;
+
+            // Note: Nemotron-H uses "mixer" prefix, not "self_attn".
+            lw.q_proj = upload_tensor(store, backend, &format!("{prefix}.mixer.q_proj.weight"), &[q_dim, hidden])?;
+            lw.k_proj = upload_tensor(store, backend, &format!("{prefix}.mixer.k_proj.weight"), &[kv_dim, hidden])?;
+            lw.v_proj = upload_tensor(store, backend, &format!("{prefix}.mixer.v_proj.weight"), &[kv_dim, hidden])?;
+            lw.o_proj = upload_tensor(store, backend, &format!("{prefix}.mixer.o_proj.weight"), &[hidden, q_dim])?;
+
+            if layer_idx <= 5 {
+                eprintln!(
+                    "  attention: q_dim={q_dim}, kv_dim={kv_dim}, heads={}/{}kv",
+                    config.num_attention_heads, config.num_key_value_heads
+                );
+            }
+        }
+        other => anyhow::bail!("unknown Nemotron-H layer type '{other}' at layer {layer_idx}"),
+    }
+
+    Ok(lw)
 }
 
 /// Upload a single tensor from the store to GPU memory (bf16, f32, Q4, or Q8).

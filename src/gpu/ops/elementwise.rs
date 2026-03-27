@@ -85,4 +85,45 @@ pub(crate) trait GpuElementwise: GpuCore {
 
     /// GPU-side top-k selection with softmax for MoE expert routing.
     fn top_k_softmax(&self, logits: &Self::Tensor, output: &Self::Tensor, num_experts: u32, k: u32);
+
+    /// ReLU-squared activation: out[i] = max(0, in[i])².
+    ///
+    /// Learning note: ReLU-squared (also written ReLU²) is an activation used
+    /// by Nemotron-H's MoE experts instead of SwiGLU.  Unlike SwiGLU which
+    /// needs TWO projections (gate + up) and a multiply, relu² needs only ONE
+    /// projection (up) making each expert simpler: up_proj → relu² → down_proj.
+    ///
+    /// The squaring amplifies larger activations relative to smaller ones,
+    /// providing a softer "gating" effect compared to plain ReLU.  This was
+    /// found to match SwiGLU quality with fewer parameters per expert.
+    fn relu_squared(&self, input: &Self::Tensor, out: &Self::Tensor, size: u32);
+
+    /// GPU-side top-k selection with sigmoid routing for Nemotron-H MoE.
+    ///
+    /// Learning note: standard MoE routing (Mixtral, Qwen) uses softmax over
+    /// all experts to produce routing weights.  Nemotron-H instead uses
+    /// DeepSeek-V3 style routing:
+    ///
+    ///   1. Compute sigmoid scores: score[i] = sigmoid(logits[i])
+    ///   2. Add correction bias for SELECTION only: adj[i] = score[i] + bias[i]
+    ///   3. Select top-k by adjusted score
+    ///   4. Routing weights come from ORIGINAL sigmoid scores (without bias)
+    ///   5. Optionally normalize weights to sum to 1
+    ///   6. Multiply by scaling factor
+    ///
+    /// The correction bias steers which experts get selected (load balancing)
+    /// without distorting the actual routing weights — a clever decoupling.
+    ///
+    /// Output format: [2*k] f32 — interleaved (expert_index, weight) pairs,
+    /// same layout as `top_k_softmax` for downstream compatibility.
+    fn top_k_sigmoid(
+        &self,
+        logits: &Self::Tensor,          // [num_experts] bf16 — raw router output
+        correction_bias: &Self::Tensor, // [num_experts] f32 — load-balancing bias
+        output: &Self::Tensor,          // [2*k] f32 — (index, weight) pairs
+        num_experts: u32,
+        k: u32,
+        scaling_factor: f32,
+        norm_topk_prob: bool,
+    );
 }

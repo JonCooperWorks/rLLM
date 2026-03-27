@@ -21,6 +21,7 @@ mod attention;
 mod core;
 mod deltanet;
 mod elementwise;
+mod mamba2;
 mod embed;
 mod matmul;
 mod moe;

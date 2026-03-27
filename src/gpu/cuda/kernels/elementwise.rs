@@ -328,4 +328,21 @@ impl GpuElementwise for CudaBackend {
         }
         .expect("top_k_softmax launch failed");
     }
+
+    fn relu_squared(&self, _input: &CudaTensor, _out: &CudaTensor, _size: u32) {
+        unimplemented!("relu_squared CUDA kernel not yet implemented")
+    }
+
+    fn top_k_sigmoid(
+        &self,
+        _logits: &CudaTensor,
+        _correction_bias: &CudaTensor,
+        _output: &CudaTensor,
+        _num_experts: u32,
+        _k: u32,
+        _scaling_factor: f32,
+        _norm_topk_prob: bool,
+    ) {
+        unimplemented!("top_k_sigmoid CUDA kernel not yet implemented")
+    }
 }

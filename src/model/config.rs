@@ -184,6 +184,38 @@ pub enum ModelArch {
     ///
     /// No QKV bias, no QK-norm.  Chat uses `<start_of_turn>`/`<end_of_turn>`.
     Gemma3,
+    /// NVIDIA Nemotron-H family (Nemotron 3 Nano 30B-A3B, 120B-A22B).
+    ///
+    /// Learning note: Nemotron-H is a THREE-WAY hybrid architecture that
+    /// interleaves three fundamentally different layer types:
+    ///
+    ///   1. **Mamba-2 SSM layers** (~44% of layers): Selective State Space Model
+    ///      with O(1) per-token cost.  Each layer maintains a fixed-size
+    ///      [num_heads, head_dim, state_size] = [64, 64, 128] recurrent state
+    ///      matrix per sequence.  Uses depthwise Conv1D for local context
+    ///      (no RoPE — positional info comes from the convolution) and input-
+    ///      dependent discretization via B, C, dt parameters.
+    ///
+    ///   2. **MoE FFN layers** (~44%): Mixture-of-Experts feed-forward blocks
+    ///      with 128 routed experts + 1 shared expert, top-6 routing.  Uses
+    ///      relu-squared activation (NOT SwiGLU) — each expert is just
+    ///      up_proj → relu² → down_proj.  Routing uses sigmoid scores with
+    ///      an additive correction bias (DeepSeek-V3 style).
+    ///
+    ///   3. **Self-attention layers** (~12%): Standard GQA with 32 Q-heads,
+    ///      2 KV-heads, head_dim=128, and full RoPE.  Only these 6 layers
+    ///      need KV cache — the rest use recurrent state or are stateless.
+    ///
+    /// The layer pattern is encoded in `hybrid_override_pattern` from config.json:
+    ///   M = Mamba-2, E = MoE (Experts), * = Attention.
+    ///   Example (52-layer 30B): "MEMEM*EMEMEM*EMEMEM*..."
+    ///
+    /// Each layer is purely ONE type — unlike Qwen 3.5 where each layer pairs
+    /// attention/DeltaNet with an FFN, Nemotron-H layers are standalone blocks.
+    ///
+    /// Weight prefix: `backbone.` (not `model.`), with `mixer` subkey.
+    /// Chat template: ChatML.
+    NemotronH,
 }
 
 impl ModelArch {
@@ -202,7 +234,7 @@ impl ModelArch {
             | ModelArch::Phi
             | ModelArch::Gemma3 => false,
             ModelArch::Qwen2 | ModelArch::GptOss => true,
-            ModelArch::Qwen3Moe | ModelArch::Qwen3_5 => false,
+            ModelArch::Qwen3Moe | ModelArch::Qwen3_5 | ModelArch::NemotronH => false,
         }
     }
 
@@ -212,7 +244,7 @@ impl ModelArch {
     /// projection.  GPT-OSS-20B is the exception — it has bias on ALL projections
     /// (Q, K, V, and O).
     pub fn has_o_proj_bias(&self) -> bool {
-        matches!(self, ModelArch::GptOss)
+        matches!(self, ModelArch::GptOss) // NemotronH has attention_bias: false
     }
 
     /// Whether the MoE router gate has a bias vector.
@@ -245,7 +277,8 @@ impl ModelArch {
             | ModelArch::Mixtral
             | ModelArch::Qwen2
             | ModelArch::Phi
-            | ModelArch::GptOss => false,
+            | ModelArch::GptOss
+            | ModelArch::NemotronH => false,
             ModelArch::Gemma3 => true, // Both 4B and 27B have q_norm/k_norm weights
             ModelArch::Qwen3_5 => true, // GQA layers have QK-norm
             ModelArch::Qwen3Moe => true,
@@ -277,8 +310,10 @@ impl ModelArch {
             "phi3" | "phi4" => Ok(ModelArch::Phi),
             "gemma3_text" | "gemma3" => Ok(ModelArch::Gemma3),
             "gpt_oss" => Ok(ModelArch::GptOss),
+            "nemotron_h" => Ok(ModelArch::NemotronH),
             other => anyhow::bail!(
-                "unsupported model_type '{}' (expected 'llama', 'mistral', 'mixtral', 'qwen2', 'qwen3_moe', 'qwen3_5', 'phi3', 'gemma3_text', or 'gpt_oss')",
+                "unsupported model_type '{}' (expected 'llama', 'mistral', 'mixtral', 'qwen2', \
+                 'qwen3_moe', 'qwen3_5', 'phi3', 'gemma3_text', 'gpt_oss', or 'nemotron_h')",
                 other
             ),
         }
@@ -333,7 +368,7 @@ pub struct ModelConfig {
     pub rope_theta: f64,
     /// Epsilon for RMSNorm numerical stability.
     /// Prevents division by zero when the input vector is near-zero.
-    #[serde(default)]
+    #[serde(default, alias = "norm_eps", alias = "layer_norm_epsilon")]
     pub rms_norm_eps: f64,
     /// Whether the LM head shares weights with the embedding table.
     /// When true, there is no separate `lm_head.weight` in the checkpoint.
@@ -355,7 +390,7 @@ pub struct ModelConfig {
     /// Total number of expert FFN sub-networks per layer.
     /// Qwen3-Coder-30B-A3B: 128 experts per layer.
     /// Mixtral uses `num_local_experts` in config.json (serde alias handles this).
-    #[serde(default, alias = "num_local_experts")]
+    #[serde(default, alias = "num_local_experts", alias = "n_routed_experts")]
     pub num_experts: usize,
     /// How many experts are activated (routed to) per token.
     /// Qwen3-Coder-30B-A3B: top-8 experts selected per token.
@@ -374,7 +409,7 @@ pub struct ModelConfig {
     pub moe_intermediate_size: usize,
     /// Hidden dimension of the shared (always-active) expert's FFN.
     /// Qwen3.5-35B-A3B: 512.  Only present in models with a shared expert.
-    #[serde(default)]
+    #[serde(default, alias = "moe_shared_expert_intermediate_size")]
     pub shared_expert_intermediate_size: usize,
 
     // --- Qwen 3.5 hybrid DeltaNet + GQA fields ---
@@ -428,6 +463,76 @@ pub struct ModelConfig {
     /// attention output is gated: out = rmsnorm_no_weight(attn_out) * silu(Z).
     #[serde(default)]
     pub attn_output_gate: bool,
+
+    // --- Nemotron-H Mamba-2 SSM fields ---
+    //
+    // Learning note: Mamba-2 (Selective State Space Duality) is a recurrent
+    // sequence model that maintains a [num_heads, head_dim, state_size] state
+    // matrix per layer.  It's related to continuous-time state space models
+    // (S4, S5) but uses input-dependent discretization — the B, C, dt
+    // parameters are computed from the input at each step, making the model
+    // "selective" (it can decide which information to remember or forget).
+    //
+    // The recurrent update:
+    //   state[h] = dA[h] * state[h] + dt[h] * outer(x[h], B[group(h)])
+    //   y[h] = state[h] @ C[group(h)] + D[h] * x[h]
+    //
+    // where dA = exp(-softplus(dt + dt_bias) * exp(A_log)).  The D parameter
+    // provides a skip connection from input to output.
+    //
+    // "Grouped" B/C: instead of per-head B and C vectors (expensive), Mamba-2
+    // shares them across groups of heads (similar to GQA vs MHA).  With
+    // n_groups=8 and num_heads=64, each group of 8 heads shares one B/C pair.
+    /// Number of heads in Mamba-2 SSM layers.
+    /// Nemotron-H 30B: 64 heads × head_dim=64 → d_inner=4096.
+    #[serde(default)]
+    pub mamba_num_heads: usize,
+    /// Head dimension for Mamba-2 SSM layers.
+    /// Nemotron-H 30B: 64 (d_inner = mamba_num_heads × mamba_head_dim = 4096).
+    #[serde(default)]
+    pub mamba_head_dim: usize,
+    /// State size (d_state) for the Mamba-2 recurrent state matrix.
+    /// Each head maintains a [head_dim, state_size] state in f32.
+    /// Nemotron-H 30B: 128.
+    #[serde(default)]
+    pub ssm_state_size: usize,
+    /// Number of groups for shared B/C parameters in Mamba-2.
+    /// Reduces parameters by sharing B/C across heads within a group.
+    /// Nemotron-H 30B: 8 groups with 64 heads → 8 heads per group.
+    #[serde(default, alias = "n_groups")]
+    pub mamba_n_groups: usize,
+    /// Mamba-2 conv kernel size (causal depthwise Conv1D).
+    /// Provides local positional context since Mamba has no RoPE.
+    /// Nemotron-H: 4 (same as DeltaNet).
+    #[serde(default, alias = "conv_kernel")]
+    pub mamba_conv_kernel: usize,
+    /// Whether Mamba-2 Conv1D has a bias vector.
+    /// Nemotron-H: true (unlike DeltaNet which has no conv bias).
+    #[serde(default)]
+    pub use_conv_bias: bool,
+    /// Whether to scale the pre-norm output by 1/√(2 × num_layers).
+    /// Prevents signal amplification through deep networks.  Applied after
+    /// RMSNorm and before the mixer block (Mamba, MoE, or attention).
+    /// Nemotron-H: true.
+    #[serde(default)]
+    pub rescale_prenorm_residual: bool,
+    /// Hybrid layer pattern string from config.json.
+    /// Each character maps to one layer: M=Mamba-2, E=MoE, *=Attention.
+    /// Parsed into `layer_types` during `from_file()`.
+    /// Example: "MEMEM*EMEMEM*..." (52 chars for 52 layers).
+    #[serde(default)]
+    pub hybrid_override_pattern: String,
+
+    // --- Nemotron-H MoE routing fields ---
+    /// Scaling factor for routed expert outputs (DeepSeek-V3 style).
+    /// Combined expert output is multiplied by this before residual add.
+    /// Nemotron-H: 2.5.
+    #[serde(default)]
+    pub routed_scaling_factor: f64,
+    /// Whether to normalize top-k routing probabilities to sum to 1.
+    /// Nemotron-H: true.
+    #[serde(default)]
+    pub norm_topk_prob: bool,
 
     // --- Gemma 3 fields ---
     //
@@ -765,6 +870,33 @@ impl ModelConfig {
             && config.num_experts > 0
         {
             config.moe_intermediate_size = config.intermediate_size;
+        }
+
+        // Nemotron-H: parse hybrid_override_pattern into layer_types and set
+        // the weight prefix to "backbone." (not "model.").
+        if config.model_type == "nemotron_h" {
+            config.weight_prefix = "backbone.".to_string();
+            // Also ensure moe_intermediate_size is set from intermediate_size
+            // if the config uses the same field for both.
+            if config.moe_intermediate_size == 0 && config.num_experts > 0 {
+                config.moe_intermediate_size = config.intermediate_size;
+            }
+            // Parse hybrid_override_pattern: M=mamba2, E=moe, *=attention.
+            if !config.hybrid_override_pattern.is_empty() && config.layer_types.is_empty() {
+                config.layer_types = config
+                    .hybrid_override_pattern
+                    .chars()
+                    .map(|c| match c {
+                        'M' => "mamba2".to_string(),
+                        'E' => "moe".to_string(),
+                        '*' => "attention".to_string(),
+                        _ => panic!(
+                            "unknown character '{}' in hybrid_override_pattern",
+                            c
+                        ),
+                    })
+                    .collect();
+            }
         }
 
         // Apply Gemma 3 defaults for fields omitted by minimal HF configs.
@@ -1135,23 +1267,25 @@ impl ModelConfig {
     /// For Gemma 3, ALL layers need KV cache (both "sliding_attention" and
     /// "full_attention" use standard softmax attention, just with different
     /// context windows).
+    /// For Nemotron-H, only "attention" layers (the * in the pattern) need KV —
+    /// Mamba-2 ("mamba2") and MoE ("moe") layers are stateless or use recurrent
+    /// state, not KV cache.
     pub fn num_kv_layers(&self) -> usize {
         if self.layer_types.is_empty() {
             self.num_hidden_layers
         } else {
-            // Only DeltaNet layers skip KV cache.  Sliding attention and full
-            // attention both need it.
             self.layer_types
                 .iter()
-                .filter(|t| t.as_str() != "linear_attention")
+                .filter(|t| Self::layer_needs_kv(t))
                 .count()
         }
     }
 
-    /// Build a mapping from layer_idx → kv_pool_idx (None for DeltaNet layers).
+    /// Build a mapping from layer_idx → kv_pool_idx.
     ///
-    /// Layers using any form of softmax attention (full or sliding window) get
-    /// a KV pool slot.  Only DeltaNet (linear_attention) layers return None.
+    /// Layers using softmax attention get a KV pool slot (Some(idx)).
+    /// Layers using recurrent state (DeltaNet, Mamba-2) or stateless MoE
+    /// return None.
     pub fn kv_layer_map(&self) -> Vec<Option<usize>> {
         if self.layer_types.is_empty() {
             (0..self.num_hidden_layers).map(Some).collect()
@@ -1160,17 +1294,58 @@ impl ModelConfig {
             self.layer_types
                 .iter()
                 .map(|t| {
-                    if t == "linear_attention" {
-                        None
-                    } else {
-                        // Both "full_attention" and "sliding_attention" need KV.
+                    if Self::layer_needs_kv(t) {
                         let r = Some(idx);
                         idx += 1;
                         r
+                    } else {
+                        None
                     }
                 })
                 .collect()
         }
+    }
+
+    /// Whether a layer type string represents a layer that needs KV cache.
+    /// "linear_attention" (DeltaNet) and "mamba2" use recurrent state.
+    /// "moe" layers are stateless FFN blocks.
+    /// Everything else (full_attention, sliding_attention, attention) needs KV.
+    fn layer_needs_kv(layer_type: &str) -> bool {
+        !matches!(layer_type, "linear_attention" | "mamba2" | "moe")
+    }
+
+    /// Whether this model uses the hybrid Nemotron-H (Mamba-2 + MoE + attention)
+    /// architecture.
+    pub fn is_hybrid_mamba2(&self) -> bool {
+        !self.layer_types.is_empty() && self.layer_types.iter().any(|t| t == "mamba2")
+    }
+
+    /// Whether a given layer is a Mamba-2 SSM layer.
+    pub fn is_mamba2_layer(&self, layer_idx: usize) -> bool {
+        layer_idx < self.layer_types.len() && self.layer_types[layer_idx] == "mamba2"
+    }
+
+    /// Whether a given layer is a standalone MoE FFN layer (Nemotron-H).
+    /// Distinct from `is_moe()` which checks if the model has any MoE layers.
+    pub fn is_moe_layer(&self, layer_idx: usize) -> bool {
+        layer_idx < self.layer_types.len() && self.layer_types[layer_idx] == "moe"
+    }
+
+    /// Whether a given layer is an attention layer in Nemotron-H.
+    pub fn is_nemotron_attention_layer(&self, layer_idx: usize) -> bool {
+        layer_idx < self.layer_types.len() && self.layer_types[layer_idx] == "attention"
+    }
+
+    /// Mamba-2 inner dimension: d_inner = mamba_num_heads × mamba_head_dim.
+    pub fn mamba2_d_inner(&self) -> usize {
+        self.mamba_num_heads * self.mamba_head_dim
+    }
+
+    /// Mamba-2 in_proj output dimension:
+    /// 2 × d_inner (z + x) + 2 × n_groups × state_size (B + C) + num_heads (dt).
+    pub fn mamba2_in_proj_dim(&self) -> usize {
+        let d_inner = self.mamba2_d_inner();
+        2 * d_inner + 2 * self.mamba_n_groups * self.ssm_state_size + self.mamba_num_heads
     }
 }
 
@@ -1239,6 +1414,10 @@ mod tests {
             ModelArch::from_model_type("gemma3").unwrap(),
             ModelArch::Gemma3
         );
+        assert_eq!(
+            ModelArch::from_model_type("nemotron_h").unwrap(),
+            ModelArch::NemotronH
+        );
         assert!(ModelArch::from_model_type("gpt2").is_err());
         assert!(ModelArch::from_model_type("").is_err());
     }
@@ -1252,6 +1431,7 @@ mod tests {
         assert!(!ModelArch::Qwen3_5.has_qkv_bias());
         assert!(!ModelArch::Phi.has_qkv_bias());
         assert!(!ModelArch::Gemma3.has_qkv_bias());
+        assert!(!ModelArch::NemotronH.has_qkv_bias());
     }
 
     #[test]
@@ -1263,6 +1443,7 @@ mod tests {
         assert!(ModelArch::Qwen3_5.has_qk_norm());
         assert!(!ModelArch::Phi.has_qk_norm());
         assert!(ModelArch::Gemma3.has_qk_norm());
+        assert!(!ModelArch::NemotronH.has_qk_norm());
     }
 
     #[test]
@@ -1842,6 +2023,112 @@ mod tests {
             image_token_id: None,
             vision_start_token_id: None,
             vision_end_token_id: None,
+            mamba_num_heads: 0,
+            mamba_head_dim: 0,
+            ssm_state_size: 0,
+            mamba_n_groups: 0,
+            mamba_conv_kernel: 0,
+            use_conv_bias: false,
+            rescale_prenorm_residual: false,
+            hybrid_override_pattern: String::new(),
+            routed_scaling_factor: 0.0,
+            norm_topk_prob: false,
         }
+    }
+
+    #[test]
+    fn test_hybrid_override_pattern_parsing() {
+        // Simulate what from_file() does for the Nemotron-H pattern.
+        let pattern = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME";
+        let layer_types: Vec<String> = pattern
+            .chars()
+            .map(|c| match c {
+                'M' => "mamba2".to_string(),
+                'E' => "moe".to_string(),
+                '*' => "attention".to_string(),
+                _ => panic!("unknown char"),
+            })
+            .collect();
+
+        assert_eq!(layer_types.len(), 52);
+
+        // Count each layer type.
+        let mamba_count = layer_types.iter().filter(|t| t.as_str() == "mamba2").count();
+        let moe_count = layer_types.iter().filter(|t| t.as_str() == "moe").count();
+        let attn_count = layer_types.iter().filter(|t| t.as_str() == "attention").count();
+        assert_eq!(mamba_count, 23);
+        assert_eq!(moe_count, 23);
+        assert_eq!(attn_count, 6);
+
+        // Verify specific positions.
+        assert_eq!(layer_types[0], "mamba2");   // M at position 0
+        assert_eq!(layer_types[1], "moe");      // E at position 1
+        assert_eq!(layer_types[5], "attention"); // * at position 5
+
+        // Check that only attention layers need KV cache.
+        let kv_count = layer_types.iter().filter(|t| ModelConfig::layer_needs_kv(t)).count();
+        assert_eq!(kv_count, 6);
+    }
+
+    #[test]
+    fn test_nemotron_h_config_helpers() {
+        let mut config = minimal_config();
+        config.model_type = "nemotron_h".to_string();
+        config.mamba_num_heads = 64;
+        config.mamba_head_dim = 64;
+        config.ssm_state_size = 128;
+        config.mamba_n_groups = 8;
+        config.layer_types = vec![
+            "mamba2".to_string(), "moe".to_string(), "attention".to_string(),
+        ];
+
+        assert!(config.is_hybrid_mamba2());
+        assert!(config.is_mamba2_layer(0));
+        assert!(config.is_moe_layer(1));
+        assert!(config.is_nemotron_attention_layer(2));
+        assert!(!config.is_mamba2_layer(1));
+        assert_eq!(config.mamba2_d_inner(), 4096);
+        assert_eq!(config.mamba2_in_proj_dim(), 2 * 4096 + 2 * 8 * 128 + 64);
+        // Only the attention layer needs KV.
+        assert_eq!(config.num_kv_layers(), 1);
+    }
+
+    #[test]
+    fn test_parse_nemotron_h_config() {
+        let Some(config) = load_config("nemotron-3-30b") else {
+            return;
+        };
+        assert_eq!(config.model_type, "nemotron_h");
+        assert_eq!(config.arch().unwrap(), ModelArch::NemotronH);
+        assert_eq!(config.hidden_size, 2688);
+        assert_eq!(config.num_hidden_layers, 52);
+        assert_eq!(config.num_attention_heads, 32);
+        assert_eq!(config.num_key_value_heads, 2);
+        assert_eq!(config.head_dim, 128);
+        assert_eq!(config.vocab_size, 131072);
+        assert_eq!(config.weight_prefix, "backbone.");
+        // Mamba-2 fields.
+        assert_eq!(config.mamba_num_heads, 64);
+        assert_eq!(config.mamba_head_dim, 64);
+        assert_eq!(config.ssm_state_size, 128);
+        assert_eq!(config.mamba_n_groups, 8);
+        assert_eq!(config.mamba_conv_kernel, 4);
+        assert!(config.use_conv_bias);
+        assert!(config.rescale_prenorm_residual);
+        // MoE fields.
+        assert_eq!(config.num_experts, 128);
+        assert_eq!(config.num_experts_per_tok, 6);
+        assert_eq!(config.moe_intermediate_size, 1856);
+        assert_eq!(config.shared_expert_intermediate_size, 3712);
+        assert!(config.is_moe());
+        assert!(config.has_shared_expert());
+        // Hybrid layer pattern.
+        assert_eq!(config.layer_types.len(), 52);
+        assert!(config.is_hybrid_mamba2());
+        assert!(config.is_mamba2_layer(0));
+        assert!(config.is_moe_layer(1));
+        assert!(config.is_nemotron_attention_layer(5));
+        // Only 6 attention layers need KV cache.
+        assert_eq!(config.num_kv_layers(), 6);
     }
 }
