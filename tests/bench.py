@@ -50,7 +50,9 @@ from conftest import ServerManager, _find_rllm_binary, _get_gpu_count, _get_avai
 
 KNOWN_MODELS = {
     # Small tier
+    "llama-3.2-1b":                    ("Llama",     False,  2, True),
     "llama-3.2-1b-instruct":           ("Llama",     False,  2, True),
+    "llama-3.2-3b":                    ("Llama",     False,  6, True),
     "llama-3.2-3b-instruct":           ("Llama",     False,  6, True),
     "qwen2.5-3b-instruct":             ("Qwen2",     False,  6, True),
     "gemma-3-4b-it":                   ("Gemma3",    False,  8, True),
@@ -64,16 +66,19 @@ KNOWN_MODELS = {
     "qwen3.5-27b":                     ("Qwen3_5",   False, 54, True),
     "gpt-oss-20b":                     ("GptOss",    True,  40, False),
     "qwen3-coder-30b-a3b-instruct":    ("Qwen3Moe",  True,  60, True),
-    "qwen3.5-35b-a3b":                 ("Qwen3_5M",  True,  70, True),
+    "qwen3.5-35b-a3b":                ("Qwen3_5M",  True,  70, True),
     "deepseek-r1-distill-qwen-32b":    ("Qwen2",     False, 64, True),
     "mixtral-8x7b-instruct-v0.1":      ("Mixtral",   True,  93, True),
     # Big tier
     "llama-3.1-70b-instruct":          ("Llama",     False, 140, True),
     "qwen2.5-72b-instruct":            ("Qwen2",     False, 144, True),
+    # Directory name aliases (HF download lowercases, strips -A suffixes).
+    "qwen3.5-122b":                   ("Qwen3_5M",  True,  244, True),
     "qwen3.5-122b-a10b":              ("Qwen3_5M",  True,  244, True),
     "mixtral-8x22b-instruct-v0.1":     ("Mixtral",   True,  352, True),
     "gpt-oss-120b":                    ("GptOss",    True,  240, False),
     # Massive tier
+    "qwen3.5-397b":                   ("Qwen3_5M",  True,  794, True),
     "qwen3.5-397b-a27b":              ("Qwen3_5M",  True,  794, True),
 }
 
