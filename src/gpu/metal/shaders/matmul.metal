@@ -61,7 +61,7 @@ struct MatvecParams {
 // Q4 uses 1 row per SIMD to avoid register pressure from dequant.
 // Each thread maintains ROWS_PER_SIMD independent float accumulators.
 constant constexpr uint ROWS_PER_SIMD = 2;
-constant constexpr uint ROWS_PER_SIMD_Q4 = 1;
+constant constexpr uint ROWS_PER_SIMD_Q4 = 2;
 
 // Shared memory tile size for input vector caching.  4096 floats = 16 KB,
 // well within Apple Silicon's 32 KB threadgroup memory limit.  Covers
@@ -169,21 +169,35 @@ kernel void matvec_bf16(
 }
 
 // ===========================================================================
-// Matrix-vector multiply kernel (Q4) — multi-row SIMD with shared memory
-// input caching and inline dequantisation.
+// Matrix-vector multiply kernel (Q4) — multi-row SIMD with fused dequant,
+// packed uint loads, split accumulators, and shared memory x caching.
 //
 // LEARNING OVERVIEW
 //
-// Same multi-row SIMD + shared memory caching pattern as matvec_bf16, but
-// weights are stored in block-wise 4-bit quantisation.
+// Four GGML-inspired optimisations over the original kernel:
 //
-// Multi-row benefit for Q4:
-//   Q4 dequantisation is compute-heavy (nibble extract + scale multiply per
-//   weight).  With 2 rows per SIMD, each thread reads weight blocks from
-//   TWO rows but shares x values from shared memory.  The x values are
-//   already loaded and the scale*x products are reusable across rows.
-//   This doubles the useful compute per memory cycle, improving the
-//   compute-to-bandwidth ratio.
+// 1. Fused dequant-multiply-accumulate:
+//    Instead of precomputing 8 sx = scale*x intermediates (heavy register
+//    pressure), compute neg8s = -8*scale once per block, then per weight:
+//      w = fma(nibble, scale, neg8s)   // (nibble - 8) * scale
+//      acc = fma(w, x_val, acc)        // accumulate
+//    Same 2 FMAs per weight, but only 1 x_val register live at a time
+//    instead of 8 sx registers.
+//
+// 2. Multi-row SIMD (2 rows per SIMD group):
+//    Matches the bf16 kernel — each SIMD group computes 2 output rows,
+//    sharing x values from shared memory.  Enabled by the register savings
+//    from fused dequant.  Doubles useful compute per x-vector load.
+//
+// 3. Packed uint loads:
+//    Read 4 nibble bytes as a single uint instead of 4 separate uchars.
+//    Extract with shifts: (packed >> k*4) & 0xF for weight k.
+//    4 wide loads per block instead of 16 narrow loads.
+//
+// 4. Split accumulators:
+//    Two independent accumulators per row (acc_a for weights 0-15, acc_b
+//    for weights 16-31).  Breaks the serial dependency chain, giving the
+//    GPU two independent FMA streams to pipeline.
 //
 // Block layout (18 bytes per block of 32 weights):
 //   bytes  0-1:  bf16 scale factor
@@ -191,7 +205,6 @@ kernel void matvec_bf16(
 //
 // Packing: byte[i] = (q[2i] & 0xF) | (q[2i+1] << 4)
 // Dequant: weight = (nibble - 8) * scale
-//   (symmetric quantisation with offset encoding: q ∈ [0,15] → signed [-8,7])
 //
 // Dispatch: grid_size = ceil(M / 2) × 32, threadgroup_size = 256.
 // ===========================================================================
@@ -210,17 +223,23 @@ kernel void matvec_q4(
     uint simd_idx = gid / 32;
     uint lane = gid % 32;
 
-    uint row = simd_idx;
+    // Multi-row: each SIMD group computes 2 output rows.
+    uint row0 = simd_idx * ROWS_PER_SIMD_Q4;
+    uint row1 = row0 + 1;
+    bool has_row1 = (row1 < M);
 
     const uint blocks_per_row = K / 32;
     const uint bytes_per_block = 18;  // 2 (bf16 scale) + 16 (packed nibbles)
 
-    device const uchar* row_data = W_q4 + row * blocks_per_row * bytes_per_block;
+    device const uchar* row0_data = W_q4 + row0 * blocks_per_row * bytes_per_block;
+    device const uchar* row1_data = W_q4 + row1 * blocks_per_row * bytes_per_block;
 
     // Shared memory cache for input vector x.
     threadgroup float x_shared[X_TILE];
 
-    float acc = 0.0f;
+    // Split accumulators: acc_a for weights 0-15, acc_b for 16-31.
+    float acc0_a = 0.0f, acc0_b = 0.0f;
+    float acc1_a = 0.0f, acc1_b = 0.0f;
 
     for (uint tile = 0; tile < K; tile += X_TILE) {
         uint tile_len = min((uint)X_TILE, K - tile);
@@ -231,39 +250,147 @@ kernel void matvec_q4(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (row < M) {
+        if (row0 < M) {
             uint block_start = tile / 32;
             uint block_end   = (tile + tile_len) / 32;
 
             for (uint block_idx = block_start + lane; block_idx < block_end; block_idx += 32) {
-                device const uchar* block_ptr = row_data + block_idx * bytes_per_block;
-                float scale = float(*((device const bfloat*)block_ptr));
-                device const uchar* data = block_ptr + 2;
+                // Row 0 block header.
+                device const uchar* bp0 = row0_data + block_idx * bytes_per_block;
+                float scale0 = float(*((device const bfloat*)bp0));
+                float neg8s0 = -8.0f * scale0;
+                device const uchar* d0 = bp0 + 2;
 
-                uint x_local = (block_idx * 32) - tile;
+                // Row 1 block header (conditional).
+                float scale1, neg8s1;
+                device const uchar* d1;
+                if (has_row1) {
+                    device const uchar* bp1 = row1_data + block_idx * bytes_per_block;
+                    scale1 = float(*((device const bfloat*)bp1));
+                    neg8s1 = -8.0f * scale1;
+                    d1 = bp1 + 2;
+                }
 
-                // FMA-optimised dequant: precompute scale*x, then
-                // fma(nibble, sx, -8*sx) = (nibble - 8) * scale * x.
-                for (uint i = 0; i < 16; i += 4) {
-                    uchar b0 = data[i], b1 = data[i+1], b2 = data[i+2], b3 = data[i+3];
+                uint xb = (block_idx * 32) - tile;
 
-                    float sx0 = scale * x_shared[x_local + i * 2];
-                    float sx1 = scale * x_shared[x_local + i * 2 + 1];
-                    float sx2 = scale * x_shared[x_local + i * 2 + 2];
-                    float sx3 = scale * x_shared[x_local + i * 2 + 3];
-                    float sx4 = scale * x_shared[x_local + i * 2 + 4];
-                    float sx5 = scale * x_shared[x_local + i * 2 + 5];
-                    float sx6 = scale * x_shared[x_local + i * 2 + 6];
-                    float sx7 = scale * x_shared[x_local + i * 2 + 7];
+                // --- Chunk 0: weights 0-7, packed uint load → acc_a ---
+                {
+                    uint pk = *((device const uint*)(d0));
+                    float x0 = x_shared[xb],     x1 = x_shared[xb + 1];
+                    float x2 = x_shared[xb + 2], x3 = x_shared[xb + 3];
+                    float x4 = x_shared[xb + 4], x5 = x_shared[xb + 5];
+                    float x6 = x_shared[xb + 6], x7 = x_shared[xb + 7];
 
-                    acc = fma(float(b0 & 0xF), sx0, fma(-8.0f, sx0, acc));
-                    acc = fma(float(b0 >> 4),  sx1, fma(-8.0f, sx1, acc));
-                    acc = fma(float(b1 & 0xF), sx2, fma(-8.0f, sx2, acc));
-                    acc = fma(float(b1 >> 4),  sx3, fma(-8.0f, sx3, acc));
-                    acc = fma(float(b2 & 0xF), sx4, fma(-8.0f, sx4, acc));
-                    acc = fma(float(b2 >> 4),  sx5, fma(-8.0f, sx5, acc));
-                    acc = fma(float(b3 & 0xF), sx6, fma(-8.0f, sx6, acc));
-                    acc = fma(float(b3 >> 4),  sx7, fma(-8.0f, sx7, acc));
+                    acc0_a = fma(fma(float(pk & 0xF),         scale0, neg8s0), x0, acc0_a);
+                    acc0_a = fma(fma(float((pk >> 4) & 0xF),  scale0, neg8s0), x1, acc0_a);
+                    acc0_a = fma(fma(float((pk >> 8) & 0xF),  scale0, neg8s0), x2, acc0_a);
+                    acc0_a = fma(fma(float((pk >> 12) & 0xF), scale0, neg8s0), x3, acc0_a);
+                    acc0_a = fma(fma(float((pk >> 16) & 0xF), scale0, neg8s0), x4, acc0_a);
+                    acc0_a = fma(fma(float((pk >> 20) & 0xF), scale0, neg8s0), x5, acc0_a);
+                    acc0_a = fma(fma(float((pk >> 24) & 0xF), scale0, neg8s0), x6, acc0_a);
+                    acc0_a = fma(fma(float((pk >> 28)),        scale0, neg8s0), x7, acc0_a);
+
+                    if (has_row1) {
+                        uint p1 = *((device const uint*)(d1));
+                        acc1_a = fma(fma(float(p1 & 0xF),         scale1, neg8s1), x0, acc1_a);
+                        acc1_a = fma(fma(float((p1 >> 4) & 0xF),  scale1, neg8s1), x1, acc1_a);
+                        acc1_a = fma(fma(float((p1 >> 8) & 0xF),  scale1, neg8s1), x2, acc1_a);
+                        acc1_a = fma(fma(float((p1 >> 12) & 0xF), scale1, neg8s1), x3, acc1_a);
+                        acc1_a = fma(fma(float((p1 >> 16) & 0xF), scale1, neg8s1), x4, acc1_a);
+                        acc1_a = fma(fma(float((p1 >> 20) & 0xF), scale1, neg8s1), x5, acc1_a);
+                        acc1_a = fma(fma(float((p1 >> 24) & 0xF), scale1, neg8s1), x6, acc1_a);
+                        acc1_a = fma(fma(float((p1 >> 28)),        scale1, neg8s1), x7, acc1_a);
+                    }
+                }
+
+                // --- Chunk 1: weights 8-15 → acc_a ---
+                {
+                    uint pk = *((device const uint*)(d0 + 4));
+                    float x0 = x_shared[xb + 8],  x1 = x_shared[xb + 9];
+                    float x2 = x_shared[xb + 10], x3 = x_shared[xb + 11];
+                    float x4 = x_shared[xb + 12], x5 = x_shared[xb + 13];
+                    float x6 = x_shared[xb + 14], x7 = x_shared[xb + 15];
+
+                    acc0_a = fma(fma(float(pk & 0xF),         scale0, neg8s0), x0, acc0_a);
+                    acc0_a = fma(fma(float((pk >> 4) & 0xF),  scale0, neg8s0), x1, acc0_a);
+                    acc0_a = fma(fma(float((pk >> 8) & 0xF),  scale0, neg8s0), x2, acc0_a);
+                    acc0_a = fma(fma(float((pk >> 12) & 0xF), scale0, neg8s0), x3, acc0_a);
+                    acc0_a = fma(fma(float((pk >> 16) & 0xF), scale0, neg8s0), x4, acc0_a);
+                    acc0_a = fma(fma(float((pk >> 20) & 0xF), scale0, neg8s0), x5, acc0_a);
+                    acc0_a = fma(fma(float((pk >> 24) & 0xF), scale0, neg8s0), x6, acc0_a);
+                    acc0_a = fma(fma(float((pk >> 28)),        scale0, neg8s0), x7, acc0_a);
+
+                    if (has_row1) {
+                        uint p1 = *((device const uint*)(d1 + 4));
+                        acc1_a = fma(fma(float(p1 & 0xF),         scale1, neg8s1), x0, acc1_a);
+                        acc1_a = fma(fma(float((p1 >> 4) & 0xF),  scale1, neg8s1), x1, acc1_a);
+                        acc1_a = fma(fma(float((p1 >> 8) & 0xF),  scale1, neg8s1), x2, acc1_a);
+                        acc1_a = fma(fma(float((p1 >> 12) & 0xF), scale1, neg8s1), x3, acc1_a);
+                        acc1_a = fma(fma(float((p1 >> 16) & 0xF), scale1, neg8s1), x4, acc1_a);
+                        acc1_a = fma(fma(float((p1 >> 20) & 0xF), scale1, neg8s1), x5, acc1_a);
+                        acc1_a = fma(fma(float((p1 >> 24) & 0xF), scale1, neg8s1), x6, acc1_a);
+                        acc1_a = fma(fma(float((p1 >> 28)),        scale1, neg8s1), x7, acc1_a);
+                    }
+                }
+
+                // --- Chunk 2: weights 16-23 → acc_b ---
+                {
+                    uint pk = *((device const uint*)(d0 + 8));
+                    float x0 = x_shared[xb + 16], x1 = x_shared[xb + 17];
+                    float x2 = x_shared[xb + 18], x3 = x_shared[xb + 19];
+                    float x4 = x_shared[xb + 20], x5 = x_shared[xb + 21];
+                    float x6 = x_shared[xb + 22], x7 = x_shared[xb + 23];
+
+                    acc0_b = fma(fma(float(pk & 0xF),         scale0, neg8s0), x0, acc0_b);
+                    acc0_b = fma(fma(float((pk >> 4) & 0xF),  scale0, neg8s0), x1, acc0_b);
+                    acc0_b = fma(fma(float((pk >> 8) & 0xF),  scale0, neg8s0), x2, acc0_b);
+                    acc0_b = fma(fma(float((pk >> 12) & 0xF), scale0, neg8s0), x3, acc0_b);
+                    acc0_b = fma(fma(float((pk >> 16) & 0xF), scale0, neg8s0), x4, acc0_b);
+                    acc0_b = fma(fma(float((pk >> 20) & 0xF), scale0, neg8s0), x5, acc0_b);
+                    acc0_b = fma(fma(float((pk >> 24) & 0xF), scale0, neg8s0), x6, acc0_b);
+                    acc0_b = fma(fma(float((pk >> 28)),        scale0, neg8s0), x7, acc0_b);
+
+                    if (has_row1) {
+                        uint p1 = *((device const uint*)(d1 + 8));
+                        acc1_b = fma(fma(float(p1 & 0xF),         scale1, neg8s1), x0, acc1_b);
+                        acc1_b = fma(fma(float((p1 >> 4) & 0xF),  scale1, neg8s1), x1, acc1_b);
+                        acc1_b = fma(fma(float((p1 >> 8) & 0xF),  scale1, neg8s1), x2, acc1_b);
+                        acc1_b = fma(fma(float((p1 >> 12) & 0xF), scale1, neg8s1), x3, acc1_b);
+                        acc1_b = fma(fma(float((p1 >> 16) & 0xF), scale1, neg8s1), x4, acc1_b);
+                        acc1_b = fma(fma(float((p1 >> 20) & 0xF), scale1, neg8s1), x5, acc1_b);
+                        acc1_b = fma(fma(float((p1 >> 24) & 0xF), scale1, neg8s1), x6, acc1_b);
+                        acc1_b = fma(fma(float((p1 >> 28)),        scale1, neg8s1), x7, acc1_b);
+                    }
+                }
+
+                // --- Chunk 3: weights 24-31 → acc_b ---
+                {
+                    uint pk = *((device const uint*)(d0 + 12));
+                    float x0 = x_shared[xb + 24], x1 = x_shared[xb + 25];
+                    float x2 = x_shared[xb + 26], x3 = x_shared[xb + 27];
+                    float x4 = x_shared[xb + 28], x5 = x_shared[xb + 29];
+                    float x6 = x_shared[xb + 30], x7 = x_shared[xb + 31];
+
+                    acc0_b = fma(fma(float(pk & 0xF),         scale0, neg8s0), x0, acc0_b);
+                    acc0_b = fma(fma(float((pk >> 4) & 0xF),  scale0, neg8s0), x1, acc0_b);
+                    acc0_b = fma(fma(float((pk >> 8) & 0xF),  scale0, neg8s0), x2, acc0_b);
+                    acc0_b = fma(fma(float((pk >> 12) & 0xF), scale0, neg8s0), x3, acc0_b);
+                    acc0_b = fma(fma(float((pk >> 16) & 0xF), scale0, neg8s0), x4, acc0_b);
+                    acc0_b = fma(fma(float((pk >> 20) & 0xF), scale0, neg8s0), x5, acc0_b);
+                    acc0_b = fma(fma(float((pk >> 24) & 0xF), scale0, neg8s0), x6, acc0_b);
+                    acc0_b = fma(fma(float((pk >> 28)),        scale0, neg8s0), x7, acc0_b);
+
+                    if (has_row1) {
+                        uint p1 = *((device const uint*)(d1 + 12));
+                        acc1_b = fma(fma(float(p1 & 0xF),         scale1, neg8s1), x0, acc1_b);
+                        acc1_b = fma(fma(float((p1 >> 4) & 0xF),  scale1, neg8s1), x1, acc1_b);
+                        acc1_b = fma(fma(float((p1 >> 8) & 0xF),  scale1, neg8s1), x2, acc1_b);
+                        acc1_b = fma(fma(float((p1 >> 12) & 0xF), scale1, neg8s1), x3, acc1_b);
+                        acc1_b = fma(fma(float((p1 >> 16) & 0xF), scale1, neg8s1), x4, acc1_b);
+                        acc1_b = fma(fma(float((p1 >> 20) & 0xF), scale1, neg8s1), x5, acc1_b);
+                        acc1_b = fma(fma(float((p1 >> 24) & 0xF), scale1, neg8s1), x6, acc1_b);
+                        acc1_b = fma(fma(float((p1 >> 28)),        scale1, neg8s1), x7, acc1_b);
+                    }
                 }
             }
         }
@@ -271,9 +398,16 @@ kernel void matvec_q4(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    acc = simd_sum(acc);
-    if (lane == 0 && row < M) {
-        y[row] = bfloat(acc);
+    // Merge split accumulators, then SIMD reduce.
+    if (row0 < M) {
+        float acc0 = acc0_a + acc0_b;
+        acc0 = simd_sum(acc0);
+        if (lane == 0) y[row0] = bfloat(acc0);
+    }
+    if (has_row1) {
+        float acc1 = acc1_a + acc1_b;
+        acc1 = simd_sum(acc1);
+        if (lane == 0) y[row1] = bfloat(acc1);
     }
 }
 
@@ -367,16 +501,16 @@ kernel void gemm_bf16(
 // ===========================================================================
 // Batched matrix multiply (GEMM) — Q4 weights.
 //
-// Same as gemm_bf16 but with inline dequantisation of 4-bit packed weights.
-// Each SIMD group handles one (batch, row) output element.
+// Same optimisations as matvec_q4 except multi-row (each SIMD group still
+// handles one (batch, row) element since GEMM parallelises across batch):
+//   1. Fused dequant: neg8s = -8*scale once per block.
+//   3. Packed uint loads: 4 uint loads per block instead of 16 uchar.
+//   4. Split accumulators: acc_a (first 16 weights), acc_b (last 16).
 //
 // Q4 GEMM compounds TWO bandwidth savings:
 //   1. Batching: weight matrix loaded once for B tokens (B× fewer loads)
 //   2. Quantisation: 18 bytes per 32 weights vs 64 bytes (3.6× smaller)
 //   Combined: for B=100, memory traffic drops ~360× compared to 100 bf16 matvecs.
-//
-// Block layout: the Q4 GEMM kernel uses the same 18-byte block format as
-// matvec_q4 (2-byte bf16 scale + 16 bytes packed nibbles).
 // ===========================================================================
 
 kernel void gemm_q4(
@@ -403,41 +537,89 @@ kernel void gemm_q4(
     device const uchar* row_data = W_q4 + row * blocks_per_row * bytes_per_block;
     device const bfloat* x_vec = X + batch * K;
 
-    float acc = 0.0f;
+    float acc_a = 0.0f, acc_b = 0.0f;
 
     for (uint block_idx = lane; block_idx < blocks_per_row; block_idx += 32) {
         device const uchar* block_ptr = row_data + block_idx * bytes_per_block;
         float scale = float(*((device const bfloat*)block_ptr));
+        float neg8s = -8.0f * scale;
         device const uchar* data = block_ptr + 2;
-        uint x_base = block_idx * 32;
+        uint xb = block_idx * 32;
 
-        // FMA-optimised dequant (same as matvec_q4 — see comment there).
-        for (uint i = 0; i < 16; i += 4) {
-            uchar b0 = data[i];
-            uchar b1 = data[i + 1];
-            uchar b2 = data[i + 2];
-            uchar b3 = data[i + 3];
+        // Chunk 0: weights 0-7 → acc_a.
+        {
+            uint pk = *((device const uint*)(data));
+            float x0 = float(x_vec[xb]),     x1 = float(x_vec[xb + 1]);
+            float x2 = float(x_vec[xb + 2]), x3 = float(x_vec[xb + 3]);
+            float x4 = float(x_vec[xb + 4]), x5 = float(x_vec[xb + 5]);
+            float x6 = float(x_vec[xb + 6]), x7 = float(x_vec[xb + 7]);
 
-            float sx0 = scale * float(x_vec[x_base + i * 2]);
-            float sx1 = scale * float(x_vec[x_base + i * 2 + 1]);
-            float sx2 = scale * float(x_vec[x_base + i * 2 + 2]);
-            float sx3 = scale * float(x_vec[x_base + i * 2 + 3]);
-            float sx4 = scale * float(x_vec[x_base + i * 2 + 4]);
-            float sx5 = scale * float(x_vec[x_base + i * 2 + 5]);
-            float sx6 = scale * float(x_vec[x_base + i * 2 + 6]);
-            float sx7 = scale * float(x_vec[x_base + i * 2 + 7]);
+            acc_a = fma(fma(float(pk & 0xF),         scale, neg8s), x0, acc_a);
+            acc_a = fma(fma(float((pk >> 4) & 0xF),  scale, neg8s), x1, acc_a);
+            acc_a = fma(fma(float((pk >> 8) & 0xF),  scale, neg8s), x2, acc_a);
+            acc_a = fma(fma(float((pk >> 12) & 0xF), scale, neg8s), x3, acc_a);
+            acc_a = fma(fma(float((pk >> 16) & 0xF), scale, neg8s), x4, acc_a);
+            acc_a = fma(fma(float((pk >> 20) & 0xF), scale, neg8s), x5, acc_a);
+            acc_a = fma(fma(float((pk >> 24) & 0xF), scale, neg8s), x6, acc_a);
+            acc_a = fma(fma(float((pk >> 28)),        scale, neg8s), x7, acc_a);
+        }
 
-            acc = fma(float(b0 & 0xF), sx0, fma(-8.0f, sx0, acc));
-            acc = fma(float(b0 >> 4),  sx1, fma(-8.0f, sx1, acc));
-            acc = fma(float(b1 & 0xF), sx2, fma(-8.0f, sx2, acc));
-            acc = fma(float(b1 >> 4),  sx3, fma(-8.0f, sx3, acc));
-            acc = fma(float(b2 & 0xF), sx4, fma(-8.0f, sx4, acc));
-            acc = fma(float(b2 >> 4),  sx5, fma(-8.0f, sx5, acc));
-            acc = fma(float(b3 & 0xF), sx6, fma(-8.0f, sx6, acc));
-            acc = fma(float(b3 >> 4),  sx7, fma(-8.0f, sx7, acc));
+        // Chunk 1: weights 8-15 → acc_a.
+        {
+            uint pk = *((device const uint*)(data + 4));
+            float x0 = float(x_vec[xb + 8]),  x1 = float(x_vec[xb + 9]);
+            float x2 = float(x_vec[xb + 10]), x3 = float(x_vec[xb + 11]);
+            float x4 = float(x_vec[xb + 12]), x5 = float(x_vec[xb + 13]);
+            float x6 = float(x_vec[xb + 14]), x7 = float(x_vec[xb + 15]);
+
+            acc_a = fma(fma(float(pk & 0xF),         scale, neg8s), x0, acc_a);
+            acc_a = fma(fma(float((pk >> 4) & 0xF),  scale, neg8s), x1, acc_a);
+            acc_a = fma(fma(float((pk >> 8) & 0xF),  scale, neg8s), x2, acc_a);
+            acc_a = fma(fma(float((pk >> 12) & 0xF), scale, neg8s), x3, acc_a);
+            acc_a = fma(fma(float((pk >> 16) & 0xF), scale, neg8s), x4, acc_a);
+            acc_a = fma(fma(float((pk >> 20) & 0xF), scale, neg8s), x5, acc_a);
+            acc_a = fma(fma(float((pk >> 24) & 0xF), scale, neg8s), x6, acc_a);
+            acc_a = fma(fma(float((pk >> 28)),        scale, neg8s), x7, acc_a);
+        }
+
+        // Chunk 2: weights 16-23 → acc_b.
+        {
+            uint pk = *((device const uint*)(data + 8));
+            float x0 = float(x_vec[xb + 16]), x1 = float(x_vec[xb + 17]);
+            float x2 = float(x_vec[xb + 18]), x3 = float(x_vec[xb + 19]);
+            float x4 = float(x_vec[xb + 20]), x5 = float(x_vec[xb + 21]);
+            float x6 = float(x_vec[xb + 22]), x7 = float(x_vec[xb + 23]);
+
+            acc_b = fma(fma(float(pk & 0xF),         scale, neg8s), x0, acc_b);
+            acc_b = fma(fma(float((pk >> 4) & 0xF),  scale, neg8s), x1, acc_b);
+            acc_b = fma(fma(float((pk >> 8) & 0xF),  scale, neg8s), x2, acc_b);
+            acc_b = fma(fma(float((pk >> 12) & 0xF), scale, neg8s), x3, acc_b);
+            acc_b = fma(fma(float((pk >> 16) & 0xF), scale, neg8s), x4, acc_b);
+            acc_b = fma(fma(float((pk >> 20) & 0xF), scale, neg8s), x5, acc_b);
+            acc_b = fma(fma(float((pk >> 24) & 0xF), scale, neg8s), x6, acc_b);
+            acc_b = fma(fma(float((pk >> 28)),        scale, neg8s), x7, acc_b);
+        }
+
+        // Chunk 3: weights 24-31 → acc_b.
+        {
+            uint pk = *((device const uint*)(data + 12));
+            float x0 = float(x_vec[xb + 24]), x1 = float(x_vec[xb + 25]);
+            float x2 = float(x_vec[xb + 26]), x3 = float(x_vec[xb + 27]);
+            float x4 = float(x_vec[xb + 28]), x5 = float(x_vec[xb + 29]);
+            float x6 = float(x_vec[xb + 30]), x7 = float(x_vec[xb + 31]);
+
+            acc_b = fma(fma(float(pk & 0xF),         scale, neg8s), x0, acc_b);
+            acc_b = fma(fma(float((pk >> 4) & 0xF),  scale, neg8s), x1, acc_b);
+            acc_b = fma(fma(float((pk >> 8) & 0xF),  scale, neg8s), x2, acc_b);
+            acc_b = fma(fma(float((pk >> 12) & 0xF), scale, neg8s), x3, acc_b);
+            acc_b = fma(fma(float((pk >> 16) & 0xF), scale, neg8s), x4, acc_b);
+            acc_b = fma(fma(float((pk >> 20) & 0xF), scale, neg8s), x5, acc_b);
+            acc_b = fma(fma(float((pk >> 24) & 0xF), scale, neg8s), x6, acc_b);
+            acc_b = fma(fma(float((pk >> 28)),        scale, neg8s), x7, acc_b);
         }
     }
 
+    float acc = acc_a + acc_b;
     acc = simd_sum(acc);
     if (lane == 0) {
         Y[batch * M + row] = bfloat(acc);

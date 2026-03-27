@@ -4,11 +4,9 @@
 // Trait contract: gpu/ops/matmul.rs
 // Metal shader:   metal/shaders/matmul.metal
 //
-// Two code paths based on weight dtype:
-//   - BF16: multi-row SIMD matvec with shared memory x caching (2 rows per
-//     SIMD group, 16 rows per threadgroup)
-//   - Q4: multi-row SIMD matvec with shared memory x caching and inline
-//     dequantisation (18 bytes per 32 weights: bf16 scale + packed nibbles)
+// Both BF16 and Q4 use multi-row SIMD (2 rows per SIMD group, 16 rows per
+// threadgroup) with shared memory x caching.  Q4 additionally uses fused
+// dequant, packed uint loads, and split accumulators.
 //
 // Multi-row dispatch: grid = ceil(M/2) × 32 threads.  Each SIMD group
 // computes 2 output rows, sharing x loads via threadgroup shared memory.
@@ -47,9 +45,9 @@ impl GpuMatmul for MetalBackend {
     fn matmul(&self, weight: &MetalTensor, input: &MetalTensor, out: &MetalTensor, m: u32, k: u32) {
         let params = MatvecParams { m, k };
         let (pipeline, rows_per_simd) = match weight.dtype {
-            // Q4: single-row SIMD (1 row per SIMD group) — dequant is heavy
-            // enough that multi-row would cause register spilling.
-            TensorDtype::Q4 => (&self.pipeline_matvec_q4, 1u64),
+            // Q4: multi-row SIMD (2 rows per SIMD group) — fused dequant
+            // reduces register pressure enough to match bf16.
+            TensorDtype::Q4 => (&self.pipeline_matvec_q4, 2u64),
             // BF16: multi-row SIMD (2 rows per SIMD group) — x loaded once,
             // used for both rows, giving free ILP via independent accumulators.
             _ => (&self.pipeline_matvec, ROWS_PER_SIMD_BF16),
