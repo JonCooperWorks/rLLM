@@ -49,22 +49,19 @@ All models support bf16 and Q4. Multi-GPU via `--tp N` requires CUDA + NCCL.
 
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
-| Llama 3.2 1B Instruct | 1.2B | 121 tok/s | 172 tok/s | 69 ms | 53 ms |
-| Llama 3.2 3B Instruct | 3.2B | 48 tok/s | 72 tok/s | 217 ms | 136 ms |
+| Llama 3.2 1B Instruct | 1.2B | 119 tok/s | 174 tok/s | 62 ms | 41 ms |
+| Llama 3.2 3B Instruct | 3.2B | 47 tok/s | 74 tok/s | 187 ms | 89 ms |
 | Qwen 2.5 3B Instruct | 3.1B | 59 tok/s | 75 tok/s | 269 ms | 250 ms |
-| Gemma 3 4B Instruct | 4.3B | 29 tok/s | 37 tok/s | 251 ms | 170 ms |
+| Gemma 3 4B Instruct | 4.3B | 29 tok/s | 39 tok/s | 214 ms | 111 ms |
 | Qwen 2.5 7B Instruct | 7.6B | 30 tok/s | 75 tok/s | 720 ms | 250 ms |
-| Mistral 7B Instruct | 7.2B | 26 tok/s | 52 tok/s | 374 ms | 162 ms |
-| Llama 3.1 8B Instruct | 8.0B | 25 tok/s | 50 tok/s | 509 ms | 197 ms |
+| Mistral 7B Instruct | 7.2B | 26 tok/s | 55 tok/s | 334 ms | 121 ms |
+| Llama 3.1 8B Instruct | 8.0B | 25 tok/s | 54 tok/s | 464 ms | 155 ms |
 | Qwen3.5 9B | ~9B | 23 tok/s | 47 tok/s | 1,404 ms | 736 ms |
 | Phi-4 | 14.7B | 13 tok/s | 32 tok/s | 9,152 ms | 288 ms |
-| GPT-OSS 20B | 20.0B (3.6B active) | 23 tok/s | 17 tok/s | 8,575 ms | 6,790 ms |
-| Gemma 3 27B Instruct | 27.4B | — | 14 tok/s | — | 613 ms |
-| Qwen3 Coder 30B-A3B | 30.5B (3.3B active) | 2 tok/s | 11 tok/s | 40,000 ms | 2,900 ms |
-| DeepSeek-R1-Distill-Qwen-32B | 32.8B | — | 5 tok/s | — | 4,700 ms |
-| Mixtral 8x7B Instruct ⚡ | 46.7B (12.9B active) | 0.4 tok/s | 3.3 tok/s | 20,089 ms | 6,014 ms |
-| Qwen3.5 27B ⚡ | ~27B | 7.8 tok/s | 17 tok/s | 50,239 ms | 1,973 ms |
-| Qwen3.5 35B-A3B ⚡ | 35.1B (3.3B active) | 3.0 tok/s | — | 2,600 ms | 10,600 ms |
+| GPT-OSS 20B | 20.0B (3.6B active) | 31 tok/s | 37 tok/s | 3,483 ms | 2,214 ms |
+| Gemma 3 27B Instruct | 27.4B | — | 16 tok/s | — | 548 ms |
+| Mixtral 8x7B Instruct ⚡ | 46.7B (12.9B active) | 0.4 tok/s | 28 tok/s | 19,445 ms | 1,572 ms |
+| Qwen3.5 27B ⚡ | ~27B | 7.8 tok/s | 18 tok/s | 50,239 ms | 1,973 ms |
 | Qwen3.5 122B-A10B ⚡ | 122B (10B active) | 1.3 tok/s | 6.9 tok/s | 16,756 ms | 6,272 ms |
 | Qwen3.5 397B-A27B ⚡ | 397B (17B active) | — | 3.3 tok/s | — | 9,735 ms |
 
