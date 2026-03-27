@@ -153,7 +153,7 @@ fn deltanet_attention_block<
 
     // Update conv history: shift left and append current token's QKV.
     m.backend
-        .conv1d_shift_history(conv_history, qkv_buf, conv_dim, kernel_size);
+        .conv1d_shift_history(conv_history, qkv_buf, conv_dim, kernel_size, 0);
 
     // Step 5: L2 normalize Q and K (per head, in-place on conv_out).
     m.backend.l2_normalize_heads(conv_out, num_qk_heads, hd, 0);

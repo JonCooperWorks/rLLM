@@ -33,6 +33,7 @@ impl GpuMamba2 for CudaBackend {
         _out: &CudaTensor,
         _dim: u32,
         _kernel_size: u32,
+        _input_offset: u32,
     ) {
         unimplemented!("Mamba2 conv1d+silu CUDA kernel not yet implemented")
     }
@@ -41,9 +42,7 @@ impl GpuMamba2 for CudaBackend {
         &self,
         _state: &CudaTensor,
         _x: &CudaTensor,
-        _b: &CudaTensor,
-        _c: &CudaTensor,
-        _dt: &CudaTensor,
+        _bcdt_buf: &CudaTensor,
         _a_log: &CudaTensor,
         _d_skip: &CudaTensor,
         _dt_bias: &CudaTensor,
@@ -53,6 +52,9 @@ impl GpuMamba2 for CudaBackend {
         _head_dim: u32,
         _state_size: u32,
         _n_groups: u32,
+        _b_offset: u32,
+        _c_offset: u32,
+        _dt_offset: u32,
         _eps: f32,
     ) {
         unimplemented!("Mamba2 SSM step CUDA kernel not yet implemented")

@@ -1393,6 +1393,7 @@ impl GpuDeltaNet for CpuBackend {
         _input: &CpuTensor,
         _dim: u32,
         _kernel_size: u32,
+        _input_offset: u32,
     ) {
         unimplemented!("CpuBackend::conv1d_shift_history")
     }
@@ -1466,19 +1467,21 @@ impl GpuMamba2 for CpuBackend {
         out: &CpuTensor,
         dim: u32,
         kernel_size: u32,
+        input_offset: u32,
     ) {
         // Depthwise conv1d with bias and SiLU activation.
         // For each channel i:
         //   acc = bias[i]
         //   acc += sum over j in 0..kernel_size-1 of weight[i, j] * history[j * dim + i]
-        //   acc += weight[i, kernel_size-1] * input[i]
+        //   acc += weight[i, kernel_size-1] * input[input_offset + i]
         //   out[i] = silu(acc)
         let d = dim as usize;
         let ks = kernel_size as usize;
-        let inp = read_bf16(input, d);
+        let off = input_offset as usize;
+        let inp = read_bf16(input, off + d);
         let hist = read_bf16(history, (ks - 1) * d);
         let w = read_bf16(weight, d * ks); // [dim, kernel_size] row-major
-        let b = read_bf16(bias, d);
+        let b = read_f32(bias, d); // bias is f32 (loaded as f32 by weight loader)
 
         let mut result = vec![0.0f32; d];
         for i in 0..d {
@@ -1487,8 +1490,8 @@ impl GpuMamba2 for CpuBackend {
             for j in 0..(ks - 1) {
                 acc += w[i * ks + j] * hist[j * d + i];
             }
-            // Current input tap: weight[i, kernel_size-1] * input[i]
-            acc += w[i * ks + (ks - 1)] * inp[i];
+            // Current input tap: weight[i, kernel_size-1] * input[input_offset + i]
+            acc += w[i * ks + (ks - 1)] * inp[off + i];
             // SiLU activation: x / (1 + exp(-x))
             result[i] = acc / (1.0 + (-acc).exp());
         }
@@ -1499,9 +1502,7 @@ impl GpuMamba2 for CpuBackend {
         &self,
         state: &CpuTensor,
         x: &CpuTensor,
-        b: &CpuTensor,
-        c: &CpuTensor,
-        dt: &CpuTensor,
+        bcdt_buf: &CpuTensor,
         a_log: &CpuTensor,
         d_skip: &CpuTensor,
         dt_bias: &CpuTensor,
@@ -1511,6 +1512,9 @@ impl GpuMamba2 for CpuBackend {
         head_dim: u32,
         state_size: u32,
         n_groups: u32,
+        b_offset: u32,
+        c_offset: u32,
+        dt_offset: u32,
         eps: f32,
     ) {
         // Selective SSM step with grouped B/C, persistent state, and RMSNorm.
@@ -1519,12 +1523,16 @@ impl GpuMamba2 for CpuBackend {
         let ss = state_size as usize;
         let ng = n_groups as usize;
         let heads_per_group = nh / ng;
+        let b_off = b_offset as usize;
+        let c_off = c_offset as usize;
+        let dt_off = dt_offset as usize;
 
-        // Read inputs
+        // Read inputs — B, C, dt all come from the unified bcdt_buf at specified offsets.
         let x_data = read_bf16(x, nh * hd);
-        let b_data = read_bf16(b, ng * ss);
-        let c_data = read_bf16(c, ng * ss);
-        let dt_data = read_bf16(dt, nh);
+        // Read enough of bcdt_buf to cover all three regions.
+        let max_needed = [b_off + ng * ss, c_off + ng * ss, dt_off + nh]
+            .into_iter().max().unwrap();
+        let bcdt_data = read_bf16(bcdt_buf, max_needed);
         let a_log_data = read_f32(a_log, nh);
         let d_skip_data = read_f32(d_skip, nh);
         let dt_bias_data = read_f32(dt_bias, nh);
@@ -1539,7 +1547,7 @@ impl GpuMamba2 for CpuBackend {
             let g = h / heads_per_group;
 
             // 1. Discretize: dt_h = softplus(dt_raw + dt_bias)
-            let dt_raw = dt_data[h] + dt_bias_data[h];
+            let dt_raw = bcdt_data[dt_off + h] + dt_bias_data[h];
             let dt_h = (1.0 + dt_raw.exp()).ln(); // softplus
 
             // dA = exp(dt * (-exp(A_log)))
@@ -1550,7 +1558,7 @@ impl GpuMamba2 for CpuBackend {
                 for si in 0..ss {
                     let idx = h * hd * ss + di * ss + si;
                     let x_val = x_data[h * hd + di];
-                    let b_val = b_data[g * ss + si];
+                    let b_val = bcdt_data[b_off + g * ss + si];
                     st[idx] = da * st[idx] + dt_h * x_val * b_val;
                 }
             }
@@ -1559,7 +1567,7 @@ impl GpuMamba2 for CpuBackend {
             for di in 0..hd {
                 let mut dot = 0.0f32;
                 for si in 0..ss {
-                    dot += st[h * hd * ss + di * ss + si] * c_data[g * ss + si];
+                    dot += st[h * hd * ss + di * ss + si] * bcdt_data[c_off + g * ss + si];
                 }
                 y[h * hd + di] = dot + d_skip_data[h] * x_data[h * hd + di];
             }

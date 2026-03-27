@@ -2192,6 +2192,28 @@ fn load_nemotron_h_layer<B: GpuCore>(
 
     // All Nemotron-H layers have a pre-layer RMSNorm.
     let input_layernorm = upload_tensor(store, backend, &format!("{prefix}.norm.weight"), &[hidden])?;
+
+    // Bake rescale_prenorm_residual into the norm weights at load time.
+    // This is a constant 1/√(2 × num_layers) scale factor that would otherwise
+    // require a separate scalar_mul dispatch on every layer of every token.
+    // By folding it into the norm weights, we get it for free: the RMSNorm
+    // output becomes `normalized(x) * (weight * scale)` instead of needing
+    // a separate `scalar_mul(output, scale)` afterwards.
+    //
+    // We do this on the host (read bf16 → scale → write bf16) since the loader
+    // only requires GpuCore, not GpuElementwise.
+    if config.rescale_prenorm_residual {
+        let scale = 1.0 / ((2.0 * config.num_hidden_layers as f64).sqrt()) as f32;
+        let byte_count = backend.tensor_byte_count(&input_layernorm);
+        let mut buf = vec![0u8; byte_count];
+        backend.copy_to_host(&input_layernorm, &mut buf);
+        let bf16_slice: &mut [half::bf16] = bytemuck::cast_slice_mut(&mut buf);
+        for v in bf16_slice.iter_mut() {
+            *v = half::bf16::from_f32(v.to_f32() * scale);
+        }
+        backend.copy_to_tensor(&input_layernorm, &buf);
+    }
+
     // Nemotron-H has only one norm per layer (no post-attention norm).
     // Create a dummy for the required post_attention_layernorm field.
     let dummy_norm = backend.alloc_tensor(&[1], TensorDtype::BF16);

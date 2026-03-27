@@ -59,13 +59,14 @@ pub(crate) trait GpuMamba2: GpuCore {
     /// `conv1d_shift_history` — same FIFO operation, no bias involved.
     fn mamba2_conv1d_silu(
         &self,
-        input: &Self::Tensor,   // [d_inner] — current token's SSM input
-        history: &Self::Tensor, // [(kernel_size-1) × d_inner] — prior tokens
-        weight: &Self::Tensor,  // [d_inner, kernel_size] — per-channel weights
-        bias: &Self::Tensor,    // [d_inner] — per-channel bias
-        out: &Self::Tensor,     // [d_inner] — conv1d + silu output
+        input: &Self::Tensor,   // buffer containing x at `input_offset`
+        history: &Self::Tensor, // [(kernel_size-1) × dim] — prior tokens
+        weight: &Self::Tensor,  // [dim, kernel_size] — per-channel weights
+        bias: &Self::Tensor,    // [dim] — per-channel bias
+        out: &Self::Tensor,     // [dim] — conv1d + silu output
         dim: u32,               // d_inner
         kernel_size: u32,       // typically 4
+        input_offset: u32,      // element offset into `input` where x starts
     );
 
     /// Mamba-2 selective SSM step: state update + output with grouped B/C.
@@ -87,9 +88,7 @@ pub(crate) trait GpuMamba2: GpuCore {
         &self,
         state: &Self::Tensor,       // [num_heads × head_dim × state_size] f32 (persistent)
         x: &Self::Tensor,           // [num_heads × head_dim] bf16 — SSM input (after conv1d + silu)
-        b: &Self::Tensor,           // [n_groups × state_size] bf16 — state input vector
-        c: &Self::Tensor,           // [n_groups × state_size] bf16 — state output vector
-        dt: &Self::Tensor,          // [num_heads] bf16 — raw time steps (before softplus)
+        bcdt_buf: &Self::Tensor,    // buffer containing B, C, dt at specified offsets
         a_log: &Self::Tensor,       // [num_heads] f32 — log of diagonal decay rates
         d_skip: &Self::Tensor,      // [num_heads] f32 — skip connection scalars
         dt_bias: &Self::Tensor,     // [num_heads] f32 — learned time step bias
@@ -99,6 +98,9 @@ pub(crate) trait GpuMamba2: GpuCore {
         head_dim: u32,
         state_size: u32,
         n_groups: u32,
+        b_offset: u32,              // element offset in bcdt_buf where B starts
+        c_offset: u32,              // element offset where C starts
+        dt_offset: u32,             // element offset where dt starts
         eps: f32,                   // RMSNorm epsilon
     );
 }

@@ -23,6 +23,7 @@ use crate::gpu::ops::GpuMamba2;
 struct MambaConv1dParams {
     dim: u32,
     kernel_size: u32,
+    input_offset: u32,
 }
 
 #[repr(C)]
@@ -32,6 +33,9 @@ struct Mamba2SsmStepParams {
     head_dim: u32,
     state_size: u32,
     n_groups: u32,
+    b_offset: u32,
+    c_offset: u32,
+    dt_offset: u32,
     eps: f32,
 }
 
@@ -45,8 +49,9 @@ impl GpuMamba2 for MetalBackend {
         out: &MetalTensor,
         dim: u32,
         kernel_size: u32,
+        input_offset: u32,
     ) {
-        let params = MambaConv1dParams { dim, kernel_size };
+        let params = MambaConv1dParams { dim, kernel_size, input_offset };
         self.dispatch_async(
             &self.pipeline_mamba2_conv1d_silu,
             &params,
@@ -66,9 +71,7 @@ impl GpuMamba2 for MetalBackend {
         &self,
         state: &MetalTensor,
         x: &MetalTensor,
-        b: &MetalTensor,
-        c: &MetalTensor,
-        dt: &MetalTensor,
+        bcdt_buf: &MetalTensor,
         a_log: &MetalTensor,
         d_skip: &MetalTensor,
         dt_bias: &MetalTensor,
@@ -78,6 +81,9 @@ impl GpuMamba2 for MetalBackend {
         head_dim: u32,
         state_size: u32,
         n_groups: u32,
+        b_offset: u32,
+        c_offset: u32,
+        dt_offset: u32,
         eps: f32,
     ) {
         let params = Mamba2SsmStepParams {
@@ -85,6 +91,9 @@ impl GpuMamba2 for MetalBackend {
             head_dim,
             state_size,
             n_groups,
+            b_offset,
+            c_offset,
+            dt_offset,
             eps,
         };
         let threads_per_group: u64 = 256;
@@ -94,14 +103,12 @@ impl GpuMamba2 for MetalBackend {
             &[
                 (&state.buffer, 1),
                 (&x.buffer, 2),
-                (&b.buffer, 3),
-                (&c.buffer, 4),
-                (&dt.buffer, 5),
-                (&a_log.buffer, 6),
-                (&d_skip.buffer, 7),
-                (&dt_bias.buffer, 8),
-                (&norm_weight.buffer, 9),
-                (&out.buffer, 10),
+                (&bcdt_buf.buffer, 3),
+                (&a_log.buffer, 4),
+                (&d_skip.buffer, 5),
+                (&dt_bias.buffer, 6),
+                (&norm_weight.buffer, 7),
+                (&out.buffer, 8),
             ],
             MTLSize::new(num_heads as u64 * threads_per_group, 1, 1),
             MTLSize::new(threads_per_group, 1, 1),

@@ -46,8 +46,9 @@ using namespace metal;
 // ===========================================================================
 
 struct MambaConv1dParams {
-    uint dim;         // Number of channels (d_inner).
-    uint kernel_size; // Convolution window (typically 4).
+    uint dim;          // Number of channels (d_inner).
+    uint kernel_size;  // Convolution window (typically 4).
+    uint input_offset; // Element offset into input buffer where x starts.
 };
 
 kernel void mamba2_conv1d_silu(
@@ -55,14 +56,15 @@ kernel void mamba2_conv1d_silu(
     device const bfloat* input         [[buffer(1)]],
     device const bfloat* history       [[buffer(2)]],
     device const bfloat* weight        [[buffer(3)]],
-    device const bfloat* bias          [[buffer(4)]],
+    device const float* bias           [[buffer(4)]],
     device bfloat* out                 [[buffer(5)]],
     uint gid                           [[thread_position_in_grid]]
 ) {
     if (gid >= params.dim) return;
 
     // Start with bias — the key difference from DeltaNet's conv1d.
-    float acc = float(bias[gid]);
+    // Bias is f32 (loaded as f32 by the weight loader), no cast needed.
+    float acc = bias[gid];
 
     // Convolve over the history buffer (kernel_size - 1 prior tokens).
     // History layout: [time_step, dim] — each row is one prior token's
@@ -75,7 +77,7 @@ kernel void mamba2_conv1d_silu(
 
     // The current token occupies the last weight tap.
     acc += float(weight[gid * params.kernel_size + params.kernel_size - 1]) *
-           float(input[gid]);
+           float(input[params.input_offset + gid]);
 
     // SiLU activation: silu(x) = x / (1 + exp(-x)).
     out[gid] = bfloat(acc / (1.0f + exp(-acc)));
@@ -108,6 +110,9 @@ struct Mamba2SsmStepParams {
     uint head_dim;    // Dimension per head.
     uint state_size;  // SSM state size (N in the paper).
     uint n_groups;    // Number of B/C groups (shared across heads).
+    uint b_offset;    // Element offset in bcdt buffer where B starts.
+    uint c_offset;    // Element offset where C starts.
+    uint dt_offset;   // Element offset where dt starts.
     float eps;        // RMSNorm epsilon.
 };
 
@@ -115,14 +120,12 @@ kernel void mamba2_ssm_step(
     constant Mamba2SsmStepParams& params [[buffer(0)]],
     device float* state                  [[buffer(1)]],
     device const bfloat* x               [[buffer(2)]],
-    device const bfloat* b               [[buffer(3)]],
-    device const bfloat* c               [[buffer(4)]],
-    device const bfloat* dt              [[buffer(5)]],
-    device const float* a_log            [[buffer(6)]],
-    device const float* d_skip           [[buffer(7)]],
-    device const float* dt_bias          [[buffer(8)]],
-    device const bfloat* norm_weight     [[buffer(9)]],
-    device bfloat* out                   [[buffer(10)]],
+    device const bfloat* bcdt            [[buffer(3)]],
+    device const float* a_log            [[buffer(4)]],
+    device const float* d_skip           [[buffer(5)]],
+    device const float* dt_bias          [[buffer(6)]],
+    device const bfloat* norm_weight     [[buffer(7)]],
+    device bfloat* out                   [[buffer(8)]],
     uint tgid                            [[threadgroup_position_in_grid]],
     uint tid                             [[thread_index_in_threadgroup]],
     uint tg_size                         [[threads_per_threadgroup]]
@@ -147,7 +150,7 @@ kernel void mamba2_ssm_step(
 
     if (tid == 0) {
         // Softplus: log(1 + exp(x)).  dt_bias is in f32 (learned parameter).
-        float dt_raw = float(dt[h]) + dt_bias[h];
+        float dt_raw = float(bcdt[params.dt_offset + h]) + dt_bias[h];
         float dt_val = log(1.0f + exp(dt_raw));
 
         // Discretised decay: dA = exp(dt * (-exp(A_log))).
@@ -188,14 +191,14 @@ kernel void mamba2_ssm_step(
 
         for (uint s = 0; s < ss; s++) {
             uint idx = state_base + s;
-            float b_val = float(b[g * ss + s]);
+            float b_val = float(bcdt[params.b_offset + g * ss + s]);
 
             // State update: state[h,i,s] = dA * state[h,i,s] + dt * x[i] * B[g,s]
             // The outer(x, B) term is rank-1: each element is x[i] * B[s].
             state[idx] = dA * state[idx] + dt_val * x_val * b_val;
 
             // Accumulate output: y[i] += state[h,i,s] * C[g,s]
-            float c_val = float(c[g * ss + s]);
+            float c_val = float(bcdt[params.c_offset + g * ss + s]);
             y_val += state[idx] * c_val;
         }
 

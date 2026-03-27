@@ -65,27 +65,11 @@ use crate::model::{Model, PrefillBuffers};
 // which KV pool slot to use).
 // ---------------------------------------------------------------------------
 
-/// Map global layer index → Mamba-2 state index.
-/// Counts how many Mamba layers appear before this one.
-fn mamba2_layer_index(config: &ModelConfig, layer_idx: usize) -> usize {
-    config.layer_types[..layer_idx]
-        .iter()
-        .filter(|t| t.as_str() == "mamba2")
-        .count()
-}
-
-/// Prenorm scaling factor: 1/√(2 × num_layers).
-/// Applied after RMSNorm and before the mixer when rescale_prenorm_residual=true.
-/// Prevents signal amplification through deep networks.
-fn prenorm_scale(config: &ModelConfig) -> f32 {
-    if config.rescale_prenorm_residual {
-        1.0 / ((2.0 * config.num_hidden_layers as f64).sqrt()) as f32
-    } else {
-        1.0
-    }
-}
-
 /// Shared dimension struct to avoid recomputing sizes on every layer.
+///
+/// Note: rescale_prenorm_residual is NOT applied here — it's baked into the
+/// RMSNorm weights at load time (see loader.rs load_nemotron_h_layer).
+/// This eliminates 52 separate scalar_mul dispatches per token.
 struct NemotronDims {
     hidden_size: u32,
     q_dim: u32,
@@ -102,11 +86,25 @@ struct NemotronDims {
     moe_inter: u32,
     shared_inter: u32,
     eps: f32,
-    prenorm_scale: f32,
+    /// Precomputed mapping: global layer_idx → Mamba-2 state index.
+    /// None for non-Mamba layers.  Avoids O(n) string scan per layer call.
+    mamba2_state_map: Vec<Option<usize>>,
 }
 
 impl NemotronDims {
     fn from_config(config: &ModelConfig) -> Self {
+        // Precompute Mamba-2 state indices.
+        let mut m2_idx = 0;
+        let mamba2_state_map: Vec<Option<usize>> = config.layer_types.iter().map(|t| {
+            if t == "mamba2" {
+                let idx = m2_idx;
+                m2_idx += 1;
+                Some(idx)
+            } else {
+                None
+            }
+        }).collect();
+
         Self {
             hidden_size: config.hidden_size as u32,
             q_dim: (config.num_attention_heads * config.head_dim) as u32,
@@ -123,7 +121,7 @@ impl NemotronDims {
             moe_inter: config.moe_intermediate_size as u32,
             shared_inter: config.shared_expert_intermediate_size as u32,
             eps: config.rms_norm_eps as f32,
-            prenorm_scale: prenorm_scale(config),
+            mamba2_state_map,
         }
     }
 }
@@ -194,8 +192,7 @@ pub(crate) fn forward_single_paged<
 //
 // Pipeline:
 //   1. RMSNorm(hidden) → norm_buf
-//   2. Scale by prenorm_scale
-//   3. in_proj matmul → [z, x, B, C, dt] split by offset
+//   2. in_proj matmul → [z, x, B, C, dt] split by offset
 //   4. conv1d(x) + silu → conv_out (with bias)
 //   5. shift conv history
 //   6. SSM step: state update + output + norm → ssm_out
@@ -209,7 +206,7 @@ fn mamba2_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuDeltaNet 
     d: &NemotronDims,
 ) {
     let layer = &m.weights.layers[layer_idx];
-    let dn_idx = mamba2_layer_index(&m.config, layer_idx);
+    let dn_idx = d.mamba2_state_map[layer_idx].expect("mamba2 layer must have state index");
 
     // Unwrap Mamba state and scratch buffers.
     let states = m.mamba2_states.as_ref().expect("mamba2_states");
@@ -235,34 +232,30 @@ fn mamba2_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuDeltaNet 
     // 1. RMSNorm.
     m.backend.rms_norm(&m.hidden, &layer.input_layernorm, d.eps, &m.norm_buf);
 
-    // 2. Scale by prenorm_scale.
-    if d.prenorm_scale != 1.0 {
-        m.backend.scalar_mul(&m.norm_buf, &m.norm_buf, d.prenorm_scale, d.hidden_size);
-    }
-
-    // 3. in_proj: [in_proj_dim, hidden_size] × norm_buf → in_proj_buf.
+    // 2. in_proj: [in_proj_dim, hidden_size] × norm_buf → in_proj_buf.
     m.backend.matmul(in_proj, &m.norm_buf, in_proj_buf, in_proj_dim, d.hidden_size);
 
     // 4. Conv1d + SiLU on x portion (offset d_inner..2*d_inner in in_proj_buf).
-    // The x portion is at element offset d_inner from the start of in_proj_buf.
-    // We use element-offset views via the backend's tensor slicing.
-    // For now, we pass the full in_proj_buf and use offsets in the kernel.
+    // The mamba2_conv1d_silu kernel accepts input_offset to read x at the
+    // correct position within the concatenated in_proj_buf.
     m.backend.mamba2_conv1d_silu(
-        in_proj_buf,  // x portion accessed at offset d_inner
+        in_proj_buf,
         history,
         conv_w,
         conv_b,
         conv_out,
         d.d_inner,
         m.config.mamba_conv_kernel as u32,
+        d.d_inner, // input_offset: x starts at element d_inner
     );
 
-    // 5. Shift conv history: append the current x to the FIFO buffer.
+    // 5. Shift conv history: append the current x (at offset d_inner) to the FIFO.
     m.backend.conv1d_shift_history(
         history,
-        in_proj_buf,  // x at offset d_inner
+        in_proj_buf,
         d.d_inner,
         m.config.mamba_conv_kernel as u32,
+        d.d_inner, // input_offset: x starts at element d_inner
     );
 
     // 6. SSM step: state update + output + RMSNorm.
@@ -271,9 +264,7 @@ fn mamba2_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuDeltaNet 
     m.backend.mamba2_ssm_step(
         state,
         conv_out,
-        in_proj_buf,  // B at offset 2*d_inner
-        in_proj_buf,  // C at offset 2*d_inner + n_groups*state_size
-        in_proj_buf,  // dt at offset 2*d_inner + 2*n_groups*state_size
+        in_proj_buf,  // unified B/C/dt buffer with offsets below
         a_log,
         d_skip,
         dt_bias,
@@ -283,6 +274,9 @@ fn mamba2_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuDeltaNet 
         d.mamba_head_dim,
         d.state_size,
         d.n_groups,
+        2 * d.d_inner,                                // b_offset
+        2 * d.d_inner + d.n_groups * d.state_size,     // c_offset
+        2 * d.d_inner + 2 * d.n_groups * d.state_size, // dt_offset
         d.eps,
     );
 
@@ -302,8 +296,7 @@ fn mamba2_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuDeltaNet 
 //
 // Pipeline:
 //   1. RMSNorm(hidden) → norm_buf
-//   2. Scale by prenorm_scale
-//   3. Router: gate × norm_buf → logits, sigmoid top-k → indices + weights
+//   2. Router: gate × norm_buf → logits, sigmoid top-k → indices + weights
 //   4. For each selected expert: up_proj → relu² → down_proj
 //   5. Shared expert: up_proj → relu² → down_proj (always active)
 //   6. Combine expert outputs + residual
@@ -328,12 +321,7 @@ fn moe_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
     // 1. RMSNorm.
     m.backend.rms_norm(&m.hidden, &layer.input_layernorm, d.eps, &m.norm_buf);
 
-    // 2. Scale.
-    if d.prenorm_scale != 1.0 {
-        m.backend.scalar_mul(&m.norm_buf, &m.norm_buf, d.prenorm_scale, d.hidden_size);
-    }
-
-    // 3. Router: matmul → sigmoid top-k.
+    // 2. Router: matmul → sigmoid top-k.
     m.backend.matmul(router_gate, &m.norm_buf, router_logits, num_experts, d.hidden_size);
 
     // Use sigmoid routing with correction bias (DeepSeek-V3 style).
@@ -421,12 +409,7 @@ fn attention_block<
     // 1. RMSNorm.
     m.backend.rms_norm(&m.hidden, &layer.input_layernorm, d.eps, &m.norm_buf);
 
-    // 2. Scale.
-    if d.prenorm_scale != 1.0 {
-        m.backend.scalar_mul(&m.norm_buf, &m.norm_buf, d.prenorm_scale, d.hidden_size);
-    }
-
-    // 3. QKV projections.
+    // 2. QKV projections.
     m.backend.matmul(&layer.q_proj, &m.norm_buf, &m.q_buf, d.q_dim, d.hidden_size);
     m.backend.matmul(&layer.k_proj, &m.norm_buf, &m.k_buf, d.kv_dim, d.hidden_size);
     m.backend.matmul(&layer.v_proj, &m.norm_buf, &m.v_buf, d.kv_dim, d.hidden_size);
@@ -493,6 +476,13 @@ pub(crate) fn forward_prefill_paged<
     let start_pos = seq_state.seq_len as u32;
     let hidden_byte_size = m.config.hidden_size * crate::gpu::TensorDtype::BF16.byte_size();
 
+    // Pre-allocate host buffers for the token-by-token Mamba/MoE loop.
+    // These are reused across all 46 sequential layers, avoiding ~94K
+    // allocations during a 1000-token prefill.
+    let mut host_hidden_buf = Vec::new();
+    let token_buf_size = m.backend.tensor_byte_count(&m.hidden);
+    let mut token_hidden_buf = vec![0u8; token_buf_size];
+
     for layer_idx in 0..m.config.num_hidden_layers {
         let layer = &m.weights.layers[layer_idx];
         let layer_type = m.config.layer_types[layer_idx].as_str();
@@ -512,14 +502,16 @@ pub(crate) fn forward_prefill_paged<
             // -----------------------------------------------------------------
             "mamba2" | "moe" => {
                 let full_bytes = m.backend.tensor_byte_count(&bufs.hidden);
-                let mut host_hidden = vec![0u8; full_bytes];
-                m.backend.copy_to_host(&bufs.hidden, &mut host_hidden);
+                // Pre-allocate host buffers outside the token loop to avoid
+                // per-token allocation overhead (~46 layers × N tokens).
+                host_hidden_buf.resize(full_bytes, 0u8);
+                m.backend.copy_to_host(&bufs.hidden, &mut host_hidden_buf);
 
                 for t in 0..tokens.len() {
                     let offset = t * hidden_byte_size;
                     m.backend.copy_to_tensor(
                         &m.hidden,
-                        &host_hidden[offset..offset + hidden_byte_size],
+                        &host_hidden_buf[offset..offset + hidden_byte_size],
                     );
 
                     if layer_type == "mamba2" {
@@ -528,13 +520,12 @@ pub(crate) fn forward_prefill_paged<
                         moe_block(m, layer_idx, &d);
                     }
 
-                    let mut token_hidden = vec![0u8; hidden_byte_size];
-                    m.backend.copy_to_host(&m.hidden, &mut token_hidden);
-                    host_hidden[offset..offset + hidden_byte_size]
-                        .copy_from_slice(&token_hidden);
+                    m.backend.copy_to_host(&m.hidden, &mut token_hidden_buf);
+                    host_hidden_buf[offset..offset + hidden_byte_size]
+                        .copy_from_slice(&token_hidden_buf[..hidden_byte_size]);
                 }
 
-                m.backend.copy_to_tensor(&bufs.hidden, &host_hidden);
+                m.backend.copy_to_tensor(&bufs.hidden, &host_hidden_buf);
             }
 
             // -----------------------------------------------------------------
@@ -552,16 +543,6 @@ pub(crate) fn forward_prefill_paged<
                     &bufs.norm_buf,
                     bs,
                 );
-
-                // Prenorm scaling (batched).
-                if d.prenorm_scale != 1.0 {
-                    m.backend.scalar_mul(
-                        &bufs.norm_buf,
-                        &bufs.norm_buf,
-                        d.prenorm_scale,
-                        bs * d.hidden_size,
-                    );
-                }
 
                 // Batched QKV projections.
                 m.backend.matmul_batch(
@@ -591,11 +572,12 @@ pub(crate) fn forward_prefill_paged<
 
                     let q_tensor_bytes = m.backend.tensor_byte_count(&m.q_buf);
                     let k_tensor_bytes = m.backend.tensor_byte_count(&m.k_buf);
+                    // Pre-allocate upload/download buffers outside the loop.
+                    let mut q_upload = vec![0u8; q_tensor_bytes];
+                    let mut k_upload = vec![0u8; k_tensor_bytes];
 
                     for t in 0..tokens.len() {
                         let token_pos = start_pos + t as u32;
-                        let mut q_upload = vec![0u8; q_tensor_bytes];
-                        let mut k_upload = vec![0u8; k_tensor_bytes];
                         q_upload[..q_row_bytes].copy_from_slice(
                             &host_q[t * q_row_bytes..(t + 1) * q_row_bytes],
                         );
@@ -612,14 +594,13 @@ pub(crate) fn forward_prefill_paged<
                             d.num_heads, d.num_kv_heads, d.head_dim,
                         );
 
-                        let mut q_out = vec![0u8; q_tensor_bytes];
-                        let mut k_out = vec![0u8; k_tensor_bytes];
-                        m.backend.copy_to_host(&m.q_buf, &mut q_out);
-                        m.backend.copy_to_host(&m.k_buf, &mut k_out);
+                        // Reuse the same buffers for readback.
+                        m.backend.copy_to_host(&m.q_buf, &mut q_upload);
+                        m.backend.copy_to_host(&m.k_buf, &mut k_upload);
                         host_q[t * q_row_bytes..(t + 1) * q_row_bytes]
-                            .copy_from_slice(&q_out[..q_row_bytes]);
+                            .copy_from_slice(&q_upload[..q_row_bytes]);
                         host_k[t * k_row_bytes..(t + 1) * k_row_bytes]
-                            .copy_from_slice(&k_out[..k_row_bytes]);
+                            .copy_from_slice(&k_upload[..k_row_bytes]);
                     }
 
                     m.backend.copy_to_tensor(&bufs.q_buf, &host_q);

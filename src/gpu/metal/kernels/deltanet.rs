@@ -28,6 +28,7 @@ use crate::gpu::ops::GpuDeltaNet;
 struct Conv1dParams {
     dim: u32,
     kernel_size: u32,
+    input_offset: u32,
 }
 
 #[repr(C)]
@@ -65,7 +66,7 @@ impl GpuDeltaNet for MetalBackend {
         dim: u32,
         kernel_size: u32,
     ) {
-        let params = Conv1dParams { dim, kernel_size };
+        let params = Conv1dParams { dim, kernel_size, input_offset: 0 };
         self.dispatch_async(
             &self.pipeline_conv1d_depthwise,
             &params,
@@ -86,8 +87,9 @@ impl GpuDeltaNet for MetalBackend {
         input: &MetalTensor,
         dim: u32,
         kernel_size: u32,
+        input_offset: u32,
     ) {
-        let params = Conv1dParams { dim, kernel_size };
+        let params = Conv1dParams { dim, kernel_size, input_offset };
         self.dispatch_async(
             &self.pipeline_conv1d_shift,
             &params,
