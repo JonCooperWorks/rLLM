@@ -50,6 +50,7 @@ pub(crate) use ops::{
     GpuAllReduce, GpuAttention, GpuCore, GpuDeltaNet, GpuElementwise, GpuEmbed, GpuMatmul, GpuMoe,
     GpuNorm, GpuRope, GpuTurboQuant, GpuVision,
 };
+pub(crate) use ops::quant::{QuantFormat, WeightQuantiser, quantiser};
 
 // ---------------------------------------------------------------------------
 // GpuBackend — the supertrait combining all kernel families.

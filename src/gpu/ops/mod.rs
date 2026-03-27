@@ -49,6 +49,7 @@ mod matmul;
 mod moe;
 mod norm;
 mod rope;
+pub(crate) mod quant;
 mod turboquant;
 mod vision;
 
