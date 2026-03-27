@@ -117,9 +117,11 @@ MAX_TOKENS = 512
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _resolve_model_dir(models_dir: Path, config: ModelConfig, q4: bool = False) -> Path | None:
+def _resolve_model_dir(models_dir: Path, config: ModelConfig, q4: bool = False,
+                       q8: bool = False) -> Path | None:
     """Return the model directory path, or None if it doesn't exist."""
-    name = config.model_name + ("-q4" if q4 else "")
+    suffix = "-q4" if q4 else ("-q8" if q8 else "")
+    name = config.model_name + suffix
     d = models_dir / name
     return d if d.is_dir() else None
 
@@ -315,6 +317,49 @@ def test_model_q4(config_index, server_manager, models_dir):
     ok, reason = check_coherence(content)
     assert ok, (
         f"coherence check failed for {config.test_id}-q4: {reason}\n"
+        f"Prompt: {prompt}\nOutput: {content[:500]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests — Q8-quantized model inference
+# ---------------------------------------------------------------------------
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "config_index", range(len(BASE_MODELS)),
+    ids=[f"{c.test_id}-q8" for c in BASE_MODELS],
+)
+def test_model_q8(config_index, server_manager, models_dir):
+    """Q8-quantized variant of each model family (skipped if not quantized).
+
+    Uses a different prompt than bf16 and Q4 tests (offset by 3) so each model
+    is tested with three distinct prompts across bf16, Q4, and Q8.
+    """
+    config = BASE_MODELS[config_index]
+
+    model_dir = _resolve_model_dir(models_dir, config, q8=True)
+    if model_dir is None:
+        pytest.skip(f"Q8 model not found: {config.model_name}-q8")
+
+    extra_args = _build_extra_args(config, is_q4=False)
+    # Q8 is ~53% of bf16 size (34/64 bytes per weight)
+    mem = _estimate_memory_gb(config, is_q4=False) * 0.53
+    base_url = server_manager.get_or_start(str(model_dir), extra_args, memory_gb=mem)
+
+    prompt = _prompt_for_index(config_index + 3)
+    resp = _chat_completion(base_url, prompt, temperature=config.temperature)
+    assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text[:500]}"
+
+    body = resp.json()
+    content = body["choices"][0]["message"]["content"]
+    usage = body.get("usage", {})
+
+    assert usage.get("completion_tokens", 0) > 0, "no tokens generated"
+
+    ok, reason = check_coherence(content)
+    assert ok, (
+        f"coherence check failed for {config.test_id}-q8: {reason}\n"
         f"Prompt: {prompt}\nOutput: {content[:500]}"
     )
 

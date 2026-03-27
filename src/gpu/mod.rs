@@ -476,4 +476,38 @@ mod tests {
         // clear message instead of silently wrapping around.
         let _ = q4_byte_count(usize::MAX / 2, 64);
     }
+
+    // Q8 byte count tests.
+
+    #[test]
+    #[should_panic(expected = "Q8 has variable byte size")]
+    fn test_tensor_dtype_byte_size_q8_panics() {
+        let _ = TensorDtype::Q8.byte_size();
+    }
+
+    #[test]
+    fn test_q8_byte_count_single_block() {
+        assert_eq!(q8_byte_count(1, 32), 34);
+    }
+
+    #[test]
+    fn test_q8_byte_count_multiple_blocks() {
+        assert_eq!(q8_byte_count(1, 64), 68);
+    }
+
+    #[test]
+    fn test_q8_byte_count_multiple_rows() {
+        assert_eq!(q8_byte_count(4, 64), 4 * 2 * 34);
+    }
+
+    #[test]
+    fn test_q8_byte_count_large() {
+        assert_eq!(q8_byte_count(2048, 2048), 2048 * (2048 / 32) * 34);
+    }
+
+    #[test]
+    #[should_panic(expected = "q8_byte_count overflow")]
+    fn test_q8_byte_count_overflow_panics() {
+        let _ = q8_byte_count(usize::MAX / 2, 64);
+    }
 }

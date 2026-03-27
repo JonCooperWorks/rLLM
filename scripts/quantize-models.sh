@@ -1,19 +1,21 @@
 #!/bin/bash
 # ---------------------------------------------------------------------------
-# quantize-models.sh — batch-quantize every bf16 model in models/ to Q4.
+# quantize-models.sh — batch-quantize every bf16 model in models/ to Q4/Q8.
 #
-# Iterates model directories, skips any that already end in -q4 or already
-# have a -q4 sibling, and runs `rllm quantize` on the rest.
+# Iterates model directories, skips any that already end in -q4/-q8 or already
+# have the target sibling, and runs `rllm quantize` on the rest.
 #
 # Usage:
-#   scripts/quantize-models.sh [models_dir]
+#   scripts/quantize-models.sh [--format q4|q8] [models_dir]
 #
 # Arguments:
-#   models_dir   directory containing model subdirectories (default: models/)
+#   --format FMT  quantization format: q4 (default) or q8
+#   models_dir    directory containing model subdirectories (default: models/)
 #
 # Examples:
-#   scripts/quantize-models.sh              # quantize everything in models/
-#   scripts/quantize-models.sh /mnt/models  # custom model directory
+#   scripts/quantize-models.sh                     # quantize everything to Q4
+#   scripts/quantize-models.sh --format q8         # quantize everything to Q8
+#   scripts/quantize-models.sh --format q8 /mnt/models  # Q8, custom directory
 #
 # Related files:
 #   src/commands/quantize.rs  — the rllm quantize CLI command
@@ -22,12 +24,34 @@
 
 set -euo pipefail
 
+FORMAT="q4"
+
+# Parse optional --format flag.
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --format)
+      FORMAT="$2"
+      shift 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
 DEST="${1:-models}"
 
 if [[ ! -d "$DEST" ]]; then
   echo "Error: model directory '$DEST' does not exist."
   exit 1
 fi
+
+if [[ "$FORMAT" != "q4" && "$FORMAT" != "q8" ]]; then
+  echo "Error: unsupported format '$FORMAT' (use q4 or q8)"
+  exit 1
+fi
+
+SUFFIX="-${FORMAT}"
 
 # Build once in release mode before iterating models.
 echo "Building rllm in release mode..."
@@ -44,16 +68,16 @@ for model_dir in "$DEST"/*/; do
   model_dir="${model_dir%/}"
   name="$(basename "$model_dir")"
 
-  # Skip directories that are already Q4.
-  if [[ "$name" == *-q4 ]]; then
-    echo "skip: $name (already Q4)"
+  # Skip directories that are already quantized (any format).
+  if [[ "$name" == *-q4 ]] || [[ "$name" == *-q8 ]]; then
+    echo "skip: $name (already quantized)"
     SKIPPED=$((SKIPPED + 1))
     continue
   fi
 
-  # Skip if a -q4 sibling already exists.
-  if [[ -d "$DEST/${name}-q4" ]]; then
-    echo "skip: $name (${name}-q4 exists)"
+  # Skip if the target sibling already exists.
+  if [[ -d "$DEST/${name}${SUFFIX}" ]]; then
+    echo "skip: $name (${name}${SUFFIX} exists)"
     SKIPPED=$((SKIPPED + 1))
     continue
   fi
@@ -65,8 +89,8 @@ for model_dir in "$DEST"/*/; do
     continue
   fi
 
-  echo "=== Quantizing $name → ${name}-q4 ==="
-  if "$BINARY" quantize --model "$model_dir" --output "$DEST/${name}-q4"; then
+  echo "=== Quantizing $name → ${name}${SUFFIX} (${FORMAT}) ==="
+  if "$BINARY" quantize --model "$model_dir" --output "$DEST/${name}${SUFFIX}" --format "$FORMAT"; then
     echo "  ✓ done"
     QUANTIZED=$((QUANTIZED + 1))
   else
@@ -77,6 +101,7 @@ for model_dir in "$DEST"/*/; do
 done
 
 echo "=== Summary ==="
+echo "Format:    ${FORMAT}"
 echo "Quantized: $QUANTIZED"
 echo "Skipped:   $SKIPPED"
 

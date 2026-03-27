@@ -109,6 +109,10 @@ impl GpuCore for CpuBackend {
                 let total_elements: usize = shape.iter().product();
                 (total_elements / 32) * 18
             }
+            TensorDtype::Q8 => {
+                let total_elements: usize = shape.iter().product();
+                (total_elements / 32) * 34
+            }
             other => {
                 let total_elements: usize = shape.iter().product();
                 total_elements * other.byte_size()
@@ -531,6 +535,27 @@ impl GpuMatmul for CpuBackend {
                 }
                 write_bf16(out, &result);
             }
+            TensorDtype::Q8 => {
+                let inp = read_bf16(input, kk);
+                let blocks_per_row = kk / 32;
+                let mut result = vec![0.0f32; mm];
+
+                for row in 0..mm {
+                    let row_offset = row * blocks_per_row * 34;
+                    let mut acc = 0.0f32;
+                    for block in 0..blocks_per_row {
+                        let block_offset = row_offset + block * 34;
+                        let scale: f32 = read_q4_scale(&weight.data, block_offset);
+                        for j in 0..32 {
+                            let q = weight.data[block_offset + 2 + j] as i8;
+                            let w = q as f32 * scale;
+                            acc += w * inp[block * 32 + j];
+                        }
+                    }
+                    result[row] = acc;
+                }
+                write_bf16(out, &result);
+            }
             _ => unimplemented!("CpuBackend::matmul for {:?}", weight.dtype),
         }
     }
@@ -592,6 +617,30 @@ impl GpuMatmul for CpuBackend {
                                 let j = block * 32 + i * 2;
                                 acc += (lo as f32 * scale) * inp[j];
                                 acc += (hi as f32 * scale) * inp[j + 1];
+                            }
+                        }
+                        row_result[row] = acc;
+                    }
+                    write_bf16_at(out, b * mm * 2, &row_result);
+                }
+            }
+            TensorDtype::Q8 => {
+                let blocks_per_row = kk / 32;
+                for b in 0..bs {
+                    let inp_offset = b * kk * 2;
+                    let inp = read_bf16_bytes(&input.data[inp_offset..], kk);
+
+                    let mut row_result = vec![0.0f32; mm];
+                    for row in 0..mm {
+                        let row_offset = row * blocks_per_row * 34;
+                        let mut acc = 0.0f32;
+                        for block in 0..blocks_per_row {
+                            let block_offset = row_offset + block * 34;
+                            let scale: f32 = read_q4_scale(&weight.data, block_offset);
+                            for j in 0..32 {
+                                let q = weight.data[block_offset + 2 + j] as i8;
+                                let w = q as f32 * scale;
+                                acc += w * inp[block * 32 + j];
                             }
                         }
                         row_result[row] = acc;
@@ -1388,6 +1437,33 @@ impl GpuMoe for CpuBackend {
                             acc_gate += ghi as f32 * g_scale * inp[x_idx + 1];
                             acc_up += ulo as f32 * u_scale * inp[x_idx];
                             acc_up += uhi as f32 * u_scale * inp[x_idx + 1];
+                        }
+                    }
+
+                    let silu = acc_gate / (1.0 + (-acc_gate).exp());
+                    result[row] = silu * acc_up;
+                }
+            }
+            TensorDtype::Q8 => {
+                let blocks_per_row = kk / 32;
+                for row in 0..mm {
+                    let row_offset = row * blocks_per_row * 34;
+                    let mut acc_gate = 0.0f32;
+                    let mut acc_up = 0.0f32;
+
+                    for block in 0..blocks_per_row {
+                        let g_off = row_offset + block * 34;
+                        let g_scale: f32 = read_q4_scale(&w_gate.data, g_off);
+                        let u_off = row_offset + block * 34;
+                        let u_scale: f32 = read_q4_scale(&w_up.data, u_off);
+
+                        for j in 0..32 {
+                            let gq = w_gate.data[g_off + 2 + j] as i8;
+                            let uq = w_up.data[u_off + 2 + j] as i8;
+                            let x_idx = block * 32 + j;
+
+                            acc_gate += gq as f32 * g_scale * inp[x_idx];
+                            acc_up += uq as f32 * u_scale * inp[x_idx];
                         }
                     }
 
@@ -4287,5 +4363,66 @@ mod tests {
             }
         }
         assert!(any_diff, "causal and bidirectional attention should produce different outputs");
+    }
+
+    // -----------------------------------------------------------------------
+    // Q8 quantization tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_core_q8_alloc() {
+        let b = CpuBackend;
+        // 2 blocks of 32 elements = 2 × 34 bytes
+        let t = b.alloc_tensor(&[64], TensorDtype::Q8);
+        assert_eq!(b.tensor_byte_count(&t), 68);
+    }
+
+    #[test]
+    fn test_matmul_q8() {
+        let b = CpuBackend;
+        // 1 row of 32 elements (1 block = 34 bytes)
+        // Scale = 1.0, all values = 1 (stored as signed int8 = 1)
+        let mut block = vec![0u8; 34];
+        let scale_bf16 = (1.0f32.to_bits() >> 16) as u16;
+        block[0..2].copy_from_slice(&scale_bf16.to_le_bytes());
+        for i in 2..34 {
+            block[i] = 1i8 as u8; // signed 1
+        }
+        let weight = b.upload_tensor(&block, &[32], TensorDtype::Q8);
+        let input = b.upload_tensor(&bf16_bytes(&vec![1.0; 32]), &[32], TensorDtype::BF16);
+        let out = b.alloc_tensor(&[1], TensorDtype::BF16);
+        b.matmul(&weight, &input, &out, 1, 32);
+        let result = read_bf16(&out, 1);
+        assert!(
+            (result[0] - 32.0).abs() < 1.0,
+            "Q8 matmul result: {}",
+            result[0]
+        );
+    }
+
+    #[test]
+    fn test_matmul_q8_negative() {
+        let b = CpuBackend;
+        let mut block = vec![0u8; 34];
+        let scale_bf16 = (2.0f32.to_bits() >> 16) as u16;
+        block[0..2].copy_from_slice(&scale_bf16.to_le_bytes());
+        // First 16 weights = +1 (dequant = 2.0), last 16 = -1 (dequant = -2.0)
+        for i in 2..18 {
+            block[i] = 1i8 as u8;
+        }
+        for i in 18..34 {
+            block[i] = (-1i8) as u8;
+        }
+        let weight = b.upload_tensor(&block, &[32], TensorDtype::Q8);
+        let input = b.upload_tensor(&bf16_bytes(&vec![1.0; 32]), &[32], TensorDtype::BF16);
+        let out = b.alloc_tensor(&[1], TensorDtype::BF16);
+        b.matmul(&weight, &input, &out, 1, 32);
+        let result = read_bf16(&out, 1);
+        // 16*2.0 + 16*(-2.0) = 0.0
+        assert!(
+            (result[0] - 0.0).abs() < 1.0,
+            "Q8 negative matmul result: {}",
+            result[0]
+        );
     }
 }
