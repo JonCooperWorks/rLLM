@@ -124,7 +124,7 @@ pub(crate) fn format_tool_system_prompt(arch: ModelArch, tools: &[ToolDefinition
     match arch {
         ModelArch::Llama => format_tools_llama(tools),
         ModelArch::Mistral | ModelArch::Mixtral => format_tools_mistral(tools),
-        ModelArch::Qwen2 | ModelArch::Qwen3Moe | ModelArch::Qwen3_5 | ModelArch::GptOss => {
+        ModelArch::Qwen2 | ModelArch::Qwen3Moe | ModelArch::Qwen3_5 | ModelArch::GptOss | ModelArch::NemotronH => {
             format_tools_chatml(tools)
         }
         ModelArch::Phi => format_tools_chatml(tools),
@@ -247,7 +247,7 @@ pub(crate) fn parse_tool_calls(arch: ModelArch, text: &str) -> (String, Vec<Tool
     match arch {
         ModelArch::Llama => parse_tool_calls_llama(text),
         ModelArch::Mistral | ModelArch::Mixtral => parse_tool_calls_mistral(text),
-        ModelArch::Qwen2 | ModelArch::Qwen3Moe | ModelArch::Qwen3_5 | ModelArch::GptOss => {
+        ModelArch::Qwen2 | ModelArch::Qwen3Moe | ModelArch::Qwen3_5 | ModelArch::GptOss | ModelArch::NemotronH => {
             parse_tool_calls_chatml(text)
         }
         ModelArch::Phi => parse_tool_calls_chatml(text),

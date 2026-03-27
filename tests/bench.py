@@ -67,6 +67,7 @@ KNOWN_MODELS = {
     "gpt-oss-20b":                     ("GptOss",    True,  40, False),
     "qwen3-coder-30b-a3b-instruct":    ("Qwen3Moe",  True,  60, True),
     "qwen3.5-35b-a3b":                ("Qwen3_5M",  True,  70, True),
+    "nemotron-3-30b":                   ("NemotronH",  True,  63, False),
     "deepseek-r1-distill-qwen-32b":    ("Qwen2",     False, 64, True),
     "mixtral-8x7b-instruct-v0.1":      ("Mixtral",   True,  93, True),
     # Big tier
@@ -77,6 +78,7 @@ KNOWN_MODELS = {
     "qwen3.5-122b-a10b":              ("Qwen3_5M",  True,  244, True),
     "mixtral-8x22b-instruct-v0.1":     ("Mixtral",   True,  352, True),
     "gpt-oss-120b":                    ("GptOss",    True,  240, False),
+    "nemotron-3-120b":                  ("NemotronH",  True,  240, True),
     # Massive tier
     "qwen3.5-397b":                   ("Qwen3_5M",  True,  794, True),
     "qwen3.5-397b-a27b":              ("Qwen3_5M",  True,  794, True),

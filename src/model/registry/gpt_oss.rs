@@ -35,7 +35,7 @@
 
 use crate::gpu::{
     GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
-    GpuTurboQuant,
+    GpuTurboQuant, TensorDtype,
 };
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives::{self, Dims};
@@ -419,4 +419,262 @@ pub(crate) fn forward_prefill_paged<
     );
 
     Ok(())
+}
+
+// ===========================================================================
+// Weight loading — GPT-OSS-specific layer loading.
+//
+// GPT-OSS has several unique loading needs vs. standard models:
+//   - O-projection bias on attention (other models have no o_proj bias)
+//   - Attention sinks (per-head scalar logits)
+//   - MXFP4 expert weight format (microscaling FP4)
+//   - Router bias on MoE gate
+//   - Per-expert biases (gate, up, down)
+//   - Interleaved gate/up weights (even/odd rows, not first/second half)
+//
+// These are moved from loader.rs to keep GPT-OSS logic self-contained.
+// Shared primitives (upload_tensor, load_layer_norms, etc.) are called
+// from loader.rs.
+// ===========================================================================
+
+use crate::model::loader::{
+    TensorStore, LayerWeights, LoaderHints, ExpertWeights, FfnLoaded,
+    upload_tensor, upload_raw_bf16, dequantize_mxfp4,
+    load_layer_norms, load_attention_weights, assemble_layer_weights,
+};
+use crate::model::config::ModelConfig;
+
+/// Load weights for one GPT-OSS layer (attention + MoE FFN).
+///
+/// Delegates to shared helpers for norms and standard attention projections,
+/// then adds GPT-OSS-specific fields (o_proj_bias, sinks, MXFP4 MoE).
+pub(crate) fn load_layer<B: GpuCore>(
+    store: &TensorStore,
+    backend: &B,
+    prefix: &str,
+    config: &ModelConfig,
+    hints: &LoaderHints,
+    layer_idx: usize,
+    sharding: Option<&crate::gpu::parallel::ShardingPlan>,
+    skip_experts: bool,
+) -> anyhow::Result<LayerWeights<B>> {
+    // Norms: standard (no residual, no sandwich).
+    let norms = load_layer_norms(store, backend, prefix, config, hints)?;
+
+    // Attention: standard GQA via shared helper.
+    // The shared helper loads QKV bias (via hints.has_qkv_bias), O-proj bias
+    // (via hints.has_o_proj_bias), and sinks (via hints.is_gpt_oss).
+    let attn = load_attention_weights(
+        store, backend, prefix, config, hints, layer_idx,
+        false, // not deltanet
+        sharding,
+    )?;
+
+    // MoE FFN: router + MXFP4 experts + router bias.
+    let ffn = load_gpt_oss_moe(
+        store, backend, prefix, config, layer_idx, sharding, skip_experts,
+    )?;
+
+    Ok(assemble_layer_weights(norms, attn, ffn))
+}
+
+/// Load GPT-OSS MoE FFN weights: router with bias + MXFP4 experts.
+fn load_gpt_oss_moe<B: GpuCore>(
+    store: &TensorStore,
+    backend: &B,
+    prefix: &str,
+    config: &ModelConfig,
+    layer_idx: usize,
+    _sharding: Option<&crate::gpu::parallel::ShardingPlan>,
+    skip_experts: bool,
+) -> anyhow::Result<FfnLoaded<B>> {
+    let hidden = config.hidden_size;
+    let moe_inter = config.moe_intermediate_size;
+    let num_experts = config.num_experts;
+
+    // Dummy tensors for dense FFN fields (unused by MoE forward pass).
+    let dummy = backend.alloc_tensor(&[1], TensorDtype::BF16);
+    let dummy2 = backend.alloc_tensor(&[1], TensorDtype::BF16);
+    let dummy3 = backend.alloc_tensor(&[1], TensorDtype::BF16);
+
+    // Router gate: GPT-OSS uses mlp.router.weight naming.
+    let router = upload_tensor(
+        store, backend,
+        &format!("{prefix}.mlp.router.weight"),
+        &[num_experts, hidden],
+    )?;
+
+    // Router bias (GPT-OSS only).
+    let router_bias = Some(upload_tensor(
+        store, backend,
+        &format!("{prefix}.mlp.router.bias"),
+        &[num_experts],
+    )?);
+
+    // Detect MXFP4 format by looking for packed blocks tensor.
+    let mxfp4_name = format!("{prefix}.mlp.experts.gate_up_proj_blocks");
+    let is_mxfp4 = store.tensor(&mxfp4_name).is_ok();
+
+    let expert_vec = if skip_experts {
+        if layer_idx == 0 {
+            eprintln!("  skipping {} experts per layer (streaming from SSD)", num_experts);
+        }
+        Vec::new()
+    } else if is_mxfp4 {
+        load_mxfp4_experts_local(store, backend, prefix, hidden, moe_inter, num_experts)?
+    } else {
+        // Fallback: per-expert format (shouldn't happen for GPT-OSS, but be safe).
+        let mut experts = Vec::with_capacity(num_experts);
+        for j in 0..num_experts {
+            let ep = format!("{prefix}.mlp.experts.{j}");
+            experts.push(ExpertWeights {
+                gate_proj: upload_tensor(store, backend, &format!("{ep}.gate_proj.weight"), &[moe_inter, hidden])?,
+                up_proj: upload_tensor(store, backend, &format!("{ep}.up_proj.weight"), &[moe_inter, hidden])?,
+                down_proj: upload_tensor(store, backend, &format!("{ep}.down_proj.weight"), &[hidden, moe_inter])?,
+                gate_bias: None,
+                up_bias: None,
+                down_bias: None,
+            });
+        }
+        experts
+    };
+
+    if layer_idx == 0 {
+        eprintln!(
+            "  loading {} experts per layer (moe_inter={}){}",
+            num_experts, moe_inter,
+            if is_mxfp4 { " [MXFP4 format]" } else { "" },
+        );
+    }
+
+    Ok(FfnLoaded {
+        gate_proj: dummy,
+        up_proj: dummy2,
+        down_proj: dummy3,
+        router_gate: Some(router),
+        router_bias,
+        experts: if skip_experts { None } else { Some(expert_vec) },
+        shared_expert_gate_proj: None,
+        shared_expert_up_proj: None,
+        shared_expert_down_proj: None,
+        shared_expert_gate: None,
+    })
+}
+
+/// Load MXFP4-format expert weights (GPT-OSS).
+///
+/// MXFP4 stores weights as packed fp4 blocks with per-block E8M0 scales
+/// and optional per-expert biases.  We dequant to bf16 on the CPU,
+/// de-interleave gate/up rows, then upload.
+fn load_mxfp4_experts_local<B: GpuCore>(
+    store: &TensorStore,
+    backend: &B,
+    prefix: &str,
+    hidden: usize,
+    moe_inter: usize,
+    num_experts: usize,
+) -> anyhow::Result<Vec<ExpertWeights<B>>> {
+    let block_size = 32usize;
+
+    let gu_blocks_view = store.tensor(&format!("{prefix}.mlp.experts.gate_up_proj_blocks"))?;
+    let gu_scales_view = store.tensor(&format!("{prefix}.mlp.experts.gate_up_proj_scales"))?;
+    let gu_blocks_data = gu_blocks_view.data();
+    let gu_scales_data = gu_scales_view.data();
+
+    let down_blocks_view = store.tensor(&format!("{prefix}.mlp.experts.down_proj_blocks"))?;
+    let down_scales_view = store.tensor(&format!("{prefix}.mlp.experts.down_proj_scales"))?;
+    let down_blocks_data = down_blocks_view.data();
+    let down_scales_data = down_scales_view.data();
+
+    // Optional biases.
+    let gu_bias_name = format!("{prefix}.mlp.experts.gate_up_proj_bias");
+    let gu_bias_data = store.tensor(&gu_bias_name).ok().map(|v| v.data().to_vec());
+    let down_bias_name = format!("{prefix}.mlp.experts.down_proj_bias");
+    let down_bias_data = store.tensor(&down_bias_name).ok().map(|v| v.data().to_vec());
+
+    // Per-expert byte sizes for slicing fused tensors.
+    let gu_rows = 2 * moe_inter;
+    let gu_blocks_per_expert = gu_rows * (hidden / 2);
+    let gu_num_scale_blocks = (hidden + block_size - 1) / block_size;
+    let gu_scales_per_expert = gu_rows * gu_num_scale_blocks;
+
+    let down_rows = hidden;
+    let down_blocks_per_expert = down_rows * (moe_inter / 2);
+    let down_num_scale_blocks = (moe_inter + block_size - 1) / block_size;
+    let down_scales_per_expert = down_rows * down_num_scale_blocks;
+
+    let gu_bias_per_expert = gu_rows * 2; // bf16
+    let down_bias_per_expert = down_rows * 2;
+
+    let mut experts = Vec::with_capacity(num_experts);
+    for j in 0..num_experts {
+        // Dequant gate_up.
+        let gu_b_off = j * gu_blocks_per_expert;
+        let gu_s_off = j * gu_scales_per_expert;
+        let gu_bf16 = dequantize_mxfp4(
+            &gu_blocks_data[gu_b_off..gu_b_off + gu_blocks_per_expert],
+            &gu_scales_data[gu_s_off..gu_s_off + gu_scales_per_expert],
+            gu_rows, hidden, block_size,
+        );
+
+        // De-interleave gate and up from fused gate_up_proj.
+        // GPT-OSS: interleaved rows (even=gate, odd=up).
+        let row_bytes = hidden * 2;
+        let mut gate_raw = vec![0u8; moe_inter * row_bytes];
+        let mut up_raw = vec![0u8; moe_inter * row_bytes];
+        for r in 0..moe_inter {
+            let even_start = (2 * r) * row_bytes;
+            let odd_start = (2 * r + 1) * row_bytes;
+            gate_raw[r * row_bytes..(r + 1) * row_bytes]
+                .copy_from_slice(&gu_bf16[even_start..even_start + row_bytes]);
+            up_raw[r * row_bytes..(r + 1) * row_bytes]
+                .copy_from_slice(&gu_bf16[odd_start..odd_start + row_bytes]);
+        }
+        let gate_t = upload_raw_bf16(backend, &gate_raw, &[moe_inter, hidden]);
+        let up_t = upload_raw_bf16(backend, &up_raw, &[moe_inter, hidden]);
+
+        // Dequant down.
+        let d_b_off = j * down_blocks_per_expert;
+        let d_s_off = j * down_scales_per_expert;
+        let down_bf16 = dequantize_mxfp4(
+            &down_blocks_data[d_b_off..d_b_off + down_blocks_per_expert],
+            &down_scales_data[d_s_off..d_s_off + down_scales_per_expert],
+            down_rows, moe_inter, block_size,
+        );
+        let down_t = upload_raw_bf16(backend, &down_bf16, &[hidden, moe_inter]);
+
+        // Expert biases — de-interleave fused gate_up_bias.
+        let (gate_bias, up_bias) = if let Some(ref bias) = gu_bias_data {
+            let off = j * gu_bias_per_expert;
+            let bias_slice = &bias[off..off + gu_bias_per_expert];
+            let bias_bf16: &[u16] = bytemuck::cast_slice(bias_slice);
+            let gate_vals: Vec<u16> = (0..moe_inter).map(|i| bias_bf16[2 * i]).collect();
+            let up_vals: Vec<u16> = (0..moe_inter).map(|i| bias_bf16[2 * i + 1]).collect();
+            let gate_bytes: &[u8] = bytemuck::cast_slice(&gate_vals);
+            let up_bytes: &[u8] = bytemuck::cast_slice(&up_vals);
+            (
+                Some(backend.upload_tensor(gate_bytes, &[moe_inter], TensorDtype::BF16)),
+                Some(backend.upload_tensor(up_bytes, &[moe_inter], TensorDtype::BF16)),
+            )
+        } else {
+            (None, None)
+        };
+        let down_bias = if let Some(ref bias) = down_bias_data {
+            let off = j * down_bias_per_expert;
+            let bias_slice = &bias[off..off + down_bias_per_expert];
+            Some(backend.upload_tensor(bias_slice, &[down_rows], TensorDtype::BF16))
+        } else {
+            None
+        };
+
+        experts.push(ExpertWeights {
+            gate_proj: gate_t,
+            up_proj: up_t,
+            down_proj: down_t,
+            gate_bias,
+            up_bias,
+            down_bias,
+        });
+    }
+    Ok(experts)
 }

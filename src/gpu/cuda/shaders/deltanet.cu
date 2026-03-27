@@ -42,6 +42,7 @@ __device__ __forceinline__ float warp_sum(float val) {
 struct Conv1dParams {
     unsigned int dim;
     unsigned int kernel_size;
+    unsigned int input_offset;
 };
 
 extern "C" __global__ void conv1d_depthwise_single(
@@ -86,7 +87,7 @@ extern "C" __global__ void conv1d_shift_history(
     for (unsigned int k_idx = 0; k_idx < ks - 2; k_idx++) {
         history[k_idx * dim + gid] = history[(k_idx + 1) * dim + gid];
     }
-    history[(ks - 2) * dim + gid] = input[gid];
+    history[(ks - 2) * dim + gid] = input[params.input_offset + gid];
 }
 
 // ===========================================================================

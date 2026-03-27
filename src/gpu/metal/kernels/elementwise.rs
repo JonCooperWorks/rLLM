@@ -77,6 +77,15 @@ struct TopKParams {
     k: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TopKSigmoidParams {
+    num_experts: u32,
+    k: u32,
+    scaling_factor: f32,
+    norm_topk_prob: u32,
+}
+
 impl GpuElementwise for MetalBackend {
     fn silu_mul(&self, gate: &MetalTensor, up: &MetalTensor, out: &MetalTensor, size: u32) {
         let params = ElemParams { size };
@@ -261,6 +270,46 @@ impl GpuElementwise for MetalBackend {
             &self.pipeline_top_k_softmax,
             &params,
             &[(&logits.buffer, 1), (&output.buffer, 2)],
+            MTLSize::new(1, 1, 1),
+            MTLSize::new(1, 1, 1),
+        );
+    }
+
+    fn relu_squared(&self, input: &MetalTensor, out: &MetalTensor, size: u32) {
+        let params = ElemParams { size };
+        self.dispatch_async(
+            &self.pipeline_relu_squared,
+            &params,
+            &[(&input.buffer, 1), (&out.buffer, 2)],
+            MTLSize::new(size as u64, 1, 1),
+            MTLSize::new(256.min(size as u64), 1, 1),
+        );
+    }
+
+    fn top_k_sigmoid(
+        &self,
+        logits: &MetalTensor,
+        correction_bias: &MetalTensor,
+        output: &MetalTensor,
+        num_experts: u32,
+        k: u32,
+        scaling_factor: f32,
+        norm_topk_prob: bool,
+    ) {
+        let params = TopKSigmoidParams {
+            num_experts,
+            k,
+            scaling_factor,
+            norm_topk_prob: if norm_topk_prob { 1 } else { 0 },
+        };
+        self.dispatch_async(
+            &self.pipeline_top_k_sigmoid,
+            &params,
+            &[
+                (&logits.buffer, 1),
+                (&correction_bias.buffer, 2),
+                (&output.buffer, 3),
+            ],
             MTLSize::new(1, 1, 1),
             MTLSize::new(1, 1, 1),
         );

@@ -60,6 +60,7 @@ using namespace metal;
 struct Conv1dParams {
     uint dim;           // total dimension (qk_dim + qk_dim + v_dim = 10240 for 27B)
     uint kernel_size;   // convolution kernel size (4)
+    uint input_offset;  // element offset into input buffer (0 for DeltaNet, d_inner for Mamba-2)
 };
 
 kernel void conv1d_depthwise_single(
@@ -115,7 +116,7 @@ kernel void conv1d_shift_history(
         history[k * dim + gid] = history[(k + 1) * dim + gid];
     }
     // Append current input at the end.
-    history[(ks - 2) * dim + gid] = input[gid];
+    history[(ks - 2) * dim + gid] = input[params.input_offset + gid];
 }
 
 // ===========================================================================

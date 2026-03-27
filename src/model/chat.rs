@@ -336,7 +336,7 @@ pub(crate) fn format_chat_with_thinking(
     let mut out = match arch {
         ModelArch::Llama => format_llama3(messages),
         ModelArch::Mistral | ModelArch::Mixtral => format_mistral(messages),
-        ModelArch::Qwen2 | ModelArch::Qwen3Moe | ModelArch::Qwen3_5 | ModelArch::GptOss => {
+        ModelArch::Qwen2 | ModelArch::Qwen3Moe | ModelArch::Qwen3_5 | ModelArch::GptOss | ModelArch::NemotronH => {
             format_chatml(messages)
         }
         ModelArch::Phi => format_phi(messages),

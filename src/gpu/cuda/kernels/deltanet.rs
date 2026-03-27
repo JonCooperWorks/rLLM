@@ -28,6 +28,7 @@ use crate::gpu::ops::GpuDeltaNet;
 struct Conv1dParams {
     dim: u32,
     kernel_size: u32,
+    input_offset: u32,
 }
 unsafe impl DeviceRepr for Conv1dParams {}
 
@@ -69,7 +70,7 @@ impl GpuDeltaNet for CudaBackend {
         dim: u32,
         kernel_size: u32,
     ) {
-        let params = Conv1dParams { dim, kernel_size };
+        let params = Conv1dParams { dim, kernel_size, input_offset: 0 };
         let block = 256.min(dim);
         let cfg = CudaBackend::cfg_1d(dim, block);
         unsafe {
@@ -91,8 +92,9 @@ impl GpuDeltaNet for CudaBackend {
         input: &CudaTensor,
         dim: u32,
         kernel_size: u32,
+        input_offset: u32,
     ) {
-        let params = Conv1dParams { dim, kernel_size };
+        let params = Conv1dParams { dim, kernel_size, input_offset };
         let block = 256.min(dim);
         let cfg = CudaBackend::cfg_1d(dim, block);
         unsafe {

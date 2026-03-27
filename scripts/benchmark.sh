@@ -102,6 +102,7 @@ MEDIUM_MODELS=(
   "qwen3.5-35b-a3b"
   "deepseek-r1-distill-qwen-32b"
   "openai/gpt-oss-20b"
+  "nemotron-3-30b"
 )
 
 BIG_MODELS=(
@@ -110,6 +111,7 @@ BIG_MODELS=(
   "qwen3.5-122b-a10b"
   "mixtral-8x22b-instruct-v0.1"
   "openai/gpt-oss-120b"
+  "nemotron-3-120b"
 )
 
 MASSIVE_MODELS=(

@@ -28,12 +28,17 @@ pub(crate) trait GpuDeltaNet: GpuCore {
     );
 
     /// Shift Conv1D history buffer: discard oldest entry, append current input.
+    ///
+    /// `input_offset` allows reading from a sub-region of `input` (e.g., for
+    /// Mamba-2 where x is at offset d_inner within the in_proj output buffer).
+    /// DeltaNet callers pass 0 since their buffer starts at the right position.
     fn conv1d_shift_history(
         &self,
         history: &Self::Tensor,
         input: &Self::Tensor,
         dim: u32,
         kernel_size: u32,
+        input_offset: u32,
     );
 
     /// L2-normalize each head's vector in place.

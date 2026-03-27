@@ -384,3 +384,120 @@ kernel void top_k_softmax(
         output[2 * j + 1] = top_logits[j] / exp_sum;
     }
 }
+
+// ---------------------------------------------------------------------------
+// ReLU-squared activation: out[i] = max(0, input[i])²
+//
+// Used by Nemotron-H's MoE experts instead of SwiGLU.  Unlike SwiGLU which
+// needs TWO projections (gate + up) and a multiply, relu² needs only ONE
+// projection (up) making each expert simpler: up_proj → relu² → down_proj.
+//
+// The squaring amplifies larger activations relative to smaller ones,
+// providing a softer "gating" effect compared to plain ReLU.  This was
+// found to match SwiGLU quality with fewer parameters per expert.
+//
+// Numerically: max(0, x)² is always non-negative, so no precision concerns.
+// ---------------------------------------------------------------------------
+
+kernel void relu_squared(
+    constant ElemParams& params [[buffer(0)]],
+    device const bfloat* input  [[buffer(1)]],
+    device bfloat* output       [[buffer(2)]],
+    uint gid                    [[thread_position_in_grid]]
+) {
+    if (gid >= params.size) return;
+    float v = float(input[gid]);
+    float r = v > 0.0f ? v * v : 0.0f;
+    output[gid] = bfloat(r);
+}
+
+// ---------------------------------------------------------------------------
+// GPU-side top-k selection with sigmoid routing for Nemotron-H MoE.
+//
+// DeepSeek-V3 style routing with correction bias for load balancing:
+//
+//   1. Compute sigmoid scores: score[i] = sigmoid(logits[i])
+//   2. Add correction bias for SELECTION only: adj[i] = score[i] + bias[i]
+//   3. Select top-k by adjusted scores (simple iterative max)
+//   4. Routing weights come from ORIGINAL sigmoid scores (without bias)
+//   5. Optionally normalize weights to sum to 1
+//   6. Multiply by scaling factor
+//
+// The correction bias steers which experts get selected (for load balancing)
+// without distorting the actual routing weights — a clever decoupling from
+// DeepSeek-V3 (arXiv:2412.19437).
+//
+// Like top_k_softmax, this runs a single thread since num_experts is small
+// (typically 64–128).  The entire kernel is cheaper than a GPU→CPU sync.
+//
+// Output format: [2*k] f32 — interleaved (expert_index, weight) pairs,
+// same layout as top_k_softmax for downstream compatibility.
+// ---------------------------------------------------------------------------
+
+struct TopKSigmoidParams {
+    uint num_experts;      // Number of experts to route over.
+    uint k;                // Number of experts to select.
+    float scaling_factor;  // Multiply final weights by this factor.
+    uint norm_topk_prob;   // If non-zero, normalize weights to sum to 1.
+};
+
+kernel void top_k_sigmoid(
+    constant TopKSigmoidParams& params   [[buffer(0)]],
+    device const bfloat* logits          [[buffer(1)]],
+    device const float* correction_bias  [[buffer(2)]],
+    device float* output                 [[buffer(3)]],
+    uint gid                             [[thread_position_in_grid]]
+) {
+    if (gid != 0) return;
+
+    uint n = params.num_experts;
+    uint k = params.k;
+
+    // Step 1: Compute sigmoid scores from bf16 logits.
+    float scores[1024];    // Original sigmoid scores (for weights).
+    float adjusted[1024];  // Adjusted scores (for selection).
+    for (uint i = 0; i < n && i < 1024; i++) {
+        float s = 1.0f / (1.0f + exp(-float(logits[i])));
+        scores[i] = s;
+        // Step 2: Bias shifts selection without affecting final weights.
+        adjusted[i] = s + correction_bias[i];
+    }
+
+    // Step 3: Select top-k by adjusted scores (simple iterative max).
+    // For k=8, n=128 this is 8 × 128 = 1024 comparisons — trivial.
+    uint top_indices[32];   // max k=32
+    float top_weights[32];  // Original sigmoid scores for selected experts.
+    for (uint j = 0; j < k; j++) {
+        float best_val = -INFINITY;
+        uint best_idx = 0;
+        for (uint i = 0; i < n; i++) {
+            if (adjusted[i] > best_val) {
+                best_val = adjusted[i];
+                best_idx = i;
+            }
+        }
+        top_indices[j] = best_idx;
+        // Step 4: Use ORIGINAL sigmoid score as the routing weight.
+        top_weights[j] = scores[best_idx];
+        adjusted[best_idx] = -INFINITY;  // Mark as used.
+    }
+
+    // Step 5: Optionally normalize weights to sum to 1.
+    if (params.norm_topk_prob != 0) {
+        float weight_sum = 0.0f;
+        for (uint j = 0; j < k; j++) {
+            weight_sum += top_weights[j];
+        }
+        if (weight_sum > 0.0f) {
+            for (uint j = 0; j < k; j++) {
+                top_weights[j] /= weight_sum;
+            }
+        }
+    }
+
+    // Step 6: Write (index, weight) pairs with scaling factor applied.
+    for (uint j = 0; j < k; j++) {
+        output[2 * j]     = float(top_indices[j]);
+        output[2 * j + 1] = top_weights[j] * params.scaling_factor;
+    }
+}

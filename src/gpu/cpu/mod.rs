@@ -453,6 +453,89 @@ impl GpuElementwise for CpuBackend {
         }
         write_f32(output, &result);
     }
+
+    fn relu_squared(&self, input: &CpuTensor, out: &CpuTensor, size: u32) {
+        // ReLU²: max(0, x)² — used by Nemotron-H MoE experts instead of SwiGLU.
+        // The squaring amplifies large activations, providing a softer gating effect.
+        let n = size as usize;
+        let x = read_bf16(input, n);
+        let result: Vec<f32> = x
+            .iter()
+            .map(|&v| {
+                let relu = v.max(0.0);
+                relu * relu
+            })
+            .collect();
+        write_bf16(out, &result);
+    }
+
+    fn top_k_sigmoid(
+        &self,
+        logits: &CpuTensor,
+        correction_bias: &CpuTensor,
+        output: &CpuTensor,
+        num_experts: u32,
+        k: u32,
+        scaling_factor: f32,
+        norm_topk_prob: bool,
+    ) {
+        // DeepSeek-V3 style sigmoid routing for Nemotron-H MoE:
+        //   1. Sigmoid scores from raw logits
+        //   2. Add correction bias for SELECTION only (load balancing)
+        //   3. Top-k by adjusted score
+        //   4. Routing weights from ORIGINAL sigmoid scores (unbiased)
+        //   5. Optionally normalize weights to sum to 1
+        //   6. Scale by factor
+        let n = num_experts as usize;
+        let kk = k as usize;
+        let x = read_bf16(logits, n);
+        let bias = read_f32(correction_bias, n);
+
+        // Step 1: compute sigmoid scores
+        let scores: Vec<f32> = x.iter().map(|&v| 1.0 / (1.0 + (-v).exp())).collect();
+
+        // Step 2: adjusted scores for selection (add correction bias)
+        let adjusted: Vec<f32> = scores
+            .iter()
+            .zip(bias.iter())
+            .map(|(&s, &b)| s + b)
+            .collect();
+
+        // Step 3: find top-k by adjusted score
+        let mut indices: Vec<usize> = (0..n).collect();
+        indices.sort_by(|&a, &b| {
+            adjusted[b]
+                .partial_cmp(&adjusted[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let top_indices = &indices[..kk];
+
+        // Step 4: routing weights from original (unbiased) sigmoid scores
+        let mut weights: Vec<f32> = top_indices.iter().map(|&i| scores[i]).collect();
+
+        // Step 5: optionally normalize weights to sum to 1
+        if norm_topk_prob {
+            let sum: f32 = weights.iter().sum();
+            if sum > 0.0 {
+                for w in weights.iter_mut() {
+                    *w /= sum;
+                }
+            }
+        }
+
+        // Step 6: scale by factor
+        for w in weights.iter_mut() {
+            *w *= scaling_factor;
+        }
+
+        // Output format: [index0_f32, weight0_f32, index1_f32, weight1_f32, ...]
+        let mut result = vec![0.0f32; kk * 2];
+        for (i, (&idx, &weight)) in top_indices.iter().zip(weights.iter()).enumerate() {
+            result[i * 2] = idx as f32;
+            result[i * 2 + 1] = weight;
+        }
+        write_f32(output, &result);
+    }
 }
 
 // ===========================================================================
@@ -1310,6 +1393,7 @@ impl GpuDeltaNet for CpuBackend {
         _input: &CpuTensor,
         _dim: u32,
         _kernel_size: u32,
+        _input_offset: u32,
     ) {
         unimplemented!("CpuBackend::conv1d_shift_history")
     }
@@ -1349,6 +1433,198 @@ impl GpuDeltaNet for CpuBackend {
         _v_offset: u32,
     ) {
         unimplemented!("CpuBackend::deltanet_step")
+    }
+}
+
+// ===========================================================================
+// GpuMamba2 — Mamba-2 selective SSM reference implementation.
+//
+// Pure Rust implementation of the Mamba-2 (SSD) recurrent model used by
+// Nemotron-H.  Two kernels:
+//
+//   mamba2_conv1d_silu — causal depthwise conv1d + bias + SiLU activation
+//   mamba2_ssm_step   — selective SSM state update + output + RMSNorm
+//
+// The SSM recurrence at each step (per head h, with group g):
+//   dt    = softplus(dt_raw + dt_bias)
+//   dA    = exp(dt × (-exp(A_log)))
+//   state = dA × state + dt × outer(x, B[g])
+//   y     = state @ C[g] + D × x
+//   out   = rmsnorm(y, norm_weight)
+//
+// Trait contract: gpu/ops/mamba2.rs
+// Metal impl:     gpu/metal/kernels/mamba2.rs
+// CUDA stub:      cuda/kernels/mamba2.rs
+// ===========================================================================
+
+impl GpuMamba2 for CpuBackend {
+    fn mamba2_conv1d_silu(
+        &self,
+        input: &CpuTensor,
+        history: &CpuTensor,
+        weight: &CpuTensor,
+        bias: &CpuTensor,
+        out: &CpuTensor,
+        dim: u32,
+        kernel_size: u32,
+        input_offset: u32,
+    ) {
+        // Depthwise conv1d with bias and SiLU activation.
+        // For each channel i:
+        //   acc = bias[i]
+        //   acc += sum over j in 0..kernel_size-1 of weight[i, j] * history[j * dim + i]
+        //   acc += weight[i, kernel_size-1] * input[input_offset + i]
+        //   out[i] = silu(acc)
+        let d = dim as usize;
+        let ks = kernel_size as usize;
+        let off = input_offset as usize;
+        let inp = read_bf16(input, off + d);
+        let hist = read_bf16(history, (ks - 1) * d);
+        let w = read_bf16(weight, d * ks); // [dim, kernel_size] row-major
+        let b = read_f32(bias, d); // bias is f32 (loaded as f32 by weight loader)
+
+        let mut result = vec![0.0f32; d];
+        for i in 0..d {
+            let mut acc = b[i];
+            // History taps: weight[i, j] * history[j * dim + i]
+            for j in 0..(ks - 1) {
+                acc += w[i * ks + j] * hist[j * d + i];
+            }
+            // Current input tap: weight[i, kernel_size-1] * input[input_offset + i]
+            acc += w[i * ks + (ks - 1)] * inp[off + i];
+            // SiLU activation: x / (1 + exp(-x))
+            result[i] = acc / (1.0 + (-acc).exp());
+        }
+        write_bf16(out, &result);
+    }
+
+    fn mamba2_ssm_step(
+        &self,
+        state: &CpuTensor,
+        x: &CpuTensor,
+        bc_buf: &CpuTensor,
+        dt_buf: &CpuTensor,
+        a_log: &CpuTensor,
+        d_skip: &CpuTensor,
+        dt_bias: &CpuTensor,
+        norm_weight: &CpuTensor,
+        out: &CpuTensor,
+        num_heads: u32,
+        head_dim: u32,
+        state_size: u32,
+        n_groups: u32,
+        b_offset: u32,
+        c_offset: u32,
+        dt_offset: u32,
+        eps: f32,
+    ) {
+        // Selective SSM step with grouped B/C, persistent state, and RMSNorm.
+        let nh = num_heads as usize;
+        let hd = head_dim as usize;
+        let ss = state_size as usize;
+        let ng = n_groups as usize;
+        let heads_per_group = nh / ng;
+        let b_off = b_offset as usize;
+        let c_off = c_offset as usize;
+        let dt_off = dt_offset as usize;
+
+        // Read inputs — B/C come from bc_buf, dt from dt_buf (separate buffers).
+        let x_data = read_bf16(x, nh * hd);
+        let bc_max = [b_off + ng * ss, c_off + ng * ss].into_iter().max().unwrap();
+        let bc_data = read_bf16(bc_buf, bc_max);
+        let dt_data = read_bf16(dt_buf, dt_off + nh);
+        let a_log_data = read_f32(a_log, nh);
+        let d_skip_data = read_f32(d_skip, nh);
+        let dt_bias_data = read_f32(dt_bias, nh);
+        let nw_data = read_bf16(norm_weight, nh * hd);
+
+        // Read mutable state as f32: [num_heads * head_dim * state_size]
+        let mut st = read_f32(state, nh * hd * ss);
+
+        let mut y = vec![0.0f32; nh * hd];
+
+        for h in 0..nh {
+            let g = h / heads_per_group;
+
+            // 1. Discretize: dt_h = softplus(dt_raw + dt_bias)
+            let dt_raw = dt_data[dt_off + h] + dt_bias_data[h];
+            let dt_h = (1.0 + dt_raw.exp()).ln(); // softplus
+
+            // dA = exp(dt * (-exp(A_log)))
+            let da = (dt_h * (-a_log_data[h].exp())).exp();
+
+            // 2. State update: state[h] = dA * state[h] + dt * outer(x[h], B[g])
+            for di in 0..hd {
+                for si in 0..ss {
+                    let idx = h * hd * ss + di * ss + si;
+                    let x_val = x_data[h * hd + di];
+                    let b_val = bc_data[b_off + g * ss + si];
+                    st[idx] = da * st[idx] + dt_h * x_val * b_val;
+                }
+            }
+
+            // 3. Output: y[h] = state[h] @ C[g] + D[h] * x[h]
+            for di in 0..hd {
+                let mut dot = 0.0f32;
+                for si in 0..ss {
+                    dot += st[h * hd * ss + di * ss + si] * bc_data[c_off + g * ss + si];
+                }
+                y[h * hd + di] = dot + d_skip_data[h] * x_data[h * hd + di];
+            }
+        }
+
+        // Write updated state back
+        write_f32(state, &st);
+
+        // Write raw output (no norm — gated norm happens outside this function).
+        write_bf16(out, &y);
+    }
+
+    fn mamba2_gated_rms_norm(
+        &self,
+        y: &CpuTensor,
+        z_buf: &CpuTensor,
+        weight: &CpuTensor,
+        out: &CpuTensor,
+        d_inner: u32,
+        group_size: u32,
+        z_offset: u32,
+        eps: f32,
+    ) {
+        let di = d_inner as usize;
+        let gs = group_size as usize;
+        let zo = z_offset as usize;
+
+        let y_data = read_bf16(y, di);
+        let z_data = read_bf16(z_buf, zo + di);
+        let w_data = read_bf16(weight, di);
+
+        let mut result = vec![0.0f32; di];
+        let num_groups = (di + gs - 1) / gs;
+
+        for g in 0..num_groups {
+            let base = g * gs;
+            let end = (base + gs).min(di);
+            let len = end - base;
+
+            // Gate + sum of squares
+            let mut sum_sq = 0.0f32;
+            for i in 0..len {
+                let z_val = z_data[zo + base + i];
+                let gate = z_val / (1.0 + (-z_val).exp()); // silu
+                let gated = y_data[base + i] * gate;
+                result[base + i] = gated;
+                sum_sq += gated * gated;
+            }
+
+            // Normalize
+            let rms = (sum_sq / len as f32 + eps).sqrt();
+            for i in 0..len {
+                result[base + i] = (result[base + i] / rms) * w_data[base + i];
+            }
+        }
+
+        write_bf16(out, &result);
     }
 }
 

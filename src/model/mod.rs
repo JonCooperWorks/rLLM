@@ -186,7 +186,28 @@ pub(crate) struct Model<'a, B: GpuCore> {
     pub(crate) dn_attn_out: Option<B::Tensor>, // [v_dim] bf16 — DeltaNet attention output
     pub(crate) dn_norm_out: Option<B::Tensor>, // [v_dim] bf16 — RMSNorm-no-weight output
 
-    // KV layer mapping: layer_idx → kv_pool_idx (None for DeltaNet layers).
+    // -----------------------------------------------------------------------
+    // Mamba-2 state (Nemotron-H Mamba layers only).
+    //
+    // Learning note: Mamba-2 layers maintain a [num_heads, head_dim, state_size]
+    // recurrent state matrix per layer in f32.  This is the "memory" of the SSM —
+    // it grows and decays based on the input at each step, via the B/C/dt/A_log
+    // parameters.  Unlike KV cache which grows with sequence length, the Mamba
+    // state is fixed-size.  The trade-off: fixed-size state can't represent
+    // every detail of long contexts, but it's O(1) in memory and compute.
+    //
+    // Total per sequence: 23 layers × 64 heads × 64 head_dim × 128 state_size
+    // × 4 bytes = ~46 MB.  Conv history adds ~550 KB.
+    // -----------------------------------------------------------------------
+    pub(crate) mamba2_states: Option<Vec<B::Tensor>>,       // per-Mamba-layer f32 state
+    pub(crate) mamba2_conv_history: Option<Vec<B::Tensor>>,  // per-Mamba-layer bf16 history
+
+    // Mamba-2 scratch buffers (reused every forward pass).
+    pub(crate) m2_in_proj_buf: Option<B::Tensor>,  // [in_proj_dim] bf16
+    pub(crate) m2_conv_out: Option<B::Tensor>,      // [conv_dim] bf16 (holds [x, B, C] after conv1d)
+    pub(crate) m2_ssm_out: Option<B::Tensor>,       // [d_inner] bf16
+
+    // KV layer mapping: layer_idx → kv_pool_idx (None for DeltaNet/Mamba/MoE layers).
     pub(crate) kv_layer_map: Vec<Option<usize>>,
 
     // SSD expert streaming (None when all experts are GPU-resident).
@@ -424,6 +445,54 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
             (None, None, None, None, None, None, None, None, None)
         };
 
+        // Mamba-2 state and scratch buffers: only for Nemotron-H.
+        let is_mamba2 = config.is_hybrid_mamba2();
+        let (mamba2_states, mamba2_conv_history, m2_in_proj_buf, m2_conv_out, m2_ssm_out) =
+            if is_mamba2 {
+                let d_inner = config.mamba2_d_inner();
+                let conv_dim = config.mamba2_conv_dim(); // d_inner + 2*n_groups*state_size
+                let in_proj_dim = config.mamba2_in_proj_dim();
+                let ks = config.mamba_conv_kernel;
+                let n_heads = config.mamba_num_heads;
+                let hd = config.mamba_head_dim;
+                let ss = config.ssm_state_size;
+
+                let num_m2_layers = config
+                    .layer_types
+                    .iter()
+                    .filter(|t| t.as_str() == "mamba2")
+                    .count();
+                let state_size = n_heads * hd * ss;
+                let mut states = Vec::with_capacity(num_m2_layers);
+                let mut conv_histories = Vec::with_capacity(num_m2_layers);
+                for _ in 0..num_m2_layers {
+                    states.push(backend.alloc_tensor(&[state_size], TensorDtype::F32));
+                    // Conv history is [(ks-1) * conv_dim] because conv1d operates
+                    // on the full [x, B, C] concatenation, not just x.
+                    conv_histories.push(
+                        backend.alloc_tensor(&[(ks - 1) * conv_dim], TensorDtype::BF16),
+                    );
+                }
+                // Zero-initialise states and conv histories.
+                for s in &states {
+                    backend.fill_zero(s, state_size as u32);
+                }
+                for h in &conv_histories {
+                    backend.fill_zero(h, ((ks - 1) * conv_dim) as u32);
+                }
+
+                (
+                    Some(states),
+                    Some(conv_histories),
+                    Some(backend.alloc_tensor(&[in_proj_dim], TensorDtype::BF16)),
+                    // conv_out needs conv_dim (not d_inner) — it holds [x, B, C] post-conv.
+                    Some(backend.alloc_tensor(&[conv_dim], TensorDtype::BF16)),
+                    Some(backend.alloc_tensor(&[d_inner], TensorDtype::BF16)),
+                )
+            } else {
+                (None, None, None, None, None)
+            };
+
         let kv_layer_map = config.kv_layer_map();
 
         Ok(Self {
@@ -456,6 +525,11 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
             dn_conv_out,
             dn_attn_out,
             dn_norm_out,
+            mamba2_states,
+            mamba2_conv_history,
+            m2_in_proj_buf,
+            m2_conv_out,
+            m2_ssm_out,
             kv_layer_map,
             expert_streamer: None,
             vision_weights: None,
@@ -617,6 +691,13 @@ impl<'a, B: GpuCore + GpuElementwise> Model<'a, B> {
             dn_conv_out,
             dn_attn_out,
             dn_norm_out,
+            // Mamba-2 state: not yet TP-aware, use None for TP path.
+            // TODO: add TP-aware Mamba-2 state allocation.
+            mamba2_states: None,
+            mamba2_conv_history: None,
+            m2_in_proj_buf: None,
+            m2_conv_out: None,
+            m2_ssm_out: None,
             kv_layer_map,
             expert_streamer: None,
             vision_weights: None,
@@ -710,6 +791,9 @@ impl<'a, B: GpuBackend> Model<'a, B> {
             }
             ModelArch::Qwen3_5 => {
                 registry::qwen3_5::forward_single_paged(self, token_id, pool, seq_state)
+            }
+            ModelArch::NemotronH => {
+                registry::nemotron_h::forward_single_paged(self, token_id, pool, seq_state)
             }
         }
     }
@@ -822,6 +906,9 @@ impl<'a, B: GpuBackend> Model<'a, B> {
             }
             ModelArch::Qwen3_5 => {
                 registry::qwen3_5::forward_prefill_paged(self, tokens, pool, seq_state, bufs)
+            }
+            ModelArch::NemotronH => {
+                registry::nemotron_h::forward_prefill_paged(self, tokens, pool, seq_state, bufs)
             }
         }
     }

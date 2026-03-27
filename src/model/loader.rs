@@ -97,21 +97,21 @@ use crate::gpu::{GpuCore, TensorDtype};
 // regardless of which shard file it lives in.
 // ---------------------------------------------------------------------------
 
-struct TensorStore<'a> {
-    shards: Vec<SafeTensors<'a>>,
+pub(crate) struct TensorStore<'a> {
+    pub(crate) shards: Vec<SafeTensors<'a>>,
     /// Maps tensor names to shard indices.  Empty for single-file models
     /// (all tensors are in shards[0]).
-    weight_map: HashMap<String, usize>,
+    pub(crate) weight_map: HashMap<String, usize>,
     /// Pre-quantized Q4 tensors: name → original (m, k) shape.
     /// Populated from safetensors metadata when loading a model quantized
     /// by `rllm quantize`.  Empty for normal bf16 models.
-    q4_map: HashMap<String, (usize, usize)>,
+    pub(crate) q4_map: HashMap<String, (usize, usize)>,
     /// Pre-quantized Q8 tensors: name → original (m, k) shape.
-    q8_map: HashMap<String, (usize, usize)>,
+    pub(crate) q8_map: HashMap<String, (usize, usize)>,
 }
 
 impl<'a> TensorStore<'a> {
-    fn tensor(&self, name: &str) -> anyhow::Result<safetensors::tensor::TensorView<'a>> {
+    pub(crate) fn tensor(&self, name: &str) -> anyhow::Result<safetensors::tensor::TensorView<'a>> {
         if let Some(&idx) = self.weight_map.get(name) {
             self.shards[idx]
                 .tensor(name)
@@ -125,17 +125,17 @@ impl<'a> TensorStore<'a> {
     }
 
     /// Check if a tensor is pre-quantized Q4, returning its original shape.
-    fn q4_shape(&self, name: &str) -> Option<(usize, usize)> {
+    pub(crate) fn q4_shape(&self, name: &str) -> Option<(usize, usize)> {
         self.q4_map.get(name).copied()
     }
 
     /// Check if a tensor is pre-quantized Q8, returning its original shape.
-    fn q8_shape(&self, name: &str) -> Option<(usize, usize)> {
+    pub(crate) fn q8_shape(&self, name: &str) -> Option<(usize, usize)> {
         self.q8_map.get(name).copied()
     }
 
     /// Check if a tensor is pre-quantized (Q4 or Q8), returning (m, k, dtype).
-    fn quant_shape(&self, name: &str) -> Option<(usize, usize, crate::gpu::TensorDtype)> {
+    pub(crate) fn quant_shape(&self, name: &str) -> Option<(usize, usize, crate::gpu::TensorDtype)> {
         if let Some((m, k)) = self.q4_shape(name) {
             Some((m, k, crate::gpu::TensorDtype::Q4))
         } else if let Some((m, k)) = self.q8_shape(name) {
@@ -401,6 +401,35 @@ pub(crate) struct LayerWeights<B: GpuCore> {
     pub shared_expert_up_proj: Option<B::Tensor>,   // [shared_inter, hidden_size]
     pub shared_expert_down_proj: Option<B::Tensor>, // [hidden_size, shared_inter]
     pub shared_expert_gate: Option<B::Tensor>,      // [1, hidden_size] — scalar gate weight
+
+    // --- Mamba-2 SSM (Nemotron-H Mamba layers only) ---
+    //
+    // Learning note: Mamba-2 layers replace the attention+FFN pair with a single
+    // selective state space model block.  The in_proj maps hidden_size to a
+    // concatenated [z, x, B, C, dt] output (see config.rs for size calculation).
+    // The SSM processes x through conv1d and the recurrent state update, while
+    // z provides an output gate (gated by silu(z)).
+    //
+    // A_log and D are per-head f32 parameters (not weight matrices):
+    //   A_log: log of the diagonal decay rate — controls how fast old state decays
+    //   D: skip connection scalar — adds a fraction of input directly to output
+    //   dt_bias: learned bias for the time step — controls discretization speed
+    pub mamba_in_proj: Option<B::Tensor>,      // [in_proj_dim, hidden_size] bf16
+    pub mamba_conv1d_weight: Option<B::Tensor>, // [d_inner, kernel_size] bf16
+    pub mamba_conv1d_bias: Option<B::Tensor>,   // [d_inner] f32
+    pub mamba_out_proj: Option<B::Tensor>,      // [hidden_size, d_inner] bf16
+    pub mamba_a_log: Option<B::Tensor>,         // [num_heads] f32
+    pub mamba_d: Option<B::Tensor>,             // [num_heads] f32
+    pub mamba_dt_bias: Option<B::Tensor>,       // [num_heads] f32
+    pub mamba_norm: Option<B::Tensor>,          // [d_inner] bf16 — RMSNorm before output gate
+
+    // --- MoE routing correction bias (Nemotron-H, DeepSeek-V3 style) ---
+    //
+    // Learning note: this bias is added to sigmoid routing scores ONLY for
+    // expert selection (which top-k to pick), NOT for computing routing weights.
+    // This cleverly decouples load balancing (via bias) from the actual expert
+    // weighting (via raw sigmoid scores).
+    pub e_score_correction_bias: Option<B::Tensor>, // [num_experts] f32
 }
 
 // ---------------------------------------------------------------------------
@@ -429,7 +458,7 @@ pub(crate) struct LayerWeights<B: GpuCore> {
 // ---------------------------------------------------------------------------
 
 /// Lookup table: FP4 E2M1 nibble → f32 value.
-const FP4_E2M1_LUT: [f32; 16] = [
+pub(crate) const FP4_E2M1_LUT: [f32; 16] = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, // positive (sign=0)
     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0, // negative (sign=1)
 ];
@@ -440,7 +469,7 @@ const FP4_E2M1_LUT: [f32; 16] = [
 ///   value = 2^(byte - 127)
 /// Special cases: 0 → 0.0, 255 → NaN.
 #[inline]
-fn e8m0_to_f32(byte: u8) -> f32 {
+pub(crate) fn e8m0_to_f32(byte: u8) -> f32 {
     match byte {
         0 => 0.0,
         255 => f32::NAN,
@@ -457,7 +486,7 @@ fn e8m0_to_f32(byte: u8) -> f32 {
 ///   - `block_size`: number of elements per scale block (typically 32)
 ///
 /// Returns: bf16 bytes for [rows, cols] weight tensor.
-fn dequantize_mxfp4(
+pub(crate) fn dequantize_mxfp4(
     blocks: &[u8],
     scales: &[u8],
     rows: usize,
@@ -500,29 +529,33 @@ fn dequantize_mxfp4(
 // flags and the existing helpers handle the rest.
 // ---------------------------------------------------------------------------
 
-struct LoaderHints {
+pub(crate) struct LoaderHints {
     /// QKV projections have bias vectors (Qwen 2.5, GPT-OSS).
-    has_qkv_bias: bool,
+    pub(crate) has_qkv_bias: bool,
     /// QK-norm: per-head RMSNorm on Q and K before RoPE (Qwen3-MoE, Qwen3.5, Gemma3).
-    has_qk_norm: bool,
+    pub(crate) has_qk_norm: bool,
     /// Fused qkv_proj and gate_up_proj tensors, split on load (Phi).
-    has_fused_qkv: bool,
+    pub(crate) has_fused_qkv: bool,
     /// O-projection has bias (GPT-OSS only).
-    has_o_proj_bias: bool,
+    pub(crate) has_o_proj_bias: bool,
     /// MoE router has bias (GPT-OSS only).
-    has_router_bias: bool,
+    pub(crate) has_router_bias: bool,
     /// MoE experts have per-expert bias vectors (GPT-OSS only).
-    _has_expert_bias: bool,
+    pub(crate) _has_expert_bias: bool,
     /// RMSNorm weights stored as residual offsets: effective = 1 + stored (Qwen3.5, Gemma3).
-    residual_norm: bool,
+    pub(crate) residual_norm: bool,
     /// Gemma 3: sandwich norms (extra pre/post norms around FFN).
-    is_gemma3: bool,
+    pub(crate) is_gemma3: bool,
     /// GPT-OSS: attention sinks, O-proj bias, MXFP4 expert format.
-    is_gpt_oss: bool,
+    pub(crate) is_gpt_oss: bool,
     /// Mixtral: different expert weight naming convention (w1/w2/w3).
-    is_mixtral: bool,
+    pub(crate) is_mixtral: bool,
     /// Hybrid DeltaNet + GQA model (Qwen 3.5).
-    is_hybrid: bool,
+    /// Only used in test assertions — main loop dispatches via ModelArch match.
+    pub(crate) _is_hybrid: bool,
+    /// Nemotron-H: three-way hybrid (Mamba-2 + MoE + attention).
+    /// Only used in test assertions — main loop dispatches via ModelArch match.
+    pub(crate) _is_nemotron_h: bool,
 }
 
 impl LoaderHints {
@@ -538,7 +571,8 @@ impl LoaderHints {
             is_gemma3: matches!(arch, ModelArch::Gemma3),
             is_gpt_oss: matches!(arch, ModelArch::GptOss),
             is_mixtral: matches!(arch, ModelArch::Mixtral),
-            is_hybrid: config.is_hybrid_deltanet(),
+            _is_hybrid: config.is_hybrid_deltanet(),
+            _is_nemotron_h: matches!(arch, ModelArch::NemotronH),
         }
     }
 }
@@ -552,51 +586,187 @@ impl LoaderHints {
 // ---------------------------------------------------------------------------
 
 /// Attention projection weights loaded for one layer.
-struct AttentionLoaded<B: GpuCore> {
-    q_proj: B::Tensor,
-    k_proj: B::Tensor,
-    v_proj: B::Tensor,
-    o_proj: B::Tensor,
-    q_bias: Option<B::Tensor>,
-    k_bias: Option<B::Tensor>,
-    v_bias: Option<B::Tensor>,
-    o_proj_bias: Option<B::Tensor>,
-    sinks: Option<B::Tensor>,
-    q_norm: Option<B::Tensor>,
-    k_norm: Option<B::Tensor>,
-    attn_z_proj: Option<B::Tensor>,
+pub(crate) struct AttentionLoaded<B: GpuCore> {
+    pub(crate) q_proj: B::Tensor,
+    pub(crate) k_proj: B::Tensor,
+    pub(crate) v_proj: B::Tensor,
+    pub(crate) o_proj: B::Tensor,
+    pub(crate) q_bias: Option<B::Tensor>,
+    pub(crate) k_bias: Option<B::Tensor>,
+    pub(crate) v_bias: Option<B::Tensor>,
+    pub(crate) o_proj_bias: Option<B::Tensor>,
+    pub(crate) sinks: Option<B::Tensor>,
+    pub(crate) q_norm: Option<B::Tensor>,
+    pub(crate) k_norm: Option<B::Tensor>,
+    pub(crate) attn_z_proj: Option<B::Tensor>,
     // DeltaNet fields (all None for standard GQA layers).
-    in_proj_qkv: Option<B::Tensor>,
-    in_proj_a: Option<B::Tensor>,
-    in_proj_b: Option<B::Tensor>,
-    in_proj_z: Option<B::Tensor>,
-    conv1d_weight: Option<B::Tensor>,
-    linear_out_proj: Option<B::Tensor>,
-    a_log: Option<B::Tensor>,
-    dt_bias: Option<B::Tensor>,
-    linear_norm: Option<B::Tensor>,
+    pub(crate) in_proj_qkv: Option<B::Tensor>,
+    pub(crate) in_proj_a: Option<B::Tensor>,
+    pub(crate) in_proj_b: Option<B::Tensor>,
+    pub(crate) in_proj_z: Option<B::Tensor>,
+    pub(crate) conv1d_weight: Option<B::Tensor>,
+    pub(crate) linear_out_proj: Option<B::Tensor>,
+    pub(crate) a_log: Option<B::Tensor>,
+    pub(crate) dt_bias: Option<B::Tensor>,
+    pub(crate) linear_norm: Option<B::Tensor>,
 }
 
 /// FFN / MoE weights loaded for one layer.
-struct FfnLoaded<B: GpuCore> {
-    gate_proj: B::Tensor,
-    up_proj: B::Tensor,
-    down_proj: B::Tensor,
-    router_gate: Option<B::Tensor>,
-    router_bias: Option<B::Tensor>,
-    experts: Option<Vec<ExpertWeights<B>>>,
-    shared_expert_gate_proj: Option<B::Tensor>,
-    shared_expert_up_proj: Option<B::Tensor>,
-    shared_expert_down_proj: Option<B::Tensor>,
-    shared_expert_gate: Option<B::Tensor>,
+pub(crate) struct FfnLoaded<B: GpuCore> {
+    pub(crate) gate_proj: B::Tensor,
+    pub(crate) up_proj: B::Tensor,
+    pub(crate) down_proj: B::Tensor,
+    pub(crate) router_gate: Option<B::Tensor>,
+    pub(crate) router_bias: Option<B::Tensor>,
+    pub(crate) experts: Option<Vec<ExpertWeights<B>>>,
+    pub(crate) shared_expert_gate_proj: Option<B::Tensor>,
+    pub(crate) shared_expert_up_proj: Option<B::Tensor>,
+    pub(crate) shared_expert_down_proj: Option<B::Tensor>,
+    pub(crate) shared_expert_gate: Option<B::Tensor>,
 }
 
 /// Norm weights loaded for one layer.
-struct NormLoaded<B: GpuCore> {
-    input_layernorm: B::Tensor,
-    post_attention_layernorm: B::Tensor,
-    pre_feedforward_layernorm: Option<B::Tensor>,
-    post_feedforward_layernorm: Option<B::Tensor>,
+pub(crate) struct NormLoaded<B: GpuCore> {
+    pub(crate) input_layernorm: B::Tensor,
+    pub(crate) post_attention_layernorm: B::Tensor,
+    pub(crate) pre_feedforward_layernorm: Option<B::Tensor>,
+    pub(crate) post_feedforward_layernorm: Option<B::Tensor>,
+}
+
+// ---------------------------------------------------------------------------
+// load_standard_layer — wraps the three-helper pattern for standard models.
+// ---------------------------------------------------------------------------
+
+/// Load one standard transformer layer using the three-helper pattern.
+///
+/// Used by models that follow the standard dense/MoE architecture (Llama,
+/// Mistral, Phi, Qwen, Qwen3-MoE, Gemma, Mixtral).  Models with unique
+/// layer structures (Nemotron-H, Qwen 3.5, GPT-OSS) have their own
+/// `load_layer()` in their registry files.
+pub(crate) fn load_standard_layer<B: GpuCore>(
+    store: &TensorStore,
+    backend: &B,
+    prefix: &str,
+    config: &ModelConfig,
+    hints: &LoaderHints,
+    layer_idx: usize,
+    sharding: Option<&crate::gpu::parallel::ShardingPlan>,
+    skip_experts: bool,
+) -> anyhow::Result<LayerWeights<B>> {
+    let norms = load_layer_norms(store, backend, prefix, config, hints)?;
+    let attn = load_attention_weights(
+        store, backend, prefix, config, hints, layer_idx,
+        false, // is_deltanet_layer — always false for standard models
+        sharding,
+    )?;
+    let ffn = load_ffn_weights(
+        store, backend, prefix, config, hints, layer_idx, sharding,
+        skip_experts,
+    )?;
+
+    Ok(LayerWeights {
+        input_layernorm: norms.input_layernorm,
+        post_attention_layernorm: norms.post_attention_layernorm,
+        pre_feedforward_layernorm: norms.pre_feedforward_layernorm,
+        post_feedforward_layernorm: norms.post_feedforward_layernorm,
+        q_proj: attn.q_proj,
+        k_proj: attn.k_proj,
+        v_proj: attn.v_proj,
+        o_proj: attn.o_proj,
+        q_bias: attn.q_bias,
+        k_bias: attn.k_bias,
+        v_bias: attn.v_bias,
+        o_proj_bias: attn.o_proj_bias,
+        sinks: attn.sinks,
+        q_norm: attn.q_norm,
+        k_norm: attn.k_norm,
+        attn_z_proj: attn.attn_z_proj,
+        in_proj_qkv: attn.in_proj_qkv,
+        in_proj_a: attn.in_proj_a,
+        in_proj_b: attn.in_proj_b,
+        in_proj_z: attn.in_proj_z,
+        conv1d_weight: attn.conv1d_weight,
+        linear_out_proj: attn.linear_out_proj,
+        a_log: attn.a_log,
+        dt_bias: attn.dt_bias,
+        linear_norm: attn.linear_norm,
+        gate_proj: ffn.gate_proj,
+        up_proj: ffn.up_proj,
+        down_proj: ffn.down_proj,
+        router_gate: ffn.router_gate,
+        router_bias: ffn.router_bias,
+        experts: ffn.experts,
+        shared_expert_gate_proj: ffn.shared_expert_gate_proj,
+        shared_expert_up_proj: ffn.shared_expert_up_proj,
+        shared_expert_down_proj: ffn.shared_expert_down_proj,
+        shared_expert_gate: ffn.shared_expert_gate,
+        mamba_in_proj: None,
+        mamba_conv1d_weight: None,
+        mamba_conv1d_bias: None,
+        mamba_out_proj: None,
+        mamba_a_log: None,
+        mamba_d: None,
+        mamba_dt_bias: None,
+        mamba_norm: None,
+        e_score_correction_bias: None,
+    })
+}
+
+/// Assemble a LayerWeights from AttentionLoaded, FfnLoaded, and NormLoaded.
+///
+/// Convenience for architecture-specific loaders that call the shared
+/// helpers individually (e.g., Qwen 3.5 GQA layers, GPT-OSS).
+pub(crate) fn assemble_layer_weights<B: GpuCore>(
+    norms: NormLoaded<B>,
+    attn: AttentionLoaded<B>,
+    ffn: FfnLoaded<B>,
+) -> LayerWeights<B> {
+    LayerWeights {
+        input_layernorm: norms.input_layernorm,
+        post_attention_layernorm: norms.post_attention_layernorm,
+        pre_feedforward_layernorm: norms.pre_feedforward_layernorm,
+        post_feedforward_layernorm: norms.post_feedforward_layernorm,
+        q_proj: attn.q_proj,
+        k_proj: attn.k_proj,
+        v_proj: attn.v_proj,
+        o_proj: attn.o_proj,
+        q_bias: attn.q_bias,
+        k_bias: attn.k_bias,
+        v_bias: attn.v_bias,
+        o_proj_bias: attn.o_proj_bias,
+        sinks: attn.sinks,
+        q_norm: attn.q_norm,
+        k_norm: attn.k_norm,
+        attn_z_proj: attn.attn_z_proj,
+        in_proj_qkv: attn.in_proj_qkv,
+        in_proj_a: attn.in_proj_a,
+        in_proj_b: attn.in_proj_b,
+        in_proj_z: attn.in_proj_z,
+        conv1d_weight: attn.conv1d_weight,
+        linear_out_proj: attn.linear_out_proj,
+        a_log: attn.a_log,
+        dt_bias: attn.dt_bias,
+        linear_norm: attn.linear_norm,
+        gate_proj: ffn.gate_proj,
+        up_proj: ffn.up_proj,
+        down_proj: ffn.down_proj,
+        router_gate: ffn.router_gate,
+        router_bias: ffn.router_bias,
+        experts: ffn.experts,
+        shared_expert_gate_proj: ffn.shared_expert_gate_proj,
+        shared_expert_up_proj: ffn.shared_expert_up_proj,
+        shared_expert_down_proj: ffn.shared_expert_down_proj,
+        shared_expert_gate: ffn.shared_expert_gate,
+        mamba_in_proj: None,
+        mamba_conv1d_weight: None,
+        mamba_conv1d_bias: None,
+        mamba_out_proj: None,
+        mamba_a_log: None,
+        mamba_d: None,
+        mamba_dt_bias: None,
+        mamba_norm: None,
+        e_score_correction_bias: None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -696,13 +866,23 @@ fn load_weights_inner<B: GpuCore>(
     };
 
     let hidden = config.hidden_size;
-    let wp = &config.weight_prefix; // "model." or "model.language_model."
+    let wp = &config.weight_prefix; // "model." or "backbone."
+
+    // Compute architecture-specific loading hints once up front.
+    let arch = config.arch()?;
+    let hints = LoaderHints::new(arch, config);
 
     // Load the embedding table.
+    // Nemotron-H uses "{prefix}embeddings.weight" (backbone.embeddings.weight);
+    // all other models use "{prefix}embed_tokens.weight".
+    let embed_name = match arch {
+        ModelArch::NemotronH => format!("{wp}embeddings.weight"),
+        _ => format!("{wp}embed_tokens.weight"),
+    };
     let embed_tokens = upload_tensor(
         &store,
         backend,
-        &format!("{wp}embed_tokens.weight"),
+        &embed_name,
         &[config.vocab_size, hidden],
     )?;
 
@@ -720,76 +900,56 @@ fn load_weights_inner<B: GpuCore>(
         None
     };
 
-    // Compute architecture-specific loading hints once up front.
-    let arch = config.arch()?;
-    let hints = LoaderHints::new(arch, config);
-
-    // Load per-layer weights via focused helpers.
+    // Load per-layer weights, dispatching to architecture-specific loaders
+    // for models with unique layer structures.
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for i in 0..config.num_hidden_layers {
         let prefix = format!("{wp}layers.{i}");
-        let is_deltanet_layer = hints.is_hybrid && config.is_linear_attention_layer(i);
 
-        let norms = load_layer_norms(&store, backend, &prefix, config, &hints)?;
-        let attn = load_attention_weights(
-            &store,
-            backend,
-            &prefix,
-            config,
-            &hints,
-            i,
-            is_deltanet_layer,
-            sharding,
-        )?;
-        let ffn = load_ffn_weights(
-            &store, backend, &prefix, config, &hints, i, sharding,
-            skip_experts,
-        )?;
-
-        layers.push(LayerWeights {
-            input_layernorm: norms.input_layernorm,
-            post_attention_layernorm: norms.post_attention_layernorm,
-            pre_feedforward_layernorm: norms.pre_feedforward_layernorm,
-            post_feedforward_layernorm: norms.post_feedforward_layernorm,
-            q_proj: attn.q_proj,
-            k_proj: attn.k_proj,
-            v_proj: attn.v_proj,
-            o_proj: attn.o_proj,
-            q_bias: attn.q_bias,
-            k_bias: attn.k_bias,
-            v_bias: attn.v_bias,
-            o_proj_bias: attn.o_proj_bias,
-            sinks: attn.sinks,
-            q_norm: attn.q_norm,
-            k_norm: attn.k_norm,
-            attn_z_proj: attn.attn_z_proj,
-            in_proj_qkv: attn.in_proj_qkv,
-            in_proj_a: attn.in_proj_a,
-            in_proj_b: attn.in_proj_b,
-            in_proj_z: attn.in_proj_z,
-            conv1d_weight: attn.conv1d_weight,
-            linear_out_proj: attn.linear_out_proj,
-            a_log: attn.a_log,
-            dt_bias: attn.dt_bias,
-            linear_norm: attn.linear_norm,
-            gate_proj: ffn.gate_proj,
-            up_proj: ffn.up_proj,
-            down_proj: ffn.down_proj,
-            router_gate: ffn.router_gate,
-            router_bias: ffn.router_bias,
-            experts: ffn.experts,
-            shared_expert_gate_proj: ffn.shared_expert_gate_proj,
-            shared_expert_up_proj: ffn.shared_expert_up_proj,
-            shared_expert_down_proj: ffn.shared_expert_down_proj,
-            shared_expert_gate: ffn.shared_expert_gate,
-        });
+        let layer = match arch {
+            // Nemotron-H: each layer is purely one type (Mamba-2, MoE, or attention).
+            // Uses "mixer" subkey instead of "self_attn"/"mlp".
+            ModelArch::NemotronH => {
+                super::registry::nemotron_h::load_layer(
+                    &store, backend, &prefix, config, i, sharding, skip_experts,
+                )?
+            }
+            // Qwen 3.5: hybrid DeltaNet + GQA with MoE FFN.
+            // DeltaNet layers use fused QKV + gate projections; GQA layers
+            // use standard attention with QK-norm and output gate.
+            ModelArch::Qwen3_5 => {
+                let is_deltanet = config.is_linear_attention_layer(i);
+                super::registry::qwen3_5::load_layer(
+                    &store, backend, &prefix, config, &hints, i,
+                    is_deltanet, sharding, skip_experts,
+                )?
+            }
+            // GPT-OSS: standard attention + o_proj_bias + sinks + MXFP4 MoE.
+            ModelArch::GptOss => {
+                super::registry::gpt_oss::load_layer(
+                    &store, backend, &prefix, config, &hints, i,
+                    sharding, skip_experts,
+                )?
+            }
+            // Standard models: Llama, Mistral, Phi, Qwen, Qwen3-MoE, Gemma, Mixtral.
+            _ => load_standard_layer(
+                &store, backend, &prefix, config, &hints, i,
+                sharding, skip_experts,
+            )?,
+        };
+        layers.push(layer);
     }
 
     // Final RMSNorm weight (applied after all layers, before lm_head).
+    // Nemotron-H names this `norm_f.weight` instead of `norm.weight`.
+    let norm_name = match arch {
+        ModelArch::NemotronH => format!("{wp}norm_f.weight"),
+        _ => format!("{wp}norm.weight"),
+    };
     let norm_weight = if hints.residual_norm {
-        upload_norm_residual(&store, backend, &format!("{wp}norm.weight"), &[hidden])?
+        upload_norm_residual(&store, backend, &norm_name, &[hidden])?
     } else {
-        upload_tensor(&store, backend, &format!("{wp}norm.weight"), &[hidden])?
+        upload_tensor(&store, backend, &norm_name, &[hidden])?
     };
 
     eprintln!("loaded {} layers", layers.len());
@@ -814,7 +974,7 @@ fn load_weights_inner<B: GpuCore>(
 /// Standard models have two norms per layer (input_layernorm, post_attention_layernorm).
 /// Gemma 3 adds two more for sandwich norms (pre/post_feedforward_layernorm).
 /// Qwen 3.5 and Gemma 3 use residual form (effective = 1 + stored weight).
-fn load_layer_norms<B: GpuCore>(
+pub(crate) fn load_layer_norms<B: GpuCore>(
     store: &TensorStore,
     backend: &B,
     prefix: &str,
@@ -871,7 +1031,7 @@ fn load_layer_norms<B: GpuCore>(
 ///
 /// Also loads QKV bias (Qwen 2.5), QK-norm (Qwen3-MoE), O-proj bias and
 /// attention sinks (GPT-OSS), and the attn_output_gate (Qwen 3.5 GQA).
-fn load_attention_weights<B: GpuCore>(
+pub(crate) fn load_attention_weights<B: GpuCore>(
     store: &TensorStore,
     backend: &B,
     prefix: &str,
@@ -1030,7 +1190,7 @@ fn load_attention_weights<B: GpuCore>(
 /// instead of standard q/k/v_proj.  Returns dummy tensors for q/k/v/o_proj
 /// (unused by the forward pass) and populates the DeltaNet-specific fields.
 #[allow(clippy::type_complexity)]
-fn load_deltanet_attention<B: GpuCore>(
+pub(crate) fn load_deltanet_attention<B: GpuCore>(
     store: &TensorStore,
     backend: &B,
     prefix: &str,
@@ -1298,7 +1458,7 @@ fn load_deltanet_attention<B: GpuCore>(
 /// next kv_dim = V.  We slice the raw bytes at the correct
 /// offsets and upload as three separate GPU tensors.
 #[allow(clippy::type_complexity)]
-fn load_fused_qkv_attention<B: GpuCore>(
+pub(crate) fn load_fused_qkv_attention<B: GpuCore>(
     store: &TensorStore,
     backend: &B,
     prefix: &str,
@@ -1375,7 +1535,7 @@ fn load_fused_qkv_attention<B: GpuCore>(
 /// output gate projection: [2*q_dim, hidden].  The weight rows are
 /// interleaved per head — we deinterleave into separate Q and Z tensors.
 #[allow(clippy::type_complexity)]
-fn load_standard_attention<B: GpuCore>(
+pub(crate) fn load_standard_attention<B: GpuCore>(
     store: &TensorStore,
     backend: &B,
     prefix: &str,
@@ -1504,7 +1664,7 @@ fn load_standard_attention<B: GpuCore>(
 ///      Three MoE formats: per-expert (Qwen3-MoE), fused (Qwen3.5), MXFP4 (GPT-OSS).
 ///   2. Fused gate_up_proj (Phi): single tensor split into gate and up on load.
 ///   3. Dense FFN: standard gate/up/down projections.
-fn load_ffn_weights<B: GpuCore>(
+pub(crate) fn load_ffn_weights<B: GpuCore>(
     store: &TensorStore,
     backend: &B,
     prefix: &str,
@@ -1628,7 +1788,7 @@ fn load_ffn_weights<B: GpuCore>(
 ///   1. MXFP4 (GPT-OSS): packed fp4 blocks with E8M0 scales, de-interleaved gate/up.
 ///   2. Fused (Qwen3.5): gate_up_proj [num_experts, 2*moe_inter, hidden], split on load.
 ///   3. Per-expert (Qwen3-MoE, Mixtral): separate tensors per expert.
-fn load_moe_ffn_weights<B: GpuCore>(
+pub(crate) fn load_moe_ffn_weights<B: GpuCore>(
     store: &TensorStore,
     backend: &B,
     prefix: &str,
@@ -1846,7 +2006,7 @@ fn load_moe_ffn_weights<B: GpuCore>(
 ///   down_proj_blocks:    [num_experts, hidden, moe_inter/2]
 ///   down_proj_scales:    [num_experts, hidden, num_blocks]
 ///   down_proj_bias:      [num_experts, hidden]  (bf16, optional)
-fn load_mxfp4_experts<B: GpuCore>(
+pub(crate) fn load_mxfp4_experts<B: GpuCore>(
     store: &TensorStore,
     backend: &B,
     prefix: &str,
@@ -1990,7 +2150,7 @@ fn load_mxfp4_experts<B: GpuCore>(
 /// Fused format: gate_up_proj [num_experts, 2*moe_inter, hidden]
 /// and down_proj [num_experts, hidden, moe_inter].
 /// Split into per-expert tensors during loading.
-fn load_fused_experts<B: GpuCore>(
+pub(crate) fn load_fused_experts<B: GpuCore>(
     store: &TensorStore,
     backend: &B,
     prefix: &str,
@@ -2076,7 +2236,7 @@ fn load_fused_experts<B: GpuCore>(
 // ---------------------------------------------------------------------------
 
 /// Compute total byte count for a quantized [m, k] tensor.
-fn quant_byte_count(dtype: TensorDtype, m: usize, k: usize) -> usize {
+pub(crate) fn quant_byte_count(dtype: TensorDtype, m: usize, k: usize) -> usize {
     match dtype {
         TensorDtype::Q4 => crate::gpu::q4_byte_count(m, k),
         TensorDtype::Q8 => crate::gpu::q8_byte_count(m, k),
@@ -2086,7 +2246,7 @@ fn quant_byte_count(dtype: TensorDtype, m: usize, k: usize) -> usize {
 
 /// Compute row byte stride for a weight dimension, given an optional quant dtype.
 /// Returns bf16 row bytes (k * 2) when dtype is None.
-fn quant_row_bytes(dtype: Option<TensorDtype>, k: usize) -> usize {
+pub(crate) fn quant_row_bytes(dtype: Option<TensorDtype>, k: usize) -> usize {
     match dtype {
         Some(TensorDtype::Q4) => (k / 32) * 18,
         Some(TensorDtype::Q8) => (k / 32) * 34,
@@ -2096,7 +2256,7 @@ fn quant_row_bytes(dtype: Option<TensorDtype>, k: usize) -> usize {
 }
 
 /// Short name for a quant dtype (for error messages).
-fn quant_dtype_name(dtype: TensorDtype) -> &'static str {
+pub(crate) fn quant_dtype_name(dtype: TensorDtype) -> &'static str {
     match dtype {
         TensorDtype::Q4 => "Q4",
         TensorDtype::Q8 => "Q8",
@@ -2108,7 +2268,7 @@ fn quant_dtype_name(dtype: TensorDtype) -> &'static str {
 ///
 /// If the tensor is in the store's quant map (pre-quantized by `rllm quantize`),
 /// uploads the raw quantized bytes directly with the original logical shape.
-fn upload_tensor<B: GpuCore>(
+pub(crate) fn upload_tensor<B: GpuCore>(
     store: &TensorStore,
     backend: &B,
     name: &str,
@@ -2153,7 +2313,7 @@ fn upload_tensor<B: GpuCore>(
 /// effective weight starts at 1.0).  This differs from Llama/Qwen2 which store
 /// direct scale factors (initialized to ones).  We add 1.0 during loading so the
 /// existing rms_norm kernel works unchanged.
-fn upload_norm_residual<B: GpuCore>(
+pub(crate) fn upload_norm_residual<B: GpuCore>(
     store: &TensorStore,
     backend: &B,
     name: &str,
@@ -2185,7 +2345,7 @@ fn upload_norm_residual<B: GpuCore>(
 ///
 /// Used for pre-sliced byte buffers (e.g. when splitting a fused QKV or
 /// MoE expert weight from a larger tensor).
-fn upload_raw_bf16<B: GpuCore>(
+pub(crate) fn upload_raw_bf16<B: GpuCore>(
     backend: &B,
     bf16_data: &[u8],
     shape: &[usize],
@@ -2198,7 +2358,7 @@ fn upload_raw_bf16<B: GpuCore>(
 /// If a sharding plan is provided and has a non-Replicated entry for this
 /// weight, the raw bytes are sliced to this rank's portion before uploading.
 /// Otherwise falls through to the regular upload path.
-fn upload_sharded<B: GpuCore>(
+pub(crate) fn upload_sharded<B: GpuCore>(
     store: &TensorStore,
     backend: &B,
     name: &str,
@@ -3249,7 +3409,7 @@ mod tests {
         assert!(!hints.is_gemma3);
         assert!(!hints.is_gpt_oss);
         assert!(!hints.is_mixtral);
-        assert!(!hints.is_hybrid);
+        assert!(!hints._is_hybrid);
     }
 
     #[test]
@@ -3316,7 +3476,7 @@ mod tests {
         // Qwen 3.5 hybrid has layer_types with linear_attention entries.
         config.layer_types = vec!["full_attention".to_string(), "linear_attention".to_string()];
         let hints = LoaderHints::new(ModelArch::Qwen3_5, &config);
-        assert!(hints.is_hybrid, "Qwen3.5 with layer_types is hybrid");
+        assert!(hints._is_hybrid, "Qwen3.5 with layer_types is hybrid");
         assert!(hints.residual_norm, "Qwen3.5 uses residual norms");
         assert!(hints.has_qk_norm, "Qwen3.5 has QK-norm");
         assert!(!hints.has_fused_qkv);
@@ -3328,7 +3488,7 @@ mod tests {
         let config = minimal_config("qwen3_5");
         let hints = LoaderHints::new(ModelArch::Qwen3_5, &config);
         assert!(
-            !hints.is_hybrid,
+            !hints._is_hybrid,
             "Qwen3.5 without layer_types is not hybrid"
         );
         assert!(hints.residual_norm);

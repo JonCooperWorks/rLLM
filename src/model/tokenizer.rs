@@ -97,6 +97,10 @@ impl Tokenizer {
             // GPT-OSS-20B: no BOS.  eos_token_id=200002 from config.json.
             // Uses a 201088-token vocabulary.
             ModelArch::GptOss => (None, vec![200002]),
+
+            // Nemotron-H: eos_token_id=2 from config.json.  No BOS.
+            // Uses a 131072-token vocabulary (Tekken-based).
+            ModelArch::NemotronH => (None, vec![2]),
         };
 
         Ok(Self {
