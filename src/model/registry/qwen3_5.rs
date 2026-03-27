@@ -53,7 +53,7 @@
 
 use crate::gpu::{
     GpuAllReduce, GpuAttention, GpuCore, GpuDeltaNet, GpuElementwise, GpuEmbed, GpuMatmul, GpuMoe,
-    GpuNorm, GpuRope, GpuTurboQuant,
+    GpuNorm, GpuRope, GpuTurboQuant, TensorDtype,
 };
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives::{self, Dims};
@@ -783,4 +783,92 @@ pub(crate) fn forward_prefill_paged<
     );
 
     Ok(())
+}
+
+// ===========================================================================
+// Weight loading — Qwen 3.5 hybrid layer loading.
+//
+// Qwen 3.5 layers pair a mixer (DeltaNet or GQA) with an MoE/dense FFN.
+// DeltaNet layers use fused QKV + gate projections, Conv1D, decay/update
+// gates, and an output norm.  GQA layers use standard attention with
+// QK-norm, partial RoPE, and an output gate (attn_z_proj).
+//
+// MoE models use fused expert format (gate_up_proj [num_experts, 2*inter, hidden]).
+// Dense models use standard gate/up/down projections.
+//
+// Moved here from loader.rs to keep architecture-specific logic co-located
+// with the forward pass.
+// ===========================================================================
+
+use crate::model::loader::{
+    TensorStore, LayerWeights, LoaderHints,
+    load_layer_norms, load_attention_weights, load_ffn_weights,
+    load_deltanet_attention, assemble_layer_weights,
+};
+
+/// Load weights for one Qwen 3.5 layer (DeltaNet or GQA mixer + FFN).
+///
+/// For DeltaNet layers: loads fused QKV, gate projections, Conv1D, etc.
+/// For GQA layers: delegates to shared attention helper (QK-norm + output gate).
+/// FFN: delegates to shared FFN helper (handles MoE fused + dense + shared expert).
+pub(crate) fn load_layer<B: GpuCore>(
+    store: &TensorStore,
+    backend: &B,
+    prefix: &str,
+    config: &crate::model::config::ModelConfig,
+    hints: &LoaderHints,
+    layer_idx: usize,
+    is_deltanet_layer: bool,
+    sharding: Option<&crate::gpu::parallel::ShardingPlan>,
+    skip_experts: bool,
+) -> anyhow::Result<LayerWeights<B>> {
+    // Norms: residual form (effective = 1 + stored), handled by hints.
+    let norms = load_layer_norms(store, backend, prefix, config, hints)?;
+
+    // Attention: dispatch based on layer type.
+    let attn = if is_deltanet_layer {
+        // DeltaNet: fused QKV + gate projections, Conv1D, decay/update gates.
+        let dummy = backend.alloc_tensor(&[1], TensorDtype::BF16);
+        let dummy2 = backend.alloc_tensor(&[1], TensorDtype::BF16);
+        let dummy3 = backend.alloc_tensor(&[1], TensorDtype::BF16);
+        let dummy4 = backend.alloc_tensor(&[1], TensorDtype::BF16);
+
+        let (
+            _q, _k, _v, _o,
+            in_proj_qkv, in_proj_a, in_proj_b, in_proj_z,
+            conv1d_weight, linear_out_proj,
+            a_log, dt_bias, linear_norm, attn_z_proj,
+        ) = load_deltanet_attention(
+            store, backend, prefix, config, layer_idx, sharding,
+        )?;
+
+        crate::model::loader::AttentionLoaded {
+            q_proj: dummy, k_proj: dummy2, v_proj: dummy3, o_proj: dummy4,
+            q_bias: None, k_bias: None, v_bias: None,
+            o_proj_bias: None, sinks: None,
+            q_norm: None, k_norm: None,
+            attn_z_proj,
+            in_proj_qkv, in_proj_a, in_proj_b, in_proj_z,
+            conv1d_weight, linear_out_proj,
+            a_log, dt_bias, linear_norm,
+        }
+    } else {
+        // GQA: standard attention with QK-norm + output gate.
+        // The shared helper handles QK-norm (via hints.has_qk_norm) and
+        // the attn_output_gate deinterleaving (via config.attn_output_gate).
+        load_attention_weights(
+            store, backend, prefix, config, hints, layer_idx,
+            false, // not deltanet
+            sharding,
+        )?
+    };
+
+    // FFN: MoE (fused experts + shared expert) or dense SwiGLU.
+    // The shared helper handles both via config.is_moe().
+    let ffn = load_ffn_weights(
+        store, backend, prefix, config, hints, layer_idx,
+        sharding, skip_experts,
+    )?;
+
+    Ok(assemble_layer_weights(norms, attn, ffn))
 }

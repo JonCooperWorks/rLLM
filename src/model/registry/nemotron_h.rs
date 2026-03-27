@@ -50,7 +50,7 @@
 
 use crate::gpu::{
     GpuAttention, GpuCore, GpuDeltaNet, GpuElementwise, GpuEmbed, GpuMamba2, GpuMatmul, GpuMoe,
-    GpuNorm, GpuRope, GpuAllReduce, GpuTurboQuant,
+    GpuNorm, GpuRope, GpuAllReduce, GpuTurboQuant, TensorDtype,
 };
 use crate::model::config::ModelConfig;
 use crate::model::kv_cache::{KvPool, SeqKvState};
@@ -675,4 +675,202 @@ pub(crate) fn forward_prefill_paged<
     );
 
     Ok(())
+}
+
+// ===========================================================================
+// Weight loading — Nemotron-H three-way hybrid layer loading.
+//
+// Each layer is purely one type (Mamba-2, MoE, or attention), unlike
+// standard transformers where every layer has both attention + FFN.
+// Moved here from loader.rs to keep architecture-specific logic co-located
+// with the forward pass.
+//
+// Weight naming convention (different from standard models):
+//   backbone.layers.{i}.norm.weight           — pre-layer RMSNorm (all types)
+//   backbone.layers.{i}.mixer.in_proj.weight  — Mamba-2 input projection
+//   backbone.layers.{i}.mixer.q_proj.weight   — attention Q projection
+//   backbone.layers.{i}.mixer.experts.{j}.*   — MoE expert weights
+//   backbone.layers.{i}.mixer.gate.weight     — MoE router
+// ===========================================================================
+
+use crate::model::loader::{
+    TensorStore, LayerWeights, ExpertWeights, upload_tensor,
+};
+
+/// Load weights for one Nemotron-H layer (Mamba-2, MoE, or attention).
+pub(crate) fn load_layer<B: GpuCore>(
+    store: &TensorStore,
+    backend: &B,
+    prefix: &str,
+    config: &ModelConfig,
+    layer_idx: usize,
+    _sharding: Option<&crate::gpu::parallel::ShardingPlan>,
+    skip_experts: bool,
+) -> anyhow::Result<LayerWeights<B>> {
+    let hidden = config.hidden_size;
+
+    // All Nemotron-H layers have a pre-layer RMSNorm.
+    let input_layernorm = upload_tensor(store, backend, &format!("{prefix}.norm.weight"), &[hidden])?;
+
+    // Bake rescale_prenorm_residual into the norm weights at load time.
+    // This is a constant 1/sqrt(2 * num_layers) scale factor that would otherwise
+    // require a separate scalar_mul dispatch on every layer of every token.
+    // By folding it into the norm weights, we get it for free: the RMSNorm
+    // output becomes `normalized(x) * (weight * scale)` instead of needing
+    // a separate `scalar_mul(output, scale)` afterwards.
+    if config.rescale_prenorm_residual {
+        let scale = 1.0 / ((2.0 * config.num_hidden_layers as f64).sqrt()) as f32;
+        let byte_count = backend.tensor_byte_count(&input_layernorm);
+        let mut buf = vec![0u8; byte_count];
+        backend.copy_to_host(&input_layernorm, &mut buf);
+        let bf16_slice: &mut [half::bf16] = bytemuck::cast_slice_mut(&mut buf);
+        for v in bf16_slice.iter_mut() {
+            *v = half::bf16::from_f32(v.to_f32() * scale);
+        }
+        backend.copy_to_tensor(&input_layernorm, &buf);
+    }
+
+    // Nemotron-H has only one norm per layer (no post-attention norm).
+    let dummy_norm = backend.alloc_tensor(&[1], TensorDtype::BF16);
+
+    let layer_type = config.layer_types.get(layer_idx).map(|s| s.as_str()).unwrap_or("");
+    let dummy = || backend.alloc_tensor(&[1], TensorDtype::BF16);
+
+    let mut lw = LayerWeights {
+        input_layernorm,
+        post_attention_layernorm: dummy_norm,
+        pre_feedforward_layernorm: None,
+        post_feedforward_layernorm: None,
+        q_proj: dummy(), k_proj: dummy(), v_proj: dummy(), o_proj: dummy(),
+        q_bias: None, k_bias: None, v_bias: None, o_proj_bias: None,
+        sinks: None, q_norm: None, k_norm: None, attn_z_proj: None,
+        in_proj_qkv: None, in_proj_a: None, in_proj_b: None, in_proj_z: None,
+        conv1d_weight: None, linear_out_proj: None, a_log: None, dt_bias: None,
+        linear_norm: None,
+        gate_proj: dummy(), up_proj: dummy(), down_proj: dummy(),
+        router_gate: None, router_bias: None, experts: None,
+        shared_expert_gate_proj: None, shared_expert_up_proj: None,
+        shared_expert_down_proj: None, shared_expert_gate: None,
+        mamba_in_proj: None, mamba_conv1d_weight: None, mamba_conv1d_bias: None,
+        mamba_out_proj: None, mamba_a_log: None, mamba_d: None,
+        mamba_dt_bias: None, mamba_norm: None,
+        e_score_correction_bias: None,
+    };
+
+    match layer_type {
+        "mamba2" => {
+            let d_inner = config.mamba2_d_inner();
+            let in_proj_dim = config.mamba2_in_proj_dim();
+            let ks = config.mamba_conv_kernel;
+            let n_heads = config.mamba_num_heads;
+
+            lw.mamba_in_proj = Some(upload_tensor(
+                store, backend, &format!("{prefix}.mixer.in_proj.weight"), &[in_proj_dim, hidden],
+            )?);
+            lw.mamba_conv1d_weight = Some(upload_tensor(
+                store, backend, &format!("{prefix}.mixer.conv1d.weight"), &[d_inner, ks],
+            )?);
+            let conv_b_view = store.tensor(&format!("{prefix}.mixer.conv1d.bias"))?;
+            lw.mamba_conv1d_bias = Some(backend.upload_tensor(conv_b_view.data(), &[d_inner], TensorDtype::F32));
+
+            lw.mamba_out_proj = Some(upload_tensor(
+                store, backend, &format!("{prefix}.mixer.out_proj.weight"), &[hidden, d_inner],
+            )?);
+
+            let a_log_view = store.tensor(&format!("{prefix}.mixer.A_log"))?;
+            lw.mamba_a_log = Some(backend.upload_tensor(a_log_view.data(), &[n_heads], TensorDtype::F32));
+
+            let d_view = store.tensor(&format!("{prefix}.mixer.D"))?;
+            lw.mamba_d = Some(backend.upload_tensor(d_view.data(), &[n_heads], TensorDtype::F32));
+
+            let dt_bias_view = store.tensor(&format!("{prefix}.mixer.dt_bias"))?;
+            lw.mamba_dt_bias = Some(backend.upload_tensor(dt_bias_view.data(), &[n_heads], TensorDtype::F32));
+
+            lw.mamba_norm = Some(upload_tensor(
+                store, backend, &format!("{prefix}.mixer.norm.weight"), &[d_inner],
+            )?);
+
+            if layer_idx == 0 {
+                eprintln!(
+                    "  mamba2: d_inner={d_inner}, in_proj={in_proj_dim}, conv_k={ks}, \
+                     state={}, groups={}, heads={n_heads}",
+                    config.ssm_state_size, config.mamba_n_groups
+                );
+            }
+        }
+        "moe" => {
+            let n_experts = config.num_experts;
+            let moe_inter = config.moe_intermediate_size;
+            let shared_inter = config.shared_expert_intermediate_size;
+
+            lw.router_gate = Some(upload_tensor(
+                store, backend, &format!("{prefix}.mixer.gate.weight"), &[n_experts, hidden],
+            )?);
+
+            let e_bias_name = format!("{prefix}.mixer.gate.e_score_correction_bias");
+            if let Ok(view) = store.tensor(&e_bias_name) {
+                lw.e_score_correction_bias = Some(
+                    backend.upload_tensor(view.data(), &[n_experts], TensorDtype::F32),
+                );
+            }
+
+            if !skip_experts {
+                let mut expert_vec = Vec::with_capacity(n_experts);
+                for j in 0..n_experts {
+                    let ep = format!("{prefix}.mixer.experts.{j}");
+                    let up = upload_tensor(store, backend, &format!("{ep}.up_proj.weight"), &[moe_inter, hidden])?;
+                    let down = upload_tensor(store, backend, &format!("{ep}.down_proj.weight"), &[hidden, moe_inter])?;
+                    expert_vec.push(ExpertWeights {
+                        gate_proj: dummy(),
+                        up_proj: up,
+                        down_proj: down,
+                        gate_bias: None,
+                        up_bias: None,
+                        down_bias: None,
+                    });
+                }
+                lw.experts = Some(expert_vec);
+            }
+
+            if shared_inter > 0 {
+                lw.shared_expert_up_proj = Some(upload_tensor(
+                    store, backend,
+                    &format!("{prefix}.mixer.shared_experts.up_proj.weight"),
+                    &[shared_inter, hidden],
+                )?);
+                lw.shared_expert_down_proj = Some(upload_tensor(
+                    store, backend,
+                    &format!("{prefix}.mixer.shared_experts.down_proj.weight"),
+                    &[hidden, shared_inter],
+                )?);
+            }
+
+            if layer_idx <= 1 {
+                eprintln!(
+                    "  moe: {n_experts} experts x inter={moe_inter}, shared={shared_inter}, \
+                     top_k={}, scale={:.1}",
+                    config.num_experts_per_tok, config.routed_scaling_factor
+                );
+            }
+        }
+        "attention" => {
+            let q_dim = config.num_attention_heads * config.head_dim;
+            let kv_dim = config.num_key_value_heads * config.head_dim;
+
+            lw.q_proj = upload_tensor(store, backend, &format!("{prefix}.mixer.q_proj.weight"), &[q_dim, hidden])?;
+            lw.k_proj = upload_tensor(store, backend, &format!("{prefix}.mixer.k_proj.weight"), &[kv_dim, hidden])?;
+            lw.v_proj = upload_tensor(store, backend, &format!("{prefix}.mixer.v_proj.weight"), &[kv_dim, hidden])?;
+            lw.o_proj = upload_tensor(store, backend, &format!("{prefix}.mixer.o_proj.weight"), &[hidden, q_dim])?;
+
+            if layer_idx <= 5 {
+                eprintln!(
+                    "  attention: q_dim={q_dim}, kv_dim={kv_dim}, heads={}/{}kv",
+                    config.num_attention_heads, config.num_key_value_heads
+                );
+            }
+        }
+        other => anyhow::bail!("unknown Nemotron-H layer type '{other}' at layer {layer_idx}"),
+    }
+
+    Ok(lw)
 }
