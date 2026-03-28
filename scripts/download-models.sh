@@ -116,6 +116,9 @@ if [[ "$TIER" == "medium" || "$TIER" == "big" || "$TIER" == "massive" ]]; then
     # DeepSeek R1 distill
     "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
     "openai/gpt-oss-20b"
+
+    # Nemotron-H 30B — Mamba-2 + MoE + attention hybrid, 31.6B (3.6B active)
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
   )
 fi
 
@@ -134,6 +137,9 @@ if [[ "$TIER" == "big" || "$TIER" == "massive" ]]; then
     # Qwen 3.5 122B MoE — 122B total (10B active), largest MoE we test
     "Qwen/Qwen3.5-122B-A10B"
     "openai/gpt-oss-120b"
+
+    # Nemotron-H 120B — Mamba-2 + MoE + attention hybrid, 120B (12B active)
+    "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
   )
 fi
 
@@ -150,8 +156,18 @@ echo ""
 
 FAILED=()
 
+# Models whose HF repo name doesn't match our local convention
+declare -A RENAME=(
+  ["nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"]="nemotron-3-30b"
+  ["nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"]="nemotron-3-120b"
+)
+
 for model in "${MODELS[@]}"; do
-  name=$(echo "$model" | awk -F/ '{print $NF}' | tr '[:upper:]' '[:lower:]')
+  if [[ -n "${RENAME[$model]:-}" ]]; then
+    name="${RENAME[$model]}"
+  else
+    name=$(echo "$model" | awk -F/ '{print $NF}' | tr '[:upper:]' '[:lower:]')
+  fi
   echo "=== $model → $DEST/$name ==="
 
   # If dir exists but has no safetensors, clear stale HF cache to force re-download

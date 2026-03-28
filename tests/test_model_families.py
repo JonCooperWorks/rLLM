@@ -64,6 +64,7 @@ BASE_MODELS = [
     # reduced logit precision.  temperature=0.6 adds enough noise to break the loop.
     ModelConfig("gpt-oss-20b", "gpt-oss-20b",                     "GptOss",    is_moe=True, bf16_size_gb=40, supports_stream_experts=False, temperature=0.6),
     ModelConfig("nemotron-h-30b", "nemotron-3-30b",               "NemotronH", is_moe=True, bf16_size_gb=63, supports_stream_experts=False),
+    ModelConfig("nemotron-h-120b","nemotron-3-120b",              "NemotronH", is_moe=True, bf16_size_gb=240),
 ]
 
 # TurboQuant variations (tested on Llama 1B — fastest to load).
