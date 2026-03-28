@@ -95,6 +95,14 @@ struct TopKSigmoidParams {
 }
 unsafe impl DeviceRepr for TopKSigmoidParams {}
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ArgmaxParams {
+    vocab_size: u32,
+    batch_size: u32,
+}
+unsafe impl DeviceRepr for ArgmaxParams {}
+
 impl GpuElementwise for CudaBackend {
     fn silu_mul(&self, gate: &CudaTensor, up: &CudaTensor, out: &CudaTensor, size: u32) {
         let params = ElemParams { size };
@@ -392,5 +400,30 @@ impl GpuElementwise for CudaBackend {
                 .launch(cfg)
         }
         .expect("top_k_sigmoid launch failed");
+    }
+
+    fn argmax_gpu(
+        &self,
+        logits: &CudaTensor,
+        output: &CudaTensor,
+        vocab_size: u32,
+        batch_size: u32,
+    ) {
+        let params = ArgmaxParams {
+            vocab_size,
+            batch_size,
+        };
+        // One block per row, up to 1024 threads per block.
+        let block = 1024.min(vocab_size);
+        let cfg = CudaBackend::cfg_blocks(batch_size, block);
+        unsafe {
+            self.stream
+                .launch_builder(&self.fn_argmax_gpu)
+                .arg(&params)
+                .arg(&logits.buf)
+                .arg(&output.buf)
+                .launch(cfg)
+        }
+        .expect("argmax_gpu launch failed");
     }
 }

@@ -97,6 +97,21 @@ pub(crate) trait Dispatch {
     fn sample(&self, temperature: f32, top_p: f32, rng: &mut impl rand::Rng)
     -> anyhow::Result<u32>;
 
+    /// GPU-resident greedy sampling: argmax entirely on device.
+    ///
+    /// Avoids copying the full logits tensor to CPU — only 4 bytes (one u32
+    /// token ID) are transferred.  Used when temperature == 0.0.
+    ///
+    /// Inspired by rvLLM (Andy Norris / m0at).
+    fn sample_greedy_gpu(&self) -> anyhow::Result<u32> {
+        anyhow::bail!("GPU greedy sampling not supported by this Dispatch implementation")
+    }
+
+    /// GPU-resident batched greedy sampling: argmax for N sequences at once.
+    fn sample_batch_greedy_gpu(&self, _batch_size: usize) -> anyhow::Result<Vec<u32>> {
+        anyhow::bail!("GPU batched greedy sampling not supported by this Dispatch implementation")
+    }
+
     // -----------------------------------------------------------------------
     // Prefix caching — reusing KV blocks across requests with shared prefixes.
     //

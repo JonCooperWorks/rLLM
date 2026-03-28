@@ -126,4 +126,26 @@ pub(crate) trait GpuElementwise: GpuCore {
         scaling_factor: f32,
         norm_topk_prob: bool,
     );
+
+    /// GPU-side argmax: find the index of the maximum value per row.
+    /// Returns token IDs directly on device — avoids DtoH logit transfer.
+    ///
+    /// For greedy decoding (temperature=0), this eliminates the dominant
+    /// device-to-host bottleneck in LLM inference: instead of copying the
+    /// full [batch_size, vocab_size] logits tensor to CPU (~37 MB at
+    /// batch=128, vocab=152K), only batch_size × 4 bytes of token IDs
+    /// are transferred — a ~72,000x reduction in DtoH traffic.
+    ///
+    /// Inspired by rvLLM (Andy Norris / m0at): GPU-resident greedy decoding.
+    /// See: https://github.com/m0at/rvllm
+    ///
+    /// `logits`: [batch_size, vocab_size] bf16 — model output logits.
+    /// `output`: [batch_size] u32 — one argmax token ID per row.
+    fn argmax_gpu(
+        &self,
+        logits: &Self::Tensor,
+        output: &Self::Tensor,
+        vocab_size: u32,
+        batch_size: u32,
+    );
 }

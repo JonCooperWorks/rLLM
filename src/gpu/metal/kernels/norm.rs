@@ -105,4 +105,59 @@ impl GpuNorm for MetalBackend {
             MTLSize::new(256, 1, 1),
         );
     }
+
+    fn fused_residual_rms_norm(
+        &self,
+        hidden: &MetalTensor,
+        residual: &MetalTensor,
+        weight: &MetalTensor,
+        out: &MetalTensor,
+        _hidden_size: u32,
+        eps: f32,
+    ) {
+        let hidden_size = weight.shape[0] as u32;
+        let params = RmsNormParams { hidden_size, eps };
+        self.dispatch_async(
+            &self.pipeline_fused_residual_rms_norm,
+            &params,
+            &[
+                (&hidden.buffer, 1),
+                (&residual.buffer, 2),
+                (&weight.buffer, 3),
+                (&out.buffer, 4),
+            ],
+            MTLSize::new(256, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+    }
+
+    fn fused_residual_rms_norm_batch(
+        &self,
+        hidden: &MetalTensor,
+        residual: &MetalTensor,
+        weight: &MetalTensor,
+        out: &MetalTensor,
+        _hidden_size: u32,
+        eps: f32,
+        batch_size: u32,
+    ) {
+        let hidden_size = weight.shape[0] as u32;
+        let params = RmsNormBatchParams {
+            hidden_size,
+            eps,
+            batch_size,
+        };
+        self.dispatch_async(
+            &self.pipeline_fused_residual_rms_norm_batch,
+            &params,
+            &[
+                (&hidden.buffer, 1),
+                (&residual.buffer, 2),
+                (&weight.buffer, 3),
+                (&out.buffer, 4),
+            ],
+            MTLSize::new(batch_size as u64 * 256, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+    }
 }

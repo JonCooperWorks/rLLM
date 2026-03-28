@@ -364,6 +364,43 @@ pub(crate) fn o_proj_residual_qdim<B: GpuMatmul + GpuElementwise + GpuAllReduce>
     backend.add(hidden, norm_buf, hidden, hidden_size);
 }
 
+/// O projection + fused residual-add + RMSNorm for the post-attention norm.
+///
+/// Combines `o_proj_residual` and the beginning of `ffn_block` into one call:
+///   matmul(o_proj) → allreduce → fused(hidden += norm_buf; rms_norm → norm_buf)
+///
+/// This saves one full read of the hidden tensor per layer by fusing the
+/// residual add with the post-attention RMSNorm.
+///
+/// Inspired by rvLLM (Andy Norris / m0at): fusing residual + norm eliminates
+/// redundant memory traffic.  See: https://github.com/m0at/rvllm
+/// O projection + fused residual-add + RMSNorm for the post-attention norm.
+///
+/// Combines `o_proj_residual` and the FFN block's initial rms_norm into one call:
+///   matmul(o_proj) → allreduce → fused(hidden += proj; rms_norm → norm_buf)
+///
+/// After this call, `hidden` contains the updated residual state and `norm_buf`
+/// contains the RMSNorm'd hidden state ready for the FFN.
+///
+/// Inspired by rvLLM (Andy Norris / m0at): fusing residual + norm eliminates
+/// redundant memory traffic.  See: https://github.com/m0at/rvllm
+pub(crate) fn o_proj_fused_residual_norm_qdim<B: GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce>(
+    backend: &B,
+    layer: &LayerWeights<B>,
+    attn_out: &B::Tensor,
+    norm_buf: &B::Tensor,
+    hidden: &B::Tensor,
+    hidden_size: u32,
+    q_dim: u32,
+    eps: f32,
+) {
+    backend.matmul(&layer.o_proj, attn_out, norm_buf, hidden_size, q_dim);
+    backend.all_reduce_sum(norm_buf, hidden_size);
+    backend.fused_residual_rms_norm(
+        hidden, norm_buf, &layer.post_attention_layernorm, norm_buf, hidden_size, eps,
+    );
+}
+
 // ===========================================================================
 // SwiGLU FFN block.
 // ===========================================================================
@@ -406,6 +443,40 @@ pub(crate) fn ffn_block<B: GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce +
         inter_size,
     );
     backend.all_reduce_sum(norm_buf, hidden_size); // no-op when world_size=1
+    backend.add(hidden, norm_buf, hidden, hidden_size);
+}
+
+/// FFN sub-block that takes a pre-normed input (norm already done by fused residual+norm).
+///
+/// Used when the preceding o_proj_fused_residual_norm already produced the
+/// post-attention normalized state in norm_buf.  Skips the initial rms_norm.
+pub(crate) fn ffn_block_pre_normed<B: GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce + GpuMoe>(
+    backend: &B,
+    layer: &LayerWeights<B>,
+    hidden: &B::Tensor,
+    norm_buf: &B::Tensor,
+    gate_buf: &B::Tensor,
+    _up_buf: &B::Tensor,
+    hidden_size: u32,
+    inter_size: u32,
+) {
+    // norm_buf already contains the RMSNorm'd hidden state.
+    backend.fused_gate_up_swiglu(
+        &layer.gate_proj,
+        &layer.up_proj,
+        norm_buf,
+        gate_buf,
+        inter_size,
+        hidden_size,
+    );
+    backend.matmul(
+        &layer.down_proj,
+        gate_buf,
+        norm_buf,
+        hidden_size,
+        inter_size,
+    );
+    backend.all_reduce_sum(norm_buf, hidden_size);
     backend.add(hidden, norm_buf, hidden, hidden_size);
 }
 

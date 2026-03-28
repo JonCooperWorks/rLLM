@@ -249,6 +249,59 @@ impl GpuNorm for CpuBackend {
             write_bf16_at(out, offset, &result);
         }
     }
+
+    fn fused_residual_rms_norm(
+        &self,
+        hidden: &CpuTensor,
+        residual: &CpuTensor,
+        weight: &CpuTensor,
+        out: &CpuTensor,
+        hidden_size: u32,
+        eps: f32,
+    ) {
+        let n = hidden_size as usize;
+        let h = read_bf16(hidden, n);
+        let r = read_bf16(residual, n);
+        let w = read_bf16(weight, n);
+
+        // hidden += residual
+        let summed: Vec<f32> = h.iter().zip(r.iter()).map(|(hi, ri)| hi + ri).collect();
+        write_bf16(hidden, &summed);
+
+        // RMSNorm on the summed result
+        let mean_sq: f32 = summed.iter().map(|v| v * v).sum::<f32>() / n as f32;
+        let scale = 1.0 / (mean_sq + eps).sqrt();
+        let result: Vec<f32> = summed.iter().zip(w.iter()).map(|(si, wi)| si * scale * wi).collect();
+        write_bf16(out, &result);
+    }
+
+    fn fused_residual_rms_norm_batch(
+        &self,
+        hidden: &CpuTensor,
+        residual: &CpuTensor,
+        weight: &CpuTensor,
+        out: &CpuTensor,
+        hidden_size: u32,
+        eps: f32,
+        batch_size: u32,
+    ) {
+        let dim = hidden_size as usize;
+        let w = read_bf16(weight, dim);
+
+        for b in 0..batch_size as usize {
+            let offset = b * dim * 2;
+            let h = read_bf16_bytes(&hidden.data[offset..], dim);
+            let r = read_bf16_bytes(&residual.data[offset..], dim);
+
+            let summed: Vec<f32> = h.iter().zip(r.iter()).map(|(hi, ri)| hi + ri).collect();
+            write_bf16_at(hidden, offset, &summed);
+
+            let mean_sq: f32 = summed.iter().map(|v| v * v).sum::<f32>() / dim as f32;
+            let scale = 1.0 / (mean_sq + eps).sqrt();
+            let result: Vec<f32> = summed.iter().zip(w.iter()).map(|(si, wi)| si * scale * wi).collect();
+            write_bf16_at(out, offset, &result);
+        }
+    }
 }
 
 // ===========================================================================
@@ -535,6 +588,31 @@ impl GpuElementwise for CpuBackend {
             result[i * 2 + 1] = weight;
         }
         write_f32(output, &result);
+    }
+
+    fn argmax_gpu(
+        &self,
+        logits: &CpuTensor,
+        output: &CpuTensor,
+        vocab_size: u32,
+        batch_size: u32,
+    ) {
+        let v = vocab_size as usize;
+        for b in 0..batch_size as usize {
+            let offset = b * v;
+            let row = read_bf16_bytes(&logits.data[offset * 2..], v);
+            let mut best_idx = 0u32;
+            let mut best_val = f32::NEG_INFINITY;
+            for (i, &val) in row.iter().enumerate() {
+                if val > best_val {
+                    best_val = val;
+                    best_idx = i as u32;
+                }
+            }
+            // Write u32 token ID at position b.
+            let dst = unsafe { (output.data.as_ptr() as *mut u32).add(b) };
+            unsafe { *dst = best_idx };
+        }
     }
 }
 

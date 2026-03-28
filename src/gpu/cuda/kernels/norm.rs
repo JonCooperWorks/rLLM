@@ -109,4 +109,57 @@ impl GpuNorm for CudaBackend {
         }
         .expect("layer_norm_batch launch failed");
     }
+
+    fn fused_residual_rms_norm(
+        &self,
+        hidden: &CudaTensor,
+        residual: &CudaTensor,
+        weight: &CudaTensor,
+        out: &CudaTensor,
+        hidden_size: u32,
+        eps: f32,
+    ) {
+        let params = RmsNormParams { hidden_size, eps };
+        let cfg = CudaBackend::cfg_blocks(1, 256);
+        unsafe {
+            self.stream
+                .launch_builder(&self.fn_fused_residual_rms_norm)
+                .arg(&params)
+                .arg(&hidden.buf)
+                .arg(&residual.buf)
+                .arg(&weight.buf)
+                .arg(&out.buf)
+                .launch(cfg)
+        }
+        .expect("fused_residual_rms_norm launch failed");
+    }
+
+    fn fused_residual_rms_norm_batch(
+        &self,
+        hidden: &CudaTensor,
+        residual: &CudaTensor,
+        weight: &CudaTensor,
+        out: &CudaTensor,
+        hidden_size: u32,
+        eps: f32,
+        batch_size: u32,
+    ) {
+        let params = RmsNormBatchParams {
+            hidden_size,
+            eps,
+            batch_size,
+        };
+        let cfg = CudaBackend::cfg_blocks(batch_size, 256);
+        unsafe {
+            self.stream
+                .launch_builder(&self.fn_fused_residual_rms_norm_batch)
+                .arg(&params)
+                .arg(&hidden.buf)
+                .arg(&residual.buf)
+                .arg(&weight.buf)
+                .arg(&out.buf)
+                .launch(cfg)
+        }
+        .expect("fused_residual_rms_norm_batch launch failed");
+    }
 }

@@ -61,7 +61,7 @@
 use half::bf16;
 use rand::Rng;
 
-use crate::gpu::GpuBackend;
+use crate::gpu::{GpuBackend, TensorDtype};
 
 /// Sample the next token using temperature scaling and top-p (nucleus) filtering.
 ///
@@ -330,6 +330,48 @@ pub(crate) fn sample_greedy<B: GpuBackend>(backend: &B, logits: &B::Tensor, voca
     // Truncate to tokenizer vocab size (see sample() for rationale).
     let effective_bytes = (vocab_size * 2).min(buf.len());
     Ok(argmax_bf16(&buf[..effective_bytes]))
+}
+
+/// GPU-resident greedy sampling: argmax computed entirely on device.
+///
+/// Only 4 bytes transferred (one u32 token ID), not the full logit vector.
+/// For vocab_size=152K this reduces DtoH from ~300 KB to 4 bytes per sequence.
+///
+/// Technique from rvLLM (Andy Norris / m0at): the single most impactful
+/// optimization for greedy decode.  See: https://github.com/m0at/rvllm
+pub(crate) fn sample_greedy_gpu<B: GpuBackend>(
+    backend: &B,
+    logits: &B::Tensor,
+    vocab_size: usize,
+) -> anyhow::Result<u32> {
+    // Allocate a tiny output buffer for one u32 token ID.
+    let output = backend.alloc_tensor(&[1], TensorDtype::F32); // 4 bytes = 1 u32
+    backend.argmax_gpu(logits, &output, vocab_size as u32, 1);
+
+    // Copy just the single u32 result back to host.
+    let mut buf = [0u8; 4];
+    backend.copy_to_host(&output, &mut buf);
+    Ok(u32::from_ne_bytes(buf))
+}
+
+/// GPU-resident batched greedy sampling: argmax for N sequences at once.
+///
+/// Only N × 4 bytes transferred instead of N × vocab_size × 2 bytes.
+/// At batch=128, vocab=152K: 512 bytes vs ~37 MB — a ~72,000x reduction.
+pub(crate) fn sample_batch_greedy_gpu<B: GpuBackend>(
+    backend: &B,
+    logits_batch: &B::Tensor,
+    batch_size: usize,
+    vocab_size: usize,
+) -> anyhow::Result<Vec<u32>> {
+    let output = backend.alloc_tensor(&[batch_size], TensorDtype::F32);
+    backend.argmax_gpu(logits_batch, &output, vocab_size as u32, batch_size as u32);
+
+    // Copy N u32 token IDs back to host.
+    let mut buf = vec![0u8; batch_size * 4];
+    backend.copy_to_host(&output, &mut buf);
+    let ids: &[u32] = bytemuck::cast_slice(&buf);
+    Ok(ids.to_vec())
 }
 
 /// Find the index of the maximum value in a bf16 byte slice.

@@ -460,7 +460,18 @@ pub(crate) fn run_step<D: Dispatch>(
         }
         model::profile::tick();
 
-        let sampled = dispatch.sample_batch(&temperatures, &top_ps, &mut rng)?;
+        // Greedy gate: if ALL sequences are greedy (temperature==0), try
+        // GPU-resident batched argmax.  Falls back to CPU sampling if the
+        // backend doesn't support it.  Inspired by rvLLM (m0at).
+        let all_greedy = temperatures.iter().all(|&t| t == 0.0);
+        let sampled = if all_greedy {
+            match dispatch.sample_batch_greedy_gpu(temperatures.len()) {
+                Ok(tokens) => tokens,
+                Err(_) => dispatch.sample_batch(&temperatures, &top_ps, &mut rng)?,
+            }
+        } else {
+            dispatch.sample_batch(&temperatures, &top_ps, &mut rng)?
+        };
         for (i, &id) in decoding_ids.iter().enumerate() {
             let seq = scheduler.active.get_mut(&id).unwrap();
             seq.generated_tokens.push(sampled[i]);
@@ -528,7 +539,15 @@ fn sample_and_finish<D: Dispatch>(
     step_tokens: &mut Vec<(SeqId, u32)>,
     global_rng: &mut impl rand::Rng,
 ) -> anyhow::Result<()> {
-    let next_token = if let Some(ref mut seq_rng) = seq.seeded_rng {
+    // Greedy gate: when temperature==0, try GPU-resident argmax to avoid
+    // copying the full logits tensor to CPU.  Falls back to CPU sampling
+    // if the backend doesn't support it.  Inspired by rvLLM (m0at).
+    let next_token = if seq.temperature == 0.0 {
+        match dispatch.sample_greedy_gpu() {
+            Ok(token) => token,
+            Err(_) => dispatch.sample(0.0, 1.0, global_rng)?,
+        }
+    } else if let Some(ref mut seq_rng) = seq.seeded_rng {
         dispatch.sample(seq.temperature, seq.top_p, seq_rng)?
     } else {
         dispatch.sample(seq.temperature, seq.top_p, global_rng)?
@@ -673,6 +692,19 @@ impl<'a, B: GpuBackend> Dispatch for SingleGpuDispatch<'a, B> {
         rng: &mut impl rand::Rng,
     ) -> anyhow::Result<u32> {
         crate::model::sampler::sample(self.backend, self.model.logits(), temperature, top_p, rng, self.tokenizer_vocab_size)
+    }
+
+    fn sample_greedy_gpu(&self) -> anyhow::Result<u32> {
+        crate::model::sampler::sample_greedy_gpu(self.backend, self.model.logits(), self.tokenizer_vocab_size)
+    }
+
+    fn sample_batch_greedy_gpu(&self, batch_size: usize) -> anyhow::Result<Vec<u32>> {
+        crate::model::sampler::sample_batch_greedy_gpu(
+            self.backend,
+            &self.logits_batch,
+            batch_size,
+            self.model.config().vocab_size,
+        )
     }
 
     fn prefix_cache_lookup(&mut self, prompt_tokens: &[u32]) -> Option<(Vec<BlockHandle>, usize)> {

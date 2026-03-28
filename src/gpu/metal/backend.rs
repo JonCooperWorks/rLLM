@@ -176,6 +176,13 @@ pub(crate) struct MetalBackend {
     pub(crate) pipeline_relu_squared: metal::ComputePipelineState,
     pub(crate) pipeline_top_k_sigmoid: metal::ComputePipelineState,
 
+    // GPU-side argmax for greedy decoding (rvLLM-inspired).
+    pub(crate) pipeline_argmax_gpu: metal::ComputePipelineState,
+
+    // Fused residual-add + RMSNorm (rvLLM-inspired).
+    pub(crate) pipeline_fused_residual_rms_norm: metal::ComputePipelineState,
+    pub(crate) pipeline_fused_residual_rms_norm_batch: metal::ComputePipelineState,
+
     // TurboQuant KV cache quantization kernels (arXiv:2504.19874).
     pub(crate) pipeline_turbo_quantize_paged: metal::ComputePipelineState,
     pub(crate) pipeline_turbo_quantize_paged_batch: metal::ComputePipelineState,
@@ -518,6 +525,28 @@ impl MetalBackend {
             &compile_opts,
         )?;
 
+        // GPU-side argmax (rvLLM-inspired).
+        let pipeline_argmax_gpu = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_ELEMENTWISE,
+            "argmax_gpu",
+            &compile_opts,
+        )?;
+
+        // Fused residual-add + RMSNorm (rvLLM-inspired).
+        let pipeline_fused_residual_rms_norm = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_RMS_NORM,
+            "fused_residual_rms_norm",
+            &compile_opts,
+        )?;
+        let pipeline_fused_residual_rms_norm_batch = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_RMS_NORM,
+            "fused_residual_rms_norm_batch",
+            &compile_opts,
+        )?;
+
         // TurboQuant KV cache quantization pipelines.
         let pipeline_turbo_quantize_paged = Self::make_pipeline(
             &device,
@@ -609,6 +638,9 @@ impl MetalBackend {
             pipeline_mamba2_gated_rms_norm,
             pipeline_relu_squared,
             pipeline_top_k_sigmoid,
+            pipeline_argmax_gpu,
+            pipeline_fused_residual_rms_norm,
+            pipeline_fused_residual_rms_norm_batch,
             pipeline_turbo_quantize_paged,
             pipeline_turbo_quantize_paged_batch,
             pipeline_turbo_rotate_q,

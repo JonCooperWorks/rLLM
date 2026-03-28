@@ -281,6 +281,95 @@ struct TopKSigmoidParams {
     unsigned int norm_topk_prob;
 };
 
+// ===========================================================================
+// GPU-side argmax for greedy decoding.
+//
+// One block per row (batch element), block_size = min(vocab_size, 1024).
+// Each thread strides across its row finding a local max, then a shared-memory
+// tree reduction produces the per-row argmax.
+//
+// Output: int32[batch_size] — one token ID per sequence.
+//
+// This kernel eliminates the dominant DtoH bottleneck in greedy decoding:
+// instead of copying [batch_size, vocab_size] bf16 logits to CPU (~37 MB at
+// batch=128, vocab=152K), only batch_size × 4 bytes of token IDs transfer.
+//
+// Inspired by rvLLM (Andy Norris / m0at): GPU-resident greedy decoding.
+// See: https://github.com/m0at/rvllm
+// ===========================================================================
+
+struct ArgmaxParams {
+    unsigned int vocab_size;
+    unsigned int batch_size;
+};
+
+extern "C" __global__ void argmax_gpu(
+    const ArgmaxParams params,
+    const __nv_bfloat16* __restrict__ logits,   // [batch_size, vocab_size]
+    unsigned int* __restrict__ output            // [batch_size] token IDs
+) {
+    const unsigned int row = blockIdx.x;
+    if (row >= params.batch_size) return;
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int tg_size = blockDim.x;
+    const unsigned int vocab = params.vocab_size;
+    const __nv_bfloat16* row_logits = logits + row * vocab;
+
+    // Phase 1: Each thread finds its local max via strided scan.
+    float best_val = -INFINITY;
+    unsigned int best_idx = 0;
+    for (unsigned int i = tid; i < vocab; i += tg_size) {
+        float v = __bfloat162float(row_logits[i]);
+        if (v > best_val) {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+
+    // Phase 2: Warp-level reduction — find max within each 32-thread warp.
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other_val = __shfl_xor_sync(0xffffffff, best_val, offset);
+        unsigned int other_idx = __shfl_xor_sync(0xffffffff, best_idx, offset);
+        if (other_val > best_val) {
+            best_val = other_val;
+            best_idx = other_idx;
+        }
+    }
+
+    // Phase 3: Cross-warp reduction via shared memory.
+    __shared__ float smem_vals[32];
+    __shared__ unsigned int smem_idxs[32];
+    unsigned int warp_id = tid / 32;
+    unsigned int lane_id = tid % 32;
+
+    if (lane_id == 0) {
+        smem_vals[warp_id] = best_val;
+        smem_idxs[warp_id] = best_idx;
+    }
+    __syncthreads();
+
+    // Final reduction in warp 0.
+    if (warp_id == 0) {
+        unsigned int num_warps = (tg_size + 31) / 32;
+        best_val = (lane_id < num_warps) ? smem_vals[lane_id] : -INFINITY;
+        best_idx = (lane_id < num_warps) ? smem_idxs[lane_id] : 0;
+
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float other_val = __shfl_xor_sync(0xffffffff, best_val, offset);
+            unsigned int other_idx = __shfl_xor_sync(0xffffffff, best_idx, offset);
+            if (other_val > best_val) {
+                best_val = other_val;
+                best_idx = other_idx;
+            }
+        }
+
+        if (lane_id == 0) {
+            output[row] = best_idx;
+        }
+    }
+}
+
 extern "C" __global__ void top_k_sigmoid(
     const TopKSigmoidParams params,
     const __nv_bfloat16* __restrict__ logits,

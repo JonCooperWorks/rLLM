@@ -301,3 +301,115 @@ kernel void layer_norm_batch(
         row_out[i] = bfloat(val * float(weight[i]) + float(bias[i]));
     }
 }
+
+// ===========================================================================
+// Fused residual-add + RMSNorm — single vector.
+//
+// hidden[i] += residual[i], then out[i] = weight[i] * hidden[i] / sqrt(mean(hidden²) + eps)
+//
+// Saves one full read of the hidden tensor vs separate add() + rms_norm().
+//
+// Inspired by rvLLM (Andy Norris / m0at): fusing residual + norm eliminates
+// redundant memory traffic.  See: https://github.com/m0at/rvllm
+// ===========================================================================
+
+kernel void fused_residual_rms_norm(
+    constant RmsNormParams& params   [[buffer(0)]],
+    device bfloat* hidden            [[buffer(1)]],   // in-place: hidden += residual
+    device const bfloat* residual    [[buffer(2)]],
+    device const bfloat* weight      [[buffer(3)]],
+    device bfloat* output            [[buffer(4)]],
+    uint tid                         [[thread_index_in_threadgroup]],
+    uint tg_size                     [[threads_per_threadgroup]],
+    uint sg                          [[simdgroup_index_in_threadgroup]],
+    uint sl                          [[thread_index_in_simdgroup]]
+) {
+    uint hidden_size = params.hidden_size;
+
+    // Phase 1: Add residual in-place and accumulate sum-of-squares.
+    float sum_sq = 0.0f;
+    for (uint i = tid; i < hidden_size; i += tg_size) {
+        float h = float(hidden[i]) + float(residual[i]);
+        hidden[i] = bfloat(h);
+        sum_sq += h * h;
+    }
+
+    // Phase 2: SIMD-level reduction.
+    sum_sq = simd_sum(sum_sq);
+
+    // Phase 3: Cross-SIMD reduction.
+    threadgroup float shared[32];
+    if (sl == 0) shared[sg] = sum_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        uint nsg = (tg_size + 31) / 32;
+        float val = (sl < nsg) ? shared[sl] : 0.0f;
+        val = simd_sum(val);
+        if (sl == 0) shared[0] = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float mean_sq = shared[0] / float(hidden_size);
+    float scale = rsqrt(mean_sq + params.eps);
+
+    // Phase 4: Normalise and multiply by learned weight.
+    for (uint i = tid; i < hidden_size; i += tg_size) {
+        float val = float(hidden[i]);
+        output[i] = bfloat(val * scale * float(weight[i]));
+    }
+}
+
+// ===========================================================================
+// Batched fused residual-add + RMSNorm — one threadgroup per row.
+// ===========================================================================
+
+kernel void fused_residual_rms_norm_batch(
+    constant RmsNormBatchParams& params [[buffer(0)]],
+    device bfloat* hidden               [[buffer(1)]],
+    device const bfloat* residual       [[buffer(2)]],
+    device const bfloat* weight         [[buffer(3)]],
+    device bfloat* output               [[buffer(4)]],
+    uint tgid                           [[threadgroup_position_in_grid]],
+    uint tid                            [[thread_index_in_threadgroup]],
+    uint tg_size                        [[threads_per_threadgroup]],
+    uint sg                             [[simdgroup_index_in_threadgroup]],
+    uint sl                             [[thread_index_in_simdgroup]]
+) {
+    uint row = tgid;
+    if (row >= params.batch_size) return;
+
+    uint hidden_size = params.hidden_size;
+    device bfloat* row_h    = hidden   + row * hidden_size;
+    device const bfloat* row_r = residual + row * hidden_size;
+    device bfloat* row_out  = output   + row * hidden_size;
+
+    // Phase 1: Add residual in-place and accumulate sum-of-squares.
+    float sum_sq = 0.0f;
+    for (uint i = tid; i < hidden_size; i += tg_size) {
+        float h = float(row_h[i]) + float(row_r[i]);
+        row_h[i] = bfloat(h);
+        sum_sq += h * h;
+    }
+
+    // Phase 2+3: Reduction.
+    sum_sq = simd_sum(sum_sq);
+    threadgroup float shared[32];
+    if (sl == 0) shared[sg] = sum_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        uint nsg = (tg_size + 31) / 32;
+        float val = (sl < nsg) ? shared[sl] : 0.0f;
+        val = simd_sum(val);
+        if (sl == 0) shared[0] = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float mean_sq = shared[0] / float(hidden_size);
+    float scale = rsqrt(mean_sq + params.eps);
+
+    // Phase 4: Normalise.
+    for (uint i = tid; i < hidden_size; i += tg_size) {
+        float val = float(row_h[i]);
+        row_out[i] = bfloat(val * scale * float(weight[i]));
+    }
+}

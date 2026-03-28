@@ -230,7 +230,10 @@ pub(crate) fn forward_single_impl<
             None, // No sliding window, default attention scale, no sinks.
             m.turbo_ctx.as_ref(),
         );
-        primitives::o_proj_residual_qdim(
+        // Fused O-proj + residual-add + post-attention RMSNorm: saves one
+        // full read of the hidden tensor by combining the residual add with
+        // the FFN's initial norm.  Inspired by rvLLM (m0at).
+        primitives::o_proj_fused_residual_norm_qdim(
             m.backend,
             layer,
             &m.attn_out,
@@ -238,19 +241,19 @@ pub(crate) fn forward_single_impl<
             &m.hidden,
             d.hidden_size,
             d.q_dim,
+            d.eps,
         );
         profile::record(m.backend, t, Component::Attention);
 
-        // --- FFN sub-block ---
+        // --- FFN sub-block (pre-normed: fused residual+norm already produced norm_buf) ---
         let t = profile::begin(m.backend);
-        primitives::ffn_block(
+        primitives::ffn_block_pre_normed(
             m.backend,
             layer,
             &m.hidden,
             &m.norm_buf,
             &m.gate_buf,
             &m.up_buf,
-            d.eps,
             d.hidden_size,
             d.inter_size,
         );

@@ -59,4 +59,36 @@ pub(crate) trait GpuNorm: GpuCore {
         out: &Self::Tensor,
         batch_size: u32,
     );
+
+    /// Fused residual-add + RMSNorm: hidden += residual, then normalise hidden.
+    ///
+    /// Equivalent to `add(hidden, residual, hidden, size); rms_norm(hidden, weight, eps, out)`
+    /// but saves one full read of the hidden tensor by fusing both operations
+    /// into a single kernel — critical for bandwidth-bound decode steps.
+    ///
+    /// Inspired by rvLLM (Andy Norris / m0at): fusing residual + norm eliminates
+    /// redundant memory traffic.  See: https://github.com/m0at/rvllm
+    fn fused_residual_rms_norm(
+        &self,
+        hidden: &Self::Tensor,
+        residual: &Self::Tensor,
+        weight: &Self::Tensor,
+        out: &Self::Tensor,
+        hidden_size: u32,
+        eps: f32,
+    );
+
+    /// Batched fused residual-add + RMSNorm: operates on [batch_size, hidden_size].
+    ///
+    /// Each row independently: hidden[row] += residual[row], then normalise.
+    fn fused_residual_rms_norm_batch(
+        &self,
+        hidden: &Self::Tensor,
+        residual: &Self::Tensor,
+        weight: &Self::Tensor,
+        out: &Self::Tensor,
+        hidden_size: u32,
+        eps: f32,
+        batch_size: u32,
+    );
 }

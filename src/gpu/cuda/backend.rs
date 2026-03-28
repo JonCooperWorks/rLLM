@@ -200,6 +200,13 @@ pub(crate) struct CudaBackend {
     // Fused QKV attention (vision encoder).
     pub(crate) fn_prefill_attention_fused_qkv: CudaFunction,
 
+    // GPU-side argmax for greedy decoding (rvLLM-inspired).
+    pub(crate) fn_argmax_gpu: CudaFunction,
+
+    // Fused residual-add + RMSNorm (rvLLM-inspired).
+    pub(crate) fn_fused_residual_rms_norm: CudaFunction,
+    pub(crate) fn_fused_residual_rms_norm_batch: CudaFunction,
+
     // TurboQuant KV cache quantization kernels.
     pub(crate) fn_turbo_quantize_paged: CudaFunction,
     pub(crate) fn_turbo_quantize_paged_batch: CudaFunction,
@@ -434,6 +441,13 @@ impl CudaBackend {
 
             // Fused QKV attention (vision encoder).
             fn_prefill_attention_fused_qkv: func(&mod_attn_128, "prefill_attention_fused_qkv")?,
+
+            // GPU-side argmax (rvLLM-inspired).
+            fn_argmax_gpu: func(&mod_elementwise, "argmax_gpu")?,
+
+            // Fused residual-add + RMSNorm (rvLLM-inspired).
+            fn_fused_residual_rms_norm: func(&mod_rms_norm, "fused_residual_rms_norm")?,
+            fn_fused_residual_rms_norm_batch: func(&mod_rms_norm, "fused_residual_rms_norm_batch")?,
 
             // TurboQuant kernels.
             fn_turbo_quantize_paged: func(&mod_turboquant, "turbo_quantize_paged")?,

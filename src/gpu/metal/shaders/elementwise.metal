@@ -501,3 +501,87 @@ kernel void top_k_sigmoid(
         output[2 * j + 1] = top_weights[j] * params.scaling_factor;
     }
 }
+
+// ===========================================================================
+// GPU-side argmax for greedy decoding.
+//
+// One threadgroup per row (batch element).  Threads stride across the row
+// finding a local max, then simd_max + threadgroup reduction produces the
+// per-row argmax.
+//
+// Inspired by rvLLM (Andy Norris / m0at): GPU-resident greedy decoding.
+// See: https://github.com/m0at/rvllm
+// ===========================================================================
+
+struct ArgmaxParams {
+    uint vocab_size;
+    uint batch_size;
+};
+
+kernel void argmax_gpu(
+    constant ArgmaxParams& params [[buffer(0)]],
+    device const bfloat* logits   [[buffer(1)]],   // [batch_size, vocab_size]
+    device uint* output           [[buffer(2)]],   // [batch_size]
+    uint tgid                     [[threadgroup_position_in_grid]],
+    uint tid                      [[thread_index_in_threadgroup]],
+    uint tg_size                  [[threads_per_threadgroup]],
+    uint simd_id                  [[simdgroup_index_in_threadgroup]],
+    uint lane_id                  [[thread_index_in_simdgroup]]
+) {
+    uint row = tgid;
+    if (row >= params.batch_size) return;
+
+    uint vocab = params.vocab_size;
+    device const bfloat* row_logits = logits + row * vocab;
+
+    // Phase 1: Each thread finds its local max via strided scan.
+    float best_val = -INFINITY;
+    uint best_idx = 0;
+    for (uint i = tid; i < vocab; i += tg_size) {
+        float v = float(row_logits[i]);
+        if (v > best_val) {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+
+    // Phase 2: SIMD-level reduction (32-lane warp).
+    for (ushort offset = 16; offset > 0; offset >>= 1) {
+        float other_val = simd_shuffle_xor(best_val, offset);
+        uint other_idx = simd_shuffle_xor(best_idx, offset);
+        if (other_val > best_val) {
+            best_val = other_val;
+            best_idx = other_idx;
+        }
+    }
+
+    // Phase 3: Cross-SIMD reduction via threadgroup memory.
+    threadgroup float smem_vals[32];
+    threadgroup uint smem_idxs[32];
+
+    if (lane_id == 0) {
+        smem_vals[simd_id] = best_val;
+        smem_idxs[simd_id] = best_idx;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Final reduction in SIMD 0.
+    if (simd_id == 0) {
+        uint num_simds = (tg_size + 31) / 32;
+        best_val = (lane_id < num_simds) ? smem_vals[lane_id] : -INFINITY;
+        best_idx = (lane_id < num_simds) ? smem_idxs[lane_id] : 0;
+
+        for (ushort offset = 16; offset > 0; offset >>= 1) {
+            float other_val = simd_shuffle_xor(best_val, offset);
+            uint other_idx = simd_shuffle_xor(best_idx, offset);
+            if (other_val > best_val) {
+                best_val = other_val;
+                best_idx = other_idx;
+            }
+        }
+
+        if (lane_id == 0) {
+            output[row] = best_idx;
+        }
+    }
+}

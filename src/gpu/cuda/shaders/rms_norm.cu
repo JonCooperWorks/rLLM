@@ -172,6 +172,126 @@ extern "C" __global__ void rms_norm_batch(
 }
 
 // ===========================================================================
+// Fused residual-add + RMSNorm — single vector.
+//
+// hidden[i] += residual[i], then out[i] = weight[i] * hidden[i] / sqrt(mean(hidden²) + eps)
+//
+// Saves one full read of the hidden tensor vs separate add() + rms_norm().
+// For bandwidth-bound decode steps, this roughly halves memory traffic for
+// the two most common consecutive operations in each transformer layer.
+//
+// Inspired by rvLLM (Andy Norris / m0at): fusing residual + norm eliminates
+// redundant memory traffic.  See: https://github.com/m0at/rvllm
+// ===========================================================================
+
+extern "C" __global__ void fused_residual_rms_norm(
+    const RmsNormParams params,
+    __nv_bfloat16* __restrict__ hidden,          // in-place: hidden += residual
+    const __nv_bfloat16* __restrict__ residual,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ output
+) {
+    const unsigned int hidden_size = params.hidden_size;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int tg_size = blockDim.x;
+
+    // Phase 1: Add residual in-place and accumulate sum-of-squares.
+    float sum_sq = 0.0f;
+    for (unsigned int i = tid; i < hidden_size; i += tg_size) {
+        float h = __bfloat162float(hidden[i]) + __bfloat162float(residual[i]);
+        hidden[i] = __float2bfloat16(h);
+        sum_sq += h * h;
+    }
+
+    // Phase 2: Warp-level reduction.
+    sum_sq = warp_sum(sum_sq);
+
+    // Phase 3: Cross-warp reduction.
+    __shared__ float shared[32];
+    unsigned int warp_id = tid / 32;
+    unsigned int lane_id = tid % 32;
+
+    if (lane_id == 0) shared[warp_id] = sum_sq;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        unsigned int num_warps = (tg_size + 31) / 32;
+        float val = (lane_id < num_warps) ? shared[lane_id] : 0.0f;
+        val = warp_sum(val);
+        if (lane_id == 0) shared[0] = val;
+    }
+    __syncthreads();
+
+    float mean_sq = shared[0] / (float)hidden_size;
+    float scale = rsqrtf(mean_sq + params.eps);
+
+    // Phase 4: Normalise and multiply by learned weight.
+    for (unsigned int i = tid; i < hidden_size; i += tg_size) {
+        float val = __bfloat162float(hidden[i]);
+        output[i] = __float2bfloat16(val * scale * __bfloat162float(weight[i]));
+    }
+}
+
+// ===========================================================================
+// Fused residual-add + RMSNorm — batched: one block per row.
+// ===========================================================================
+
+extern "C" __global__ void fused_residual_rms_norm_batch(
+    const RmsNormBatchParams params,
+    __nv_bfloat16* __restrict__ hidden,          // [batch_size, hidden_size] in-place
+    const __nv_bfloat16* __restrict__ residual,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ output
+) {
+    const unsigned int row_id = blockIdx.x;
+    if (row_id >= params.batch_size) return;
+
+    const unsigned int hidden_size = params.hidden_size;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int tg_size = blockDim.x;
+
+    __nv_bfloat16* row_hidden    = hidden   + row_id * hidden_size;
+    const __nv_bfloat16* row_res = residual + row_id * hidden_size;
+    __nv_bfloat16* row_out       = output   + row_id * hidden_size;
+
+    // Phase 1: Add residual in-place and accumulate sum-of-squares.
+    float sum_sq = 0.0f;
+    for (unsigned int i = tid; i < hidden_size; i += tg_size) {
+        float h = __bfloat162float(row_hidden[i]) + __bfloat162float(row_res[i]);
+        row_hidden[i] = __float2bfloat16(h);
+        sum_sq += h * h;
+    }
+
+    // Phase 2: Warp-level reduction.
+    sum_sq = warp_sum(sum_sq);
+
+    // Phase 3: Cross-warp reduction.
+    __shared__ float shared[32];
+    unsigned int warp_id = tid / 32;
+    unsigned int lane_id = tid % 32;
+
+    if (lane_id == 0) shared[warp_id] = sum_sq;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        unsigned int num_warps = (tg_size + 31) / 32;
+        float val = (lane_id < num_warps) ? shared[lane_id] : 0.0f;
+        val = warp_sum(val);
+        if (lane_id == 0) shared[0] = val;
+    }
+    __syncthreads();
+
+    float mean_sq = shared[0] / (float)hidden_size;
+    float scale = rsqrtf(mean_sq + params.eps);
+
+    // Phase 4: Normalise and multiply by learned weight.
+    for (unsigned int i = tid; i < hidden_size; i += tg_size) {
+        float val = __bfloat162float(row_hidden[i]);
+        row_out[i] = __float2bfloat16(val * scale * __bfloat162float(weight[i]));
+    }
+}
+
+// ===========================================================================
 // LayerNorm — one block per row of [batch_size, hidden_size].
 // Unlike RMSNorm, LayerNorm has two reductions (mean and variance) and
 // includes both weight and bias parameters.  Used by SigLIP ViT encoder.

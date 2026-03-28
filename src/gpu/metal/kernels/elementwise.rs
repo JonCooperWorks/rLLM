@@ -30,6 +30,13 @@ struct ElemParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct ArgmaxParams {
+    vocab_size: u32,
+    batch_size: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct ScaleAddParams {
     size: u32,
     scale: f32,
@@ -312,6 +319,27 @@ impl GpuElementwise for MetalBackend {
             ],
             MTLSize::new(1, 1, 1),
             MTLSize::new(1, 1, 1),
+        );
+    }
+
+    fn argmax_gpu(
+        &self,
+        logits: &MetalTensor,
+        output: &MetalTensor,
+        vocab_size: u32,
+        batch_size: u32,
+    ) {
+        let params = ArgmaxParams {
+            vocab_size,
+            batch_size,
+        };
+        let block = 256.min(vocab_size as u64);
+        self.dispatch_async(
+            &self.pipeline_argmax_gpu,
+            &params,
+            &[(&logits.buffer, 1), (&output.buffer, 2)],
+            MTLSize::new(batch_size as u64, 1, 1),      // threadgroups
+            MTLSize::new(block, 1, 1),                   // threads per threadgroup
         );
     }
 }
