@@ -4,3 +4,5 @@ test_prompts.txt
 .DS_Store
 *.log
 results/
+__pycache__
+.venv
