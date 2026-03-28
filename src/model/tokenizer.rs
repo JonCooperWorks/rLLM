@@ -98,11 +98,9 @@ impl Tokenizer {
             // Uses a 201088-token vocabulary.
             ModelArch::GptOss => (None, vec![200002]),
 
-            // Nemotron-H: eos_token_id=2 (</s>) from config.json.  No BOS.
-            // Uses ChatML format with <|im_end|> (token 11) as the turn
-            // delimiter — must also stop on it or generation runs past the
-            // assistant's response and produces garbage.
-            ModelArch::NemotronH => (None, vec![2, 11]),
+            // Nemotron-H: eos_token_id=2 from config.json.  No BOS.
+            // Uses a 131072-token vocabulary (Tekken-based).
+            ModelArch::NemotronH => (None, vec![2]),
         };
 
         Ok(Self {
@@ -261,18 +259,15 @@ impl Tokenizer {
     /// decoded output so the text-level thinking parser can find it.
     pub fn is_think_start(&self, token_id: u32) -> bool {
         // Qwen 3 / 3.5: <think> = 248068
-        // Nemotron-H:    <think> = 12
-        token_id == 248068 || token_id == 12
+        token_id == 248068
     }
 
     /// Check if a token ID is a thinking end marker (`</think>`).
     ///
-    /// See `is_think_start()` for context.  `</think>` = 248069 in Qwen 3.5,
-    /// 13 in Nemotron-H.
+    /// See `is_think_start()` for context.  `</think>` = 248069 in Qwen 3.5.
     pub fn is_think_end(&self, token_id: u32) -> bool {
         // Qwen 3 / 3.5: </think> = 248069
-        // Nemotron-H:    </think> = 13
-        token_id == 248069 || token_id == 13
+        token_id == 248069
     }
 
     /// Decode tokens incrementally, simulating the streaming API path.

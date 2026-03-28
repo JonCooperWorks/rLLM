@@ -390,11 +390,13 @@ fn moe_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
         // relu²: in-place.
         m.backend.relu_squared(moe_up_buf, moe_up_buf, d.moe_inter);
 
-        // down_proj: [hidden, moe_inter] × moe_up_buf → moe_gate_buf.
-        m.backend.matmul(&expert.down_proj, moe_up_buf, moe_gate_buf, d.hidden_size, d.moe_inter);
+        // down_proj: [hidden, moe_inter] × moe_up_buf → gate_buf.
+        // gate_buf is [effective_intermediate_size] ≥ [hidden_size], safe for
+        // the down_proj output.  moe_gate_buf is only [moe_inter] — too small!
+        m.backend.matmul(&expert.down_proj, moe_up_buf, &m.gate_buf, d.hidden_size, d.moe_inter);
 
-        // Weighted accumulate: moe_output += weight × moe_gate_buf.
-        m.backend.scale_add(moe_output, moe_gate_buf, weight, d.hidden_size);
+        // Weighted accumulate: moe_output += weight × gate_buf.
+        m.backend.scale_add(moe_output, &m.gate_buf, weight, d.hidden_size);
     }
 
     // 6. Shared expert (always active, same relu² pattern but larger intermediate).

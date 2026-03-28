@@ -290,11 +290,7 @@ pub(crate) async fn messages(
     // Decide which response path to use.  Thinking and tool calls both
     // require collecting all tokens (markers span multiple tokens), but
     // the result can still be emitted as SSE events (pseudo-streaming).
-    // Thinking is active when explicitly requested OR when the model always
-    // thinks (Nemotron-H, Qwen 3.x).
-    let thinking_enabled = thinking_requested.unwrap_or_else(|| {
-        crate::model::thinking::supports_thinking(state.arch)
-    });
+    let thinking_enabled = thinking_requested.is_some_and(|t| t);
     if req.stream {
         if thinking_enabled || has_tools {
             // Both thinking and tools need full-text collection before parsing.
