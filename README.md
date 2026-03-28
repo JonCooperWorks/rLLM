@@ -91,10 +91,10 @@ Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548).
 | Gemma 3 27B Instruct | 27.4B | — | 19 tok/s | — | — | 760 ms |
 | Qwen3.5 27B | ~27B | — | 21 tok/s | — | — | 1,538 ms |
 | Nemotron-H 30B | 31.6B (3.6B active) | — | 113 tok/s | — | — | 326 ms |
-| Qwen3.5 35B-A3B ⚡ | 35.1B (3.3B active) | 3.1 tok/s | 8.0 tok/s | 66 tok/s | 9,538 ms | 3,420 ms |
-| Mixtral 8x7B Instruct ⚡ | 46.7B (12.9B active) | 0.3 tok/s | 1.1 tok/s | 41 tok/s | 31,966 ms | 10,382 ms |
+| Qwen3.5 35B-A3B | 35.1B (3.3B active) | 3.6 ⚡ | 66 tok/s | 6.2 ⚡ | 4,014 ms | 446 ms |
+| Mixtral 8x7B Instruct | 46.7B (12.9B active) | 0.3 ⚡ | 41 tok/s | 0.6 ⚡ | 33,358 ms | 468 ms |
 
-⚡ = SSD expert streaming (`--stream-experts`). Nemotron-H 30B Q4 fits in 32 GB without streaming thanks to the compact Mamba-2 + MoE architecture. Models >32 GB bf16 only run as Q4. Q4-Q8 hybrid quantization (Q4 dense + Q8 experts) matches Q4-Q8 column; Mixtral Q4-Q8 at 41 tok/s fits fully in VRAM without streaming.
+⚡ = SSD expert streaming (`--stream-experts`) — bf16 and Q8 variants exceed 32 GB VRAM. Q4 MoE models fit entirely in VRAM without streaming: Qwen3.5 35B-A3B Q4 at 21 GB and Mixtral Q4 at 25 GB both load fully, delivering 18–110× speedup over their streamed bf16 counterparts. Nemotron-H 30B Q4 also fits without streaming.
 
 </details>
 

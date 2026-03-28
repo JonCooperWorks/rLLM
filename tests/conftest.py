@@ -119,15 +119,24 @@ def _get_available_memory_gb() -> float:
         return psutil.virtual_memory().total / (1024 ** 3)
 
 
-def _should_stream_experts(model_size_gb: float, is_q4: bool) -> bool:
+def _get_model_disk_size_gb(model_dir: str) -> float:
+    """Sum safetensors file sizes to get actual model size on disk."""
+    total = sum(f.stat().st_size for f in Path(model_dir).glob("*.safetensors"))
+    return total / (1024 ** 3)
+
+
+def _should_stream_experts(model_size_gb: float, is_q4: bool, model_dir: str = "") -> bool:
     """Decide whether to use --stream-experts based on available memory.
 
-    Q4 compression ratio varies widely: dense weights get ~3.5x compression,
-    but MoE models have many non-expert weights (embeddings, norms, attention)
-    that stay bf16.  We use a conservative 1.5x estimate for Q4 MoE models
-    to avoid OOM from underestimating memory needs.
+    Uses actual model size on disk when available (accurate for Q4/Q8 variants),
+    falling back to a bf16 size estimate otherwise.  Adds headroom for MoE
+    routing buffers and activations — models with many experts (256+) need
+    significant scratch memory beyond the weight footprint.
     """
-    effective_size = model_size_gb / 1.5 if is_q4 else model_size_gb
+    if model_dir:
+        effective_size = _get_model_disk_size_gb(model_dir)
+    else:
+        effective_size = model_size_gb / 1.5 if is_q4 else model_size_gb
     available = _get_available_memory_gb()
     # Stream if model exceeds 80% of available memory.
     return effective_size > available * 0.80

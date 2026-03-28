@@ -309,9 +309,19 @@ def main():
         name = entry.name
         if args.filter and args.filter not in name:
             continue
-        # Determine if this is a Q4 variant.
-        is_q4 = name.endswith("-q4")
-        base_name = name[:-3] if is_q4 else name
+        # Determine quantization variant and strip suffix to find base model.
+        # Variants: base, base-q4, base-q4-q8, base-q8
+        is_q4 = False
+        if name.endswith("-q4-q8"):
+            base_name = name[:-6]
+            is_q4 = True  # dense weights are Q4
+        elif name.endswith("-q8"):
+            base_name = name[:-3]
+        elif name.endswith("-q4"):
+            base_name = name[:-3]
+            is_q4 = True
+        else:
+            base_name = name
 
         if args.q4_only and not is_q4:
             continue
@@ -358,7 +368,7 @@ def main():
             # Build extra args.
             extra_args = []
             if model["is_moe"] and model["supports_stream_experts"]:
-                if _should_stream_experts(model["bf16_size_gb"], model["is_q4"]):
+                if _should_stream_experts(model["bf16_size_gb"], model["is_q4"], model["path"]):
                     extra_args.append("--stream-experts")
 
             try:
