@@ -81,6 +81,23 @@ pub(crate) fn supports_thinking(arch: ModelArch) -> bool {
     }
 }
 
+/// Whether thinking should be enabled by default (when the client doesn't
+/// specify a preference).
+///
+/// Qwen 3 / 3.5 were trained to always produce `<think>` blocks and loop
+/// endlessly without the prompt tag, so they default to enabled.
+///
+/// Nemotron-H supports thinking but defaults to disabled — at Q4
+/// quantization the model gets stuck in infinite reasoning loops when
+/// thinking is enabled.  The suppress tag (`<think></think>`) tells the
+/// model to skip reasoning and produce content directly.
+pub(crate) fn defaults_to_thinking(arch: ModelArch) -> bool {
+    match arch {
+        ModelArch::Qwen3Moe | ModelArch::Qwen3_5 => true,
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Thinking control tag — injected into the generation prompt.
 //
