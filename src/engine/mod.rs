@@ -539,15 +539,10 @@ fn sample_and_finish<D: Dispatch>(
     step_tokens: &mut Vec<(SeqId, u32)>,
     global_rng: &mut impl rand::Rng,
 ) -> anyhow::Result<()> {
-    // Greedy gate: when temperature==0, try GPU-resident argmax to avoid
-    // copying the full logits tensor to CPU.  Falls back to CPU sampling
-    // if the backend doesn't support it.  Inspired by rvLLM (m0at).
-    let next_token = if seq.temperature == 0.0 {
-        match dispatch.sample_greedy_gpu() {
-            Ok(token) => token,
-            Err(_) => dispatch.sample(0.0, 1.0, global_rng)?,
-        }
-    } else if let Some(ref mut seq_rng) = seq.seeded_rng {
+    // GPU argmax disabled — per-token alloc + copy_to_host sync is slower
+    // than copying the full logits buffer once with async dispatch.
+    // TODO: fix by pre-allocating the argmax output buffer once.
+    let next_token = if let Some(ref mut seq_rng) = seq.seeded_rng {
         dispatch.sample(seq.temperature, seq.top_p, seq_rng)?
     } else {
         dispatch.sample(seq.temperature, seq.top_p, global_rng)?
