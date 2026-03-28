@@ -80,6 +80,22 @@ pub(crate) fn exec(args: QuantizeArgs) -> anyhow::Result<()> {
         .collect::<Result<_, _>>()
         .map_err(|e| anyhow::anyhow!("failed to parse safetensors: {e}"))?;
 
+    // Collect pre-existing quantization metadata from input shards so we can
+    // propagate it for pass-through tensors (e.g. Q4 tensors that stay Q4 when
+    // we're adding Q8 quantization on top).
+    let mut input_quant_meta: HashMap<String, String> = HashMap::new();
+    for mmap in &mmaps {
+        if let Ok((_, metadata)) = SafeTensors::read_metadata(mmap.as_ref()) {
+            if let Some(meta) = metadata.metadata() {
+                for (key, val) in meta {
+                    if key.starts_with("rllm_q4:") || key.starts_with("rllm_q8:") {
+                        input_quant_meta.insert(key.clone(), val.clone());
+                    }
+                }
+            }
+        }
+    }
+
     // Collect all tensors across shards in a stable order.
     let all_tensors = collect_all_tensors(&shards, &weight_map);
 
@@ -135,10 +151,18 @@ pub(crate) fn exec(args: QuantizeArgs) -> anyhow::Result<()> {
                 dtype: safetensors::Dtype::U8,
                 shape: vec![quant.byte_count(m, k)],
                 quant_original_shape: Some((m, k)),
+                passthrough_quant: None,
             }
         } else {
             original_bytes += data.len() as u64;
             quantized_bytes += data.len() as u64;
+
+            // Propagate pre-existing quantization metadata for pass-through
+            // tensors (e.g. Q4 tensors kept as-is in a Q4→Q8 hybrid model).
+            let passthrough = ["rllm_q4:", "rllm_q8:"].iter().find_map(|prefix| {
+                let key = format!("{prefix}{name}");
+                input_quant_meta.get(&key).map(|v| (key, v.clone()))
+            });
 
             OutputTensor {
                 name: name.clone(),
@@ -146,6 +170,7 @@ pub(crate) fn exec(args: QuantizeArgs) -> anyhow::Result<()> {
                 dtype: view.dtype(),
                 shape: shape.to_vec(),
                 quant_original_shape: None,
+                passthrough_quant: passthrough,
             }
         };
 
@@ -303,6 +328,9 @@ struct OutputTensor<'a> {
     shape: Vec<usize>,
     /// If Some, this tensor was quantized from a [m, k] bf16 weight.
     quant_original_shape: Option<(usize, usize)>,
+    /// Pre-existing quantization metadata to propagate (e.g. "rllm_q4:name" = "m,k"
+    /// from an input model that was already quantized in a different format).
+    passthrough_quant: Option<(String, String)>,
 }
 
 /// Write one shard of tensors to disk.  Called incrementally as the shard fills.
@@ -324,6 +352,9 @@ fn write_single_shard(
     for t in tensors {
         if let Some((m, k)) = t.quant_original_shape {
             metadata.insert(format!("{}{}", format.metadata_prefix(), t.name), format!("{m},{k}"));
+        }
+        if let Some((ref key, ref val)) = t.passthrough_quant {
+            metadata.insert(key.clone(), val.clone());
         }
 
         let view = TensorView::new(t.dtype, t.shape.clone(), t.data.as_slice())

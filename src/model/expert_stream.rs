@@ -149,9 +149,9 @@ pub(crate) struct ExpertIndex {
     /// Expert dimensions.
     pub hidden: usize,
     pub moe_inter: usize,
-    /// Whether expert data on disk is already Q4 (pre-quantized model).
-    /// When true, pread reads Q4 bytes directly — 3.2x less I/O than bf16.
-    pub prequantized: bool,
+    /// Pre-quantization format of expert data on disk (Q4 or Q8).
+    /// When Some, pread reads quantized bytes directly — less I/O than bf16.
+    pub quant_format: Option<crate::gpu::ops::quant::QuantFormat>,
 }
 
 // ---------------------------------------------------------------------------
@@ -297,17 +297,9 @@ impl<B: GpuCore> ExpertStreamer<B> {
         // needed — at most K experts are loaded from disk per call (misses).
         let hidden = index.hidden;
         let moe_inter = index.moe_inter;
-        let (gate_up_bytes, down_bytes) = if index.prequantized {
-            (
-                crate::gpu::q4_byte_count(moe_inter * 2, hidden),
-                crate::gpu::q4_byte_count(hidden, moe_inter),
-            )
-        } else {
-            (
-                moe_inter * hidden * 2 * 2, // gate + up combined (bf16)
-                hidden * moe_inter * 2,
-            )
-        };
+        let (gate_up_bytes, down_bytes) = expert_byte_sizes(
+            index.quant_format, moe_inter * 2, hidden, moe_inter,
+        );
         // Try pinned (page-locked) allocation for CUDA async DMA.
         // Falls back to heap allocation on Metal/CPU or if pinned alloc fails.
         let alloc_buf = |byte_count: usize| -> ReadBuf {
@@ -350,8 +342,11 @@ impl<B: GpuCore> ExpertStreamer<B> {
     fn allocate_slots(backend: &B, index: &ExpertIndex, n: usize) -> Vec<ExpertSlot<B>> {
         let hidden = index.hidden;
         let moe_inter = index.moe_inter;
-        let use_q4 = index.prequantized;
-        let dtype = if use_q4 { TensorDtype::Q4 } else { TensorDtype::BF16 };
+        let dtype = match index.quant_format {
+            Some(crate::gpu::ops::quant::QuantFormat::Q4) => TensorDtype::Q4,
+            Some(crate::gpu::ops::quant::QuantFormat::Q8) => TensorDtype::Q8,
+            None => TensorDtype::BF16,
+        };
 
         (0..n)
             .map(|_| ExpertSlot {
@@ -610,23 +605,13 @@ pub(crate) fn build_fused_expert_index(
     hidden: usize,
     moe_inter: usize,
     num_experts: usize,
-    prequantized: bool,
+    quant_format: Option<crate::gpu::ops::quant::QuantFormat>,
 ) -> ExpertIndex {
-    // Byte sizes depend on whether experts are stored as Q4 or bf16 on disk.
-    // Q4 quantization is per-row, so fused gate+up Q4 data is still contiguous
-    // per expert: [gate Q4 rows | up Q4 rows] within each expert's slice.
-    let (gate_up_expert_bytes, gate_bytes, down_expert_bytes) = if prequantized {
-        (
-            crate::gpu::q4_byte_count(moe_inter * 2, hidden),
-            crate::gpu::q4_byte_count(moe_inter, hidden),
-            crate::gpu::q4_byte_count(hidden, moe_inter),
-        )
-    } else {
-        (
-            moe_inter * 2 * hidden * 2, // bf16
-            moe_inter * hidden * 2,
-            hidden * moe_inter * 2,
-        )
+    // Byte sizes depend on whether experts are stored as Q4/Q8 or bf16 on disk.
+    let (gate_up_expert_bytes, gate_bytes, down_expert_bytes) = {
+        let (gu, d) = expert_byte_sizes(quant_format, moe_inter * 2, hidden, moe_inter);
+        let (g, _) = expert_byte_sizes(quant_format, moe_inter, hidden, moe_inter);
+        (gu, g, d)
     };
 
     let layers = layer_info
@@ -658,7 +643,7 @@ pub(crate) fn build_fused_expert_index(
         shard_files: Arc::new(shard_files),
         hidden,
         moe_inter,
-        prequantized,
+        quant_format,
     }
 }
 
@@ -673,16 +658,9 @@ pub(crate) fn build_per_expert_index(
     shard_files: Vec<File>,
     hidden: usize,
     moe_inter: usize,
-    prequantized: bool,
+    quant_format: Option<crate::gpu::ops::quant::QuantFormat>,
 ) -> ExpertIndex {
-    let (gate_bytes, down_bytes) = if prequantized {
-        (
-            crate::gpu::q4_byte_count(moe_inter, hidden),
-            crate::gpu::q4_byte_count(hidden, moe_inter),
-        )
-    } else {
-        (moe_inter * hidden * 2, hidden * moe_inter * 2)
-    };
+    let (gate_bytes, down_bytes) = expert_byte_sizes(quant_format, moe_inter, hidden, moe_inter);
 
     let layers = layer_info
         .iter()
@@ -709,7 +687,30 @@ pub(crate) fn build_per_expert_index(
         shard_files: Arc::new(shard_files),
         hidden,
         moe_inter,
-        prequantized,
+        quant_format,
+    }
+}
+
+/// Compute (gate_up_bytes, down_bytes) for a given quant format.
+fn expert_byte_sizes(
+    quant_format: Option<crate::gpu::ops::quant::QuantFormat>,
+    gate_up_rows: usize,
+    hidden: usize,
+    moe_inter: usize,
+) -> (usize, usize) {
+    match quant_format {
+        Some(crate::gpu::ops::quant::QuantFormat::Q4) => (
+            crate::gpu::q4_byte_count(gate_up_rows, hidden),
+            crate::gpu::q4_byte_count(hidden, moe_inter),
+        ),
+        Some(crate::gpu::ops::quant::QuantFormat::Q8) => (
+            crate::gpu::q8_byte_count(gate_up_rows, hidden),
+            crate::gpu::q8_byte_count(hidden, moe_inter),
+        ),
+        None => (
+            gate_up_rows * hidden * 2, // bf16
+            hidden * moe_inter * 2,
+        ),
     }
 }
 
