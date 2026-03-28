@@ -131,11 +131,20 @@ pub(crate) fn thinking_prompt_tag(arch: ModelArch, enabled: bool) -> Option<&'st
 /// Qwen 3 / 3.5 models are trained to always produce `<think>` blocks.
 /// Simply omitting the `<think>` prompt tag is NOT sufficient — the model
 /// generates `<think>` on its own.  To suppress thinking, we inject a
-/// closed `<think>\n</think>\n` block so the model sees thinking as
-/// "already done" and proceeds directly to the visible response.
+/// closed thinking block so the model sees thinking as "already done"
+/// and proceeds directly to the visible response.
+///
+/// The exact format varies by architecture — it must match what the model
+/// saw during training or the prompt becomes out-of-distribution:
+///   Qwen:      `<think>\n</think>\n`  (newlines between/after)
+///   Nemotron:  `<think></think>`      (no newlines, no trailing newline)
 pub(crate) fn thinking_suppress_tag(arch: ModelArch) -> Option<&'static str> {
     match arch {
-        ModelArch::Qwen3Moe | ModelArch::Qwen3_5 | ModelArch::NemotronH => Some("<think>\n</think>\n"),
+        ModelArch::Qwen3Moe | ModelArch::Qwen3_5 => Some("<think>\n</think>\n"),
+        // Nemotron-H's HF template emits <think></think> with no newlines
+        // and no trailing newline.  The model was trained on this exact
+        // format — extra newline tokens push it out-of-distribution.
+        ModelArch::NemotronH => Some("<think></think>"),
         _ => None,
     }
 }
