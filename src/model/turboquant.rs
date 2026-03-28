@@ -48,6 +48,23 @@
 //   For 3-bit, head_dim=128: 2 + 48 = 50 bytes (5.1x compression)
 //   For 2-bit, head_dim=128: 2 + 32 = 34 bytes (7.5x compression)
 //
+// Simplifications vs paper:
+//   1. Single shared rotation matrix across all layers (paper is agnostic,
+//      but per-layer matrices would give ~1% better quality by decorrelating
+//      layer-specific weight distributions — not worth the complexity for v1).
+//   2. Hardcoded Max-Lloyd centroids rather than running the Lloyd-Max iterative
+//      algorithm at startup.  The centroids for N(0,1) are universal constants,
+//      so precomputation is both correct and faster.
+//   3. Gram-Schmidt orthogonalisation instead of Householder QR for generating
+//      the rotation matrix.  Both produce valid random orthogonal matrices;
+//      Gram-Schmidt is simpler and fast enough for head_dim ≤ 256.
+//   4. Prefill uses full BF16 attention (K/V are quantized into the paged pool
+//      for future decode, but the prefill attention itself reads BF16 Q/K/V
+//      directly).  This is strictly better quality than quantized prefill.
+//   5. No product quantization — the paper discusses splitting dimensions into
+//      subvectors for higher-dimensional inputs, but we use scalar quantization
+//      per coordinate only.  At head_dim ≤ 256 this is sufficient.
+//
 // Related files:
 //   gpu/ops/turboquant.rs        — GpuTurboQuant trait (GPU kernel interface)
 //   gpu/metal/shaders/turboquant.metal — Metal shader kernels
