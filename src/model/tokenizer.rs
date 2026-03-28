@@ -98,9 +98,11 @@ impl Tokenizer {
             // Uses a 201088-token vocabulary.
             ModelArch::GptOss => (None, vec![200002]),
 
-            // Nemotron-H: eos_token_id=2 from config.json.  No BOS.
-            // Uses a 131072-token vocabulary (Tekken-based).
-            ModelArch::NemotronH => (None, vec![2]),
+            // Nemotron-H: eos_token_id=2 (</s>) from config.json.  No BOS.
+            // The HF tokenizer_config.json sets eos_token to <|im_end|>
+            // (token 11) — generation must stop there or it runs past
+            // the assistant turn boundary.
+            ModelArch::NemotronH => (None, vec![2, 11]),
         };
 
         Ok(Self {
