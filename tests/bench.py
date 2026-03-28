@@ -85,7 +85,7 @@ KNOWN_MODELS = {
     "qwen3.5-397b-a27b":              ("Qwen3_5M",  True,  794, True),
 }
 
-DEFAULT_PROMPT = "Explain how a computer processor works in simple terms."
+DEFAULT_PROMPT = "The meaning of life is"
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +134,7 @@ def bench_one_streaming(base_url: str, prompt: str, max_tokens: int) -> dict:
         "max_tokens": max_tokens,
         "temperature": 0,
         "stream": True,
+        "stream_options": {"include_usage": True},
     }
 
     t_start = time.monotonic()
