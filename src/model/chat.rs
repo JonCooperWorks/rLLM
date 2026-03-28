@@ -337,7 +337,7 @@ pub(crate) fn format_chat_with_thinking(
         ModelArch::Llama => format_llama3(messages),
         ModelArch::Mistral | ModelArch::Mixtral => format_mistral(messages),
         ModelArch::Qwen2 | ModelArch::Qwen3Moe | ModelArch::Qwen3_5 | ModelArch::GptOss | ModelArch::NemotronH => {
-            format_chatml(messages)
+            format_chatml(messages, arch)
         }
         ModelArch::Phi => format_phi(messages),
         ModelArch::Gemma3 => format_gemma3(messages),
@@ -411,7 +411,7 @@ fn format_llama3(messages: &[Message]) -> String {
 ///
 /// Same as Llama 3, the returned string contains special token markers as
 /// literal text — the tokenizer parses them into token IDs.
-fn format_chatml(messages: &[Message]) -> String {
+fn format_chatml(messages: &[Message], arch: ModelArch) -> String {
     let mut out = String::with_capacity(512);
 
     // Note: no BOS here either — the HF tokenizer adds it automatically
@@ -422,10 +422,17 @@ fn format_chatml(messages: &[Message]) -> String {
     // You are a helpful assistant." when no system message is present.  Omitting
     // it shifts all token positions and degrades output quality — especially at
     // small model sizes (3B) where greedy decoding falls into repetition loops.
+    //
+    // Nemotron-H also uses ChatML but expects an empty system block when no
+    // system message is provided — injecting Qwen-specific text confuses it.
     let has_system = messages.iter().any(|m| m.role == "system");
     if !has_system {
         out.push_str("<|im_start|>system\n");
-        out.push_str("You are a helpful assistant.<|im_end|>\n");
+        if arch == ModelArch::NemotronH {
+            out.push_str("<|im_end|>\n");
+        } else {
+            out.push_str("You are a helpful assistant.<|im_end|>\n");
+        }
     }
 
     for msg in messages {

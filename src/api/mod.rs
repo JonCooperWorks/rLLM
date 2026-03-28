@@ -702,7 +702,11 @@ fn run_worker_loop(
 
                 ctx.token_ids.push(token_id);
                 let full_text = tokenizer.decode(&ctx.token_ids).unwrap_or_default();
-                let mut text = full_text[ctx.prev_text_len..].to_string();
+                // When a multi-byte character (e.g. emoji) is split across tokens,
+                // the previous decode's byte length may land inside that character
+                // in the new, longer decode.  Snap to a valid char boundary.
+                let start = full_text.floor_char_boundary(ctx.prev_text_len);
+                let mut text = full_text[start..].to_string();
                 ctx.prev_text_len = full_text.len();
 
                 // Prepend any pending thinking marker to the decoded text.

@@ -66,8 +66,10 @@ pub(crate) struct ThinkingResult {
 /// and no parsing is attempted.
 pub(crate) fn supports_thinking(arch: ModelArch) -> bool {
     match arch {
-        // Qwen 3 MoE and Qwen 3.5 were trained with /think and /no_think tags.
-        ModelArch::Qwen3Moe | ModelArch::Qwen3_5 => true,
+        // Qwen 3 MoE, Qwen 3.5, and Nemotron-H were trained with thinking tags.
+        // Nemotron-H always expects <think> in the generation prompt — even
+        // with thinking "disabled" the template emits <think></think>.
+        ModelArch::Qwen3Moe | ModelArch::Qwen3_5 | ModelArch::NemotronH => true,
         // Other architectures do not currently support thinking.
         ModelArch::Llama
         | ModelArch::Qwen2
@@ -75,8 +77,7 @@ pub(crate) fn supports_thinking(arch: ModelArch) -> bool {
         | ModelArch::Mixtral
         | ModelArch::Phi
         | ModelArch::Gemma3
-        | ModelArch::GptOss
-        | ModelArch::NemotronH => false,
+        | ModelArch::GptOss => false,
     }
 }
 
@@ -100,9 +101,10 @@ pub(crate) fn thinking_prompt_tag(arch: ModelArch, enabled: bool) -> Option<&'st
     }
 
     match arch {
-        // Qwen 3 / 3.5: appending `<think>\n` after the assistant prompt
-        // causes the model to emit its reasoning inside `<think>...</think>`.
-        ModelArch::Qwen3Moe | ModelArch::Qwen3_5 => Some("<think>\n"),
+        // Qwen 3 / 3.5 / Nemotron-H: appending `<think>\n` after the
+        // assistant prompt causes the model to emit its reasoning inside
+        // `<think>...</think>`.
+        ModelArch::Qwen3Moe | ModelArch::Qwen3_5 | ModelArch::NemotronH => Some("<think>\n"),
         _ => None,
     }
 }
@@ -116,7 +118,7 @@ pub(crate) fn thinking_prompt_tag(arch: ModelArch, enabled: bool) -> Option<&'st
 /// "already done" and proceeds directly to the visible response.
 pub(crate) fn thinking_suppress_tag(arch: ModelArch) -> Option<&'static str> {
     match arch {
-        ModelArch::Qwen3Moe | ModelArch::Qwen3_5 => Some("<think>\n</think>\n"),
+        ModelArch::Qwen3Moe | ModelArch::Qwen3_5 | ModelArch::NemotronH => Some("<think>\n</think>\n"),
         _ => None,
     }
 }
@@ -137,8 +139,8 @@ pub(crate) fn thinking_suppress_tag(arch: ModelArch) -> Option<&'static str> {
 /// to force handling each architecture.
 pub(crate) fn parse_thinking(arch: ModelArch, text: &str) -> ThinkingResult {
     match arch {
-        // Qwen 3 / 3.5 produce <think>...</think> blocks.
-        ModelArch::Qwen3Moe | ModelArch::Qwen3_5 => parse_thinking_xml(text),
+        // Qwen 3 / 3.5 / Nemotron-H produce <think>...</think> blocks.
+        ModelArch::Qwen3Moe | ModelArch::Qwen3_5 | ModelArch::NemotronH => parse_thinking_xml(text),
         // Architectures without thinking support pass through unchanged.
         ModelArch::Llama
         | ModelArch::Qwen2
@@ -146,8 +148,7 @@ pub(crate) fn parse_thinking(arch: ModelArch, text: &str) -> ThinkingResult {
         | ModelArch::Mixtral
         | ModelArch::Phi
         | ModelArch::Gemma3
-        | ModelArch::GptOss
-        | ModelArch::NemotronH => ThinkingResult {
+        | ModelArch::GptOss => ThinkingResult {
             content: text.to_string(),
             thinking: None,
         },

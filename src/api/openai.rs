@@ -368,7 +368,12 @@ pub(crate) async fn chat_completions(
     })?;
 
     let check_tools = has_tools && !tools_disabled;
-    let thinking_enabled = thinking_requested.is_some_and(|t| t);
+    // Thinking is active when explicitly requested OR when the model always
+    // thinks (Nemotron-H, Qwen 3.x).  In the latter case, `<think>` blocks
+    // appear regardless of the client's request, so we must parse them.
+    let thinking_enabled = thinking_requested.unwrap_or_else(|| {
+        crate::model::thinking::supports_thinking(state.arch)
+    });
 
     // Decide which response path to use:
     //
