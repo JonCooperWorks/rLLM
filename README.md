@@ -46,7 +46,7 @@ All models support bf16 and Q4. Multi-GPU via `--tp N` requires CUDA + NCCL.
 ## Benchmarks
 
 <details>
-<summary><b>Apple M4 Max</b> — 40-core GPU, 64 GB unified, 546 GB/s (March 2026)</summary>
+<summary><b>Apple M4 Max</b> — 40-core GPU, 64 GB unified, 546 GB/s (March 28, 2026)</summary>
 
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
@@ -99,7 +99,7 @@ Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548).
 </details>
 
 <details>
-<summary><b>NVIDIA H100 NVL 94 GB</b> — 3.35 TB/s HBM3 (March 22, older build)</summary>
+<summary><b>NVIDIA H100 NVL 94 GB</b> — 3.35 TB/s HBM3 (March 22, 2026 — older build)</summary>
 
 Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Numbers from an earlier build — expect improvement on current code.
 
@@ -129,7 +129,7 @@ Q4 is slower than bf16 on H100 — the 3.35 TB/s HBM3 bandwidth means bf16 matve
 </details>
 
 <details>
-<summary><b>NVIDIA RTX 4090 48 GB</b> — 1.01 TB/s GDDR6X (March 22, older build)</summary>
+<summary><b>NVIDIA RTX 4090 48 GB</b> — 1.01 TB/s GDDR6X (March 22, 2026 — older build)</summary>
 
 Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Numbers from an earlier build — expect improvement on current code.
 
@@ -143,7 +143,7 @@ Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Numbers from an 
 </details>
 
 <details>
-<summary><b>NVIDIA RTX PRO 6000 Blackwell</b> — 96 GB GDDR7, 1.53 TB/s (March 22, older build)</summary>
+<summary><b>NVIDIA RTX PRO 6000 Blackwell</b> — 96 GB GDDR7, 1.53 TB/s (March 22, 2026 — older build)</summary>
 
 Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Numbers from an earlier build — expect improvement on current code.
 
@@ -176,7 +176,7 @@ TP=2 shines for larger models: Gemma 27B gets 45 tok/s Q4, Llama 70B (44 GB Q4) 
 </details>
 
 <details>
-<summary><b>NVIDIA A100-SXM4-80GB</b> — 2.0 TB/s HBM2e (March 16, older build)</summary>
+<summary><b>NVIDIA A100-SXM4-80GB</b> — 2.0 TB/s HBM2e (March 16, 2026 — older build)</summary>
 
 Benchmarked on [RunPod](https://runpod.io?ref=249k2lel). Numbers from an earlier build — expect improvement on current code.
 
