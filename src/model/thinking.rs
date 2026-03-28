@@ -205,7 +205,13 @@ fn parse_thinking_xml(text: &str) -> ThinkingResult {
             text[..end_pos].trim()
         };
 
-        let content = text[end_pos + "</think>".len()..].trim();
+        // Strip the content after the first </think> and remove any remaining
+        // think tags — models sometimes re-enter thinking mode mid-response,
+        // producing scattered </think> markers throughout the output.
+        let content = text[end_pos + "</think>".len()..]
+            .replace("<think>", "")
+            .replace("</think>", "");
+        let content = content.trim();
 
         ThinkingResult {
             content: content.to_string(),

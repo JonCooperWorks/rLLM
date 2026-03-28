@@ -368,7 +368,12 @@ pub(crate) async fn chat_completions(
     })?;
 
     let check_tools = has_tools && !tools_disabled;
-    let thinking_enabled = thinking_requested.is_some_and(|t| t);
+    // Resolve the actual thinking state: explicit preference wins, otherwise
+    // use the architecture's default (Qwen 3/3.5 default to enabled).
+    // This must match the logic in chat.rs — otherwise the model produces
+    // <think> blocks but we route to the plain stream path that doesn't strip them.
+    let thinking_enabled = thinking_requested
+        .unwrap_or_else(|| thinking::defaults_to_thinking(state.arch));
 
     // Decide which response path to use:
     //

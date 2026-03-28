@@ -290,7 +290,12 @@ pub(crate) async fn messages(
     // Decide which response path to use.  Thinking and tool calls both
     // require collecting all tokens (markers span multiple tokens), but
     // the result can still be emitted as SSE events (pseudo-streaming).
-    let thinking_enabled = thinking_requested.is_some_and(|t| t);
+    // Resolve the actual thinking state: explicit preference wins, otherwise
+    // use the architecture's default (Qwen 3/3.5 default to enabled).
+    // Must match chat.rs logic so we route to the thinking-aware stream path
+    // when the model produces <think> blocks.
+    let thinking_enabled = thinking_requested
+        .unwrap_or_else(|| thinking::defaults_to_thinking(state.arch));
     if req.stream {
         if thinking_enabled || has_tools {
             // Both thinking and tools need full-text collection before parsing.
