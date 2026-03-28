@@ -85,6 +85,16 @@ struct GptOssGatedActParams {
 }
 unsafe impl DeviceRepr for GptOssGatedActParams {}
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TopKSigmoidParams {
+    num_experts: u32,
+    k: u32,
+    scaling_factor: f32,
+    norm_topk_prob: u32,
+}
+unsafe impl DeviceRepr for TopKSigmoidParams {}
+
 impl GpuElementwise for CudaBackend {
     fn silu_mul(&self, gate: &CudaTensor, up: &CudaTensor, out: &CudaTensor, size: u32) {
         let params = ElemParams { size };
@@ -118,8 +128,19 @@ impl GpuElementwise for CudaBackend {
         .expect("gelu_mul launch failed");
     }
 
-    fn gelu(&self, _input: &CudaTensor, _out: &CudaTensor, _size: u32) {
-        todo!("gelu not yet implemented for CUDA backend")
+    fn gelu(&self, input: &CudaTensor, out: &CudaTensor, size: u32) {
+        let params = ElemParams { size };
+        let block = 256.min(size);
+        let cfg = CudaBackend::cfg_1d(size, block);
+        unsafe {
+            self.stream
+                .launch_builder(&self.fn_gelu_act)
+                .arg(&params)
+                .arg(&input.buf)
+                .arg(&out.buf)
+                .launch(cfg)
+        }
+        .expect("gelu launch failed");
     }
 
     fn scalar_mul(&self, input: &CudaTensor, out: &CudaTensor, scalar: f32, size: u32) {
@@ -329,20 +350,47 @@ impl GpuElementwise for CudaBackend {
         .expect("top_k_softmax launch failed");
     }
 
-    fn relu_squared(&self, _input: &CudaTensor, _out: &CudaTensor, _size: u32) {
-        unimplemented!("relu_squared CUDA kernel not yet implemented")
+    fn relu_squared(&self, input: &CudaTensor, out: &CudaTensor, size: u32) {
+        let params = ElemParams { size };
+        let block = 256.min(size);
+        let cfg = CudaBackend::cfg_1d(size, block);
+        unsafe {
+            self.stream
+                .launch_builder(&self.fn_relu_squared)
+                .arg(&params)
+                .arg(&input.buf)
+                .arg(&out.buf)
+                .launch(cfg)
+        }
+        .expect("relu_squared launch failed");
     }
 
     fn top_k_sigmoid(
         &self,
-        _logits: &CudaTensor,
-        _correction_bias: &CudaTensor,
-        _output: &CudaTensor,
-        _num_experts: u32,
-        _k: u32,
-        _scaling_factor: f32,
-        _norm_topk_prob: bool,
+        logits: &CudaTensor,
+        correction_bias: &CudaTensor,
+        output: &CudaTensor,
+        num_experts: u32,
+        k: u32,
+        scaling_factor: f32,
+        norm_topk_prob: bool,
     ) {
-        unimplemented!("top_k_sigmoid CUDA kernel not yet implemented")
+        let params = TopKSigmoidParams {
+            num_experts,
+            k,
+            scaling_factor,
+            norm_topk_prob: if norm_topk_prob { 1 } else { 0 },
+        };
+        let cfg = CudaBackend::cfg_blocks(1, 1);
+        unsafe {
+            self.stream
+                .launch_builder(&self.fn_top_k_sigmoid)
+                .arg(&params)
+                .arg(&logits.buf)
+                .arg(&correction_bias.buf)
+                .arg(&output.buf)
+                .launch(cfg)
+        }
+        .expect("top_k_sigmoid launch failed");
     }
 }

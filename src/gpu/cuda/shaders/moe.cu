@@ -274,3 +274,58 @@ extern "C" __global__ void moe_combine_residual(
     }
     output[gid] = __float2bfloat16(sum);
 }
+
+// ---------------------------------------------------------------------------
+// Fused gate+up+SwiGLU with Q8 weights.
+//
+// Q8 block layout: 34 bytes per 32 weights (2-byte bf16 scale + 32 int8 values).
+// Same warp-cooperative pattern as bf16 but with inline Q8 dequantisation.
+// ---------------------------------------------------------------------------
+
+static constexpr unsigned int Q8_BYTES_PER_BLOCK = 34;
+
+extern "C" __global__ void fused_gate_up_swiglu_q8(
+    const FusedGateUpParams params,
+    const unsigned char* __restrict__ W_gate_q8,
+    const unsigned char* __restrict__ W_up_q8,
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ output
+) {
+    const unsigned int M = params.M;
+    const unsigned int K = params.K;
+    const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    unsigned int row = gid / 32;
+    unsigned int lane = gid % 32;
+    if (row >= M) return;
+
+    const unsigned int blocks_per_row = K / 32;
+    const unsigned char* gate_row = W_gate_q8 + row * blocks_per_row * Q8_BYTES_PER_BLOCK;
+    const unsigned char* up_row   = W_up_q8   + row * blocks_per_row * Q8_BYTES_PER_BLOCK;
+
+    float acc_gate = 0.0f;
+    float acc_up   = 0.0f;
+
+    for (unsigned int block_idx = 0; block_idx < blocks_per_row; block_idx++) {
+        const unsigned char* g_ptr = gate_row + block_idx * Q8_BYTES_PER_BLOCK;
+        float g_scale = __bfloat162float(*((const __nv_bfloat16*)g_ptr));
+        signed char g_val = (signed char)g_ptr[2 + lane];
+
+        const unsigned char* u_ptr = up_row + block_idx * Q8_BYTES_PER_BLOCK;
+        float u_scale = __bfloat162float(*((const __nv_bfloat16*)u_ptr));
+        signed char u_val = (signed char)u_ptr[2 + lane];
+
+        float x_val = __bfloat162float(x[block_idx * 32 + lane]);
+
+        acc_gate += (float)g_val * g_scale * x_val;
+        acc_up   += (float)u_val * u_scale * x_val;
+    }
+
+    acc_gate = warp_sum(acc_gate);
+    acc_up   = warp_sum(acc_up);
+
+    if (lane == 0) {
+        float silu = acc_gate / (1.0f + expf(-acc_gate));
+        output[row] = __float2bfloat16(silu * acc_up);
+    }
+}

@@ -617,3 +617,88 @@ extern "C" __global__ void prefill_attention(
     __nv_bfloat16* out_ptr = output + qi * q_stride + head_id * head_dim;
     reduce_v_and_write(v_acc, local_max, sr.x, sr.y, tid, tg_size, head_dim, shared_reduce, out_ptr);
 }
+
+// ===========================================================================
+// Fused QKV bidirectional attention for vision transformers.
+//
+// Reads a single interleaved QKV buffer [chunk_size, 3 * num_heads * head_dim]
+// and computes bidirectional (non-causal) attention.  Each row contains
+// Q, K, V concatenated: [Q₀..Q_{hd-1}, K₀..K_{hd-1}, V₀..V_{hd-1}].
+//
+// Dispatch: one block per (token, head) pair.
+// ===========================================================================
+
+struct FusedQkvAttentionParams {
+    unsigned int chunk_size;
+    unsigned int num_heads;
+    unsigned int head_dim;
+    float attn_scale;
+};
+
+extern "C" __global__ void prefill_attention_fused_qkv(
+    const FusedQkvAttentionParams params,
+    const __nv_bfloat16* __restrict__ qkv,
+    __nv_bfloat16* __restrict__ output
+) {
+    const unsigned int tg_size = blockDim.x;
+    const unsigned int tid = threadIdx.x;
+
+    const unsigned int chunk_size = params.chunk_size;
+    const unsigned int head_dim = params.head_dim;
+    const unsigned int num_heads = params.num_heads;
+    const unsigned int hd = num_heads * head_dim;
+
+    unsigned int qi      = blockIdx.x / num_heads;
+    unsigned int head_id = blockIdx.x % num_heads;
+
+    if (qi >= chunk_size) return;
+
+    const float scale = (params.attn_scale > 0.0f) ? params.attn_scale : rsqrtf((float)head_dim);
+
+    // QKV layout: row stride = 3 * hd.
+    const unsigned int qkv_stride = 3 * hd;
+
+    // Q pointer for this (token, head).
+    const __nv_bfloat16* q_ptr = qkv + qi * qkv_stride + head_id * head_dim;
+
+    // Load Q into shared memory.
+    __shared__ float q_shared[MAX_HD];
+    if (tid < head_dim) {
+        q_shared[tid] = __bfloat162float(q_ptr[tid]);
+    }
+    __syncthreads();
+
+    // Online softmax + V accumulation over ALL positions (bidirectional).
+    float v_acc[MAX_HD] = {};
+    float local_max = -INFINITY;
+    float local_sum_exp = 0.0f;
+
+    for (unsigned int pos = tid; pos < chunk_size; pos += tg_size) {
+        // K at position pos, head head_id: offset by hd (K starts after Q).
+        const __nv_bfloat16* k_vec = qkv + pos * qkv_stride + hd + head_id * head_dim;
+        float score = dot_q_k(q_shared, k_vec, head_dim) * scale;
+
+        if (score > local_max) {
+            float correction = expf(local_max - score);
+            for (unsigned int i = 0; i < head_dim; i++) v_acc[i] *= correction;
+            local_sum_exp = local_sum_exp * correction + 1.0f;
+            local_max = score;
+        } else {
+            local_sum_exp += expf(score - local_max);
+        }
+
+        float weight = expf(score - local_max);
+        // V at position pos: offset by 2*hd (V starts after Q and K).
+        const __nv_bfloat16* v_vec = qkv + pos * qkv_stride + 2 * hd + head_id * head_dim;
+        for (unsigned int i = 0; i < head_dim; i++) {
+            v_acc[i] += weight * __bfloat162float(v_vec[i]);
+        }
+    }
+
+    // Cross-thread softmax reduction + V write.
+    __shared__ float shared_reduce[NUM_WARPS * MAX_HD];
+    float2 sr = reduce_softmax(local_max, local_sum_exp, tid, tg_size, shared_reduce);
+
+    __nv_bfloat16* out_ptr = output + qi * hd + head_id * head_dim;
+    reduce_v_and_write(v_acc, local_max, sr.x, sr.y, tid, tg_size, head_dim, shared_reduce, out_ptr);
+}

@@ -73,6 +73,9 @@ const CUDA_SOURCE_ELEMENTWISE: &str = include_str!("shaders/elementwise.cu");
 const CUDA_SOURCE_EMBED: &str = include_str!("shaders/embed.cu");
 const CUDA_SOURCE_DELTANET: &str = include_str!("shaders/deltanet.cu");
 const CUDA_SOURCE_MOE: &str = include_str!("shaders/moe.cu");
+const CUDA_SOURCE_MAMBA2: &str = include_str!("shaders/mamba2.cu");
+const CUDA_SOURCE_VISION: &str = include_str!("shaders/vision.cu");
+const CUDA_SOURCE_TURBOQUANT: &str = include_str!("shaders/turboquant.cu");
 
 // ---------------------------------------------------------------------------
 // CudaBackend — holds the CUDA device context, stream, and all compiled
@@ -167,6 +170,41 @@ pub(crate) struct CudaBackend {
     pub(crate) fn_rope_yarn: CudaFunction,
     pub(crate) fn_rope_yarn_batch: CudaFunction,
     pub(crate) fn_gpt_oss_gated_act: CudaFunction,
+
+    // New elementwise kernels (Nemotron-H, vision).
+    pub(crate) fn_gelu_act: CudaFunction,
+    pub(crate) fn_relu_squared: CudaFunction,
+    pub(crate) fn_top_k_sigmoid: CudaFunction,
+
+    // LayerNorm (vision encoder).
+    pub(crate) fn_layer_norm_batch: CudaFunction,
+
+    // Q8 matmul kernels.
+    pub(crate) fn_matvec_q8: CudaFunction,
+    pub(crate) fn_gemm_q8: CudaFunction,
+    pub(crate) fn_gemm_q8_tc: Option<CudaFunction>,
+
+    // Q8 MoE kernel.
+    pub(crate) fn_fused_gate_up_swiglu_q8: CudaFunction,
+
+    // Mamba2 kernels (Nemotron-H).
+    pub(crate) fn_mamba2_conv1d_silu: CudaFunction,
+    pub(crate) fn_mamba2_ssm_step: CudaFunction,
+    pub(crate) fn_mamba2_gated_rms_norm: CudaFunction,
+
+    // Vision encoder kernels.
+    pub(crate) fn_spatial_merge: CudaFunction,
+    pub(crate) fn_spatial_merge_norm: CudaFunction,
+    pub(crate) fn_scatter_vision_tokens: CudaFunction,
+
+    // Fused QKV attention (vision encoder).
+    pub(crate) fn_prefill_attention_fused_qkv: CudaFunction,
+
+    // TurboQuant KV cache quantization kernels.
+    pub(crate) fn_turbo_quantize_paged: CudaFunction,
+    pub(crate) fn_turbo_quantize_paged_batch: CudaFunction,
+    pub(crate) fn_turbo_rotate_q: CudaFunction,
+    pub(crate) fn_turbo_paged_attention: CudaFunction,
 }
 
 impl CudaBackend {
@@ -238,6 +276,9 @@ impl CudaBackend {
         let ptx_embed = compile(CUDA_SOURCE_EMBED)?;
         let ptx_deltanet = compile(CUDA_SOURCE_DELTANET)?;
         let ptx_moe = compile(CUDA_SOURCE_MOE)?;
+        let ptx_mamba2 = compile(CUDA_SOURCE_MAMBA2)?;
+        let ptx_vision = compile(CUDA_SOURCE_VISION)?;
+        let ptx_turboquant = compile(CUDA_SOURCE_TURBOQUANT)?;
 
         // Load modules and extract function handles.
         let load = |ptx: cudarc::nvrtc::Ptx| -> anyhow::Result<Arc<CudaModule>> {
@@ -254,6 +295,9 @@ impl CudaBackend {
         let mod_embed = load(ptx_embed)?;
         let mod_deltanet = load(ptx_deltanet)?;
         let mod_moe = load(ptx_moe)?;
+        let mod_mamba2 = load(ptx_mamba2)?;
+        let mod_vision = load(ptx_vision)?;
+        let mod_turboquant = load(ptx_turboquant)?;
 
         // Tensor-core WMMA module (sm_80+ only).
         // Compiled with -arch=compute_80 so NVRTC emits WMMA (mma.h) instructions.
@@ -361,6 +405,41 @@ impl CudaBackend {
             fn_rope_yarn: func(&mod_rope, "rotary_embedding_yarn")?,
             fn_rope_yarn_batch: func(&mod_rope, "rotary_embedding_yarn_batch")?,
             fn_gpt_oss_gated_act: func(&mod_elementwise, "gpt_oss_gated_act")?,
+
+            // New elementwise kernels.
+            fn_gelu_act: func(&mod_elementwise, "gelu_act")?,
+            fn_relu_squared: func(&mod_elementwise, "relu_squared")?,
+            fn_top_k_sigmoid: func(&mod_elementwise, "top_k_sigmoid")?,
+
+            // LayerNorm (vision encoder).
+            fn_layer_norm_batch: func(&mod_rms_norm, "layer_norm_batch")?,
+
+            // Q8 matmul kernels.
+            fn_matvec_q8: func(&mod_matmul, "matvec_q8")?,
+            fn_gemm_q8: func(&mod_matmul, "gemm_q8")?,
+            fn_gemm_q8_tc: mod_matmul_tc.as_ref().map(|m| func(m, "gemm_q8_tc")).transpose()?,
+
+            // Q8 MoE kernel.
+            fn_fused_gate_up_swiglu_q8: func(&mod_moe, "fused_gate_up_swiglu_q8")?,
+
+            // Mamba2 kernels.
+            fn_mamba2_conv1d_silu: func(&mod_mamba2, "mamba2_conv1d_silu")?,
+            fn_mamba2_ssm_step: func(&mod_mamba2, "mamba2_ssm_step")?,
+            fn_mamba2_gated_rms_norm: func(&mod_mamba2, "mamba2_gated_rms_norm")?,
+
+            // Vision encoder kernels.
+            fn_spatial_merge: func(&mod_vision, "spatial_merge")?,
+            fn_spatial_merge_norm: func(&mod_vision, "spatial_merge_norm")?,
+            fn_scatter_vision_tokens: func(&mod_vision, "scatter_vision_tokens")?,
+
+            // Fused QKV attention (vision encoder).
+            fn_prefill_attention_fused_qkv: func(&mod_attn_128, "prefill_attention_fused_qkv")?,
+
+            // TurboQuant kernels.
+            fn_turbo_quantize_paged: func(&mod_turboquant, "turbo_quantize_paged")?,
+            fn_turbo_quantize_paged_batch: func(&mod_turboquant, "turbo_quantize_paged_batch")?,
+            fn_turbo_rotate_q: func(&mod_turboquant, "turbo_rotate_q")?,
+            fn_turbo_paged_attention: func(&mod_turboquant, "turbo_paged_attention")?,
         })
     }
 

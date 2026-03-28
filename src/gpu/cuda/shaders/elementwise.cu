@@ -242,3 +242,100 @@ extern "C" __global__ void gpt_oss_gated_act(
 
     output[gid] = __float2bfloat16((u_c + 1.0f) * glu);
 }
+
+// Plain GELU activation: out[i] = gelu(input[i])
+// Used by vision encoder FFN (SigLIP ViT).
+extern "C" __global__ void gelu_act(
+    const ElemParams params,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output
+) {
+    const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= params.size) return;
+    float x = __bfloat162float(input[gid]);
+    const float SQRT_2_OVER_PI = 0.7978845608028654f;
+    float inner = SQRT_2_OVER_PI * (x + 0.044715f * x * x * x);
+    output[gid] = __float2bfloat16(0.5f * x * (1.0f + tanhf(inner)));
+}
+
+// ReLU-squared activation: out[i] = max(0, input[i])²
+// Used by Nemotron-H MoE experts instead of SwiGLU.
+extern "C" __global__ void relu_squared(
+    const ElemParams params,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output
+) {
+    const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= params.size) return;
+    float v = __bfloat162float(input[gid]);
+    float r = v > 0.0f ? v * v : 0.0f;
+    output[gid] = __float2bfloat16(r);
+}
+
+// GPU-side top-k selection with sigmoid routing for Nemotron-H MoE.
+// DeepSeek-V3 style routing with correction bias for load balancing.
+struct TopKSigmoidParams {
+    unsigned int num_experts;
+    unsigned int k;
+    float scaling_factor;
+    unsigned int norm_topk_prob;
+};
+
+extern "C" __global__ void top_k_sigmoid(
+    const TopKSigmoidParams params,
+    const __nv_bfloat16* __restrict__ logits,
+    const float* __restrict__ correction_bias,
+    float* __restrict__ output
+) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+
+    unsigned int n = params.num_experts;
+    unsigned int k = params.k;
+
+    // Step 1: Compute sigmoid scores from bf16 logits.
+    float scores[1024];
+    float adjusted[1024];
+    for (unsigned int i = 0; i < n && i < 1024; i++) {
+        float s = 1.0f / (1.0f + expf(-__bfloat162float(logits[i])));
+        scores[i] = s;
+        // Step 2: Bias shifts selection without affecting final weights.
+        adjusted[i] = s + correction_bias[i];
+    }
+
+    // Step 3: Select top-k by adjusted scores.
+    unsigned int top_indices[32];
+    float top_weights[32];
+    for (unsigned int j = 0; j < k; j++) {
+        float best_val = -INFINITY;
+        unsigned int best_idx = 0;
+        for (unsigned int i = 0; i < n; i++) {
+            if (adjusted[i] > best_val) {
+                best_val = adjusted[i];
+                best_idx = i;
+            }
+        }
+        top_indices[j] = best_idx;
+        // Step 4: Use ORIGINAL sigmoid score as the routing weight.
+        top_weights[j] = scores[best_idx];
+        adjusted[best_idx] = -INFINITY;
+    }
+
+    // Step 5: Optionally normalize weights to sum to 1.
+    if (params.norm_topk_prob != 0) {
+        float weight_sum = 0.0f;
+        for (unsigned int j = 0; j < k; j++) {
+            weight_sum += top_weights[j];
+        }
+        if (weight_sum > 0.0f) {
+            for (unsigned int j = 0; j < k; j++) {
+                top_weights[j] /= weight_sum;
+            }
+        }
+    }
+
+    // Step 6: Write (index, weight) pairs with scaling factor applied.
+    for (unsigned int j = 0; j < k; j++) {
+        output[2 * j]     = (float)top_indices[j];
+        output[2 * j + 1] = top_weights[j] * params.scaling_factor;
+    }
+}

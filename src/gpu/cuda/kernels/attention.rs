@@ -385,13 +385,39 @@ impl GpuAttention for CudaBackend {
 
     fn prefill_attention_fused_qkv(
         &self,
-        _qkv: &CudaTensor,
-        _out: &CudaTensor,
-        _chunk_size: u32,
-        _num_heads: u32,
-        _head_dim: u32,
-        _attn_scale: f32,
+        qkv: &CudaTensor,
+        out: &CudaTensor,
+        chunk_size: u32,
+        num_heads: u32,
+        head_dim: u32,
+        attn_scale: f32,
     ) {
-        todo!("prefill_attention_fused_qkv not yet implemented for CUDA backend")
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct FusedQkvAttentionParams {
+            chunk_size: u32,
+            num_heads: u32,
+            head_dim: u32,
+            attn_scale: f32,
+        }
+        unsafe impl DeviceRepr for FusedQkvAttentionParams {}
+
+        let params = FusedQkvAttentionParams {
+            chunk_size,
+            num_heads,
+            head_dim,
+            attn_scale,
+        };
+        let num_blocks = chunk_size * num_heads;
+        let cfg = CudaBackend::cfg_blocks(num_blocks, 256);
+        unsafe {
+            self.stream
+                .launch_builder(&self.fn_prefill_attention_fused_qkv)
+                .arg(&params)
+                .arg(&qkv.buf)
+                .arg(&out.buf)
+                .launch(cfg)
+        }
+        .expect("prefill_attention_fused_qkv launch failed");
     }
 }

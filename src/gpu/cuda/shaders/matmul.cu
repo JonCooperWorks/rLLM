@@ -354,3 +354,91 @@ extern "C" __global__ void gemm_q4(
         Y[batch * M + row] = __float2bfloat16(acc);
     }
 }
+
+// ===========================================================================
+// Q8 kernels — 8-bit symmetric quantization.
+//
+// Q8 block layout (34 bytes per 32 weights):
+//   bytes  0-1:  bf16 scale
+//   bytes  2-33: 32 signed int8 values
+//   Dequant: weight = float(q) * scale
+//
+// Simpler than Q4 — one byte per weight, no nibble extraction.
+// ===========================================================================
+
+static constexpr unsigned int Q8_BYTES_PER_BLOCK = 34;
+
+// ---------------------------------------------------------------------------
+// matvec_q8 — SIMD-cooperative matvec with inline Q8 dequantisation.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void matvec_q8(
+    const MatvecParams params,
+    const unsigned char* __restrict__ W_q8,
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ y
+) {
+    const unsigned int M = params.M;
+    const unsigned int K = params.K;
+    const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    unsigned int row = gid / 32;
+    unsigned int lane = gid % 32;
+    if (row >= M) return;
+
+    const unsigned int blocks_per_row = K / 32;
+    const unsigned char* row_data = W_q8 + row * blocks_per_row * Q8_BYTES_PER_BLOCK;
+
+    float acc = 0.0f;
+
+    // Cooperative: all 32 lanes process the same block, each handles weight[lane].
+    for (unsigned int block_idx = 0; block_idx < blocks_per_row; block_idx++) {
+        const unsigned char* block_ptr = row_data + block_idx * Q8_BYTES_PER_BLOCK;
+        float scale = __bfloat162float(*((const __nv_bfloat16*)block_ptr));
+        signed char q_val = (signed char)block_ptr[2 + lane];
+        acc += (float)q_val * scale * __bfloat162float(x[block_idx * 32 + lane]);
+    }
+
+    acc = warp_sum(acc);
+    if (lane == 0) {
+        y[row] = __float2bfloat16(acc);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// gemm_q8 — batched GEMM with inline Q8 dequantisation.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void gemm_q8(
+    const GemmParams params,
+    const unsigned char* __restrict__ W_q8,
+    const __nv_bfloat16* __restrict__ X,
+    __nv_bfloat16* __restrict__ Y
+) {
+    const unsigned int M = params.M;
+    const unsigned int K = params.K;
+    const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    unsigned int elem = gid / 32;
+    unsigned int lane = gid % 32;
+    unsigned int batch = elem / M;
+    unsigned int row   = elem % M;
+
+    if (batch >= params.batch_size) return;
+
+    const unsigned int blocks_per_row = K / 32;
+    const unsigned char* row_data = W_q8 + row * blocks_per_row * Q8_BYTES_PER_BLOCK;
+    const __nv_bfloat16* x_vec = X + batch * K;
+
+    float acc = 0.0f;
+
+    for (unsigned int block_idx = 0; block_idx < blocks_per_row; block_idx++) {
+        const unsigned char* block_ptr = row_data + block_idx * Q8_BYTES_PER_BLOCK;
+        float scale = __bfloat162float(*((const __nv_bfloat16*)block_ptr));
+        signed char q_val = (signed char)block_ptr[2 + lane];
+        acc += (float)q_val * scale * __bfloat162float(x_vec[block_idx * 32 + lane]);
+    }
+
+    acc = warp_sum(acc);
+    if (lane == 0) {
+        Y[batch * M + row] = __float2bfloat16(acc);
+    }
+}

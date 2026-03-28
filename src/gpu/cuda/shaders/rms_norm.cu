@@ -170,3 +170,86 @@ extern "C" __global__ void rms_norm_batch(
         row_out[i] = __float2bfloat16(val * scale * __bfloat162float(weight[i]));
     }
 }
+
+// ===========================================================================
+// LayerNorm — one block per row of [batch_size, hidden_size].
+// Unlike RMSNorm, LayerNorm has two reductions (mean and variance) and
+// includes both weight and bias parameters.  Used by SigLIP ViT encoder.
+// ===========================================================================
+
+struct LayerNormBatchParams {
+    unsigned int hidden_size;
+    float eps;
+    unsigned int batch_size;
+};
+
+extern "C" __global__ void layer_norm_batch(
+    const LayerNormBatchParams params,
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ bias,
+    __nv_bfloat16* __restrict__ output
+) {
+    const unsigned int row_id = blockIdx.x;
+    if (row_id >= params.batch_size) return;
+
+    const unsigned int hidden = params.hidden_size;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int tg_size = blockDim.x;
+
+    const __nv_bfloat16* row_in  = input  + row_id * hidden;
+    __nv_bfloat16*       row_out = output + row_id * hidden;
+
+    // Phase 1: Compute mean via sum reduction.
+    float local_sum = 0.0f;
+    for (unsigned int i = tid; i < hidden; i += tg_size) {
+        local_sum += __bfloat162float(row_in[i]);
+    }
+
+    local_sum = warp_sum(local_sum);
+
+    __shared__ float shared[32];
+    unsigned int warp_id = tid / 32;
+    unsigned int lane_id = tid % 32;
+
+    if (lane_id == 0) shared[warp_id] = local_sum;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        unsigned int num_warps = (tg_size + 31) / 32;
+        float val = (lane_id < num_warps) ? shared[lane_id] : 0.0f;
+        val = warp_sum(val);
+        if (lane_id == 0) shared[0] = val;
+    }
+    __syncthreads();
+
+    float mean = shared[0] / (float)hidden;
+
+    // Phase 2: Compute variance.
+    float sum_sq = 0.0f;
+    for (unsigned int i = tid; i < hidden; i += tg_size) {
+        float d = __bfloat162float(row_in[i]) - mean;
+        sum_sq += d * d;
+    }
+
+    sum_sq = warp_sum(sum_sq);
+
+    if (lane_id == 0) shared[warp_id] = sum_sq;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        unsigned int num_warps = (tg_size + 31) / 32;
+        float val = (lane_id < num_warps) ? shared[lane_id] : 0.0f;
+        val = warp_sum(val);
+        if (lane_id == 0) shared[0] = val;
+    }
+    __syncthreads();
+
+    float scale = rsqrtf(shared[0] / (float)hidden + params.eps);
+
+    // Phase 3: Normalise, scale by weight, add bias.
+    for (unsigned int i = tid; i < hidden; i += tg_size) {
+        float val = (__bfloat162float(row_in[i]) - mean) * scale;
+        row_out[i] = __float2bfloat16(val * __bfloat162float(weight[i]) + __bfloat162float(bias[i]));
+    }
+}

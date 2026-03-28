@@ -165,8 +165,30 @@ impl GpuCore for CudaBackend {
         .expect("CUDA memcpy_dtod_async failed");
     }
 
-    fn copy_to_tensor_from_host(&self, _src: &[u8], _dst: &CudaTensor) {
-        todo!("copy_to_tensor_from_host not yet implemented for CUDA")
+    fn copy_to_tensor_from_host(&self, src: &[u8], dst: &CudaTensor) {
+        // Bind context for multi-GPU support.
+        self.ctx
+            .bind_to_thread()
+            .expect("CUDA bind_to_thread failed");
+
+        let byte_count = dst.byte_count();
+        assert!(
+            src.len() >= byte_count,
+            "copy_to_tensor_from_host: src too small ({} < {})",
+            src.len(),
+            byte_count
+        );
+
+        let dst_dptr = *dst.buf.device_ptr();
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async(
+                dst_dptr,
+                src.as_ptr() as *const _,
+                byte_count,
+                self.stream.cu_stream(),
+            )
+        }
+        .expect("CUDA memcpy_htod_async failed");
     }
 
     fn copy_to_host(&self, tensor: &CudaTensor, dst: &mut [u8]) {
