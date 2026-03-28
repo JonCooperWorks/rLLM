@@ -158,6 +158,7 @@ mod imp {
             max_gen_tokens: usize,
             temperature: f32,
             top_p: f32,
+            images: Vec<crate::model::vision::ProcessedImage>,
             seed: Option<u64>,
         ) -> SeqId {
             self.scheduler.add_request(SequenceRequest {

@@ -153,7 +153,7 @@ pub(crate) mod tp {
         }
 
         /// Run batched prefill on all ranks in parallel.
-        pub fn forward_prefill_paged(&self, tokens: &[u32]) -> anyhow::Result<()> {
+        pub fn forward_prefill_paged(&self, tokens: &[u32], images: &[crate::model::vision::ProcessedImage]) -> anyhow::Result<()> {
             if self.world_size == 1 {
                 let r = &self.ranks[0];
                 return r.model.forward_prefill_paged(
@@ -161,6 +161,7 @@ pub(crate) mod tp {
                     &r.kv_pool,
                     &r.seq_state,
                     &r.prefill_bufs,
+                    images,
                 );
             }
 
@@ -175,6 +176,7 @@ pub(crate) mod tp {
                                 &rank.kv_pool,
                                 &rank.seq_state,
                                 &rank.prefill_bufs,
+                                images,
                             )
                         })
                     })
@@ -349,6 +351,7 @@ pub(crate) mod tp {
                     &r.kv_pool,
                     &states[0],
                     &r.prefill_bufs,
+                    &[],
                 );
             }
 
@@ -364,6 +367,7 @@ pub(crate) mod tp {
                                 &rank.kv_pool,
                                 state,
                                 &rank.prefill_bufs,
+                                &[],
                             )
                         })
                     })

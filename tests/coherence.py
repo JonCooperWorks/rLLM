@@ -42,7 +42,11 @@ def check_coherence(text: str) -> tuple[bool, str]:
     #      several times in long text without being degenerate.  The threshold
     #      scales with text length: max(6, word_count // 40).  For a typical
     #      512-token response (~400 words), the threshold is 10.
-    words = text.lower().split()
+    # Filter out markdown table separators (|, |---|, etc.) and lone
+    # punctuation before repetition analysis — these are formatting, not
+    # degenerate generation.
+    words = [w for w in text.lower().split()
+             if not re.fullmatch(r'[-|:*#>_=~`]+', w)]
     if len(words) >= 6:
         trigram_counts: dict[tuple[str, ...], int] = {}
         for i in range(len(words) - 2):

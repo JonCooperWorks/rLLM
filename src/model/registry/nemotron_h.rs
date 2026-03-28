@@ -723,6 +723,15 @@ use crate::model::loader::{
     TensorStore, LayerWeights, ExpertWeights, upload_tensor,
 };
 
+/// Convert a safetensor view to Vec<f32>, handling both bf16 and f32 storage.
+fn to_f32_vec(view: &safetensors::tensor::TensorView<'_>) -> Vec<f32> {
+    match view.dtype() {
+        safetensors::Dtype::F32 => bytemuck::cast_slice::<u8, f32>(view.data()).to_vec(),
+        _ => bytemuck::cast_slice::<u8, half::bf16>(view.data())
+            .iter().map(|v| v.to_f32()).collect(),
+    }
+}
+
 /// Load weights for one Nemotron-H layer (Mamba-2, MoE, or attention).
 pub(crate) fn load_layer<B: GpuCore>(
     store: &TensorStore,
@@ -799,25 +808,24 @@ pub(crate) fn load_layer<B: GpuCore>(
                 store, backend, &format!("{prefix}.mixer.out_proj.weight"), &[hidden, d_inner],
             )?);
 
-            // A_log, D, dt_bias are stored as bf16 but the SSM kernel needs f32
-            // for numerical precision (exp/softplus on small values).
+            // A_log, D, dt_bias may be stored as bf16 (original) or f32
+            // (pre-quantized models preserve precision).  The SSM kernel needs
+            // f32 for numerical precision (exp/softplus on small values), so
+            // convert bf16→f32 if needed, or pass f32 through directly.
             let a_log_view = store.tensor(&format!("{prefix}.mixer.A_log"))?;
-            let a_log_f32: Vec<f32> = bytemuck::cast_slice::<u8, half::bf16>(a_log_view.data())
-                .iter().map(|v| v.to_f32()).collect();
+            let a_log_f32 = to_f32_vec(&a_log_view);
             lw.mamba_a_log = Some(backend.upload_tensor(
                 bytemuck::cast_slice(&a_log_f32), &[n_heads], TensorDtype::F32,
             ));
 
             let d_view = store.tensor(&format!("{prefix}.mixer.D"))?;
-            let d_f32: Vec<f32> = bytemuck::cast_slice::<u8, half::bf16>(d_view.data())
-                .iter().map(|v| v.to_f32()).collect();
+            let d_f32 = to_f32_vec(&d_view);
             lw.mamba_d = Some(backend.upload_tensor(
                 bytemuck::cast_slice(&d_f32), &[n_heads], TensorDtype::F32,
             ));
 
             let dt_bias_view = store.tensor(&format!("{prefix}.mixer.dt_bias"))?;
-            let dt_bias_f32: Vec<f32> = bytemuck::cast_slice::<u8, half::bf16>(dt_bias_view.data())
-                .iter().map(|v| v.to_f32()).collect();
+            let dt_bias_f32 = to_f32_vec(&dt_bias_view);
             lw.mamba_dt_bias = Some(backend.upload_tensor(
                 bytemuck::cast_slice(&dt_bias_f32), &[n_heads], TensorDtype::F32,
             ));

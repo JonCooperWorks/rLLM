@@ -72,6 +72,29 @@ All models support bf16 and Q4. Multi-GPU via `--tp N` requires CUDA + NCCL.
 </details>
 
 <details>
+<summary><b>NVIDIA RTX 4080 SUPER 32 GB</b> — 736 GB/s GDDR6X</summary>
+
+| Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
+|---|---|---|---|---|---|
+| Llama 3.2 1B Instruct | 1.2B | 187 tok/s | 233 tok/s | 52 ms | 70 ms |
+| Llama 3.2 3B Instruct | 3.2B | 77 tok/s | 106 tok/s | 112 ms | 158 ms |
+| Qwen 2.5 3B Instruct | 3.1B | 84 tok/s | — | 130 ms | — |
+| Gemma 3 4B Instruct | 4.3B | 51 tok/s | 35 tok/s | 120 ms | 288 ms |
+| Qwen 2.5 7B Instruct | 7.6B | 44 tok/s | 77 tok/s | 184 ms | 228 ms |
+| Mistral 7B Instruct | 7.2B | 40 tok/s | 62 tok/s | 186 ms | 240 ms |
+| Llama 3.1 8B Instruct | 8.0B | 38 tok/s | 59 tok/s | 199 ms | 256 ms |
+| Qwen3.5 9B | ~9B | 35 tok/s | 59 tok/s | 665 ms | 476 ms |
+| Phi-4 | 14.7B | 22 tok/s | 38 tok/s | 306 ms | 367 ms |
+| Qwen3.5 27B Q4 | ~27B | — | 21 tok/s | — | 1,542 ms |
+| Nemotron-H 30B Q4 | 31.6B (3.6B active) | — | 107 tok/s | — | 319 ms |
+| Mixtral 8x7B Instruct ⚡ | 46.7B (12.9B active) | 0.3 tok/s | 0.9 tok/s | 32,243 ms | 12,657 ms |
+| Qwen3.5 35B-A3B ⚡ | 35.1B (3.3B active) | 3.1 tok/s | 7.9 tok/s | 9,364 ms | 3,649 ms |
+
+⚡ = SSD expert streaming (`--stream-experts`). Nemotron-H 30B Q4 fits in 32 GB without streaming thanks to the compact Mamba-2 + MoE architecture.
+
+</details>
+
+<details>
 <summary><b>NVIDIA H100 NVL 94 GB</b> — 3.35 TB/s HBM3</summary>
 
 Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548).

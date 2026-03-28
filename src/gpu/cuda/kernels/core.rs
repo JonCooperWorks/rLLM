@@ -171,20 +171,19 @@ impl GpuCore for CudaBackend {
             .bind_to_thread()
             .expect("CUDA bind_to_thread failed");
 
-        let byte_count = dst.byte_count();
+        let byte_count = src.len();
         assert!(
-            src.len() >= byte_count,
-            "copy_to_tensor_from_host: src too small ({} < {})",
-            src.len(),
+            dst.byte_count() >= byte_count,
+            "copy_to_tensor_from_host: dst too small ({} < {})",
+            dst.byte_count(),
             byte_count
         );
 
-        let dst_dptr = *dst.buf.device_ptr();
+        let (dst_dptr, _sync) = dst.buf.device_ptr(&self.stream);
         unsafe {
             cudarc::driver::result::memcpy_htod_async(
                 dst_dptr,
-                src.as_ptr() as *const _,
-                byte_count,
+                src,
                 self.stream.cu_stream(),
             )
         }
