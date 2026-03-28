@@ -276,7 +276,7 @@ kernel void matvec_q4(
 
                 // --- Chunk 0: weights 0-7, packed uint load → acc_a ---
                 {
-                    uint pk = *((device const uint*)(d0));
+                    uint pk = uint(d0[0]) | (uint(d0[1]) << 8) | (uint(d0[2]) << 16) | (uint(d0[3]) << 24);
                     float x0 = x_shared[xb],     x1 = x_shared[xb + 1];
                     float x2 = x_shared[xb + 2], x3 = x_shared[xb + 3];
                     float x4 = x_shared[xb + 4], x5 = x_shared[xb + 5];
@@ -292,7 +292,7 @@ kernel void matvec_q4(
                     acc0_a = fma(fma(float((pk >> 28)),        scale0, neg8s0), x7, acc0_a);
 
                     if (has_row1) {
-                        uint p1 = *((device const uint*)(d1));
+                        uint p1 = uint(d1[0]) | (uint(d1[1]) << 8) | (uint(d1[2]) << 16) | (uint(d1[3]) << 24);
                         acc1_a = fma(fma(float(p1 & 0xF),         scale1, neg8s1), x0, acc1_a);
                         acc1_a = fma(fma(float((p1 >> 4) & 0xF),  scale1, neg8s1), x1, acc1_a);
                         acc1_a = fma(fma(float((p1 >> 8) & 0xF),  scale1, neg8s1), x2, acc1_a);
@@ -306,7 +306,7 @@ kernel void matvec_q4(
 
                 // --- Chunk 1: weights 8-15 → acc_a ---
                 {
-                    uint pk = *((device const uint*)(d0 + 4));
+                    uint pk = uint(d0[4]) | (uint(d0[5]) << 8) | (uint(d0[6]) << 16) | (uint(d0[7]) << 24);
                     float x0 = x_shared[xb + 8],  x1 = x_shared[xb + 9];
                     float x2 = x_shared[xb + 10], x3 = x_shared[xb + 11];
                     float x4 = x_shared[xb + 12], x5 = x_shared[xb + 13];
@@ -322,7 +322,7 @@ kernel void matvec_q4(
                     acc0_a = fma(fma(float((pk >> 28)),        scale0, neg8s0), x7, acc0_a);
 
                     if (has_row1) {
-                        uint p1 = *((device const uint*)(d1 + 4));
+                        uint p1 = uint(d1[4]) | (uint(d1[5]) << 8) | (uint(d1[6]) << 16) | (uint(d1[7]) << 24);
                         acc1_a = fma(fma(float(p1 & 0xF),         scale1, neg8s1), x0, acc1_a);
                         acc1_a = fma(fma(float((p1 >> 4) & 0xF),  scale1, neg8s1), x1, acc1_a);
                         acc1_a = fma(fma(float((p1 >> 8) & 0xF),  scale1, neg8s1), x2, acc1_a);
@@ -336,7 +336,7 @@ kernel void matvec_q4(
 
                 // --- Chunk 2: weights 16-23 → acc_b ---
                 {
-                    uint pk = *((device const uint*)(d0 + 8));
+                    uint pk = uint(d0[8]) | (uint(d0[9]) << 8) | (uint(d0[10]) << 16) | (uint(d0[11]) << 24);
                     float x0 = x_shared[xb + 16], x1 = x_shared[xb + 17];
                     float x2 = x_shared[xb + 18], x3 = x_shared[xb + 19];
                     float x4 = x_shared[xb + 20], x5 = x_shared[xb + 21];
@@ -352,7 +352,7 @@ kernel void matvec_q4(
                     acc0_b = fma(fma(float((pk >> 28)),        scale0, neg8s0), x7, acc0_b);
 
                     if (has_row1) {
-                        uint p1 = *((device const uint*)(d1 + 8));
+                        uint p1 = uint(d1[8]) | (uint(d1[9]) << 8) | (uint(d1[10]) << 16) | (uint(d1[11]) << 24);
                         acc1_b = fma(fma(float(p1 & 0xF),         scale1, neg8s1), x0, acc1_b);
                         acc1_b = fma(fma(float((p1 >> 4) & 0xF),  scale1, neg8s1), x1, acc1_b);
                         acc1_b = fma(fma(float((p1 >> 8) & 0xF),  scale1, neg8s1), x2, acc1_b);
@@ -366,7 +366,7 @@ kernel void matvec_q4(
 
                 // --- Chunk 3: weights 24-31 → acc_b ---
                 {
-                    uint pk = *((device const uint*)(d0 + 12));
+                    uint pk = uint(d0[12]) | (uint(d0[13]) << 8) | (uint(d0[14]) << 16) | (uint(d0[15]) << 24);
                     float x0 = x_shared[xb + 24], x1 = x_shared[xb + 25];
                     float x2 = x_shared[xb + 26], x3 = x_shared[xb + 27];
                     float x4 = x_shared[xb + 28], x5 = x_shared[xb + 29];
@@ -382,7 +382,7 @@ kernel void matvec_q4(
                     acc0_b = fma(fma(float((pk >> 28)),        scale0, neg8s0), x7, acc0_b);
 
                     if (has_row1) {
-                        uint p1 = *((device const uint*)(d1 + 12));
+                        uint p1 = uint(d1[12]) | (uint(d1[13]) << 8) | (uint(d1[14]) << 16) | (uint(d1[15]) << 24);
                         acc1_b = fma(fma(float(p1 & 0xF),         scale1, neg8s1), x0, acc1_b);
                         acc1_b = fma(fma(float((p1 >> 4) & 0xF),  scale1, neg8s1), x1, acc1_b);
                         acc1_b = fma(fma(float((p1 >> 8) & 0xF),  scale1, neg8s1), x2, acc1_b);
@@ -549,7 +549,7 @@ kernel void gemm_q4(
 
         // Chunk 0: weights 0-7 → acc_a.
         {
-            uint pk = *((device const uint*)(data));
+            uint pk = uint(data[0]) | (uint(data[1]) << 8) | (uint(data[2]) << 16) | (uint(data[3]) << 24);
             float x0 = float(x_vec[xb]),     x1 = float(x_vec[xb + 1]);
             float x2 = float(x_vec[xb + 2]), x3 = float(x_vec[xb + 3]);
             float x4 = float(x_vec[xb + 4]), x5 = float(x_vec[xb + 5]);
@@ -567,7 +567,7 @@ kernel void gemm_q4(
 
         // Chunk 1: weights 8-15 → acc_a.
         {
-            uint pk = *((device const uint*)(data + 4));
+            uint pk = uint(data[4]) | (uint(data[5]) << 8) | (uint(data[6]) << 16) | (uint(data[7]) << 24);
             float x0 = float(x_vec[xb + 8]),  x1 = float(x_vec[xb + 9]);
             float x2 = float(x_vec[xb + 10]), x3 = float(x_vec[xb + 11]);
             float x4 = float(x_vec[xb + 12]), x5 = float(x_vec[xb + 13]);
@@ -585,7 +585,7 @@ kernel void gemm_q4(
 
         // Chunk 2: weights 16-23 → acc_b.
         {
-            uint pk = *((device const uint*)(data + 8));
+            uint pk = uint(data[8]) | (uint(data[9]) << 8) | (uint(data[10]) << 16) | (uint(data[11]) << 24);
             float x0 = float(x_vec[xb + 16]), x1 = float(x_vec[xb + 17]);
             float x2 = float(x_vec[xb + 18]), x3 = float(x_vec[xb + 19]);
             float x4 = float(x_vec[xb + 20]), x5 = float(x_vec[xb + 21]);
@@ -603,7 +603,7 @@ kernel void gemm_q4(
 
         // Chunk 3: weights 24-31 → acc_b.
         {
-            uint pk = *((device const uint*)(data + 12));
+            uint pk = uint(data[12]) | (uint(data[13]) << 8) | (uint(data[14]) << 16) | (uint(data[15]) << 24);
             float x0 = float(x_vec[xb + 24]), x1 = float(x_vec[xb + 25]);
             float x2 = float(x_vec[xb + 26]), x3 = float(x_vec[xb + 27]);
             float x4 = float(x_vec[xb + 28]), x5 = float(x_vec[xb + 29]);
