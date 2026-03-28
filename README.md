@@ -411,10 +411,23 @@ cargo run --release -- run --model models/llama-3.2-1b-instruct --prompt "Hello"
 
 Gated models (Llama, Gemma, Mistral) require a HuggingFace token — set `HF_TOKEN` or run `hf auth login` first.
 
-### Test
+### Test & Benchmark
 
 ```bash
-cargo test                     # All tests (CPU backend, no GPU required)
+# Unit tests (CPU backend, no GPU required)
+cargo test                     # All tests
 cargo test primitives::tests   # MoE buffer sizing
 cargo test gpu::cpu::tests     # GPU kernel correctness vs CPU reference
+
+# GPU integration tests — smoke-tests all model families, validates coherent English output
+tests/run.sh                              # build + download small tier + test
+tests/run.sh --skip-download -k llama     # filter by family
+uv run pytest tests/ -v                   # run directly (models must be present)
+
+# Benchmarks — throughput + TTFT + quality validation (coherence, language detection)
+uv run python tests/bench.py --models-dir models
+uv run python tests/bench.py --filter qwen3.5 --runs 3
+tests/run.sh --bench                      # all-in-one (build + bench)
 ```
+
+The benchmark suite validates output quality alongside performance — every model's response is checked for coherent English generation (language detection, repetition, encoding integrity) so regressions in model output are caught alongside throughput changes.

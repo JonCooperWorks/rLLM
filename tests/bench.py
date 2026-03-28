@@ -41,6 +41,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from conftest import ServerManager, _find_rllm_binary, _get_gpu_count, _get_available_memory_gb, _should_stream_experts
+from coherence import check_coherence
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +85,7 @@ KNOWN_MODELS = {
     "qwen3.5-397b-a27b":              ("Qwen3_5M",  True,  794, True),
 }
 
-DEFAULT_PROMPT = "The meaning of life is"
+DEFAULT_PROMPT = "Explain how a computer processor works in simple terms."
 
 
 # ---------------------------------------------------------------------------
@@ -137,8 +138,11 @@ def bench_one_streaming(base_url: str, prompt: str, max_tokens: int) -> dict:
 
     t_start = time.monotonic()
     t_first_token = None
+    t_first_reasoning = None
+    has_thinking = False
     completion_tokens = 0
     prompt_tokens = 0
+    content_pieces = []
 
     try:
         resp = requests.post(
@@ -158,10 +162,16 @@ def bench_one_streaming(base_url: str, prompt: str, max_tokens: int) -> dict:
                 break
             try:
                 obj = json.loads(data)
-                # Record TTFT on first content delta.
                 delta = obj.get("choices", [{}])[0].get("delta", {})
-                if delta.get("content") and t_first_token is None:
-                    t_first_token = time.monotonic()
+                # Track reasoning_content (thinking models emit this before content).
+                if delta.get("reasoning_content") and t_first_reasoning is None:
+                    t_first_reasoning = time.monotonic()
+                    has_thinking = True
+                # Record TTFT on first content delta.
+                if delta.get("content"):
+                    content_pieces.append(delta["content"])
+                    if t_first_token is None:
+                        t_first_token = time.monotonic()
                 # Check for usage in final chunk.
                 usage = obj.get("usage")
                 if usage:
@@ -175,11 +185,20 @@ def bench_one_streaming(base_url: str, prompt: str, max_tokens: int) -> dict:
     except Exception:
         return None
 
-    if t_first_token is None:
+    if t_first_token is None and t_first_reasoning is None:
         return None
 
-    ttft_ms = (t_first_token - t_start) * 1000
-    gen_duration = t_end - t_first_token
+    # For thinking models, TTFT is when reasoning started (that's when the
+    # model produced its first token).  The thinking-aware streaming path
+    # collects all tokens then emits content as a burst, so t_first_token
+    # would be misleadingly late.
+    if has_thinking and t_first_reasoning is not None:
+        ttft_ms = (t_first_reasoning - t_start) * 1000
+    elif t_first_token is not None:
+        ttft_ms = (t_first_token - t_start) * 1000
+    else:
+        ttft_ms = (t_end - t_start) * 1000
+
     total_ms = (t_end - t_start) * 1000
 
     # If we didn't get usage from streaming, make a non-streaming call to get it.
@@ -200,6 +219,14 @@ def bench_one_streaming(base_url: str, prompt: str, max_tokens: int) -> dict:
         except Exception:
             pass
 
+    # For thinking models, the pseudo-streaming path collects all tokens then
+    # emits them as a burst — measuring post-first-token duration gives absurd
+    # numbers.  Use total wall time (minus prefill TTFT) instead.
+    if has_thinking:
+        gen_duration = (total_ms - ttft_ms) / 1000
+    else:
+        gen_duration = t_end - t_first_token if t_first_token else total_ms / 1000
+
     gen_tps = completion_tokens / gen_duration if gen_duration > 0 and completion_tokens > 0 else 0
 
     return {
@@ -208,6 +235,7 @@ def bench_one_streaming(base_url: str, prompt: str, max_tokens: int) -> dict:
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_ms": total_ms,
+        "content": "".join(content_pieces),
     }
 
 
@@ -383,16 +411,27 @@ def main():
 
             # Run multiple iterations and average.
             run_results = []
+            quality_ok = True
+            quality_reason = ""
             for run_idx in range(args.runs):
                 r = bench_one_streaming(base_url, args.prompt, args.max_tokens)
                 if r is None:
                     print(f"  Run {run_idx + 1}: FAILED")
                     continue
                 run_results.append(r)
+
+                # Quality check on generated content.
+                coherent, reason = check_coherence(r["content"])
+                status = "OK" if coherent else f"QUALITY FAIL: {reason}"
+                if not coherent:
+                    quality_ok = False
+                    quality_reason = reason
+
                 print(
                     f"  Run {run_idx + 1}: {r['gen_tps']:.1f} tok/s, "
                     f"TTFT {r['ttft_ms']:.0f} ms, "
-                    f"{r['completion_tokens']} tokens in {r['total_ms']:.0f} ms"
+                    f"{r['completion_tokens']} tokens in {r['total_ms']:.0f} ms "
+                    f"[{status}]"
                 )
 
             if run_results:
@@ -401,11 +440,13 @@ def main():
                 results.append({
                     "name": name, "family": model["family"],
                     "gen_tps": avg_tps, "ttft_ms": avg_ttft,
+                    "quality": "PASS" if quality_ok else f"FAIL: {quality_reason}",
                 })
             else:
                 results.append({
                     "name": name, "family": model["family"],
                     "gen_tps": None, "ttft_ms": None,
+                    "quality": "FAIL: no successful runs",
                 })
 
             print()
@@ -443,12 +484,13 @@ def format_markdown_table(results: list[dict], gpu_name: str, gpu_count: int, ar
         lines.append(f"Tensor parallelism: {gpu_count} GPUs")
     lines.append(f"Max tokens: {args.max_tokens} | Runs: {args.runs}")
     lines.append("")
-    lines.append("| Model | Family | tok/s | TTFT |")
-    lines.append("|---|---|---|---|")
+    lines.append("| Model | Family | tok/s | TTFT | Quality |")
+    lines.append("|---|---|---|---|---|")
 
     for r in results:
         name = r["name"]
         family = r["family"]
+        quality = r.get("quality", "—")
         if r["gen_tps"] is not None:
             tps = f"{r['gen_tps']:.1f} tok/s"
             ttft_ms = r["ttft_ms"]
@@ -461,7 +503,7 @@ def format_markdown_table(results: list[dict], gpu_name: str, gpu_count: int, ar
         else:
             tps = "FAIL"
             ttft = "—"
-        lines.append(f"| {name} | {family} | {tps} | {ttft} |")
+        lines.append(f"| {name} | {family} | {tps} | {ttft} | {quality} |")
 
     lines.append("")
     return "\n".join(lines)
