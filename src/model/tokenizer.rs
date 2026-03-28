@@ -261,15 +261,18 @@ impl Tokenizer {
     /// decoded output so the text-level thinking parser can find it.
     pub fn is_think_start(&self, token_id: u32) -> bool {
         // Qwen 3 / 3.5: <think> = 248068
-        token_id == 248068
+        // Nemotron-H:    <think> = 12
+        token_id == 248068 || token_id == 12
     }
 
     /// Check if a token ID is a thinking end marker (`</think>`).
     ///
-    /// See `is_think_start()` for context.  `</think>` = 248069 in Qwen 3.5.
+    /// See `is_think_start()` for context.  `</think>` = 248069 in Qwen 3.5,
+    /// 13 in Nemotron-H.
     pub fn is_think_end(&self, token_id: u32) -> bool {
         // Qwen 3 / 3.5: </think> = 248069
-        token_id == 248069
+        // Nemotron-H:    </think> = 13
+        token_id == 248069 || token_id == 13
     }
 
     /// Decode tokens incrementally, simulating the streaming API path.

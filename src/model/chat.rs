@@ -343,16 +343,21 @@ pub(crate) fn format_chat_with_thinking(
         ModelArch::Gemma3 => format_gemma3(messages),
     };
 
-    // Resolve thinking: explicit preference wins, otherwise default to enabled
-    // for thinking-capable architectures (Qwen 3/3.5 were trained to always
-    // produce <think> blocks — without the prompt tag they loop endlessly).
-    let enabled = thinking_enabled.unwrap_or_else(|| thinking::supports_thinking(arch));
+    // Resolve thinking: explicit preference wins, otherwise use the
+    // architecture's default.  Qwen 3/3.5 default to enabled (they loop
+    // without the tag).  Nemotron-H defaults to disabled (Q4 quantization
+    // gets stuck in infinite reasoning loops with thinking enabled).
+    let enabled = thinking_enabled.unwrap_or_else(|| thinking::defaults_to_thinking(arch));
 
     if enabled {
         if let Some(tag) = thinking::thinking_prompt_tag(arch, true) {
             out.push_str(tag);
         }
-    } else if thinking_enabled == Some(false) {
+    } else if thinking::supports_thinking(arch) {
+        // Model understands thinking but we're suppressing it — emit the
+        // closed tag so the model skips reasoning and produces content
+        // directly.  This fires both for explicit `thinking=false` and
+        // for the default-disabled case (e.g. Nemotron-H).
         if let Some(tag) = thinking::thinking_suppress_tag(arch) {
             out.push_str(tag);
         }
