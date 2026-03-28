@@ -46,7 +46,7 @@ All models support bf16 and Q4. Multi-GPU via `--tp N` requires CUDA + NCCL.
 ## Benchmarks
 
 <details>
-<summary><b>Apple M4 Max</b> — 40-core GPU, 64 GB unified, 546 GB/s</summary>
+<summary><b>Apple M4 Max</b> — 40-core GPU, 64 GB unified, 546 GB/s (March 2026)</summary>
 
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
@@ -72,7 +72,9 @@ All models support bf16 and Q4. Multi-GPU via `--tp N` requires CUDA + NCCL.
 </details>
 
 <details>
-<summary><b>NVIDIA RTX 4080 SUPER 32 GB</b> — 736 GB/s GDDR6X</summary>
+<summary><b>NVIDIA RTX 4080 SUPER 32 GB</b> — 736 GB/s GDDR6X (March 2026)</summary>
+
+Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548).
 
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
@@ -95,9 +97,9 @@ All models support bf16 and Q4. Multi-GPU via `--tp N` requires CUDA + NCCL.
 </details>
 
 <details>
-<summary><b>NVIDIA H100 NVL 94 GB</b> — 3.35 TB/s HBM3</summary>
+<summary><b>NVIDIA H100 NVL 94 GB</b> — 3.35 TB/s HBM3 (March 22, older build)</summary>
 
-Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548).
+Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Numbers from an earlier build — expect improvement on current code.
 
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
@@ -125,9 +127,9 @@ Q4 is slower than bf16 on H100 — the 3.35 TB/s HBM3 bandwidth means bf16 matve
 </details>
 
 <details>
-<summary><b>NVIDIA RTX 4090 48 GB</b> — 1.01 TB/s GDDR6X</summary>
+<summary><b>NVIDIA RTX 4090 48 GB</b> — 1.01 TB/s GDDR6X (March 22, older build)</summary>
 
-Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548).
+Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Numbers from an earlier build — expect improvement on current code.
 
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
@@ -139,9 +141,9 @@ Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548).
 </details>
 
 <details>
-<summary><b>NVIDIA RTX PRO 6000 Blackwell</b> — 96 GB GDDR7, 1.53 TB/s</summary>
+<summary><b>NVIDIA RTX PRO 6000 Blackwell</b> — 96 GB GDDR7, 1.53 TB/s (March 22, older build)</summary>
 
-Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548).
+Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Numbers from an earlier build — expect improvement on current code.
 
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
@@ -153,9 +155,9 @@ Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548).
 </details>
 
 <details>
-<summary><b>2× NVIDIA RTX 5090 (TP=2)</b> — 2× 1.79 TB/s GDDR7X</summary>
+<summary><b>2× NVIDIA RTX 5090 (TP=2)</b> — 2× 1.79 TB/s GDDR7X (March 22, older build)</summary>
 
-Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548).
+Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Numbers from an earlier build — expect improvement on current code.
 
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
@@ -172,9 +174,9 @@ TP=2 shines for larger models: Gemma 27B gets 45 tok/s Q4, Llama 70B (44 GB Q4) 
 </details>
 
 <details>
-<summary><b>NVIDIA A100-SXM4-80GB</b> — 2.0 TB/s HBM2e</summary>
+<summary><b>NVIDIA A100-SXM4-80GB</b> — 2.0 TB/s HBM2e (March 16, older build)</summary>
 
-Benchmarked on [RunPod](https://runpod.io?ref=249k2lel).
+Benchmarked on [RunPod](https://runpod.io?ref=249k2lel). Numbers from an earlier build — expect improvement on current code.
 
 | Model | Params | bf16 | Q4 |
 |---|---|---|---|
@@ -191,9 +193,9 @@ Benchmarked on [RunPod](https://runpod.io?ref=249k2lel).
 </details>
 
 <details>
-<summary><b>2× NVIDIA A100-SXM4-80GB (TP=2)</b> — 2× 2.0 TB/s</summary>
+<summary><b>2× NVIDIA A100-SXM4-80GB (TP=2)</b> — 2× 2.0 TB/s (March 16, older build)</summary>
 
-Benchmarked on [RunPod](https://runpod.io?ref=249k2lel).
+Benchmarked on [RunPod](https://runpod.io?ref=249k2lel). Numbers from an earlier build — expect improvement on current code.
 
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
