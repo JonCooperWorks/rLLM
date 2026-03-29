@@ -22,11 +22,11 @@ pub(crate) mod tp {
 
     use crate::gpu::cuda::CudaBackend;
     use crate::gpu::parallel::{DeviceConfig, ParallelStrategy, ShardingPlan};
-    use crate::gpu::{GpuBackend, GpuCore, TensorDtype};
-    use crate::model::config::{ModelArch, ModelConfig};
+    use crate::gpu::GpuCore;
+    use crate::model::config::ModelConfig;
     use crate::model::forward::ModelForward;
     use crate::model::kv_cache::{KvPool, SeqKvState};
-    use crate::model::loader::{self, ModelWeights};
+    use crate::model::loader;
     use crate::model::{Model, PrefillBuffers};
 
     /// Per-rank inference state: backend, model, KV cache, prefill buffers.
@@ -34,6 +34,7 @@ pub(crate) mod tp {
     /// The backend is boxed for a stable heap address (Model borrows it).
     /// Safety: backend outlives model (both in RankState, drop order is
     /// fields top-down in declaration order).
+    #[allow(dead_code)]
     pub(crate) struct RankState {
         // Order matters for drop: model and forward must drop before backend.
         pub model: Model<'static, CudaBackend>,
@@ -46,12 +47,14 @@ pub(crate) mod tp {
     }
 
     /// Multi-GPU inference controller.
+    #[allow(dead_code)]
     pub(crate) struct MultiGpuInference {
         pub ranks: Vec<RankState>,
         pub config: ModelConfig,
         pub world_size: usize,
     }
 
+    #[allow(dead_code)]
     impl MultiGpuInference {
         /// Create multi-GPU inference with `world_size` GPUs.
         pub fn new(
@@ -104,7 +107,43 @@ pub(crate) mod tp {
                 let backend_ref: &'static CudaBackend =
                     unsafe { &*(&*backend as *const CudaBackend) };
 
-                let model = Model::new_tp(config.clone(), weights, backend_ref, world_size)?;
+                let mut model = Model::new_tp(config.clone(), weights, backend_ref, world_size)?;
+
+                // Load vision encoder weights (replicated on every rank).
+                // Vision is small (~0.6B params) relative to the LLM, so
+                // replication is simpler and faster than sharding the ViT.
+                if config.vision.is_some() {
+                    use std::collections::HashMap;
+                    use safetensors::SafeTensors;
+                    let (mmaps, weight_map) = loader::load_safetensors_files(model_dir)?;
+                    let shards: Vec<SafeTensors> = mmaps
+                        .iter()
+                        .map(|m| SafeTensors::deserialize(m))
+                        .collect::<Result<_, _>>()
+                        .map_err(|e| anyhow::anyhow!("failed to parse safetensors for vision: {e}"))?;
+                    let store = loader::TensorStore {
+                        shards,
+                        weight_map,
+                        q4_map: HashMap::new(),
+                        q8_map: HashMap::new(),
+                        fp8_map: HashMap::new(),
+                    };
+                    if let Some(vw) = loader::load_vision_weights(backend_ref, &store, &config) {
+                        if let Some(vc) = &config.vision {
+                            let max_patches = vc.max_pixels / (vc.patch_size * vc.patch_size);
+                            let bufs = crate::model::vision::alloc_vision_buffers(backend_ref, vc, max_patches);
+                            model.vision_weights = Some(vw);
+                            model.vision_bufs = Some(bufs);
+                            if rank == 0 {
+                                eprintln!(
+                                    "vision encoder ready ({} blocks, hidden={}, max {} patches)",
+                                    vc.depth, vc.hidden_size, max_patches,
+                                );
+                            }
+                        }
+                    }
+                }
+
                 let forward = crate::engine::loader::create_forward(config.arch()?, &config, backend_ref, world_size, None);
 
                 ranks.push(RankState {
@@ -349,11 +388,12 @@ pub(crate) mod tp {
             &self,
             tokens: &[u32],
             states: &[SeqKvState<CudaBackend>],
+            images: &[crate::model::vision::ProcessedImage],
         ) -> anyhow::Result<()> {
             if self.world_size == 1 {
                 let r = &self.ranks[0];
                 r.forward.prefill_preamble(
-                    &r.model, tokens, &states[0], &r.prefill_bufs, &[],
+                    &r.model, tokens, &states[0], &r.prefill_bufs, images,
                 )?;
                 return r.forward.forward_prefill(
                     &r.model, tokens, &r.kv_pool, &states[0], &r.prefill_bufs,
@@ -368,7 +408,7 @@ pub(crate) mod tp {
                     .map(|(rank, state)| {
                         s.spawn(move || {
                             rank.forward.prefill_preamble(
-                                &rank.model, tokens, state, &rank.prefill_bufs, &[],
+                                &rank.model, tokens, state, &rank.prefill_bufs, images,
                             )?;
                             rank.forward.forward_prefill(
                                 &rank.model, tokens, &rank.kv_pool, state,

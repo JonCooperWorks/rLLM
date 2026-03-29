@@ -154,6 +154,29 @@ pub(crate) fn upload_sharded<B: GpuCore>(
     if let Some(plan) = sharding {
         if let Some(ws) = plan.get(name) {
             if !matches!(ws.split, SplitDimension::Replicated) {
+                // Pre-quantized FP8: 1 byte per element, no block structure.
+                // Slice the raw FP8 bytes directly and upload with FP8 dtype.
+                if let Some((m, k, TensorDtype::FP8)) = store.quant_shape(name) {
+                    let view = store.tensor(name)?;
+                    let data = view.data();
+                    let expected_bytes = quant_byte_count(TensorDtype::FP8, m, k);
+                    anyhow::ensure!(
+                        data.len() == expected_bytes,
+                        "pre-quantized FP8 tensor '{name}' byte count mismatch: \
+                         expected {expected_bytes}, got {}",
+                        data.len()
+                    );
+                    let (sliced, shard_shape) = slice_tensor_data(
+                        data,
+                        &[m, k],
+                        &ws.split,
+                        plan.device.rank,
+                        plan.device.world_size,
+                        1, // FP8: 1 byte per element
+                    );
+                    return Ok(backend.upload_tensor(&sliced, &shard_shape, TensorDtype::FP8));
+                }
+
                 // Read raw bytes from safetensors.
                 let view = store.tensor(name)?;
                 let data = view.data();

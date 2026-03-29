@@ -601,6 +601,7 @@ pub(crate) fn device_count() -> usize {
 }
 
 #[cfg(not(any(target_os = "macos", feature = "cuda")))]
+#[allow(dead_code)]
 pub(crate) type Backend = cpu::CpuBackend;
 
 // CPU backend: always available in tests for correctness validation,
