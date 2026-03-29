@@ -1024,10 +1024,16 @@ pub(crate) fn load_deltanet_attention<B: GpuCore>(
             if !matches!(ws.split, crate::gpu::parallel::SplitDimension::Replicated) {
                 let view = store.tensor(&qkv_name)?;
                 let data = view.data();
-                let bpe = 2usize; // bf16
-                let row_bytes = hidden * bpe;
                 let ws_val = plan.device.world_size;
                 let rank = plan.device.rank;
+
+                // Detect Q4: fused QKV may be pre-quantized.
+                // Q4 rows are blocks of 18 bytes per 32 weights, not bf16.
+                let (row_bytes, is_q4) = if let Some((_, _, TensorDtype::Q4)) = store.quant_shape(&qkv_name) {
+                    ((hidden / 32) * 18, true)
+                } else {
+                    (hidden * 2, false) // bf16
+                };
 
                 // Split each component independently by heads.
                 let qk_rows_per_rank = qk_dim / ws_val;
@@ -1049,7 +1055,11 @@ pub(crate) fn load_deltanet_attention<B: GpuCore>(
                 let v_start = (2 * qk_dim + rank * v_rows_per_rank) * row_bytes;
                 shard_data.extend_from_slice(&data[v_start..v_start + v_rows_per_rank * row_bytes]);
 
-                upload_raw_bf16(backend, &shard_data, &[shard_rows, hidden])
+                if is_q4 {
+                    backend.upload_tensor(&shard_data, &[shard_rows, hidden], TensorDtype::Q4)
+                } else {
+                    upload_raw_bf16(backend, &shard_data, &[shard_rows, hidden])
+                }
             } else {
                 upload_tensor(store, backend, &qkv_name, &[fused_dim, hidden])?
             }

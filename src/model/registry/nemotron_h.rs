@@ -130,7 +130,7 @@ struct NemotronDims {
 }
 
 impl NemotronDims {
-    fn from_config(config: &ModelConfig) -> Self {
+    fn from_config(config: &ModelConfig, world_size: usize) -> Self {
         // Precompute Mamba-2 state indices.
         let mut m2_idx = 0;
         let mamba2_state_map: Vec<Option<usize>> = config.layer_types.iter().map(|t| {
@@ -143,16 +143,19 @@ impl NemotronDims {
             }
         }).collect();
 
+        // TP divides heads (and therefore q_dim/kv_dim) and Mamba-2 heads.
+        // hidden_size, head_dim, moe_inter stay full (EP handles MoE splitting).
+        let ws = world_size;
         Self {
             hidden_size: config.hidden_size as u32,
-            q_dim: (config.num_attention_heads * config.head_dim) as u32,
-            kv_dim: (config.num_key_value_heads * config.head_dim) as u32,
-            d_inner: config.mamba2_d_inner() as u32,
-            conv_dim: config.mamba2_conv_dim() as u32,
-            num_heads: config.num_attention_heads as u32,
-            num_kv_heads: config.num_key_value_heads as u32,
+            q_dim: (config.num_attention_heads / ws * config.head_dim) as u32,
+            kv_dim: (config.num_key_value_heads / ws * config.head_dim) as u32,
+            d_inner: (config.mamba2_d_inner() / ws) as u32,
+            conv_dim: (config.mamba2_conv_dim() / ws) as u32,
+            num_heads: (config.num_attention_heads / ws) as u32,
+            num_kv_heads: (config.num_key_value_heads / ws) as u32,
             head_dim: config.head_dim as u32,
-            mamba_num_heads: config.mamba_num_heads as u32,
+            mamba_num_heads: (config.mamba_num_heads / ws) as u32,
             mamba_head_dim: config.mamba_head_dim as u32,
             state_size: config.ssm_state_size as u32,
             n_groups: config.mamba_n_groups as u32,
@@ -190,7 +193,7 @@ pub(crate) fn forward_single_paged<
     moe: &MoeBuffers<B>,
     mamba2: &Mamba2Buffers<B>,
 ) -> anyhow::Result<()> {
-    let d = NemotronDims::from_config(&m.config);
+    let d = NemotronDims::from_config(&m.config, m.world_size);
     let pos = seq_state.seq_len as u32;
 
     // Embed the token into the residual stream.
@@ -552,7 +555,7 @@ pub(crate) fn forward_prefill_paged<
     moe: &MoeBuffers<B>,
     mamba2: &Mamba2Buffers<B>,
 ) -> anyhow::Result<()> {
-    let d = NemotronDims::from_config(&m.config);
+    let d = NemotronDims::from_config(&m.config, m.world_size);
     let bs = tokens.len() as u32;
     let start_pos = seq_state.seq_len as u32;
     let hidden_byte_size = m.config.hidden_size * crate::gpu::TensorDtype::BF16.byte_size();
