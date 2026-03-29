@@ -83,7 +83,6 @@ echo ""
 
 # ---- Model lists by tier -------------------------------------------------
 SMALL_MODELS=(
-  "llama-3.2-1b-instruct"
   "llama-3.2-3b-instruct"
   "qwen2.5-3b-instruct"
   "qwen2.5-7b-instruct"

@@ -51,8 +51,6 @@ from coherence import check_coherence
 
 KNOWN_MODELS = {
     # Small tier
-    "llama-3.2-1b":                    ("Llama",     False,  2, True),
-    "llama-3.2-1b-instruct":           ("Llama",     False,  2, True),
     "llama-3.2-3b":                    ("Llama",     False,  6, True),
     "llama-3.2-3b-instruct":           ("Llama",     False,  6, True),
     "qwen2.5-3b-instruct":             ("Qwen2",     False,  6, True),

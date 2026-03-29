@@ -74,8 +74,7 @@ mkdir -p "$DEST"
 
 # ---- Small tier: 1B–8B, covers head_dim 64/96/128/256 -----------------
 MODELS=(
-  # Llama — head_dim=64 (1B/3B), head_dim=128 (8B)
-  "meta-llama/Llama-3.2-1B-Instruct"
+  # Llama — head_dim=64 (3B), head_dim=128 (8B)
   "meta-llama/Llama-3.2-3B-Instruct"
   "meta-llama/Llama-3.1-8B-Instruct"
 

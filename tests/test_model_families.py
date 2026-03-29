@@ -50,7 +50,7 @@ class ModelConfig:
 
 # One model per architecture family — smallest available.
 BASE_MODELS = [
-    ModelConfig("llama-1b",    "llama-3.2-1b-instruct",           "Llama",     bf16_size_gb=2),
+    ModelConfig("llama-3b",    "llama-3.2-3b-instruct",           "Llama",     bf16_size_gb=6),
     ModelConfig("qwen2-3b",    "qwen2.5-3b-instruct",             "Qwen2",     bf16_size_gb=6),
     ModelConfig("gemma3-4b",   "gemma-3-4b-it",                   "Gemma3",    bf16_size_gb=8, has_vision=True),
     ModelConfig("mistral-7b",  "mistral-7b-instruct-v0.3",        "Mistral",   bf16_size_gb=14),
@@ -67,11 +67,11 @@ BASE_MODELS = [
     ModelConfig("nemotron-h-120b","nemotron-3-120b",              "NemotronH", is_moe=True, bf16_size_gb=240),
 ]
 
-# TurboQuant variations (tested on Llama 1B — fastest to load).
+# TurboQuant variations (tested on Llama 3B — smallest instruct model).
 TURBOQUANT_CONFIGS = [
-    ModelConfig("turbo4-llama", "llama-3.2-1b-instruct", "Llama", extra_args=("--kv-quant", "turbo4")),
-    ModelConfig("turbo2-llama", "llama-3.2-1b-instruct", "Llama", extra_args=("--kv-quant", "turbo2")),
-    ModelConfig("no-kv-quant-llama", "llama-3.2-1b-instruct", "Llama", extra_args=("--kv-quant", "none")),
+    ModelConfig("turbo4-llama", "llama-3.2-3b-instruct", "Llama", extra_args=("--kv-quant", "turbo4"), bf16_size_gb=6),
+    ModelConfig("turbo2-llama", "llama-3.2-3b-instruct", "Llama", extra_args=("--kv-quant", "turbo2"), bf16_size_gb=6),
+    ModelConfig("no-kv-quant-llama", "llama-3.2-3b-instruct", "Llama", extra_args=("--kv-quant", "none"), bf16_size_gb=6),
 ]
 
 # Varied prompts that exercise different generation patterns.  Each model
@@ -415,11 +415,11 @@ def test_openai_streaming(server_manager, models_dir):
     Uses the expository internet prompt at 512 tokens to exercise sustained
     streaming over many decode steps.
     """
-    model_dir = _resolve_model_dir(models_dir, BASE_MODELS[0])  # Llama 1B
+    model_dir = _resolve_model_dir(models_dir, BASE_MODELS[0])  # Llama 3B
     if model_dir is None:
-        pytest.skip("llama-3.2-1b-instruct not found")
+        pytest.skip("llama-3.2-3b-instruct not found")
 
-    base_url = server_manager.get_or_start(str(model_dir), [], memory_gb=2.4)
+    base_url = server_manager.get_or_start(str(model_dir), [], memory_gb=7.2)
 
     prompt = PROMPTS[1]  # Internet / DNS / TCP / HTTP — longer response expected.
     resp = _chat_completion(base_url, prompt, stream=True)
@@ -440,11 +440,11 @@ def test_anthropic_streaming(server_manager, models_dir):
 
     Uses the sorting algorithms prompt to exercise list-style generation.
     """
-    model_dir = _resolve_model_dir(models_dir, BASE_MODELS[0])  # Llama 1B
+    model_dir = _resolve_model_dir(models_dir, BASE_MODELS[0])  # Llama 3B
     if model_dir is None:
-        pytest.skip("llama-3.2-1b-instruct not found")
+        pytest.skip("llama-3.2-3b-instruct not found")
 
-    base_url = server_manager.get_or_start(str(model_dir), [], memory_gb=2.4)
+    base_url = server_manager.get_or_start(str(model_dir), [], memory_gb=7.2)
 
     prompt = PROMPTS[2]  # Sorting algorithms enumeration.
     resp = _anthropic_message(base_url, prompt, stream=True)
@@ -470,11 +470,11 @@ def test_anthropic_api(server_manager, models_dir):
     Uses the public-key cryptography prompt — a technical explanation that
     any model should handle coherently at 512 tokens.
     """
-    model_dir = _resolve_model_dir(models_dir, BASE_MODELS[0])  # Llama 1B
+    model_dir = _resolve_model_dir(models_dir, BASE_MODELS[0])  # Llama 3B
     if model_dir is None:
-        pytest.skip("llama-3.2-1b-instruct not found")
+        pytest.skip("llama-3.2-3b-instruct not found")
 
-    base_url = server_manager.get_or_start(str(model_dir), [], memory_gb=2.4)
+    base_url = server_manager.get_or_start(str(model_dir), [], memory_gb=7.2)
 
     prompt = PROMPTS[5]  # Public-key cryptography.
     resp = _anthropic_message(base_url, prompt)
