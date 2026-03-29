@@ -159,17 +159,24 @@ Q4 is slower than bf16 on H100 — the 3.35 TB/s HBM3 bandwidth means bf16 matve
 
 Benchmarked on [RunPod](https://runpod.io?ref=249k2lel). Tensor parallelism across 2 GPUs. MoE models use hybrid strategy (TP for attention, expert parallelism for MoE FFN). Q8 uses FP8 E4M3 (auto-selected on SM 89+).
 
-| Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
-|---|---|---|---|---|---|
-| Llama 3.2 3B Instruct | 3.2B | 123.9 tok/s | 141.9 tok/s | 167 ms | 185 ms |
-| Gemma 3 4B Instruct | 4.3B | 84.0 tok/s | 98.8 tok/s | 219 ms | 205 ms |
-| Llama 3.1 8B Instruct | 8.0B | 72.5 tok/s | 102.6 tok/s | 249 ms | 280 ms |
-| Qwen3.5 9B † | ~9B | 45.4 tok/s | — | 2,816 ms | — |
-| Phi-4 | 14.7B | — | 67.2 tok/s | — | 382 ms |
-| Gemma 3 27B Instruct | 27.4B | — | 33.2 tok/s | — | 628 ms |
-| Mixtral 8x7B Instruct | 46.7B (12.9B active) | — | 46.2 tok/s | — | 960 ms |
+| Model | Params | bf16 | Q4 | Q8 (FP8) | TTFT (bf16) | TTFT (Q4) |
+|---|---|---|---|---|---|---|
+| Llama 3.2 3B Instruct | 3.2B | 122.5 tok/s | 138.9 tok/s | 121.3 tok/s | 172 ms | 204 ms |
+| Qwen 2.5 3B Instruct | 3.1B | 113.1 tok/s | 124.3 tok/s | — | 171 ms | 215 ms |
+| Gemma 3 4B Instruct | 4.3B | 88.1 tok/s | 98.0 tok/s | 87.4 tok/s | 184 ms | 210 ms |
+| Qwen 2.5 7B Instruct | 7.6B | 79.8 tok/s | 108.9 tok/s | — | 208 ms | 264 ms |
+| Mistral 7B Instruct | 7.2B | 81.0 tok/s | 111.0 tok/s | 78.0 tok/s | 205 ms | 268 ms |
+| Llama 3.1 8B Instruct | 8.0B | 74.1 tok/s | 102.6 tok/s | 73.1 tok/s | 221 ms | 276 ms |
+| Qwen3.5 9B † | ~9B | 47.7 tok/s | — | — | 2,683 ms | — |
+| Phi-4 | 14.7B | — | 68.4 tok/s | — | — | 344 ms |
+| GPT-OSS 20B | 20.0B (3.6B active) | 73.6 tok/s | 79.0 tok/s | 74.9 tok/s | 504 ms | 519 ms |
+| DeepSeek-R1-Distill-Qwen-32B | 32.8B | — | 35.4 tok/s | — | — | 638 ms |
+| Gemma 3 27B Instruct | 27.4B | — | 33.6 tok/s | 30.2 tok/s | — | 573 ms |
+| Mixtral 8x7B Instruct | 46.7B (12.9B active) | — | 45.4 tok/s | — | — | 1,001 ms |
+| Qwen 2.5 72B Instruct | 72.7B | — | 18.5 tok/s | — | — | 1,010 ms |
+| Llama 3.1 70B Instruct | 70.6B | — | 19.6 tok/s | — | — | 926 ms |
 
-† = thinking model (TTFT includes reasoning time). Mixtral uses expert parallelism (4/8 experts per GPU). Benchmarked via `tests/bench.py` (HTTP API).
+† = thinking model (TTFT includes reasoning time). MoE models (GPT-OSS, Mixtral) use expert parallelism (experts split across GPUs). Llama 70B and Qwen 72B fit as Q4 (~40 GB). Benchmarked via `tests/bench.py` (HTTP API).
 
 </details>
 
