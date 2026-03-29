@@ -320,6 +320,13 @@ impl ShardingPlan {
                 );
             }
 
+            // -- Attention sinks (GPT-OSS): 1D [num_heads], Column-split by heads --
+            add(
+                format!("{layer}.self_attn.sinks"),
+                SplitDimension::Column,
+                [q_dim / head_dim, 1],
+            );
+
             // -- QK-norm (Qwen3 MoE, Qwen3.5, Gemma3): per-head, replicated --
             add(
                 format!("{layer}.self_attn.q_norm.weight"),
