@@ -40,7 +40,7 @@ from pathlib import Path
 # Add this directory to path so we can import conftest helpers.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from conftest import ServerManager, _find_rllm_binary, _get_gpu_count, _get_available_memory_gb, _should_stream_experts
+from conftest import ServerManager, _find_rllm_binary, _get_gpu_count, _get_available_memory_gb, _get_model_disk_size_gb, _should_stream_experts
 from coherence import check_coherence
 
 
@@ -298,6 +298,8 @@ def main():
     parser.add_argument("--q4-only", action="store_true")
     parser.add_argument("--bf16-only", action="store_true")
     parser.add_argument("--filter", default="", help="Only bench models matching this substring")
+    parser.add_argument("--max-size", type=float, default=0,
+                        help="Skip models whose on-disk size exceeds this many GB (0 = no limit)")
     parser.add_argument("--output", nargs="?", const="auto",
                         help="Write markdown results to file.  Without a path, "
                         "auto-generates results/bench-TIMESTAMP.md")
@@ -355,6 +357,12 @@ def main():
             continue
         if args.bf16_only and is_q4:
             continue
+
+        # Skip models that exceed the --max-size threshold (actual disk size).
+        if args.max_size > 0:
+            disk_gb = _get_model_disk_size_gb(str(entry))
+            if disk_gb > args.max_size:
+                continue
 
         # Look up model info.
         if base_name in KNOWN_MODELS:
