@@ -167,16 +167,18 @@ Benchmarked on [RunPod](https://runpod.io?ref=249k2lel). Tensor parallelism acro
 | Qwen 2.5 7B Instruct | 7.6B | 79.8 tok/s | 108.9 tok/s | — | 208 ms | 264 ms |
 | Mistral 7B Instruct | 7.2B | 81.0 tok/s | 111.0 tok/s | 78.0 tok/s | 205 ms | 268 ms |
 | Llama 3.1 8B Instruct | 8.0B | 74.1 tok/s | 102.6 tok/s | 73.1 tok/s | 221 ms | 276 ms |
-| Qwen3.5 9B † | ~9B | 47.7 tok/s | — | — | 2,683 ms | — |
+| Qwen3.5 9B † | ~9B | 47.1 tok/s | 62.3 tok/s | — | 2,720 ms | 2,053 ms |
 | Phi-4 | 14.7B | — | 68.4 tok/s | — | — | 344 ms |
 | GPT-OSS 20B | 20.0B (3.6B active) | 73.6 tok/s | 79.0 tok/s | 74.9 tok/s | 504 ms | 519 ms |
+| Qwen3.5 27B † | ~27B | — | 25.4 tok/s | — | — | 5,042 ms |
 | DeepSeek-R1-Distill-Qwen-32B | 32.8B | — | 35.4 tok/s | — | — | 638 ms |
 | Gemma 3 27B Instruct | 27.4B | — | 33.6 tok/s | 30.2 tok/s | — | 573 ms |
+| Qwen3.5 35B-A3B † | 35.1B (3.3B active) | — | 57.4 tok/s | — | — | 2,230 ms |
 | Mixtral 8x7B Instruct | 46.7B (12.9B active) | — | 45.4 tok/s | — | — | 1,001 ms |
 | Qwen 2.5 72B Instruct | 72.7B | — | 18.5 tok/s | — | — | 1,010 ms |
 | Llama 3.1 70B Instruct | 70.6B | — | 19.6 tok/s | — | — | 926 ms |
 
-† = thinking model (TTFT includes reasoning time). MoE models (GPT-OSS, Mixtral) use expert parallelism (experts split across GPUs). Llama 70B and Qwen 72B fit as Q4 (~40 GB). Benchmarked via `tests/bench.py` (HTTP API).
+† = thinking model (TTFT includes reasoning time). MoE models (GPT-OSS, Mixtral, Qwen3.5 35B-A3B) use expert parallelism (experts split across GPUs). Llama 70B and Qwen 72B fit as Q4 (~40 GB). Benchmarked via `tests/bench.py` (HTTP API).
 
 </details>
 
