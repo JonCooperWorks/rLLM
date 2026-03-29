@@ -48,22 +48,22 @@ All models support bf16 and Q4. Multi-GPU via `--tp N` requires CUDA + NCCL.
 <details>
 <summary><b>Apple M4 Max</b> — 40-core GPU, 64 GB unified, 546 GB/s (March 29, 2026)</summary>
 
-| Model | Params | bf16 | Q4 | Q8 | TTFT (bf16) | TTFT (Q4) |
+| Model | Params | bf16 | Q8 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|---|
-| Llama 3.2 1B Instruct | 1.2B | 114 tok/s | 169 tok/s | 143 tok/s | 69 ms | 46 ms |
-| Llama 3.2 3B Instruct | 3.2B | 44 tok/s | 71 tok/s | 58 tok/s | 194 ms | 97 ms |
-| Qwen 2.5 3B Instruct | 3.1B | 55 tok/s | 101 tok/s | 77 tok/s | 186 ms | 122 ms |
-| Gemma 3 4B Instruct | 4.3B | 27 tok/s | 37 tok/s | 32 tok/s | 244 ms | 131 ms |
-| Qwen 2.5 7B Instruct | 7.6B | 27 tok/s | 74 tok/s | 48 tok/s | 479 ms | 167 ms |
-| Mistral 7B Instruct | 7.2B | 24 tok/s | 52 tok/s | 37 tok/s | 351 ms | 136 ms |
-| Llama 3.1 8B Instruct | 8.0B | 23 tok/s | 50 tok/s | 35 tok/s | 468 ms | 167 ms |
-| Qwen3.5 9B † | ~9B | 20 tok/s | 43 tok/s | 31 tok/s | 6,484 ms | 3,022 ms |
-| Phi-4 | 14.7B | 10 tok/s | 32 tok/s | 22 tok/s | 4,971 ms | 285 ms |
-| GPT-OSS 20B | 20.0B (3.6B active) | 18 tok/s | 19 tok/s | 20 tok/s | 6,404 ms | 4,903 ms |
-| Nemotron-H 30B | 31.6B (3.6B active) | 5.6 tok/s | 47 tok/s | 21 tok/s | 40,173 ms | 426 ms |
-| Gemma 3 27B Instruct | 27.4B | 1.9 tok/s | 15 tok/s | 8.3 tok/s | 50,900 ms | 590 ms |
-| Mixtral 8x7B Instruct ⚡ | 46.7B (12.9B active) | 0.4 tok/s | 23 tok/s | — | 20,853 ms | 696 ms |
-| Qwen3.5 27B ⚡† | ~27B | 2.0 tok/s | 16 tok/s | 9.8 tok/s | 47,200 ms | 8,194 ms |
+| Llama 3.2 1B Instruct | 1.2B | 114 tok/s | 143 tok/s | 169 tok/s | 69 ms | 46 ms |
+| Llama 3.2 3B Instruct | 3.2B | 44 tok/s | 58 tok/s | 71 tok/s | 194 ms | 97 ms |
+| Qwen 2.5 3B Instruct | 3.1B | 55 tok/s | 77 tok/s | 101 tok/s | 186 ms | 122 ms |
+| Gemma 3 4B Instruct | 4.3B | 27 tok/s | 32 tok/s | 37 tok/s | 244 ms | 131 ms |
+| Qwen 2.5 7B Instruct | 7.6B | 27 tok/s | 48 tok/s | 74 tok/s | 479 ms | 167 ms |
+| Mistral 7B Instruct | 7.2B | 24 tok/s | 37 tok/s | 52 tok/s | 351 ms | 136 ms |
+| Llama 3.1 8B Instruct | 8.0B | 23 tok/s | 35 tok/s | 50 tok/s | 468 ms | 167 ms |
+| Qwen3.5 9B † | ~9B | 20 tok/s | 31 tok/s | 43 tok/s | 6,484 ms | 3,022 ms |
+| Phi-4 | 14.7B | 10 tok/s | 22 tok/s | 32 tok/s | 4,971 ms | 285 ms |
+| GPT-OSS 20B | 20.0B (3.6B active) | 18 tok/s | 20 tok/s | 19 tok/s | 6,404 ms | 4,903 ms |
+| Nemotron-H 30B | 31.6B (3.6B active) | 5.6 tok/s | 21 tok/s | 47 tok/s | 40,173 ms | 426 ms |
+| Gemma 3 27B Instruct | 27.4B | 1.9 tok/s | 8.3 tok/s | 15 tok/s | 50,900 ms | 590 ms |
+| Mixtral 8x7B Instruct ⚡ | 46.7B (12.9B active) | 0.4 tok/s | — | 23 tok/s | 20,853 ms | 696 ms |
+| Qwen3.5 27B ⚡† | ~27B | 2.0 tok/s | 9.8 tok/s | 16 tok/s | 47,200 ms | 8,194 ms |
 | Qwen3.5 122B-A10B ⚡ | 122B (10B active) | — | — | — | 111,078 ms | 21,634 ms |
 | Qwen3.5 397B-A27B ⚡ | 397B (17B active) | — | — | — | — | 46,338 ms |
 
@@ -76,22 +76,22 @@ All models support bf16 and Q4. Multi-GPU via `--tp N` requires CUDA + NCCL.
 
 Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Q8 uses FP8 E4M3 (native on SM 12.0).
 
-| Model | Params | bf16 | Q4 | Q8 (FP8) | TTFT (bf16) | TTFT (Q4) |
+| Model | Params | bf16 | Q8 (FP8) | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|---|
-| Llama 3.2 3B Instruct | 3.2B | 108 tok/s | 129 tok/s | 97 tok/s | 100 ms | 102 ms |
-| Qwen 2.5 3B Instruct | 3.1B | 122 tok/s | 137 tok/s | 100 tok/s | 109 ms | 127 ms |
-| Gemma 3 4B Instruct | 4.3B | 60 tok/s | 68 tok/s | 58 tok/s | 119 ms | 121 ms |
-| Qwen 2.5 7B Instruct | 7.6B | 77 tok/s | 110 tok/s | 77 tok/s | 152 ms | 149 ms |
-| Mistral 7B Instruct | 7.2B | 67 tok/s | 89 tok/s | 67 tok/s | 158 ms | 162 ms |
-| Llama 3.1 8B Instruct | 8.0B | 65 tok/s | 86 tok/s | 65 tok/s | 164 ms | 165 ms |
-| Qwen3.5 9B † | ~9B | 55 tok/s | 76 tok/s | 62 tok/s | 2,323 ms | 1,679 ms |
-| Phi-4 | 14.7B | 39 tok/s | 57 tok/s | 40 tok/s | 254 ms | 253 ms |
-| Nemotron-H 30B | 31.6B (3.6B active) | — | 104 tok/s | — | — | 148 ms |
-| DeepSeek-R1-Distill-Qwen-32B | 32.8B | — | 31 tok/s | — | — | 597 ms |
-| Gemma 3 27B Instruct | 27.4B | — | 30 tok/s | — | — | 465 ms |
-| Qwen3.5 27B † | ~27B | — | 29 tok/s | 22 tok/s | — | 4,353 ms |
-| Qwen3.5 35B-A3B † | 35.1B (3.3B active) | 3.5 ⚡ | 58 tok/s | — | 38,442 ms | 2,219 ms |
-| Mixtral 8x7B Instruct | 46.7B (12.9B active) | 0.4 ⚡ | 59 tok/s | — | 21,756 ms | 251 ms |
+| Llama 3.2 3B Instruct | 3.2B | 108 tok/s | 97 tok/s | 129 tok/s | 100 ms | 102 ms |
+| Qwen 2.5 3B Instruct | 3.1B | 122 tok/s | 100 tok/s | 137 tok/s | 109 ms | 127 ms |
+| Gemma 3 4B Instruct | 4.3B | 60 tok/s | 58 tok/s | 68 tok/s | 119 ms | 121 ms |
+| Qwen 2.5 7B Instruct | 7.6B | 77 tok/s | 77 tok/s | 110 tok/s | 152 ms | 149 ms |
+| Mistral 7B Instruct | 7.2B | 67 tok/s | 67 tok/s | 89 tok/s | 158 ms | 162 ms |
+| Llama 3.1 8B Instruct | 8.0B | 65 tok/s | 65 tok/s | 86 tok/s | 164 ms | 165 ms |
+| Qwen3.5 9B † | ~9B | 55 tok/s | 62 tok/s | 76 tok/s | 2,323 ms | 1,679 ms |
+| Phi-4 | 14.7B | 39 tok/s | 40 tok/s | 57 tok/s | 254 ms | 253 ms |
+| Nemotron-H 30B | 31.6B (3.6B active) | — | — | 104 tok/s | — | 148 ms |
+| DeepSeek-R1-Distill-Qwen-32B | 32.8B | — | — | 31 tok/s | — | 597 ms |
+| Gemma 3 27B Instruct | 27.4B | — | — | 30 tok/s | — | 465 ms |
+| Qwen3.5 27B † | ~27B | — | 22 tok/s | 29 tok/s | — | 4,353 ms |
+| Qwen3.5 35B-A3B † | 35.1B (3.3B active) | 3.5 ⚡ | — | 58 tok/s | 38,442 ms | 2,219 ms |
+| Mixtral 8x7B Instruct | 46.7B (12.9B active) | 0.4 ⚡ | — | 59 tok/s | 21,756 ms | 251 ms |
 
 ⚡ = SSD expert streaming (`--stream-experts`). † = thinking model (TTFT includes reasoning time). Q8 column uses FP8 E4M3 format (auto-selected on NVIDIA SM 89+). Q4 MoE models fit entirely in VRAM: Qwen3.5 35B-A3B Q4 at 22 GB, Mixtral Q4 at 25 GB, Nemotron-H Q4 at 19 GB. Benchmarked via `tests/bench.py` (HTTP API, 2 runs averaged).
 
@@ -102,23 +102,23 @@ Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Q8 uses FP8 E4M3
 
 Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548).
 
-| Model | Params | bf16 | Q4 | Q8 | TTFT (bf16) | TTFT (Q4) |
+| Model | Params | bf16 | Q8 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|---|
-| Llama 3.2 1B Instruct | 1.2B | 205 tok/s | 273 tok/s | 238 tok/s | 54 ms | 70 ms |
-| Llama 3.2 3B Instruct | 3.2B | 81 tok/s | 120 tok/s | 95 tok/s | 111 ms | 145 ms |
-| Qwen 2.5 3B Instruct | 3.1B | 88 tok/s | — | 106 tok/s | 130 ms | — |
-| Gemma 3 4B Instruct | 4.3B | 53 tok/s | 70 tok/s | 64 tok/s | 119 ms | 154 ms |
-| Qwen 2.5 7B Instruct | 7.6B | 45 tok/s | 81 tok/s | 54 tok/s | 187 ms | 225 ms |
-| Mistral 7B Instruct | 7.2B | 40 tok/s | 69 tok/s | 48 tok/s | 186 ms | 234 ms |
-| Llama 3.1 8B Instruct | 8.0B | 38 tok/s | 67 tok/s | 46 tok/s | 188 ms | 233 ms |
-| Qwen3.5 9B | ~9B | 36 tok/s | 62 tok/s | 46 tok/s | 664 ms | 482 ms |
-| Phi-4 | 14.7B | 22 tok/s | 39 tok/s | 26 tok/s | 313 ms | 375 ms |
-| DeepSeek-R1-Distill-Qwen-32B | 32.8B | — | 19 tok/s | — | — | 869 ms |
-| Gemma 3 27B Instruct | 27.4B | — | 19 tok/s | — | — | 760 ms |
-| Qwen3.5 27B | ~27B | — | 21 tok/s | — | — | 1,538 ms |
-| Nemotron-H 30B | 31.6B (3.6B active) | — | 113 tok/s | — | — | 326 ms |
-| Qwen3.5 35B-A3B | 35.1B (3.3B active) | 3.6 ⚡ | 66 tok/s | 6.2 ⚡ | 4,014 ms | 446 ms |
-| Mixtral 8x7B Instruct | 46.7B (12.9B active) | 0.3 ⚡ | 41 tok/s | 0.6 ⚡ | 33,358 ms | 468 ms |
+| Llama 3.2 1B Instruct | 1.2B | 205 tok/s | 238 tok/s | 273 tok/s | 54 ms | 70 ms |
+| Llama 3.2 3B Instruct | 3.2B | 81 tok/s | 95 tok/s | 120 tok/s | 111 ms | 145 ms |
+| Qwen 2.5 3B Instruct | 3.1B | 88 tok/s | 106 tok/s | — | 130 ms | — |
+| Gemma 3 4B Instruct | 4.3B | 53 tok/s | 64 tok/s | 70 tok/s | 119 ms | 154 ms |
+| Qwen 2.5 7B Instruct | 7.6B | 45 tok/s | 54 tok/s | 81 tok/s | 187 ms | 225 ms |
+| Mistral 7B Instruct | 7.2B | 40 tok/s | 48 tok/s | 69 tok/s | 186 ms | 234 ms |
+| Llama 3.1 8B Instruct | 8.0B | 38 tok/s | 46 tok/s | 67 tok/s | 188 ms | 233 ms |
+| Qwen3.5 9B | ~9B | 36 tok/s | 46 tok/s | 62 tok/s | 664 ms | 482 ms |
+| Phi-4 | 14.7B | 22 tok/s | 26 tok/s | 39 tok/s | 313 ms | 375 ms |
+| DeepSeek-R1-Distill-Qwen-32B | 32.8B | — | — | 19 tok/s | — | 869 ms |
+| Gemma 3 27B Instruct | 27.4B | — | — | 19 tok/s | — | 760 ms |
+| Qwen3.5 27B | ~27B | — | — | 21 tok/s | — | 1,538 ms |
+| Nemotron-H 30B | 31.6B (3.6B active) | — | — | 113 tok/s | — | 326 ms |
+| Qwen3.5 35B-A3B | 35.1B (3.3B active) | 3.6 ⚡ | 6.2 ⚡ | 66 tok/s | 4,014 ms | 446 ms |
+| Mixtral 8x7B Instruct | 46.7B (12.9B active) | 0.3 ⚡ | 0.6 ⚡ | 41 tok/s | 33,358 ms | 468 ms |
 
 ⚡ = SSD expert streaming (`--stream-experts`) — bf16 and Q8 variants exceed 32 GB VRAM. Q4 MoE models fit entirely in VRAM without streaming: Qwen3.5 35B-A3B Q4 at 21 GB and Mixtral Q4 at 25 GB both load fully, delivering 18–110× speedup over their streamed bf16 counterparts. Nemotron-H 30B Q4 also fits without streaming.
 
