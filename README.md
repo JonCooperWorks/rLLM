@@ -46,28 +46,28 @@ All models support bf16 and Q4. Multi-GPU via `--tp N` requires CUDA + NCCL.
 ## Benchmarks
 
 <details>
-<summary><b>Apple M4 Max</b> — 40-core GPU, 64 GB unified, 546 GB/s (March 28, 2026)</summary>
+<summary><b>Apple M4 Max</b> — 40-core GPU, 64 GB unified, 546 GB/s (March 29, 2026)</summary>
 
 | Model | Params | bf16 | Q4 | Q8 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|---|
-| Llama 3.2 1B Instruct | 1.2B | 62 tok/s | 176 tok/s | 69 tok/s | 98 ms | 61 ms |
-| Llama 3.2 3B Instruct | 3.2B | 34 tok/s | 74 tok/s | 41 tok/s | 232 ms | 129 ms |
-| Qwen 2.5 3B Instruct | 3.1B | 37 tok/s | 111 tok/s | 46 tok/s | 290 ms | 134 ms |
-| Gemma 3 4B Instruct | 4.3B | 19 tok/s | 39 tok/s | 20 tok/s | 278 ms | 156 ms |
-| Qwen 2.5 7B Instruct | 7.6B | 24 tok/s | 82 tok/s | 36 tok/s | 743 ms | 257 ms |
-| Mistral 7B Instruct | 7.2B | 25 tok/s | 55 tok/s | 37 tok/s | 390 ms | 159 ms |
-| Llama 3.1 8B Instruct | 8.0B | 21 tok/s | 53 tok/s | 29 tok/s | 507 ms | 193 ms |
-| Qwen3.5 9B | ~9B | — | — | — | 9,143 ms | 3,289 ms |
-| Phi-4 | 14.7B | 13 tok/s | 34 tok/s | 20 tok/s | 1,073 ms | 311 ms |
-| GPT-OSS 20B | 20.0B (3.6B active) | 23 tok/s | 23 tok/s | 18 tok/s | 9,117 ms | 7,658 ms |
-| Nemotron-H 30B | 31.6B (3.6B active) | 5.6 tok/s | 58 tok/s | 24 tok/s | 40,173 ms | 662 ms |
-| Gemma 3 27B Instruct | 27.4B | 6.7 tok/s | 16 tok/s | 8.9 tok/s | 46,721 ms | 861 ms |
-| Mixtral 8x7B Instruct ⚡ | 46.7B (12.9B active) | 0.4 tok/s | 30 tok/s | 12 tok/s | 20,853 ms | 874 ms |
-| Qwen3.5 27B ⚡ | ~27B | — | — | — | 68,926 ms | 8,937 ms |
-| Qwen3.5 122B-A10B ⚡ | 122B (10B active) | — | — | — | 111,078 ms | 24,604 ms |
+| Llama 3.2 1B Instruct | 1.2B | 113 tok/s | 168 tok/s | 69 tok/s | 66 ms | 50 ms |
+| Llama 3.2 3B Instruct | 3.2B | 44 tok/s | 70 tok/s | 41 tok/s | 177 ms | 109 ms |
+| Qwen 2.5 3B Instruct | 3.1B | 57 tok/s | 103 tok/s | 46 tok/s | 134 ms | 94 ms |
+| Gemma 3 4B Instruct | 4.3B | 27 tok/s | 37 tok/s | 20 tok/s | 267 ms | 161 ms |
+| Qwen 2.5 7B Instruct | 7.6B | 28 tok/s | 73 tok/s | 36 tok/s | 338 ms | 183 ms |
+| Mistral 7B Instruct | 7.2B | 24 tok/s | 52 tok/s | 37 tok/s | 319 ms | 135 ms |
+| Llama 3.1 8B Instruct | 8.0B | 23 tok/s | 50 tok/s | 29 tok/s | 402 ms | 153 ms |
+| Qwen3.5 9B | ~9B | 21 tok/s | 47 tok/s | — | 584 ms | 227 ms |
+| Phi-4 | 14.7B | 7 tok/s | 32 tok/s | 20 tok/s | 7,800 ms | 229 ms |
+| GPT-OSS 20B | 20.0B (3.6B active) | 23 tok/s | 24 tok/s | 18 tok/s | 9,117 ms | 5,508 ms |
+| Nemotron-H 30B | 31.6B (3.6B active) | 5.6 tok/s | 36 tok/s | 24 tok/s | 40,173 ms | 727 ms |
+| Gemma 3 27B Instruct | 27.4B | 1.9 tok/s | 15 tok/s | 8.9 tok/s | 50,900 ms | 559 ms |
+| Mixtral 8x7B Instruct ⚡ | 46.7B (12.9B active) | 0.4 tok/s | 28 tok/s | 12 tok/s | 20,853 ms | 1,721 ms |
+| Qwen3.5 27B ⚡ | ~27B | 2.0 tok/s | 17 tok/s | — | 47,200 ms | 617 ms |
+| Qwen3.5 122B-A10B ⚡ | 122B (10B active) | — | — | — | 111,078 ms | 21,634 ms |
 | Qwen3.5 397B-A27B ⚡ | 397B (17B active) | — | — | — | — | 46,338 ms |
 
-⚡ = SSD expert streaming (`--stream-experts`). The 397B model (751 GB on disk, 213 GB Q4) runs on 64 GB using ~20 GB GPU memory. Q4 is strongly recommended for models over ~8B. Qwen3.5 tok/s omitted — thinking models use pseudo-streaming (collect-then-emit) which prevents accurate per-token timing via the HTTP API; use `rllm run` for Qwen3.5 throughput numbers.
+⚡ = SSD expert streaming (`--stream-experts`). The 397B model (751 GB on disk, 213 GB Q4) runs on 64 GB using ~20 GB GPU memory. Q4 is strongly recommended for models over ~8B. Benchmarked via `scripts/benchmark.sh` (CLI, raw GPU throughput); HTTP API numbers from `tests/bench.py` are ~30% lower due to serving overhead.
 
 </details>
 
