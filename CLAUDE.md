@@ -222,6 +222,25 @@ rllm serve  — HTTP API server (accepts images via OpenAI/Anthropic multimodal 
 - Tests: CPU backend (`src/gpu/cpu/`) — reference impl in pure Rust
 - `gpu::Backend` type alias in `src/gpu/mod.rs` resolves to the platform-specific backend
 
+## Testing & Benchmarks
+
+Python tests and benchmarks use **`uv`** (not raw `python3`).  Dependencies are in
+`tests/requirements.txt`.
+
+```bash
+# Run the full test suite
+uv run pytest tests/ -v
+
+# Benchmark a specific model (HTTP API, measures TTFT + tok/s + quality)
+uv run python tests/bench.py --filter qwen3.5-27b-q8
+
+# Benchmark all Q4 models
+uv run python tests/bench.py --q4-only
+
+# CLI benchmark (raw GPU throughput, no serving overhead)
+scripts/benchmark.sh
+```
+
 ## Q4 Quantization Format
 
 Block size 32 weights, 18 bytes per block: 2-byte bf16 scale + 16 bytes packed nibbles.

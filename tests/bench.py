@@ -189,18 +189,17 @@ def bench_one_streaming(base_url: str, prompt: str, max_tokens: int) -> dict:
     if t_first_token is None and t_first_reasoning is None:
         return None
 
-    # For thinking models, TTFT is when reasoning started (that's when the
-    # model produced its first token).  The thinking-aware streaming path
-    # collects all tokens then emits content as a burst, so t_first_token
-    # would be misleadingly late.
-    if has_thinking and t_first_reasoning is not None:
-        ttft_ms = (t_first_reasoning - t_start) * 1000
-    elif t_first_token is not None:
-        ttft_ms = (t_first_token - t_start) * 1000
-    else:
-        ttft_ms = (t_end - t_start) * 1000
-
     total_ms = (t_end - t_start) * 1000
+
+    # TTFT: for thinking models, use t_first_token (when actual content
+    # starts, after reasoning is done) — that's what the user experiences.
+    # For non-thinking models, it's just the first content delta.
+    if t_first_token is not None:
+        ttft_ms = (t_first_token - t_start) * 1000
+    elif t_first_reasoning is not None:
+        ttft_ms = (t_first_reasoning - t_start) * 1000
+    else:
+        ttft_ms = total_ms
 
     # If we didn't get usage from streaming, make a non-streaming call to get it.
     if completion_tokens == 0:
@@ -220,14 +219,14 @@ def bench_one_streaming(base_url: str, prompt: str, max_tokens: int) -> dict:
         except Exception:
             pass
 
-    # For thinking models, the pseudo-streaming path collects all tokens then
-    # emits them as a burst — measuring post-first-token duration gives absurd
-    # numbers.  Use total wall time (minus prefill TTFT) instead.
-    if has_thinking:
-        gen_duration = (total_ms - ttft_ms) / 1000
-    else:
-        gen_duration = t_end - t_first_token if t_first_token else total_ms / 1000
-
+    # tok/s = completion_tokens / total generation time.
+    #
+    # For thinking models the server collects reasoning tokens internally
+    # then burst-emits them over SSE, so measuring inter-chunk timing is
+    # meaningless.  Use total wall time for all models — this consistently
+    # measures end-to-end throughput including prefill, which is what the
+    # user actually experiences.  (The CLI benchmark.sh also uses wall time.)
+    gen_duration = total_ms / 1000
     gen_tps = completion_tokens / gen_duration if gen_duration > 0 and completion_tokens > 0 else 0
 
     return {
