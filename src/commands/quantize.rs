@@ -263,8 +263,14 @@ fn should_quantize(name: &str, shape: &[usize], dtype: safetensors::Dtype) -> bo
         return false;
     }
 
-    // Exclude norms, embeddings, conv1d, routers.
-    let exclude = ["layernorm", "norm", "embed_tokens", "conv1d", "router"];
+    // Exclude norms, embeddings, conv1d, routers, and Mamba-2 SSM projections.
+    // Mamba-2's mixer.in_proj packs SSM-critical signals (dt, B, C, x, z) and
+    // mixer.out_proj is the SSM output projection — both are too sensitive to
+    // quantization because the recurrent state amplifies per-step errors.
+    // Standard attention in_proj/out_proj (e.g. self_attn.in_proj) don't contain
+    // "mixer." so they're unaffected.
+    let exclude = ["layernorm", "norm", "embed_tokens", "conv1d", "router",
+                   "mixer.in_proj", "mixer.out_proj"];
     if exclude.iter().any(|ex| name.contains(ex)) {
         return false;
     }
@@ -508,6 +514,47 @@ mod tests {
         assert!(should_quantize(
             "model.layers.0.mlp.gate_proj.weight",
             &[8192, 2048],
+            safetensors::Dtype::BF16,
+        ));
+    }
+
+    // Mamba-2 SSM projection exclusions (Nemotron-H).
+    // These tensors pack SSM-critical signals (dt, B, C, x, z) that are
+    // too sensitive to quantization — the recurrent state amplifies errors.
+
+    #[test]
+    fn test_should_not_quantize_mamba_mixer_in_proj() {
+        assert!(!should_quantize(
+            "backbone.layers.0.mixer.in_proj.weight",
+            &[10304, 2688],
+            safetensors::Dtype::BF16,
+        ));
+    }
+
+    #[test]
+    fn test_should_not_quantize_mamba_mixer_out_proj() {
+        assert!(!should_quantize(
+            "backbone.layers.0.mixer.out_proj.weight",
+            &[2688, 4096],
+            safetensors::Dtype::BF16,
+        ));
+    }
+
+    // Ensure attention in_proj/out_proj (non-mixer) are still quantized.
+    #[test]
+    fn test_should_quantize_attention_in_proj() {
+        assert!(should_quantize(
+            "model.layers.0.self_attn.in_proj.weight",
+            &[4096, 2048],
+            safetensors::Dtype::BF16,
+        ));
+    }
+
+    #[test]
+    fn test_should_quantize_attention_out_proj() {
+        assert!(should_quantize(
+            "model.layers.0.self_attn.out_proj.weight",
+            &[2048, 4096],
             safetensors::Dtype::BF16,
         ));
     }

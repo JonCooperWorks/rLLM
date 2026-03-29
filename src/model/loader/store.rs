@@ -150,6 +150,22 @@ pub(crate) fn load_safetensors_files(model_dir: &Path) -> anyhow::Result<(Vec<Mm
         weight_map.insert(tensor_name.clone(), file_to_idx[f]);
     }
 
+    // Validate all shard files exist before attempting to mmap.
+    let missing: Vec<&str> = shard_files
+        .iter()
+        .filter(|f| !model_dir.join(f).exists())
+        .map(|f| f.as_str())
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "incomplete model in {}: missing shard file(s): {}. \
+             Re-download with: huggingface-cli download <model> --local-dir {}",
+            model_dir.display(),
+            missing.join(", "),
+            model_dir.display()
+        );
+    }
+
     // Memory-map each shard file.
     eprintln!(
         "loading from {} shard files in {}",

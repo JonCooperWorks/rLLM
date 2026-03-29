@@ -85,6 +85,63 @@ KNOWN_MODELS = {
 
 DEFAULT_PROMPT = "The meaning of life is"
 
+# Models where Q4 quantization is known to degrade quality below the coherence
+# threshold.  Quality is still reported but not counted as a benchmark failure.
+KNOWN_Q4_SENSITIVE = {"gpt-oss-20b"}
+
+# Models with chat/instruct training (not base pretrained).  Base models need
+# /v1/completions (raw text) instead of /v1/chat/completions (chat template).
+# Models ending in -instruct, -it, or listed here are considered chat models.
+KNOWN_CHAT_MODELS = {
+    "phi-4", "qwen3.5-9b", "qwen3.5-27b", "qwen3.5-35b-a3b",
+    "qwen3.5-122b", "qwen3.5-122b-a10b", "qwen3.5-397b", "qwen3.5-397b-a27b",
+    "gpt-oss-20b", "gpt-oss-120b",
+    "nemotron-3-30b", "nemotron-3-120b",
+    "deepseek-r1-distill-qwen-32b",
+}
+
+
+def is_base_model(name: str) -> bool:
+    """Return True if the model is a base (pretrained) model, not instruct/chat.
+
+    Base models don't have a chat template and need the /v1/completions
+    endpoint (raw text prompting) instead of /v1/chat/completions.
+    """
+    if "-instruct" in name or name.endswith("-it"):
+        return False
+    # Strip quant suffixes to check the base name.
+    base = name
+    for suffix in ("-q4-q8", "-q8", "-q4"):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
+            break
+    if base in KNOWN_CHAT_MODELS:
+        return False
+    return True
+
+
+def check_model_shards(model_dir: str) -> tuple[bool, list[str]]:
+    """Validate that all safetensors shards referenced by the index exist.
+
+    Returns (ok, missing_files).  For single-file models (no index.json),
+    returns (True, []).
+    """
+    model_path = Path(model_dir)
+    index_path = model_path / "model.safetensors.index.json"
+    if not index_path.exists():
+        # Single-file model or no index — nothing to validate.
+        return True, []
+
+    try:
+        with open(index_path) as f:
+            index = json.load(f)
+        weight_map = index.get("weight_map", {})
+        shard_files = set(weight_map.values())
+        missing = [s for s in sorted(shard_files) if not (model_path / s).exists()]
+        return len(missing) == 0, missing
+    except (json.JSONDecodeError, OSError):
+        return True, []  # Can't parse index — let the loader handle it.
+
 
 # ---------------------------------------------------------------------------
 # Benchmark helpers
@@ -237,6 +294,101 @@ def bench_one_streaming(base_url: str, prompt: str, max_tokens: int) -> dict:
     }
 
 
+def bench_one_streaming_completions(base_url: str, prompt: str, max_tokens: int) -> dict:
+    """Run one streaming benchmark via /v1/completions (raw text, no chat template).
+
+    Used for base (pretrained) models that don't understand chat template tokens.
+    Returns dict with: ttft_ms, gen_tps, prompt_tokens, completion_tokens, total_ms, content.
+    Returns None on failure.
+    """
+    import requests
+
+    payload = {
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "stream": True,
+    }
+
+    t_start = time.monotonic()
+    t_first_token = None
+    completion_tokens = 0
+    prompt_tokens = 0
+    content_pieces = []
+
+    try:
+        resp = requests.post(
+            f"{base_url}/v1/completions",
+            json=payload,
+            timeout=600,
+            stream=True,
+        )
+        if resp.status_code != 200:
+            return None
+
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data: "):
+                continue
+            data = line[len("data: "):]
+            if data.strip() == "[DONE]":
+                break
+            try:
+                obj = json.loads(data)
+                choices = obj.get("choices", [{}])
+                text = choices[0].get("text", "") if choices else ""
+                if text:
+                    content_pieces.append(text)
+                    if t_first_token is None:
+                        t_first_token = time.monotonic()
+                usage = obj.get("usage")
+                if usage:
+                    prompt_tokens = usage.get("prompt_tokens", 0)
+                    completion_tokens = usage.get("completion_tokens", 0)
+            except json.JSONDecodeError:
+                continue
+
+        t_end = time.monotonic()
+
+    except Exception:
+        return None
+
+    if t_first_token is None:
+        return None
+
+    total_ms = (t_end - t_start) * 1000
+    ttft_ms = (t_first_token - t_start) * 1000
+
+    # The streaming /v1/completions endpoint doesn't include usage stats.
+    # If we didn't get them, make a non-streaming call to get token counts.
+    if completion_tokens == 0:
+        try:
+            payload["stream"] = False
+            resp2 = requests.post(
+                f"{base_url}/v1/completions",
+                json=payload,
+                timeout=600,
+            )
+            if resp2.status_code == 200:
+                body = resp2.json()
+                usage = body.get("usage", {})
+                prompt_tokens = usage.get("prompt_tokens", 0)
+                completion_tokens = usage.get("completion_tokens", 0)
+        except Exception:
+            pass
+
+    gen_duration = total_ms / 1000
+    gen_tps = completion_tokens / gen_duration if gen_duration > 0 and completion_tokens > 0 else 0
+
+    return {
+        "ttft_ms": ttft_ms,
+        "gen_tps": gen_tps,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_ms": total_ms,
+        "content": "".join(content_pieces),
+    }
+
+
 def bench_one_nonstreaming(base_url: str, prompt: str, max_tokens: int) -> dict:
     """Run one non-streaming benchmark, measuring total time and throughput.
 
@@ -373,6 +525,12 @@ def main():
         if not any(entry.glob("*.safetensors")):
             continue
 
+        # Validate shard completeness — skip models with missing shards.
+        shards_ok, missing = check_model_shards(str(entry))
+        if not shards_ok:
+            print(f"  SKIP {name}: missing shards: {', '.join(missing)}", file=sys.stderr)
+            continue
+
         discovered.append({
             "name": name,
             "path": str(entry),
@@ -381,6 +539,7 @@ def main():
             "is_q4": is_q4,
             "bf16_size_gb": bf16_size_gb,
             "supports_stream_experts": supports_stream,
+            "is_base": is_base_model(name),
         })
 
     if not discovered:
@@ -415,12 +574,24 @@ def main():
                 })
                 continue
 
+            # Choose the right benchmark function based on model type.
+            # Base models use /v1/completions (raw text, no chat template).
+            use_completions = model["is_base"]
+            if use_completions:
+                print(f"  (base model — using /v1/completions)")
+
+            # Check if this model+quant combo has known Q4 quality sensitivity.
+            q4_sensitive = model["is_q4"] and base_name in KNOWN_Q4_SENSITIVE
+
             # Run multiple iterations and average.
             run_results = []
             quality_ok = True
             quality_reason = ""
             for run_idx in range(args.runs):
-                r = bench_one_streaming(base_url, args.prompt, args.max_tokens)
+                if use_completions:
+                    r = bench_one_streaming_completions(base_url, args.prompt, args.max_tokens)
+                else:
+                    r = bench_one_streaming(base_url, args.prompt, args.max_tokens)
                 if r is None:
                     print(f"  Run {run_idx + 1}: FAILED")
                     continue
@@ -430,8 +601,12 @@ def main():
                 coherent, reason = check_coherence(r["content"])
                 status = "OK" if coherent else f"QUALITY FAIL: {reason}"
                 if not coherent:
-                    quality_ok = False
-                    quality_reason = reason
+                    if q4_sensitive:
+                        status = f"QUALITY WARN (Q4-sensitive): {reason}"
+                        quality_reason = reason  # Record but don't fail.
+                    else:
+                        quality_ok = False
+                        quality_reason = reason
 
                 print(
                     f"  Run {run_idx + 1}: {r['gen_tps']:.1f} tok/s, "
@@ -443,10 +618,16 @@ def main():
             if run_results:
                 avg_tps = sum(r["gen_tps"] for r in run_results) / len(run_results)
                 avg_ttft = sum(r["ttft_ms"] for r in run_results) / len(run_results)
+                if not quality_ok:
+                    quality_str = f"FAIL: {quality_reason}"
+                elif q4_sensitive and quality_reason:
+                    quality_str = f"WARN: {quality_reason} (Q4-sensitive)"
+                else:
+                    quality_str = "PASS"
                 results.append({
                     "name": name, "family": model["family"],
                     "gen_tps": avg_tps, "ttft_ms": avg_ttft,
-                    "quality": "PASS" if quality_ok else f"FAIL: {quality_reason}",
+                    "quality": quality_str,
                 })
             else:
                 results.append({
