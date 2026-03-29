@@ -252,7 +252,7 @@ fn deltanet_attention_block<
 // Flow: hidden += routed_experts(hidden) + gate * shared_expert(hidden)
 // ---------------------------------------------------------------------------
 
-fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
+fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe + GpuAllReduce>(
     m: &Model<'_, B>,
     layer_idx: usize,
     d: &Dims,
@@ -304,6 +304,8 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
             moe_inter,
             num_experts,
             num_experts_per_tok,
+            moe.local_expert_start,
+            moe.local_expert_count,
         );
     }
 
@@ -359,7 +361,7 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
 ///
 /// norm_buf already contains the RMSNorm'd hidden state from the fused
 /// residual+norm kernel that precedes this block.  Inspired by rvLLM (m0at).
-fn moe_ffn_block_pre_normed<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
+fn moe_ffn_block_pre_normed<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe + GpuAllReduce>(
     m: &Model<'_, B>,
     layer_idx: usize,
     d: &Dims,
@@ -403,6 +405,8 @@ fn moe_ffn_block_pre_normed<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + 
             moe_inter,
             num_experts,
             num_experts_per_tok,
+            moe.local_expert_start,
+            moe.local_expert_count,
         );
     }
 

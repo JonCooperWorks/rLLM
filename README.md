@@ -155,81 +155,24 @@ Q4 is slower than bf16 on H100 — the 3.35 TB/s HBM3 bandwidth means bf16 matve
 </details>
 
 <details>
-<summary><b>NVIDIA RTX 4090 48 GB</b> — 1.01 TB/s GDDR6X (March 22, 2026 — older build)</summary>
+<summary><b>2× NVIDIA RTX 4090 (TP=2)</b> — 2× 1.01 TB/s GDDR6X, 48 GB total (March 29, 2026)</summary>
 
-Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Numbers from an earlier build — expect improvement on current code.
-
-| Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
-|---|---|---|---|---|---|
-| Qwen3.5 122B-A10B ⚡ | ~122B (~10B active) | 1.2 tok/s | 4.0 tok/s | 8,800 ms | 3,500 ms |
-| Qwen3.5 397B-A17B ⚡ | ~397B (~17B active) | 0.5 tok/s | 1.9 tok/s | 11,200 ms | 3,500 ms |
-
-⚡ = SSD expert streaming with GPU-side LRU expert cache (64 slots). Async DMA via dedicated CUDA transfer stream with pinned host memory.
-
-</details>
-
-<details>
-<summary><b>NVIDIA RTX PRO 6000 Blackwell</b> — 96 GB GDDR7, 1.53 TB/s (March 22, 2026 — older build)</summary>
-
-Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Numbers from an earlier build — expect improvement on current code.
+Benchmarked on [RunPod](https://runpod.io?ref=249k2lel). Tensor parallelism across 2 GPUs. MoE models use hybrid strategy (TP for attention, expert parallelism for MoE FFN). Q8 uses FP8 E4M3 (auto-selected on SM 89+).
 
 | Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|
-| GPT-OSS 20B | 20.0B (3.6B active) | 103 tok/s | 121 tok/s | 153 ms | 144 ms |
-| Qwen3.5 122B-A10B ⚡ | 122B (10B active) | 1.7 tok/s | 3.9 tok/s | 9,500 ms | 6,800 ms |
+| Llama 3.2 3B Instruct | 3.2B | 123.9 tok/s | 141.9 tok/s | 167 ms | 185 ms |
+| Gemma 3 4B Instruct | 4.3B | 84.0 tok/s | 98.8 tok/s | 219 ms | 205 ms |
+| Llama 3.1 8B Instruct | 8.0B | 72.5 tok/s | 102.6 tok/s | 249 ms | 280 ms |
+| Qwen3.5 9B † | ~9B | 45.4 tok/s | — | 2,816 ms | — |
+| Phi-4 | 14.7B | — | 67.2 tok/s | — | 382 ms |
+| Gemma 3 27B Instruct | 27.4B | — | 33.2 tok/s | — | 628 ms |
+| Mixtral 8x7B Instruct | 46.7B (12.9B active) | — | 42.7 tok/s | — | 1,022 ms |
 
-⚡ = SSD expert streaming. Prefill uses WMMA tensor-core GEMM (sm_80+).
-
-</details>
-
-<details>
-<summary><b>2× NVIDIA RTX 5090 (TP=2)</b> — 2× 1.79 TB/s GDDR7X (March 22, older build)</summary>
-
-Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Numbers from an earlier build — expect improvement on current code.
-
-| Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
-|---|---|---|---|---|---|
-| Llama 3.2 1B Instruct | 1.2B | 178 tok/s | 173 tok/s | 70 ms | 75 ms |
-| Llama 3.2 3B Instruct | 3.2B | 112 tok/s | 125 tok/s | 85 ms | 87 ms |
-| Gemma 3 4B Instruct | 4.3B | 82 tok/s | 89 tok/s | 47 ms | 47 ms |
-| Mistral 7B Instruct | 7.2B | 100 tok/s | 123 tok/s | 106 ms | 114 ms |
-| Llama 3.1 8B Instruct | 8.0B | 82 tok/s | 96 tok/s | 113 ms | 123 ms |
-| Gemma 3 27B Instruct | 27.4B | 35 tok/s | 45 tok/s | 140 ms | 126 ms |
-| Llama 3.1 70B Instruct | 70.6B | — | 26 tok/s | — | 535 ms |
-
-TP=2 shines for larger models: Gemma 27B gets 45 tok/s Q4, Llama 70B (44 GB Q4) splits across both GPUs at 26 tok/s. Small models are bottlenecked by NCCL all-reduce latency.
+† = thinking model (TTFT includes reasoning time). Mixtral uses expert parallelism (4/8 experts per GPU). Benchmarked via `tests/bench.py` (HTTP API).
 
 </details>
 
-<details>
-<summary><b>NVIDIA A100-SXM4-80GB</b> — 2.0 TB/s HBM2e (March 16, 2026 — older build)</summary>
-
-Benchmarked on [RunPod](https://runpod.io?ref=249k2lel). Numbers from an earlier build — expect improvement on current code.
-
-| Model | Params | bf16 | Q4 |
-|---|---|---|---|
-| Llama 3.2 1B Instruct | 1.2B | 231 tok/s | 200 tok/s |
-| Llama 3.2 3B Instruct | 3.2B | 115 tok/s | 99 tok/s |
-| Qwen 2.5 3B Instruct | 3.1B | 103 tok/s | 83 tok/s |
-| Gemma 3 4B Instruct | 4.3B | 83 tok/s | 72 tok/s |
-| Qwen 2.5 7B Instruct | 7.6B | 83 tok/s | 69 tok/s |
-| Mistral 7B Instruct | 7.2B | 80 tok/s | 64 tok/s |
-| Llama 3.1 8B Instruct | 8.0B | 74 tok/s | 61 tok/s |
-| Phi-4 | 14.7B | 51 tok/s | 42 tok/s |
-| Gemma 3 27B Instruct | 27.4B | 29 tok/s | 23 tok/s |
-
-</details>
-
-<details>
-<summary><b>2× NVIDIA A100-SXM4-80GB (TP=2)</b> — 2× 2.0 TB/s (March 16, older build)</summary>
-
-Benchmarked on [RunPod](https://runpod.io?ref=249k2lel). Numbers from an earlier build — expect improvement on current code.
-
-| Model | Params | bf16 | Q4 | TTFT (bf16) | TTFT (Q4) |
-|---|---|---|---|---|---|
-| Llama 3.1 70B Instruct | 70.6B | 14 tok/s | 11 tok/s | 457 ms | 564 ms |
-
-</details>
 
 ### TurboQuant KV Cache Quantization
 

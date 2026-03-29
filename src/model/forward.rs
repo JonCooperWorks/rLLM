@@ -52,6 +52,10 @@ pub(crate) struct MoeBuffers<B: GpuCore> {
     pub moe_output: B::Tensor,       // [hidden_size] bf16
     pub routing_output: B::Tensor,   // [2*k] f32 — (expert_index, weight) pairs
     pub expert_streamer: Option<ExpertStreamer<B>>,
+    /// Expert parallelism: global index of the first local expert (0 if no EP).
+    pub local_expert_start: usize,
+    /// Expert parallelism: number of experts on this rank (num_experts if no EP).
+    pub local_expert_count: usize,
 }
 
 /// DeltaNet recurrent state and scratch buffers (Qwen 3.5 only).

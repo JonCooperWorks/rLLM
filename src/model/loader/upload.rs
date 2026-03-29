@@ -154,30 +154,52 @@ pub(crate) fn upload_sharded<B: GpuCore>(
     if let Some(plan) = sharding {
         if let Some(ws) = plan.get(name) {
             if !matches!(ws.split, SplitDimension::Replicated) {
-                // Pre-quantized FP8: 1 byte per element, no block structure.
-                // Slice the raw FP8 bytes directly and upload with FP8 dtype.
-                if let Some((m, k, TensorDtype::FP8)) = store.quant_shape(name) {
+                // Pre-quantized weights (Q4, Q8, FP8): slice in the quantized
+                // domain so each rank gets its shard without dequantizing.
+                //
+                // Q4/Q8 use a block format (32 weights per block), so we slice
+                // in "block" coordinates: logical shape [m, k/32] with
+                // bytes_per_block = 18 (Q4) or 34 (Q8).
+                // FP8 has no block structure: 1 byte per element.
+                if let Some((m, k, qdt)) = store.quant_shape(name) {
                     let view = store.tensor(name)?;
                     let data = view.data();
-                    let expected_bytes = quant_byte_count(TensorDtype::FP8, m, k);
+                    let expected_bytes = quant_byte_count(qdt, m, k);
                     anyhow::ensure!(
                         data.len() == expected_bytes,
-                        "pre-quantized FP8 tensor '{name}' byte count mismatch: \
+                        "pre-quantized {qdt:?} tensor '{name}' byte count mismatch: \
                          expected {expected_bytes}, got {}",
                         data.len()
                     );
-                    let (sliced, shard_shape) = slice_tensor_data(
+
+                    let (block_shape, bytes_per_block) = match qdt {
+                        TensorDtype::Q4 => ([m, k / 32], 18usize),
+                        TensorDtype::Q8 => ([m, k / 32], 34usize),
+                        TensorDtype::FP8 => ([m, k], 1usize),
+                        _ => unreachable!(),
+                    };
+
+                    let (sliced, shard_block_shape) = slice_tensor_data(
                         data,
-                        &[m, k],
+                        &block_shape,
                         &ws.split,
                         plan.device.rank,
                         plan.device.world_size,
-                        1, // FP8: 1 byte per element
+                        bytes_per_block,
                     );
-                    return Ok(backend.upload_tensor(&sliced, &shard_shape, TensorDtype::FP8));
+
+                    // Convert shard block shape back to logical weight shape.
+                    let shard_shape = match qdt {
+                        TensorDtype::Q4 | TensorDtype::Q8 => {
+                            [shard_block_shape[0], shard_block_shape[1] * 32]
+                        }
+                        _ => shard_block_shape,
+                    };
+
+                    return Ok(backend.upload_tensor(&sliced, &shard_shape, qdt));
                 }
 
-                // Read raw bytes from safetensors.
+                // Read raw bytes from safetensors (bf16 / f32).
                 let view = store.tensor(name)?;
                 let data = view.data();
 

@@ -72,10 +72,18 @@ pub(crate) mod tp {
                 let backend = Box::new(backend);
 
                 // Create sharding plan for this rank.
+                // MoE models use Hybrid strategy: TP for attention, EP for MoE FFN.
+                // This assigns whole experts to ranks instead of splitting each
+                // expert's matrices, requiring only one AllReduce per MoE layer.
+                let strategy = if config.is_moe() {
+                    ParallelStrategy::Hybrid
+                } else {
+                    ParallelStrategy::TensorParallel
+                };
                 let device = DeviceConfig {
                     world_size,
                     rank,
-                    strategy: ParallelStrategy::TensorParallel,
+                    strategy,
                 };
                 let plan = ShardingPlan::derive(&config, device, false)?;
 
@@ -144,7 +152,8 @@ pub(crate) mod tp {
                     }
                 }
 
-                let forward = crate::engine::loader::create_forward(config.arch()?, &config, backend_ref, world_size, None);
+                let use_ep = matches!(strategy, ParallelStrategy::ExpertParallel | ParallelStrategy::Hybrid);
+                let forward = crate::engine::loader::create_forward(config.arch()?, &config, backend_ref, world_size, rank, use_ep, None);
 
                 ranks.push(RankState {
                     model,

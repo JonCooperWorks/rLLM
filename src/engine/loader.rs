@@ -40,17 +40,39 @@ use crate::model::{kv_cache, loader};
 use super::InferenceEngine;
 
 /// Allocate MoE scratch buffers for MoE architectures.
-fn alloc_moe_buffers<B: GpuCore>(backend: &B, config: &ModelConfig, world_size: usize) -> MoeBuffers<B> {
+///
+/// With expert parallelism (EP/Hybrid strategy), each rank owns whole experts
+/// so `moe_inter` is NOT divided.  With tensor parallelism, each expert is
+/// split across ranks so `moe_inter` is divided by `world_size`.
+fn alloc_moe_buffers<B: GpuCore>(
+    backend: &B,
+    config: &ModelConfig,
+    world_size: usize,
+    rank: usize,
+    use_ep: bool,
+) -> MoeBuffers<B> {
     let hidden = config.hidden_size;
-    let moe_inter = config.moe_intermediate_size / world_size;
+    let num_experts = config.num_experts;
     let k = config.num_experts_per_tok;
+
+    let (moe_inter, local_expert_start, local_expert_count) = if use_ep && world_size > 1 {
+        // EP: whole experts per rank, no intermediate-dim splitting.
+        let experts_per_rank = num_experts / world_size;
+        (config.moe_intermediate_size, rank * experts_per_rank, experts_per_rank)
+    } else {
+        // TP or single-GPU: each expert is split, all experts on every rank.
+        (config.moe_intermediate_size / world_size, 0, num_experts)
+    };
+
     MoeBuffers {
-        router_logits: backend.alloc_tensor(&[config.num_experts], TensorDtype::F32),
+        router_logits: backend.alloc_tensor(&[num_experts], TensorDtype::F32),
         moe_gate_buf: backend.alloc_tensor(&[moe_inter], TensorDtype::BF16),
         moe_up_buf: backend.alloc_tensor(&[moe_inter], TensorDtype::BF16),
         moe_output: backend.alloc_tensor(&[hidden], TensorDtype::BF16),
         routing_output: backend.alloc_tensor(&[2 * k], TensorDtype::F32),
         expert_streamer: None,
+        local_expert_start,
+        local_expert_count,
     }
 }
 
@@ -132,6 +154,8 @@ pub(crate) fn create_forward<B: GpuBackend + 'static>(
     config: &ModelConfig,
     backend: &B,
     world_size: usize,
+    rank: usize,
+    use_ep: bool,
     expert_streamer: Option<model::expert_stream::ExpertStreamer<B>>,
 ) -> Box<dyn ModelForward<B>> {
     match arch {
@@ -141,18 +165,18 @@ pub(crate) fn create_forward<B: GpuBackend + 'static>(
         ModelArch::Qwen2 => Box::new(registry::llama::LlamaForward::new(true)),
         ModelArch::Gemma3 => Box::new(registry::gemma::GemmaForward),
         ModelArch::Mixtral => {
-            let mut moe = alloc_moe_buffers(backend, config, world_size);
+            let mut moe = alloc_moe_buffers(backend, config, world_size, rank, use_ep);
             moe.expert_streamer = expert_streamer;
             Box::new(registry::mixtral::MixtralForward { moe })
         }
         ModelArch::Qwen3Moe => {
-            let mut moe = alloc_moe_buffers(backend, config, world_size);
+            let mut moe = alloc_moe_buffers(backend, config, world_size, rank, use_ep);
             moe.expert_streamer = expert_streamer;
             Box::new(registry::qwen3_moe::Qwen3MoeForward { moe })
         }
         ModelArch::Qwen3_5 => {
             let moe = if config.is_moe() {
-                let mut moe = alloc_moe_buffers(backend, config, world_size);
+                let mut moe = alloc_moe_buffers(backend, config, world_size, rank, use_ep);
                 moe.expert_streamer = expert_streamer;
                 Some(moe)
             } else {
@@ -164,12 +188,12 @@ pub(crate) fn create_forward<B: GpuBackend + 'static>(
             })
         }
         ModelArch::GptOss => {
-            let mut moe = alloc_moe_buffers(backend, config, world_size);
+            let mut moe = alloc_moe_buffers(backend, config, world_size, rank, use_ep);
             moe.expert_streamer = expert_streamer;
             Box::new(registry::gpt_oss::GptOssForward { moe })
         }
         ModelArch::NemotronH => {
-            let mut moe = alloc_moe_buffers(backend, config, world_size);
+            let mut moe = alloc_moe_buffers(backend, config, world_size, rank, use_ep);
             moe.expert_streamer = expert_streamer;
             Box::new(registry::nemotron_h::NemotronForward {
                 moe,
@@ -311,7 +335,7 @@ fn load_and_run_single_gpu(
         let k = config.num_experts_per_tok;
         model::expert_stream::ExpertStreamer::new(&backend, index, k)
     });
-    let forward = create_forward(arch, &config, &backend, 1, expert_streamer);
+    let forward = create_forward(arch, &config, &backend, 1, 0, false, expert_streamer);
     let mut eng = super::Engine::new(model, forward, kv_pool, tokenizer, &backend, max_active);
     run(&mut eng)
 }

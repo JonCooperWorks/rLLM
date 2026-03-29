@@ -1632,6 +1632,22 @@ pub(crate) fn load_moe_ffn_weights<B: GpuCore>(
     let fused_name = format!("{prefix}.mlp.experts.gate_up_proj");
     let is_fused = !is_mxfp4 && store.tensor(&fused_name).is_ok();
 
+    // Determine local expert range for expert parallelism.
+    // For MXFP4 and fused formats, we use the same EP detection as per-expert:
+    // probe the sharding plan for ExpertParallel entries.
+    let ep_expert_range: Option<Vec<usize>> = if let Some(plan) = sharding {
+        let mut ep_indices = None;
+        for w in &plan.weights {
+            if let crate::gpu::parallel::SplitDimension::ExpertParallel { expert_indices } = &w.split {
+                ep_indices = Some(expert_indices.clone());
+                break;
+            }
+        }
+        ep_indices
+    } else {
+        None
+    };
+
     let expert_vec = if skip_experts {
         if layer_idx == 0 {
             eprintln!(
@@ -1649,6 +1665,7 @@ pub(crate) fn load_moe_ffn_weights<B: GpuCore>(
             hidden,
             moe_inter,
             num_experts,
+            ep_expert_range.as_deref(),
         )?
     } else if is_fused {
         load_fused_experts(
@@ -1658,6 +1675,7 @@ pub(crate) fn load_moe_ffn_weights<B: GpuCore>(
             hidden,
             moe_inter,
             num_experts,
+            ep_expert_range.as_deref(),
         )?
     } else {
         // Per-expert format: separate tensors per expert.
@@ -1672,8 +1690,15 @@ pub(crate) fn load_moe_ffn_weights<B: GpuCore>(
         // upload_sharded falls back to upload_maybe_quantized when sharding
         // is None or the tensor is Replicated, so single-GPU is unaffected.
         // See parallel.rs ShardingPlan::derive() for the plan derivation.
-        let mut experts = Vec::with_capacity(num_experts);
-        for j in 0..num_experts {
+        //
+        // Expert parallelism: ep_expert_range (computed above) lists local experts.
+        let expert_iter: Vec<usize> = if let Some(ref indices) = ep_expert_range {
+            indices.clone()
+        } else {
+            (0..num_experts).collect()
+        };
+        let mut experts = Vec::with_capacity(expert_iter.len());
+        for j in expert_iter {
             let (gate_name, up_name, down_name) = if hints.is_mixtral {
                 let ep = format!("{prefix}.block_sparse_moe.experts.{j}");
                 (
@@ -1720,17 +1745,19 @@ pub(crate) fn load_moe_ffn_weights<B: GpuCore>(
     };
 
     if layer_idx == 0 {
+        let loaded_count = expert_vec.len();
+        let ep_suffix = if loaded_count < num_experts {
+            format!(" [EP: {}/{} local]", loaded_count, num_experts)
+        } else if is_mxfp4 {
+            " [MXFP4 format]".to_string()
+        } else if is_fused {
+            " [fused format]".to_string()
+        } else {
+            String::new()
+        };
         eprintln!(
             "  loading {} experts per layer (moe_inter={}){}",
-            num_experts,
-            moe_inter,
-            if is_mxfp4 {
-                " [MXFP4 format]"
-            } else if is_fused {
-                " [fused format]"
-            } else {
-                ""
-            },
+            loaded_count, moe_inter, ep_suffix,
         );
     }
 
@@ -1802,6 +1829,7 @@ pub(crate) fn load_mxfp4_experts<B: GpuCore>(
     hidden: usize,
     moe_inter: usize,
     num_experts: usize,
+    local_experts: Option<&[usize]>,
 ) -> anyhow::Result<Vec<ExpertWeights<B>>> {
     let block_size = 32usize; // MXFP4 standard block size
 
@@ -1838,8 +1866,11 @@ pub(crate) fn load_mxfp4_experts<B: GpuCore>(
     let gu_bias_per_expert = gu_rows * 2; // bf16
     let down_bias_per_expert = down_rows * 2; // bf16
 
-    let mut experts = Vec::with_capacity(num_experts);
-    for j in 0..num_experts {
+    let expert_iter: Vec<usize> = local_experts
+        .map(|indices| indices.to_vec())
+        .unwrap_or_else(|| (0..num_experts).collect());
+    let mut experts = Vec::with_capacity(expert_iter.len());
+    for j in expert_iter {
         // Dequant gate_up: on-disk [2*moe_inter, hidden] after unpacking MXFP4.
         //
         // MXFP4 stores weights transposed relative to HuggingFace convention:
@@ -1946,6 +1977,7 @@ pub(crate) fn load_fused_experts<B: GpuCore>(
     hidden: usize,
     moe_inter: usize,
     num_experts: usize,
+    local_experts: Option<&[usize]>,
 ) -> anyhow::Result<Vec<ExpertWeights<B>>> {
     let fused_name = format!("{prefix}.mlp.experts.gate_up_proj");
     let gate_up_view = store.tensor(&fused_name)?;
@@ -1986,8 +2018,11 @@ pub(crate) fn load_fused_experts<B: GpuCore>(
         )
     };
 
-    let mut experts = Vec::with_capacity(num_experts);
-    for j in 0..num_experts {
+    let expert_iter: Vec<usize> = local_experts
+        .map(|indices| indices.to_vec())
+        .unwrap_or_else(|| (0..num_experts).collect());
+    let mut experts = Vec::with_capacity(expert_iter.len());
+    for j in expert_iter {
         let gu_offset = j * gate_up_expert_bytes;
         let gate_raw = &gate_up_data[gu_offset..gu_offset + gate_bytes];
         let up_raw = &gate_up_data[gu_offset + gate_bytes..gu_offset + gate_up_expert_bytes];

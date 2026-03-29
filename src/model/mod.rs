@@ -363,16 +363,21 @@ impl<'a, B: GpuCore> Model<'a, B> {
         };
 
         // Allocate scratch buffers — TP-aware sizes.
+        // gate_buf and up_buf serve dual purposes:
+        //   - Dense FFN: gate/up projection output at [inter / world_size]
+        //   - MoE: down_proj scratch (down_buf) at [hidden_size]
+        // With expert parallelism (Hybrid strategy), inter is divided for TP
+        // but hidden_size is not, so we take the max to cover both uses.
+        let scratch_size = inter.max(hidden);
         let hidden_buf = backend.alloc_tensor(&[hidden], TensorDtype::BF16);
         let norm_buf = backend.alloc_tensor(&[hidden], TensorDtype::BF16);
         let q_buf = backend.alloc_tensor(&[eff_q_dim], TensorDtype::BF16);
         let k_buf = backend.alloc_tensor(&[eff_kv_dim], TensorDtype::BF16);
         let v_buf = backend.alloc_tensor(&[eff_kv_dim], TensorDtype::BF16);
         let attn_out = backend.alloc_tensor(&[eff_attn_dim], TensorDtype::BF16);
-        let gate_buf = backend.alloc_tensor(&[inter], TensorDtype::BF16);
-        let up_buf = backend.alloc_tensor(&[inter], TensorDtype::BF16);
+        let gate_buf = backend.alloc_tensor(&[scratch_size], TensorDtype::BF16);
+        let up_buf = backend.alloc_tensor(&[scratch_size], TensorDtype::BF16);
         let logits_buf = backend.alloc_tensor(&[vocab], TensorDtype::BF16);
-
 
         let kv_layer_map = config.kv_layer_map();
 

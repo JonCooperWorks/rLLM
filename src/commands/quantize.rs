@@ -58,21 +58,11 @@ pub(crate) struct QuantizeArgs {
 /// matches the HuggingFace convention for large models.
 const SHARD_LIMIT: usize = 5 * 1024 * 1024 * 1024;
 
-pub(crate) fn exec(args: QuantizeArgs) -> anyhow::Result<()> {
-    let input_dir = &args.model;
-    let output_dir = &args.output;
-
-    #[allow(unused_mut)]
-    let mut format = QuantFormat::from_name(&args.format).ok_or_else(|| {
-        anyhow::anyhow!(
-            "unknown quantization format '{}' (supported: q4, q8, fp8)",
-            args.format
-        )
-    })?;
-
-    // Platform-aware dispatch: `--format q8` on NVIDIA SM 89+ → FP8 E4M3.
-    // FP8 has native hardware support on Ada/Hopper, giving better throughput
-    // than Q8 block format.  On Metal or older NVIDIA GPUs, Q8 is unchanged.
+/// Apply platform-aware format dispatch: Q8 → FP8 on NVIDIA SM 89+ (Ada/Hopper).
+///
+/// FP8 has native hardware support on these GPUs, giving better throughput
+/// than Q8 block format.  On Metal or older NVIDIA GPUs, Q8 is unchanged.
+fn platform_adjusted_format(format: QuantFormat) -> QuantFormat {
     if format == QuantFormat::Q8 {
         #[cfg(feature = "cuda")]
         {
@@ -81,11 +71,26 @@ pub(crate) fn exec(args: QuantizeArgs) -> anyhow::Result<()> {
                 .and_then(|ctx| ctx.compute_capability().ok())
                 .unwrap_or((0, 0));
             if cc.0 > 8 || (cc.0 == 8 && cc.1 >= 9) {
-                format = QuantFormat::FP8;
                 eprintln!("NVIDIA SM {}.{} detected — using FP8 (E4M3) instead of Q8 blocks", cc.0, cc.1);
+                return QuantFormat::FP8;
             }
         }
     }
+    format
+}
+
+pub(crate) fn exec(args: QuantizeArgs) -> anyhow::Result<()> {
+    let input_dir = &args.model;
+    let output_dir = &args.output;
+
+    let format = QuantFormat::from_name(&args.format).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown quantization format '{}' (supported: q4, q8, fp8)",
+            args.format
+        )
+    })?;
+
+    let format = platform_adjusted_format(format);
 
     let quant = quantiser(format);
 
@@ -794,6 +799,8 @@ mod tests {
 
     #[test]
     fn test_end_to_end_quantize_q8_produces_valid_output() {
+        use crate::gpu::ops::quant::QuantFormat;
+
         let input_dir = tempfile::tempdir().unwrap();
         let output_dir = tempfile::tempdir().unwrap();
 
@@ -814,17 +821,17 @@ mod tests {
         })
         .unwrap();
 
+        // Platform-aware: `--format q8` may produce FP8 on NVIDIA SM 89+.
+        let actual_format = super::platform_adjusted_format(QuantFormat::Q8);
+
         let output_st = output_dir.path().join("model.safetensors");
         let data = std::fs::read(&output_st).unwrap();
         let (_, metadata) = SafeTensors::read_metadata(&data).unwrap();
         let meta = metadata.metadata().as_ref().unwrap();
 
-        assert_eq!(meta.get("quantization").unwrap(), "rllm-q8");
-        assert_eq!(
-            meta.get("rllm_q8:model.layers.0.self_attn.q_proj.weight")
-                .unwrap(),
-            &format!("{m},{k}")
-        );
+        assert_eq!(meta.get("quantization").unwrap(), actual_format.metadata_tag());
+        let meta_key = format!("{}model.layers.0.self_attn.q_proj.weight", actual_format.metadata_prefix());
+        assert!(meta.get(&meta_key).is_some(), "expected per-tensor metadata at {meta_key}");
         // No Q4 metadata should be present.
         assert!(
             meta.get("rllm_q4:model.layers.0.self_attn.q_proj.weight")
@@ -836,12 +843,16 @@ mod tests {
             .tensor("model.layers.0.self_attn.q_proj.weight")
             .unwrap();
         assert_eq!(q_proj.dtype(), safetensors::Dtype::U8);
-        let expected_bytes = crate::gpu::q8_byte_count(m, k);
+        let expected_bytes = match actual_format {
+            QuantFormat::FP8 => crate::gpu::fp8_byte_count(m, k),
+            _ => crate::gpu::q8_byte_count(m, k),
+        };
         assert_eq!(q_proj.data().len(), expected_bytes);
     }
 
     #[test]
     fn test_end_to_end_quantize_q8_matches_on_load() {
+        use crate::gpu::ops::quant::QuantFormat;
         use half::bf16;
 
         let m = 2;
@@ -851,7 +862,12 @@ mod tests {
             .collect();
         let bf16_bytes: &[u8] = bytemuck::cast_slice(&values);
 
-        let on_load_q8 = crate::gpu::quantize_bf16_to_q8(bf16_bytes, m, k);
+        // Platform-aware: `--format q8` may produce FP8 on NVIDIA SM 89+.
+        let actual_format = super::platform_adjusted_format(QuantFormat::Q8);
+        let on_load_quantized = match actual_format {
+            QuantFormat::FP8 => crate::gpu::quantize_bf16_to_fp8(bf16_bytes, m, k),
+            _ => crate::gpu::quantize_bf16_to_q8(bf16_bytes, m, k),
+        };
 
         let input_dir = tempfile::tempdir().unwrap();
         let output_dir = tempfile::tempdir().unwrap();
@@ -870,14 +886,15 @@ mod tests {
 
         let data = std::fs::read(output_dir.path().join("model.safetensors")).unwrap();
         let st = SafeTensors::deserialize(&data).unwrap();
-        let offline_q8 = st
+        let offline = st
             .tensor("model.layers.0.self_attn.q_proj.weight")
             .unwrap();
 
         assert_eq!(
-            offline_q8.data(),
-            on_load_q8.as_slice(),
-            "offline and on-load quantization must produce identical Q8 bytes"
+            offline.data(),
+            on_load_quantized.as_slice(),
+            "offline and on-load quantization must produce identical bytes (format: {})",
+            actual_format.name(),
         );
     }
 }

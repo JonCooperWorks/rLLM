@@ -366,7 +366,7 @@ fn mamba2_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuDeltaNet 
 //   6. Combine expert outputs + residual
 // ---------------------------------------------------------------------------
 
-fn moe_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
+fn moe_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe + GpuAllReduce>(
     m: &Model<'_, B>,
     layer_idx: usize,
     d: &NemotronDims,
@@ -380,6 +380,8 @@ fn moe_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
     let moe_up_buf = &moe.moe_up_buf;
     let _moe_gate_buf = &moe.moe_gate_buf;
     let moe_output = &moe.moe_output;
+    let use_ep = moe.local_expert_count < m.config.num_experts;
+    let local_expert_end = moe.local_expert_start + moe.local_expert_count;
 
     let num_experts = m.config.num_experts as u32;
 
@@ -417,11 +419,16 @@ fn moe_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
     m.backend.fill_zero(moe_output, d.hidden_size);
 
     // 5. For each selected expert: up_proj → relu² → down_proj → accumulate.
+    // EP: skip experts not owned by this rank, remap global → local index.
     for pair_idx in 0..k {
         let expert_idx = routing_data[pair_idx * 2] as usize;
         let weight = routing_data[pair_idx * 2 + 1];
 
-        let expert = &experts[expert_idx];
+        if use_ep && (expert_idx < moe.local_expert_start || expert_idx >= local_expert_end) {
+            continue;
+        }
+        let local_idx = expert_idx - moe.local_expert_start;
+        let expert = &experts[local_idx];
 
         // up_proj: [moe_inter, hidden] × norm_buf → moe_up_buf.
         m.backend.matmul(&expert.up_proj, &m.norm_buf, moe_up_buf, d.moe_inter, d.hidden_size);
@@ -436,6 +443,11 @@ fn moe_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
 
         // Weighted accumulate: moe_output += weight × gate_buf.
         m.backend.scale_add(moe_output, &m.gate_buf, weight, d.hidden_size);
+    }
+
+    // EP: combine partial expert outputs across ranks before shared expert.
+    if use_ep {
+        m.backend.all_reduce_sum(moe_output, d.hidden_size);
     }
 
     // 6. Shared expert (always active, same relu² pattern but larger intermediate).

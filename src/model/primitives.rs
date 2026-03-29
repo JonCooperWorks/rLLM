@@ -557,7 +557,7 @@ pub(crate) fn ffn_block_pre_normed<B: GpuNorm + GpuMatmul + GpuElementwise + Gpu
 ///   - `routing_output`: [2 * num_experts_per_tok] — GPU top-k output
 ///   - `down_buf`: [hidden_size] — scratch for expert down projection
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn moe_ffn_block<B: GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
+pub(crate) fn moe_ffn_block<B: GpuNorm + GpuMatmul + GpuElementwise + GpuMoe + GpuAllReduce>(
     backend: &B,
     // Weights
     post_attn_norm: &B::Tensor,
@@ -577,6 +577,9 @@ pub(crate) fn moe_ffn_block<B: GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
     moe_inter: u32,
     num_experts: usize,
     num_experts_per_tok: usize,
+    // Expert parallelism (pass 0, num_experts for single-GPU / TP).
+    local_expert_start: usize,
+    local_expert_count: usize,
 ) {
     // RMSNorm → norm_buf.
     backend.rms_norm(hidden, post_attn_norm, eps, norm_buf);
@@ -596,6 +599,8 @@ pub(crate) fn moe_ffn_block<B: GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
         moe_inter,
         num_experts,
         num_experts_per_tok,
+        local_expert_start,
+        local_expert_count,
     );
 
     // Residual add: hidden += moe_output.
@@ -616,7 +621,7 @@ pub(crate) fn moe_ffn_block<B: GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
 /// dispatches: 2 kernels per expert (fused_gate_up_swiglu + down matmul)
 /// instead of 4 (gate matmul + up matmul + silu_mul + down matmul).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn moe_expert_dispatch<B: GpuMatmul + GpuElementwise + GpuMoe>(
+pub(crate) fn moe_expert_dispatch<B: GpuMatmul + GpuElementwise + GpuMoe + GpuAllReduce>(
     backend: &B,
     router_gate: &B::Tensor,
     experts: &[ExpertWeights<B>],
@@ -632,7 +637,15 @@ pub(crate) fn moe_expert_dispatch<B: GpuMatmul + GpuElementwise + GpuMoe>(
     moe_inter: u32,
     num_experts: usize,
     num_experts_per_tok: usize,
+    // Expert parallelism: which experts are local to this rank.
+    // For single-GPU or TP, pass (0, num_experts) — all experts are local.
+    // For EP/Hybrid, pass (start, count) — only local experts are computed,
+    // then an AllReduce combines partial outputs across ranks.
+    local_expert_start: usize,
+    local_expert_count: usize,
 ) {
+    let use_ep = local_expert_count < num_experts;
+
     // Router matmul — compute per-expert scores.
     backend.matmul(
         router_gate,
@@ -666,8 +679,17 @@ pub(crate) fn moe_expert_dispatch<B: GpuMatmul + GpuElementwise + GpuMoe>(
     // Fused gate+up+SwiGLU: 1 dispatch instead of 3 (gate + up + silu_mul).
     backend.fill_zero(moe_output, hidden_size);
 
+    let local_expert_end = local_expert_start + local_expert_count;
+
     for &(expert_idx, routing_weight) in &selected {
-        let expert = &experts[expert_idx];
+        // EP: skip experts not owned by this rank.  Each rank only computes
+        // its local experts; the AllReduce below combines partial outputs.
+        if use_ep && (expert_idx < local_expert_start || expert_idx >= local_expert_end) {
+            continue;
+        }
+        // Map global expert index to local Vec index.
+        let local_idx = expert_idx - local_expert_start;
+        let expert = &experts[local_idx];
 
         // Fused: out = silu(gate_proj @ norm_buf) * (up_proj @ norm_buf).
         backend.fused_gate_up_swiglu(
@@ -688,6 +710,11 @@ pub(crate) fn moe_expert_dispatch<B: GpuMatmul + GpuElementwise + GpuMoe>(
             moe_inter,
         );
         backend.scale_add(moe_output, down_buf, routing_weight, hidden_size);
+    }
+
+    // EP: combine partial expert outputs across all ranks.
+    if use_ep {
+        backend.all_reduce_sum(moe_output, hidden_size);
     }
 }
 
@@ -829,7 +856,7 @@ pub(crate) fn moe_ffn_block_streamed<B: GpuNorm + GpuMatmul + GpuElementwise + G
 /// residual+norm kernel already produced the normalized state in `norm_buf`.
 /// Inspired by rvLLM (m0at).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn moe_ffn_block_pre_normed<B: GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
+pub(crate) fn moe_ffn_block_pre_normed<B: GpuNorm + GpuMatmul + GpuElementwise + GpuMoe + GpuAllReduce>(
     backend: &B,
     router_gate: &B::Tensor,
     experts: &[ExpertWeights<B>],
@@ -844,6 +871,8 @@ pub(crate) fn moe_ffn_block_pre_normed<B: GpuNorm + GpuMatmul + GpuElementwise +
     moe_inter: u32,
     num_experts: usize,
     num_experts_per_tok: usize,
+    local_expert_start: usize,
+    local_expert_count: usize,
 ) {
     // norm_buf already contains RMSNorm'd hidden from fused residual+norm kernel.
     moe_expert_dispatch(
@@ -860,6 +889,8 @@ pub(crate) fn moe_ffn_block_pre_normed<B: GpuNorm + GpuMatmul + GpuElementwise +
         moe_inter,
         num_experts,
         num_experts_per_tok,
+        local_expert_start,
+        local_expert_count,
     );
 
     backend.add(hidden, moe_output, hidden, hidden_size);
@@ -1375,7 +1406,7 @@ pub(crate) fn o_proj_residual_qdim_biased<B: GpuMatmul + GpuElementwise + GpuAll
 ///   3. GPT-OSS activation: (clamp(up,-lim,lim)+1) * clamp(gate,max=lim) * sigmoid(gate*alpha)
 ///   4. Expert down_bias added after down matmul
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn moe_expert_dispatch_biased<B: GpuMatmul + GpuElementwise>(
+pub(crate) fn moe_expert_dispatch_biased<B: GpuMatmul + GpuElementwise + GpuAllReduce>(
     backend: &B,
     router_gate: &B::Tensor,
     router_bias: Option<&B::Tensor>,
@@ -1393,7 +1424,11 @@ pub(crate) fn moe_expert_dispatch_biased<B: GpuMatmul + GpuElementwise>(
     num_experts: usize,
     num_experts_per_tok: usize,
     swiglu_limit: f32,
+    local_expert_start: usize,
+    local_expert_count: usize,
 ) {
+    let use_ep = local_expert_count < num_experts;
+
     // Router matmul → per-expert scores.
     backend.matmul(
         router_gate,
@@ -1431,8 +1466,14 @@ pub(crate) fn moe_expert_dispatch_biased<B: GpuMatmul + GpuElementwise>(
     // Zero the accumulator, then run each selected expert's FFN.
     backend.fill_zero(moe_output, hidden_size);
 
+    let local_expert_end = local_expert_start + local_expert_count;
+
     for &(expert_idx, routing_weight) in &selected {
-        let expert = &experts[expert_idx];
+        if use_ep && (expert_idx < local_expert_start || expert_idx >= local_expert_end) {
+            continue;
+        }
+        let local_idx = expert_idx - local_expert_start;
+        let expert = &experts[local_idx];
 
         // Gate and up projections.
         backend.matmul(
@@ -1489,11 +1530,15 @@ pub(crate) fn moe_expert_dispatch_biased<B: GpuMatmul + GpuElementwise>(
 
         backend.scale_add(moe_output, down_buf, routing_weight, hidden_size);
     }
+
+    if use_ep {
+        backend.all_reduce_sum(moe_output, hidden_size);
+    }
 }
 
 /// MoE FFN block with biased dispatch + GPT-OSS activation: norm → route → dispatch → residual.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn moe_ffn_block_biased<B: GpuNorm + GpuMatmul + GpuElementwise>(
+pub(crate) fn moe_ffn_block_biased<B: GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce>(
     backend: &B,
     post_attn_norm: &B::Tensor,
     router_gate: &B::Tensor,
@@ -1512,6 +1557,8 @@ pub(crate) fn moe_ffn_block_biased<B: GpuNorm + GpuMatmul + GpuElementwise>(
     num_experts: usize,
     num_experts_per_tok: usize,
     swiglu_limit: f32,
+    local_expert_start: usize,
+    local_expert_count: usize,
 ) {
     backend.rms_norm(hidden, post_attn_norm, eps, norm_buf);
     moe_expert_dispatch_biased(
@@ -1530,6 +1577,8 @@ pub(crate) fn moe_ffn_block_biased<B: GpuNorm + GpuMatmul + GpuElementwise>(
         num_experts,
         num_experts_per_tok,
         swiglu_limit,
+        local_expert_start,
+        local_expert_count,
     );
     backend.add(hidden, moe_output, hidden, hidden_size);
 }
@@ -1540,7 +1589,7 @@ pub(crate) fn moe_ffn_block_biased<B: GpuNorm + GpuMatmul + GpuElementwise>(
 /// For models with router bias and SwiGLU limit (GPT-OSS).
 /// Inspired by rvLLM (m0at).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn moe_ffn_block_biased_pre_normed<B: GpuNorm + GpuMatmul + GpuElementwise>(
+pub(crate) fn moe_ffn_block_biased_pre_normed<B: GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce>(
     backend: &B,
     router_gate: &B::Tensor,
     router_bias: Option<&B::Tensor>,
@@ -1557,6 +1606,8 @@ pub(crate) fn moe_ffn_block_biased_pre_normed<B: GpuNorm + GpuMatmul + GpuElemen
     num_experts: usize,
     num_experts_per_tok: usize,
     swiglu_limit: f32,
+    local_expert_start: usize,
+    local_expert_count: usize,
 ) {
     // norm_buf already contains RMSNorm'd hidden from fused residual+norm kernel.
     moe_expert_dispatch_biased(
@@ -1575,6 +1626,8 @@ pub(crate) fn moe_ffn_block_biased_pre_normed<B: GpuNorm + GpuMatmul + GpuElemen
         num_experts,
         num_experts_per_tok,
         swiglu_limit,
+        local_expert_start,
+        local_expert_count,
     );
     backend.add(hidden, moe_output, hidden, hidden_size);
 }

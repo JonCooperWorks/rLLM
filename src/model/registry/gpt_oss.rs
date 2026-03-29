@@ -78,7 +78,7 @@ impl<B: GpuBackend> ModelForward<B> for GptOssForward<B> {
 // MoE FFN block: biased dispatch with GPT-OSS gated activation.
 // ---------------------------------------------------------------------------
 
-fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
+fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce>(
     m: &Model<'_, B>,
     layer_idx: usize,
     d: &Dims,
@@ -108,12 +108,14 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
         num_experts,
         num_experts_per_tok,
         swiglu_limit,
+        moe.local_expert_start,
+        moe.local_expert_count,
     );
 }
 
 /// Pre-normed biased MoE FFN block — norm_buf already populated by fused residual+norm.
 /// Inspired by rvLLM (m0at).
-fn moe_ffn_block_pre_normed<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
+fn moe_ffn_block_pre_normed<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce>(
     m: &Model<'_, B>,
     layer_idx: usize,
     d: &Dims,
@@ -141,6 +143,8 @@ fn moe_ffn_block_pre_normed<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
         num_experts,
         num_experts_per_tok,
         swiglu_limit,
+        moe.local_expert_start,
+        moe.local_expert_count,
     );
 }
 
@@ -557,7 +561,7 @@ fn load_gpt_oss_moe<B: GpuCore>(
     prefix: &str,
     config: &ModelConfig,
     layer_idx: usize,
-    _sharding: Option<&crate::gpu::parallel::ShardingPlan>,
+    sharding: Option<&crate::gpu::parallel::ShardingPlan>,
     skip_experts: bool,
 ) -> anyhow::Result<FfnLoaded<B>> {
     let hidden = config.hidden_size;
@@ -587,17 +591,34 @@ fn load_gpt_oss_moe<B: GpuCore>(
     let mxfp4_name = format!("{prefix}.mlp.experts.gate_up_proj_blocks");
     let is_mxfp4 = store.tensor(&mxfp4_name).is_ok();
 
+    // Expert parallelism: detect from sharding plan.
+    let ep_expert_range: Option<Vec<usize>> = if let Some(plan) = sharding {
+        let mut ep_indices = None;
+        for w in &plan.weights {
+            if let crate::gpu::parallel::SplitDimension::ExpertParallel { expert_indices } = &w.split {
+                ep_indices = Some(expert_indices.clone());
+                break;
+            }
+        }
+        ep_indices
+    } else {
+        None
+    };
+
     let expert_vec = if skip_experts {
         if layer_idx == 0 {
             eprintln!("  skipping {} experts per layer (streaming from SSD)", num_experts);
         }
         Vec::new()
     } else if is_mxfp4 {
-        load_mxfp4_experts_local(store, backend, prefix, hidden, moe_inter, num_experts)?
+        load_mxfp4_experts_local(store, backend, prefix, hidden, moe_inter, num_experts, ep_expert_range.as_deref())?
     } else {
         // Fallback: per-expert format (shouldn't happen for GPT-OSS, but be safe).
-        let mut experts = Vec::with_capacity(num_experts);
-        for j in 0..num_experts {
+        let expert_iter: Vec<usize> = ep_expert_range.as_ref()
+            .map(|indices| indices.clone())
+            .unwrap_or_else(|| (0..num_experts).collect());
+        let mut experts = Vec::with_capacity(expert_iter.len());
+        for j in expert_iter {
             let ep = format!("{prefix}.mlp.experts.{j}");
             experts.push(ExpertWeights {
                 gate_proj: upload_tensor(store, backend, &format!("{ep}.gate_proj.weight"), &[moe_inter, hidden])?,
@@ -612,10 +633,17 @@ fn load_gpt_oss_moe<B: GpuCore>(
     };
 
     if layer_idx == 0 {
+        let loaded_count = expert_vec.len();
+        let ep_suffix = if loaded_count < num_experts {
+            format!(" [EP: {}/{} local]", loaded_count, num_experts)
+        } else if is_mxfp4 {
+            " [MXFP4 format]".to_string()
+        } else {
+            String::new()
+        };
         eprintln!(
             "  loading {} experts per layer (moe_inter={}){}",
-            num_experts, moe_inter,
-            if is_mxfp4 { " [MXFP4 format]" } else { "" },
+            loaded_count, moe_inter, ep_suffix,
         );
     }
 
@@ -645,6 +673,7 @@ fn load_mxfp4_experts_local<B: GpuCore>(
     hidden: usize,
     moe_inter: usize,
     num_experts: usize,
+    local_experts: Option<&[usize]>,
 ) -> anyhow::Result<Vec<ExpertWeights<B>>> {
     let block_size = 32usize;
 
@@ -678,8 +707,11 @@ fn load_mxfp4_experts_local<B: GpuCore>(
     let gu_bias_per_expert = gu_rows * 2; // bf16
     let down_bias_per_expert = down_rows * 2;
 
-    let mut experts = Vec::with_capacity(num_experts);
-    for j in 0..num_experts {
+    let expert_iter: Vec<usize> = local_experts
+        .map(|indices| indices.to_vec())
+        .unwrap_or_else(|| (0..num_experts).collect());
+    let mut experts = Vec::with_capacity(expert_iter.len());
+    for j in expert_iter {
         // Dequant gate_up.
         let gu_b_off = j * gu_blocks_per_expert;
         let gu_s_off = j * gu_scales_per_expert;

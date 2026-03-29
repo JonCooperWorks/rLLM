@@ -85,7 +85,7 @@ impl<B: GpuBackend> ModelForward<B> for MixtralForward<B> {
 // ---------------------------------------------------------------------------
 
 /// Run the MoE FFN block for a single token (delegates to shared primitive).
-fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
+fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe + GpuAllReduce>(
     m: &Model<'_, B>,
     moe: &MoeBuffers<B>,
     layer_idx: usize,
@@ -132,13 +132,15 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
             moe_inter,
             num_experts,
             num_experts_per_tok,
+            moe.local_expert_start,
+            moe.local_expert_count,
         );
     }
 }
 
 /// Pre-normed MoE FFN block — norm_buf already populated by fused residual+norm.
 /// Inspired by rvLLM (m0at).
-fn moe_ffn_block_pre_normed<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
+fn moe_ffn_block_pre_normed<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe + GpuAllReduce>(
     m: &Model<'_, B>,
     moe: &MoeBuffers<B>,
     layer_idx: usize,
@@ -181,6 +183,8 @@ fn moe_ffn_block_pre_normed<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + 
             moe_inter,
             num_experts,
             num_experts_per_tok,
+            moe.local_expert_start,
+            moe.local_expert_count,
         );
     }
 }
@@ -210,7 +214,11 @@ pub(crate) fn forward_single_paged<
 ) -> anyhow::Result<()> {
     let d = m.dims();
     let pos = seq_state.seq_len as u32;
-    let moe_inter = (m.config.moe_intermediate_size / m.world_size) as u32;
+    let moe_inter = if moe.local_expert_count < m.config.num_experts {
+        m.config.moe_intermediate_size as u32 // EP: whole experts
+    } else {
+        (m.config.moe_intermediate_size / m.world_size) as u32 // TP: split experts
+    };
     let num_experts = m.config.num_experts;
     let num_experts_per_tok = m.config.num_experts_per_tok;
 
@@ -347,7 +355,11 @@ pub(crate) fn forward_prefill_paged<
     let d = m.dims();
     let bs = tokens.len() as u32;
     let start_pos = seq_state.seq_len as u32;
-    let moe_inter = (m.config.moe_intermediate_size / m.world_size) as u32;
+    let moe_inter = if moe.local_expert_count < m.config.num_experts {
+        m.config.moe_intermediate_size as u32 // EP: whole experts
+    } else {
+        (m.config.moe_intermediate_size / m.world_size) as u32 // TP: split experts
+    };
     let num_experts = m.config.num_experts;
     let num_experts_per_tok = m.config.num_experts_per_tok;
 
