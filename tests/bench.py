@@ -546,6 +546,20 @@ def main():
         print("No models found to benchmark.", file=sys.stderr)
         sys.exit(1)
 
+    # Sort: group by base model name, then bf16 → q8 → q4 within each group.
+    def _quant_sort_key(m):
+        n = m["name"]
+        if n.endswith("-q4-q8"):
+            return (n[:-6], 2)  # hybrid: after q8
+        elif n.endswith("-q4"):
+            return (n[:-3], 3)
+        elif n.endswith("-q8"):
+            return (n[:-3], 1)
+        else:
+            return (n, 0)  # bf16 first
+
+    discovered.sort(key=_quant_sort_key)
+
     print(f"Found {len(discovered)} models to benchmark")
     print()
 
