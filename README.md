@@ -167,7 +167,7 @@ Benchmarked on [RunPod](https://runpod.io?ref=249k2lel). Tensor parallelism acro
 | Qwen3.5 9B † | ~9B | 45.4 tok/s | — | 2,816 ms | — |
 | Phi-4 | 14.7B | — | 67.2 tok/s | — | 382 ms |
 | Gemma 3 27B Instruct | 27.4B | — | 33.2 tok/s | — | 628 ms |
-| Mixtral 8x7B Instruct | 46.7B (12.9B active) | — | 42.7 tok/s | — | 1,022 ms |
+| Mixtral 8x7B Instruct | 46.7B (12.9B active) | — | 46.2 tok/s | — | 960 ms |
 
 † = thinking model (TTFT includes reasoning time). Mixtral uses expert parallelism (4/8 experts per GPU). Benchmarked via `tests/bench.py` (HTTP API).
 
