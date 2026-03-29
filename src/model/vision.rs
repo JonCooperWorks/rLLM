@@ -79,8 +79,8 @@
 //
 // Related files:
 //   config.rs             — VisionConfig struct (parsed from config.json)
-//   loader.rs             — load_vision_weights() (loads from safetensors)
-//   mod.rs                — forward_prefill_paged() (calls vision_encode + scatter)
+//   loader/vision.rs      — load_vision_weights() (loads from safetensors)
+//   forward.rs            — prefill_preamble() (calls vision_encode + scatter)
 //   gpu/ops/norm.rs       — layer_norm_batch (LayerNorm kernel for ViT)
 //   gpu/ops/vision.rs     — spatial_merge, scatter_vision_tokens
 //   gpu/ops/attention.rs  — prefill_attention with causal=false for bidirectional
@@ -519,7 +519,7 @@ pub(crate) fn alloc_vision_buffers<B: GpuCore>(
 /// Run the vision encoder on a preprocessed image.
 ///
 /// Transforms patches into vision tokens and writes them to `bufs.proj_out`.
-/// The caller (forward_prefill_paged in mod.rs) then scatters these tokens
+/// The caller (prefill_preamble() in forward.rs) then scatters these tokens
 /// into the text embedding buffer at <|image_pad|> positions.
 ///
 /// The forward pass mirrors a standard ViT:
@@ -802,7 +802,7 @@ pub(crate) fn vision_encode<B: GpuBackend>(
     }
 
     // Output is now in bufs.proj_out: [num_vision_tokens, out_hidden_size].
-    // The caller (forward_prefill_paged) will scatter these into the text
+    // The caller (prefill_preamble) will scatter these into the text
     // embedding buffer at <|image_pad|> positions.
     Ok(())
 }

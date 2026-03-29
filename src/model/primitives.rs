@@ -446,6 +446,50 @@ pub(crate) fn ffn_block<B: GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce +
     backend.add(hidden, norm_buf, hidden, hidden_size);
 }
 
+/// O projection + fused residual-add + RMSNorm (q_dim == hidden_size variant).
+///
+/// Same as `o_proj_fused_residual_norm_qdim` but for models where the attention
+/// dimension equals hidden_size (e.g. Mixtral).  Inspired by rvLLM (m0at).
+pub(crate) fn o_proj_fused_residual_norm<B: GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce>(
+    backend: &B,
+    layer: &LayerWeights<B>,
+    attn_out: &B::Tensor,
+    norm_buf: &B::Tensor,
+    hidden: &B::Tensor,
+    hidden_size: u32,
+    eps: f32,
+) {
+    backend.matmul(&layer.o_proj, attn_out, norm_buf, hidden_size, hidden_size);
+    backend.all_reduce_sum(norm_buf, hidden_size);
+    backend.fused_residual_rms_norm(
+        hidden, norm_buf, &layer.post_attention_layernorm, norm_buf, hidden_size, eps,
+    );
+}
+
+/// O projection with bias + fused residual-add + RMSNorm for the post-attention norm.
+///
+/// For models with O-projection bias and q_dim ≠ hidden_size (e.g. GPT-OSS).
+/// Inspired by rvLLM (m0at).
+pub(crate) fn o_proj_fused_residual_norm_qdim_biased<B: GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce>(
+    backend: &B,
+    layer: &LayerWeights<B>,
+    attn_out: &B::Tensor,
+    norm_buf: &B::Tensor,
+    hidden: &B::Tensor,
+    hidden_size: u32,
+    q_dim: u32,
+    eps: f32,
+) {
+    backend.matmul(&layer.o_proj, attn_out, norm_buf, hidden_size, q_dim);
+    if let Some(ref o_bias) = layer.o_proj_bias {
+        backend.add(norm_buf, o_bias, norm_buf, hidden_size);
+    }
+    backend.all_reduce_sum(norm_buf, hidden_size);
+    backend.fused_residual_rms_norm(
+        hidden, norm_buf, &layer.post_attention_layernorm, norm_buf, hidden_size, eps,
+    );
+}
+
 /// FFN sub-block that takes a pre-normed input (norm already done by fused residual+norm).
 ///
 /// Used when the preceding o_proj_fused_residual_norm already produced the
@@ -756,6 +800,89 @@ pub(crate) fn moe_ffn_block_streamed<B: GpuNorm + GpuMatmul + GpuElementwise + G
 ) {
     backend.rms_norm(hidden, post_attn_norm, eps, norm_buf);
 
+    moe_expert_dispatch_streamed(
+        backend,
+        streamer,
+        layer_idx,
+        router_gate,
+        norm_buf,
+        moe_gate_buf,
+        moe_output,
+        routing_output,
+        down_buf,
+        hidden_size,
+        moe_inter,
+        num_experts,
+        num_experts_per_tok,
+    );
+
+    backend.add(hidden, moe_output, hidden, hidden_size);
+}
+
+/// MoE FFN block with pre-normed input (norm already done by fused residual+norm).
+///
+/// Same as `moe_ffn_block` but skips the initial RMSNorm since the fused
+/// residual+norm kernel already produced the normalized state in `norm_buf`.
+/// Inspired by rvLLM (m0at).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn moe_ffn_block_pre_normed<B: GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
+    backend: &B,
+    router_gate: &B::Tensor,
+    experts: &[ExpertWeights<B>],
+    hidden: &B::Tensor,
+    norm_buf: &B::Tensor,
+    moe_gate_buf: &B::Tensor,
+    moe_up_buf: &B::Tensor,
+    moe_output: &B::Tensor,
+    routing_output: &B::Tensor,
+    down_buf: &B::Tensor,
+    hidden_size: u32,
+    moe_inter: u32,
+    num_experts: usize,
+    num_experts_per_tok: usize,
+) {
+    // norm_buf already contains RMSNorm'd hidden from fused residual+norm kernel.
+    moe_expert_dispatch(
+        backend,
+        router_gate,
+        experts,
+        norm_buf,
+        moe_gate_buf,
+        moe_up_buf,
+        moe_output,
+        routing_output,
+        down_buf,
+        hidden_size,
+        moe_inter,
+        num_experts,
+        num_experts_per_tok,
+    );
+
+    backend.add(hidden, moe_output, hidden, hidden_size);
+}
+
+/// Streamed MoE FFN block with pre-normed input (norm already done by fused residual+norm).
+///
+/// Same as `moe_ffn_block_streamed` but skips the initial RMSNorm.
+/// Inspired by rvLLM (m0at).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn moe_ffn_block_streamed_pre_normed<B: GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
+    backend: &B,
+    streamer: &crate::model::expert_stream::ExpertStreamer<B>,
+    layer_idx: usize,
+    router_gate: &B::Tensor,
+    hidden: &B::Tensor,
+    norm_buf: &B::Tensor,
+    moe_gate_buf: &B::Tensor,
+    moe_output: &B::Tensor,
+    routing_output: &B::Tensor,
+    down_buf: &B::Tensor,
+    hidden_size: u32,
+    moe_inter: u32,
+    num_experts: usize,
+    num_experts_per_tok: usize,
+) {
+    // norm_buf already contains RMSNorm'd hidden from fused residual+norm kernel.
     moe_expert_dispatch_streamed(
         backend,
         streamer,
@@ -1380,6 +1507,51 @@ pub(crate) fn moe_ffn_block_biased<B: GpuNorm + GpuMatmul + GpuElementwise>(
     swiglu_limit: f32,
 ) {
     backend.rms_norm(hidden, post_attn_norm, eps, norm_buf);
+    moe_expert_dispatch_biased(
+        backend,
+        router_gate,
+        router_bias,
+        experts,
+        norm_buf,
+        moe_gate_buf,
+        moe_up_buf,
+        moe_output,
+        routing_output,
+        down_buf,
+        hidden_size,
+        moe_inter,
+        num_experts,
+        num_experts_per_tok,
+        swiglu_limit,
+    );
+    backend.add(hidden, moe_output, hidden, hidden_size);
+}
+
+/// Biased MoE FFN block with pre-normed input (norm already done by fused residual+norm).
+///
+/// Same as `moe_ffn_block_biased` but skips the initial RMSNorm.
+/// For models with router bias and SwiGLU limit (GPT-OSS).
+/// Inspired by rvLLM (m0at).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn moe_ffn_block_biased_pre_normed<B: GpuNorm + GpuMatmul + GpuElementwise>(
+    backend: &B,
+    router_gate: &B::Tensor,
+    router_bias: Option<&B::Tensor>,
+    experts: &[ExpertWeights<B>],
+    hidden: &B::Tensor,
+    norm_buf: &B::Tensor,
+    moe_gate_buf: &B::Tensor,
+    moe_up_buf: &B::Tensor,
+    moe_output: &B::Tensor,
+    routing_output: &B::Tensor,
+    down_buf: &B::Tensor,
+    hidden_size: u32,
+    moe_inter: u32,
+    num_experts: usize,
+    num_experts_per_tok: usize,
+    swiglu_limit: f32,
+) {
+    // norm_buf already contains RMSNorm'd hidden from fused residual+norm kernel.
     moe_expert_dispatch_biased(
         backend,
         router_gate,

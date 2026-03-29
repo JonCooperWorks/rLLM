@@ -52,12 +52,48 @@
 // ===========================================================================
 
 use crate::gpu::{
-    GpuAllReduce, GpuAttention, GpuCore, GpuDeltaNet, GpuElementwise, GpuEmbed, GpuMatmul, GpuMoe,
-    GpuNorm, GpuRope, GpuTurboQuant, TensorDtype,
+    GpuAllReduce, GpuAttention, GpuBackend, GpuCore, GpuDeltaNet, GpuElementwise, GpuEmbed,
+    GpuMatmul, GpuMoe, GpuNorm, GpuRope, GpuTurboQuant, TensorDtype,
 };
+use crate::model::forward::{DeltaNetBuffers, MoeBuffers, ModelForward};
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives::{self, Dims};
 use crate::model::{Model, PrefillBuffers};
+
+// ===========================================================================
+// Qwen35Forward — ModelForward trait implementation.
+//
+// Holds MoE buffers (for MoE variants) and DeltaNet buffers (for all
+// Qwen 3.5 models, which have hybrid DeltaNet + GQA attention).
+// ===========================================================================
+
+pub(crate) struct Qwen35Forward<B: GpuCore> {
+    pub moe: Option<MoeBuffers<B>>,
+    pub dn: DeltaNetBuffers<B>,
+}
+
+impl<B: GpuBackend> ModelForward<B> for Qwen35Forward<B> {
+    fn forward_decode(
+        &self,
+        m: &Model<'_, B>,
+        token_id: u32,
+        pool: &KvPool<B>,
+        seq_state: &SeqKvState<B>,
+    ) -> anyhow::Result<()> {
+        forward_single_paged(m, token_id, pool, seq_state, &self.dn, self.moe.as_ref())
+    }
+
+    fn forward_prefill(
+        &self,
+        m: &Model<'_, B>,
+        tokens: &[u32],
+        pool: &KvPool<B>,
+        seq_state: &SeqKvState<B>,
+        bufs: &PrefillBuffers<B>,
+    ) -> anyhow::Result<()> {
+        forward_prefill_paged(m, tokens, pool, seq_state, bufs, &self.dn, self.moe.as_ref())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // DeltaNet attention block — single token decode.
@@ -87,6 +123,7 @@ fn deltanet_attention_block<
     m: &Model<'_, B>,
     layer_idx: usize,
     d: &Dims,
+    dn: &DeltaNetBuffers<B>,
 ) {
     let layer = &m.weights.layers[layer_idx];
 
@@ -100,19 +137,17 @@ fn deltanet_attention_block<
     let conv_dim = qk_dim * 2 + v_dim;
     let kernel_size = m.config.linear_conv_kernel_dim as u32;
 
-    // Unwrap DeltaNet-specific buffers and state.
+    // DeltaNet-specific buffers and state — no unwrap needed.
     let dn_idx = dn_layer_index(&m.config, layer_idx);
-    let states = m.deltanet_states.as_ref().unwrap();
-    let conv_histories = m.deltanet_conv_history.as_ref().unwrap();
-    let state = &states[dn_idx];
-    let conv_history = &conv_histories[dn_idx];
-    let qkv_buf = m.dn_qkv_buf.as_ref().unwrap();
-    let alpha_buf = m.dn_alpha_buf.as_ref().unwrap();
-    let beta_buf = m.dn_beta_buf.as_ref().unwrap();
-    let z_buf = m.dn_z_buf.as_ref().unwrap();
-    let conv_out = m.dn_conv_out.as_ref().unwrap();
-    let attn_out = m.dn_attn_out.as_ref().unwrap();
-    let norm_out = m.dn_norm_out.as_ref().unwrap();
+    let state = &dn.states[dn_idx];
+    let conv_history = &dn.conv_history[dn_idx];
+    let qkv_buf = &dn.qkv_buf;
+    let alpha_buf = &dn.alpha_buf;
+    let beta_buf = &dn.beta_buf;
+    let z_buf = &dn.z_buf;
+    let conv_out = &dn.conv_out;
+    let attn_out = &dn.attn_out;
+    let norm_out = &dn.norm_out;
 
     // Unwrap DeltaNet-specific weights.
     let in_proj_qkv = layer.in_proj_qkv.as_ref().unwrap();
@@ -188,12 +223,23 @@ fn deltanet_attention_block<
     m.backend.silu(z_buf, z_buf, v_dim);
     m.backend.mul(norm_out, z_buf, attn_out, v_dim);
 
-    // Step 10: Output projection + AllReduce (row-split) + residual add.
+    // Step 10: Output projection + AllReduce (row-split) + fused residual-add + RMSNorm.
+    //
+    // Fuses the residual add (hidden += o_proj_out) with the FFN's initial RMSNorm
+    // into a single kernel, saving one full read of the hidden tensor.
+    // The FFN block that follows uses the pre-normed variant.
+    // Inspired by rvLLM (m0at).
     m.backend
         .matmul(out_proj, attn_out, &m.norm_buf, d.hidden_size, v_dim);
     m.backend.all_reduce_sum(&m.norm_buf, d.hidden_size); // no-op when world_size=1
-    m.backend
-        .add(&m.hidden, &m.norm_buf, &m.hidden, d.hidden_size);
+    m.backend.fused_residual_rms_norm(
+        &m.hidden,
+        &m.norm_buf,
+        &layer.post_attention_layernorm,
+        &m.norm_buf,
+        d.hidden_size,
+        d.eps,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -210,14 +256,12 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
     m: &Model<'_, B>,
     layer_idx: usize,
     d: &Dims,
+    moe: &MoeBuffers<B>,
 ) {
     let layer = &m.weights.layers[layer_idx];
     let moe_inter = m.config.moe_intermediate_size as u32;
     let num_experts = m.config.num_experts;
     let num_experts_per_tok = m.config.num_experts_per_tok;
-    let moe_gate_buf = m.moe_gate_buf.as_ref().unwrap();
-    let moe_up_buf = m.moe_up_buf.as_ref().unwrap();
-    let moe_output = m.moe_output.as_ref().unwrap();
 
     // Step 1: RMSNorm → norm_buf.
     m.backend.rms_norm(
@@ -229,16 +273,16 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
 
     // Step 2: Core MoE expert dispatch → moe_output.
     // Uses streaming dispatch if experts are on SSD, else GPU-resident dispatch.
-    if let Some(ref streamer) = m.expert_streamer {
+    if let Some(ref streamer) = moe.expert_streamer {
         primitives::moe_expert_dispatch_streamed(
             m.backend,
             streamer,
             layer_idx,
             layer.router_gate.as_ref().unwrap(),
             &m.norm_buf,
-            moe_gate_buf,
-            moe_output,
-            m.routing_output.as_ref().unwrap(),
+            &moe.moe_gate_buf,
+            &moe.moe_output,
+            &moe.routing_output,
             &m.gate_buf,
             d.hidden_size,
             moe_inter,
@@ -251,10 +295,10 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
             layer.router_gate.as_ref().unwrap(),
             layer.experts.as_ref().unwrap(),
             &m.norm_buf,
-            moe_gate_buf,
-            moe_up_buf,
-            moe_output,
-            m.routing_output.as_ref().unwrap(),
+            &moe.moe_gate_buf,
+            &moe.moe_up_buf,
+            &moe.moe_output,
+            &moe.routing_output,
             &m.gate_buf,
             d.hidden_size,
             moe_inter,
@@ -285,17 +329,17 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
         m.backend.matmul(
             se_gate_proj,
             &m.norm_buf,
-            moe_gate_buf,
+            &moe.moe_gate_buf,
             se_inter,
             d.hidden_size,
         );
         m.backend
-            .matmul(se_up_proj, &m.norm_buf, moe_up_buf, se_inter, d.hidden_size);
+            .matmul(se_up_proj, &m.norm_buf, &moe.moe_up_buf, se_inter, d.hidden_size);
         m.backend
-            .silu_mul(moe_gate_buf, moe_up_buf, moe_gate_buf, se_inter);
+            .silu_mul(&moe.moe_gate_buf, &moe.moe_up_buf, &moe.moe_gate_buf, se_inter);
         m.backend.matmul(
             se_down_proj,
-            moe_gate_buf,
+            &moe.moe_gate_buf,
             &m.gate_buf,
             d.hidden_size,
             se_inter,
@@ -303,12 +347,107 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
 
         // Add gated shared expert output to MoE output.
         m.backend
-            .scale_add(moe_output, &m.gate_buf, gate_val, d.hidden_size);
+            .scale_add(&moe.moe_output, &m.gate_buf, gate_val, d.hidden_size);
     }
 
     // Step 4: Residual add: hidden += moe_output.
     m.backend
-        .add(&m.hidden, moe_output, &m.hidden, d.hidden_size);
+        .add(&m.hidden, &moe.moe_output, &m.hidden, d.hidden_size);
+}
+
+/// Pre-normed MoE FFN block — same as `moe_ffn_block` but skips step 1 (RMSNorm).
+///
+/// norm_buf already contains the RMSNorm'd hidden state from the fused
+/// residual+norm kernel that precedes this block.  Inspired by rvLLM (m0at).
+fn moe_ffn_block_pre_normed<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
+    m: &Model<'_, B>,
+    layer_idx: usize,
+    d: &Dims,
+    moe: &MoeBuffers<B>,
+) {
+    let layer = &m.weights.layers[layer_idx];
+    let moe_inter = m.config.moe_intermediate_size as u32;
+    let num_experts = m.config.num_experts;
+    let num_experts_per_tok = m.config.num_experts_per_tok;
+
+    // norm_buf already populated by fused residual+norm — skip to expert dispatch.
+
+    if let Some(ref streamer) = moe.expert_streamer {
+        primitives::moe_expert_dispatch_streamed(
+            m.backend,
+            streamer,
+            layer_idx,
+            layer.router_gate.as_ref().unwrap(),
+            &m.norm_buf,
+            &moe.moe_gate_buf,
+            &moe.moe_output,
+            &moe.routing_output,
+            &m.gate_buf,
+            d.hidden_size,
+            moe_inter,
+            num_experts,
+            num_experts_per_tok,
+        );
+    } else {
+        primitives::moe_expert_dispatch(
+            m.backend,
+            layer.router_gate.as_ref().unwrap(),
+            layer.experts.as_ref().unwrap(),
+            &m.norm_buf,
+            &moe.moe_gate_buf,
+            &moe.moe_up_buf,
+            &moe.moe_output,
+            &moe.routing_output,
+            &m.gate_buf,
+            d.hidden_size,
+            moe_inter,
+            num_experts,
+            num_experts_per_tok,
+        );
+    }
+
+    // Shared expert (same logic as moe_ffn_block step 3).
+    if let (Some(se_gate_proj), Some(se_up_proj), Some(se_down_proj), Some(se_gate)) = (
+        layer.shared_expert_gate_proj.as_ref(),
+        layer.shared_expert_up_proj.as_ref(),
+        layer.shared_expert_down_proj.as_ref(),
+        layer.shared_expert_gate.as_ref(),
+    ) {
+        let se_inter = m.config.shared_expert_intermediate_size as u32;
+
+        m.backend
+            .matmul(se_gate, &m.norm_buf, &m.up_buf, 1, d.hidden_size);
+        let mut gate_bytes = vec![0u8; m.backend.tensor_byte_count(&m.up_buf)];
+        m.backend.copy_to_host(&m.up_buf, &mut gate_bytes);
+        let gate_val: f32 =
+            1.0 / (1.0 + (-bytemuck::cast_slice::<u8, half::bf16>(&gate_bytes)[0].to_f32()).exp());
+
+        m.backend.matmul(
+            se_gate_proj,
+            &m.norm_buf,
+            &moe.moe_gate_buf,
+            se_inter,
+            d.hidden_size,
+        );
+        m.backend
+            .matmul(se_up_proj, &m.norm_buf, &moe.moe_up_buf, se_inter, d.hidden_size);
+        m.backend
+            .silu_mul(&moe.moe_gate_buf, &moe.moe_up_buf, &moe.moe_gate_buf, se_inter);
+        m.backend.matmul(
+            se_down_proj,
+            &moe.moe_gate_buf,
+            &m.gate_buf,
+            d.hidden_size,
+            se_inter,
+        );
+
+        m.backend
+            .scale_add(&moe.moe_output, &m.gate_buf, gate_val, d.hidden_size);
+    }
+
+    // Residual add: hidden += moe_output.
+    m.backend
+        .add(&m.hidden, &moe.moe_output, &m.hidden, d.hidden_size);
 }
 
 // ---------------------------------------------------------------------------
@@ -328,9 +467,10 @@ fn ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe + GpuAll
     m: &Model<'_, B>,
     layer_idx: usize,
     d: &Dims,
+    moe: Option<&MoeBuffers<B>>,
 ) {
-    if m.config.is_moe() {
-        moe_ffn_block(m, layer_idx, d);
+    if let Some(moe) = moe {
+        moe_ffn_block(m, layer_idx, d, moe);
     } else {
         let layer = &m.weights.layers[layer_idx];
         primitives::ffn_block(
@@ -341,6 +481,32 @@ fn ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe + GpuAll
             &m.gate_buf,
             &m.up_buf,
             d.eps,
+            d.hidden_size,
+            d.inter_size,
+        );
+    }
+}
+
+/// Pre-normed FFN dispatch — norm_buf already contains the RMSNorm'd hidden state
+/// from the fused residual+norm kernel.  Skips the initial RMSNorm in both MoE
+/// and dense paths.  Inspired by rvLLM (m0at).
+fn ffn_block_pre_normed<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe + GpuAllReduce>(
+    m: &Model<'_, B>,
+    layer_idx: usize,
+    d: &Dims,
+    moe: Option<&MoeBuffers<B>>,
+) {
+    if let Some(moe) = moe {
+        moe_ffn_block_pre_normed(m, layer_idx, d, moe);
+    } else {
+        let layer = &m.weights.layers[layer_idx];
+        primitives::ffn_block_pre_normed(
+            m.backend,
+            layer,
+            &m.hidden,
+            &m.norm_buf,
+            &m.gate_buf,
+            &m.up_buf,
             d.hidden_size,
             d.inter_size,
         );
@@ -369,6 +535,8 @@ pub(crate) fn forward_single_paged<
     token_id: u32,
     pool: &KvPool<B>,
     seq_state: &SeqKvState<B>,
+    dn: &DeltaNetBuffers<B>,
+    moe: Option<&MoeBuffers<B>>,
 ) -> anyhow::Result<()> {
     let d = m.dims();
     let pos = seq_state.seq_len as u32;
@@ -379,7 +547,7 @@ pub(crate) fn forward_single_paged<
 
     for layer_idx in 0..m.config.num_hidden_layers {
         if m.config.is_linear_attention_layer(layer_idx) {
-            deltanet_attention_block(m, layer_idx, &d);
+            deltanet_attention_block(m, layer_idx, &d, dn);
         } else {
             let layer = &m.weights.layers[layer_idx];
 
@@ -415,7 +583,7 @@ pub(crate) fn forward_single_paged<
                 rotary_dim,
             );
 
-            let z_buf = m.dn_z_buf.as_ref();
+            let z_buf = Some(&dn.z_buf);
             if has_output_gate {
                 let attn_z_proj = layer.attn_z_proj.as_ref().unwrap();
                 m.backend.matmul(
@@ -453,7 +621,10 @@ pub(crate) fn forward_single_paged<
                 m.backend.mul(&m.attn_out, z, &m.attn_out, d.q_dim);
             }
 
-            primitives::o_proj_residual_qdim(
+            // Fused O-proj + residual-add + post-attention RMSNorm: saves one
+            // full read of the hidden tensor by combining the residual add with
+            // the FFN's initial norm.  Inspired by rvLLM (m0at).
+            primitives::o_proj_fused_residual_norm_qdim(
                 m.backend,
                 layer,
                 &m.attn_out,
@@ -461,10 +632,12 @@ pub(crate) fn forward_single_paged<
                 &m.hidden,
                 d.hidden_size,
                 d.q_dim,
+                d.eps,
             );
         }
 
-        ffn_block(m, layer_idx, &d);
+        // FFN sub-block (pre-normed: fused residual+norm already produced norm_buf).
+        ffn_block_pre_normed(m, layer_idx, &d, moe);
     }
 
     primitives::final_norm_and_lm_head(
@@ -516,6 +689,8 @@ pub(crate) fn forward_prefill_paged<
     pool: &KvPool<B>,
     seq_state: &SeqKvState<B>,
     bufs: &PrefillBuffers<B>,
+    dn: &DeltaNetBuffers<B>,
+    moe: Option<&MoeBuffers<B>>,
 ) -> anyhow::Result<()> {
     let d = m.dims();
     let bs = tokens.len() as u32;
@@ -543,8 +718,10 @@ pub(crate) fn forward_prefill_paged<
                     .copy_to_tensor(&m.hidden, &host_hidden[offset..offset + hidden_byte_size]);
 
                 // Run DeltaNet attention + FFN on this single token.
-                deltanet_attention_block(m, layer_idx, &d);
-                ffn_block(m, layer_idx, &d);
+                // deltanet_attention_block uses fused residual+norm, so
+                // norm_buf already has the pre-normed state for the FFN.
+                deltanet_attention_block(m, layer_idx, &d, dn);
+                ffn_block_pre_normed(m, layer_idx, &d, moe);
 
                 // Copy updated hidden back.
                 let mut token_hidden = vec![0u8; hidden_byte_size];
@@ -738,7 +915,7 @@ pub(crate) fn forward_prefill_paged<
             // FFN sub-block: MoE requires token-by-token routing (each token
             // picks different experts), so we round-trip through host memory.
             // Dense models can use batched GEMM for the entire prefill chunk.
-            if m.config.is_moe() {
+            if let Some(moe) = moe {
                 let hidden_byte_size =
                     m.config.hidden_size * crate::gpu::TensorDtype::BF16.byte_size();
                 let full_bytes = m.backend.tensor_byte_count(&bufs.hidden);
@@ -749,7 +926,7 @@ pub(crate) fn forward_prefill_paged<
                     let offset = t * hidden_byte_size;
                     m.backend
                         .copy_to_tensor(&m.hidden, &host_hidden[offset..offset + hidden_byte_size]);
-                    moe_ffn_block(m, layer_idx, &d);
+                    moe_ffn_block(m, layer_idx, &d, moe);
                     let mut token_hidden = vec![0u8; hidden_byte_size];
                     m.backend.copy_to_host(&m.hidden, &mut token_hidden);
                     host_hidden[offset..offset + hidden_byte_size].copy_from_slice(&token_hidden);

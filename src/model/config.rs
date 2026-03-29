@@ -628,7 +628,7 @@ pub struct ModelConfig {
 ///   - Qwen: fused QKV weight [3*hd, hd], prefix "visual."
 ///   - Gemma: separate Q/K/V weights, prefix "vision_tower.vision_model."
 ///
-/// Related: model/vision.rs (forward pass), model/loader.rs (weight loading),
+/// Related: model/vision.rs (forward pass), model/loader/ (weight loading),
 ///          gpu/ops/vision.rs (spatial_merge + scatter kernels)
 #[derive(Debug, Clone)]
 pub(crate) struct VisionConfig {

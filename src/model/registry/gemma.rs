@@ -52,13 +52,68 @@
 // ===========================================================================
 
 use crate::gpu::{
-    GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
-    GpuTurboQuant,
+    GpuAllReduce, GpuAttention, GpuBackend, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul,
+    GpuNorm, GpuRope, GpuTurboQuant,
 };
+use crate::model::forward::{self, ModelForward};
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives;
 use crate::model::profile::{self, Component};
+use crate::model::vision::ProcessedImage;
 use crate::model::{Model, PrefillBuffers};
+
+// ===========================================================================
+// GemmaForward — ModelForward trait implementation.
+//
+// Overrides prefill_preamble to add √hidden_size embedding scaling.
+// ===========================================================================
+
+pub(crate) struct GemmaForward;
+
+impl<B: GpuBackend> ModelForward<B> for GemmaForward {
+    fn forward_decode(
+        &self,
+        m: &Model<'_, B>,
+        token_id: u32,
+        pool: &KvPool<B>,
+        seq_state: &SeqKvState<B>,
+    ) -> anyhow::Result<()> {
+        forward_single_paged(m, token_id, pool, seq_state)
+    }
+
+    fn forward_prefill(
+        &self,
+        m: &Model<'_, B>,
+        tokens: &[u32],
+        pool: &KvPool<B>,
+        seq_state: &SeqKvState<B>,
+        bufs: &PrefillBuffers<B>,
+    ) -> anyhow::Result<()> {
+        forward_prefill_paged(m, tokens, pool, seq_state, bufs)
+    }
+
+    fn prefill_preamble(
+        &self,
+        m: &Model<'_, B>,
+        tokens: &[u32],
+        seq_state: &SeqKvState<B>,
+        bufs: &PrefillBuffers<B>,
+        images: &[ProcessedImage],
+    ) -> anyhow::Result<()> {
+        // Default: embed + vision scatter.
+        forward::default_prefill_preamble(m, tokens, seq_state, bufs, images)?;
+        // Gemma 3: scale embeddings by √hidden_size.
+        let embed_scale = (m.config.hidden_size as f32).sqrt();
+        let bs = tokens.len() as u32;
+        m.backend.scalar_mul(
+            &bufs.hidden,
+            &bufs.hidden,
+            embed_scale,
+            bs * m.config.hidden_size as u32,
+        );
+        Ok(())
+    }
+}
 
 // ===========================================================================
 // Gemma 3 attention sub-block helpers.

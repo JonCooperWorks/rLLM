@@ -127,5 +127,5 @@ gpu/ops/moe.rs                     — GpuMoe::fused_gate_up_swiglu trait
 gpu/metal/kernels/moe.rs           — Metal dispatch (bf16 + Q4 pipelines)
 gpu/metal/shaders/moe.metal        — fused_gate_up_swiglu_bf16, _q4 kernels
 model/registry/llama.rs            — GpuMoe bound on forward_single_impl
-model/registry/qwen.rs             — GpuMoe bound on forward_single_paged
+model/forward.rs                   — ModelForward trait (GpuBackend bound includes GpuMoe)
 ```

@@ -286,7 +286,7 @@ is expensive (~1 ms per call) but enables true async DMA transfers.
 
 ## Integration Points
 
-### Loader (`model/loader.rs`)
+### Loader (`model/loader/`)
 
 When `--stream-experts` is passed:
 
@@ -307,13 +307,14 @@ used for offset calculation and buffer allocation — 3.5x less I/O than bf16.
 
 ### Engine Loader (`engine/loader.rs`)
 
-After weight loading, creates and initialises the `ExpertStreamer`:
+After weight loading, creates the `ExpertStreamer` and wires it into the
+architecture's `MoeBuffers` via `create_forward()`:
 
 ```rust
-if let Some(index) = expert_index {
-    let streamer = ExpertStreamer::new(&backend, index, config.num_experts_per_tok);
-    model.expert_streamer = Some(streamer);
-}
+let expert_streamer = expert_index.map(|index| {
+    ExpertStreamer::new(&backend, index, config.num_experts_per_tok)
+});
+let forward = create_forward(arch, &config, &backend, 1, expert_streamer);
 ```
 
 This allocates the LRU cache slots, CPU staging buffers, and prints cache stats
@@ -457,9 +458,9 @@ Dense models ignore the flag.
 | File | Purpose |
 |------|---------|
 | `model/expert_stream.rs` | ExpertIndex, ExpertStreamer, LRU cache, pread loading, index building |
-| `model/loader.rs` | Expert index construction from safetensors headers |
+| `model/loader/` | Expert index construction from safetensors headers |
 | `model/primitives.rs` | `moe_expert_dispatch_streamed()`, `moe_ffn_block_streamed()` |
-| `model/mod.rs` | `Model.expert_streamer` field |
+| `model/forward.rs` | `MoeBuffers.expert_streamer` field |
 | `gpu/ops/core.rs` | `GpuCore` trait: `tensor_mut_ptr()`, `alloc_pinned_buf()`, `copy_to_tensor_async()`, `sync_transfers()` |
 | `gpu/ops/moe.rs` | `GpuMoe` trait (fused kernels used by both streaming and resident paths) |
 | `gpu/metal/kernels/moe.rs` | Metal fused gate+up+SwiGLU and combine+residual |

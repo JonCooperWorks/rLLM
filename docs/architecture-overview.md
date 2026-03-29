@@ -12,11 +12,11 @@ to generated tokens, and how the major subsystems connect.
 flowchart TD
     CLI["CLI / HTTP API<br/><code>src/commands/{run,batch,serve}.rs</code><br/><code>src/api/{mod,openai,…}.rs</code>"]
     ENGINE["Inference Engine<br/><code>src/engine/mod.rs</code> — step loop, scheduler, sequences<br/><code>src/engine/dispatch.rs</code> — Dispatch trait (single/multi-GPU)<br/><code>src/engine/multi_gpu.rs</code> — tensor-parallel multi-GPU engine"]
-    MODEL["Model Layer<br/><code>src/model/mod.rs</code> — Model struct, arch dispatch<br/><code>src/model/config.rs</code> — ModelArch enum, ModelConfig<br/><code>src/model/loader.rs</code> — safetensors weight loading<br/><code>src/model/primitives.rs</code> — shared transformer building blocks<br/><code>src/model/registry/*.rs</code> — 9 model family forward passes<br/><code>src/model/kv_cache.rs</code> — paged KV cache"]
+    MODEL["Model Layer<br/><code>src/model/mod.rs</code> — Model struct (shared context)<br/><code>src/model/forward.rs</code> — ModelForward trait + buffer structs<br/><code>src/model/config.rs</code> — ModelArch enum, ModelConfig<br/><code>src/model/loader/</code> — safetensors weight loading<br/><code>src/model/primitives.rs</code> — shared transformer building blocks<br/><code>src/model/registry/*.rs</code> — 10 model family forward passes<br/><code>src/model/kv_cache.rs</code> — paged KV cache"]
     GPU["GPU Backend<br/><code>src/gpu/ops/*.rs</code> — 9 composable sub-traits<br/><code>src/gpu/mod.rs</code> — GpuBackend blanket supertrait<br/><code>src/gpu/metal/</code> — Metal backend (macOS)<br/><code>src/gpu/cuda/</code> — CUDA backend (Linux)<br/><code>src/gpu/cpu/</code> — CPU reference backend (tests)"]
 
     CLI -->|"WorkerRequest (tokenized prompt)"| ENGINE
-    ENGINE -->|"forward_single_paged / forward_prefill_paged"| MODEL
+    ENGINE -->|"Box&lt;dyn ModelForward&gt;::forward_decode/prefill"| MODEL
     MODEL -->|"trait method calls (B: GpuBackend)"| GPU
 ```
 

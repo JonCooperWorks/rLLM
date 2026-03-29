@@ -23,7 +23,8 @@ pub(crate) mod tp {
     use crate::gpu::cuda::CudaBackend;
     use crate::gpu::parallel::{DeviceConfig, ParallelStrategy, ShardingPlan};
     use crate::gpu::{GpuBackend, GpuCore, TensorDtype};
-    use crate::model::config::ModelConfig;
+    use crate::model::config::{ModelArch, ModelConfig};
+    use crate::model::forward::ModelForward;
     use crate::model::kv_cache::{KvPool, SeqKvState};
     use crate::model::loader::{self, ModelWeights};
     use crate::model::{Model, PrefillBuffers};
@@ -34,8 +35,9 @@ pub(crate) mod tp {
     /// Safety: backend outlives model (both in RankState, drop order is
     /// fields top-down in declaration order).
     pub(crate) struct RankState {
-        // Order matters for drop: model must drop before backend.
+        // Order matters for drop: model and forward must drop before backend.
         pub model: Model<'static, CudaBackend>,
+        pub forward: Box<dyn ModelForward<CudaBackend>>,
         pub prefill_bufs: PrefillBuffers<CudaBackend>,
         pub kv_pool: KvPool<CudaBackend>,
         pub seq_state: SeqKvState<CudaBackend>,
@@ -103,9 +105,11 @@ pub(crate) mod tp {
                     unsafe { &*(&*backend as *const CudaBackend) };
 
                 let model = Model::new_tp(config.clone(), weights, backend_ref, world_size)?;
+                let forward = crate::engine::loader::create_forward(config.arch()?, &config, backend_ref, world_size, None);
 
                 ranks.push(RankState {
                     model,
+                    forward,
                     prefill_bufs,
                     kv_pool,
                     seq_state,
@@ -124,9 +128,9 @@ pub(crate) mod tp {
         pub fn forward_single_paged(&self, token_id: u32) -> anyhow::Result<()> {
             if self.world_size == 1 {
                 let r = &self.ranks[0];
-                return r
-                    .model
-                    .forward_single_paged(token_id, &r.kv_pool, &r.seq_state);
+                return r.forward.forward_decode(
+                    &r.model, token_id, &r.kv_pool, &r.seq_state,
+                );
             }
 
             // Fan out to all ranks.
@@ -136,7 +140,8 @@ pub(crate) mod tp {
                     .iter()
                     .map(|rank| {
                         s.spawn(move || {
-                            rank.model.forward_single_paged(
+                            rank.forward.forward_decode(
+                                &rank.model,
                                 token_id,
                                 &rank.kv_pool,
                                 &rank.seq_state,
@@ -156,12 +161,11 @@ pub(crate) mod tp {
         pub fn forward_prefill_paged(&self, tokens: &[u32], images: &[crate::model::vision::ProcessedImage]) -> anyhow::Result<()> {
             if self.world_size == 1 {
                 let r = &self.ranks[0];
-                return r.model.forward_prefill_paged(
-                    tokens,
-                    &r.kv_pool,
-                    &r.seq_state,
-                    &r.prefill_bufs,
-                    images,
+                r.forward.prefill_preamble(
+                    &r.model, tokens, &r.seq_state, &r.prefill_bufs, images,
+                )?;
+                return r.forward.forward_prefill(
+                    &r.model, tokens, &r.kv_pool, &r.seq_state, &r.prefill_bufs,
                 );
             }
 
@@ -171,12 +175,13 @@ pub(crate) mod tp {
                     .iter()
                     .map(|rank| {
                         s.spawn(move || {
-                            rank.model.forward_prefill_paged(
-                                tokens,
-                                &rank.kv_pool,
-                                &rank.seq_state,
-                                &rank.prefill_bufs,
-                                images,
+                            rank.forward.prefill_preamble(
+                                &rank.model, tokens, &rank.seq_state,
+                                &rank.prefill_bufs, images,
+                            )?;
+                            rank.forward.forward_prefill(
+                                &rank.model, tokens, &rank.kv_pool,
+                                &rank.seq_state, &rank.prefill_bufs,
                             )
                         })
                     })
@@ -313,9 +318,9 @@ pub(crate) mod tp {
         ) -> anyhow::Result<()> {
             if self.world_size == 1 {
                 let r = &self.ranks[0];
-                return r
-                    .model
-                    .forward_single_paged(token_id, &r.kv_pool, &states[0]);
+                return r.forward.forward_decode(
+                    &r.model, token_id, &r.kv_pool, &states[0],
+                );
             }
 
             std::thread::scope(|s| {
@@ -325,8 +330,9 @@ pub(crate) mod tp {
                     .zip(states.iter())
                     .map(|(rank, state)| {
                         s.spawn(move || {
-                            rank.model
-                                .forward_single_paged(token_id, &rank.kv_pool, state)
+                            rank.forward.forward_decode(
+                                &rank.model, token_id, &rank.kv_pool, state,
+                            )
                         })
                     })
                     .collect();
@@ -346,12 +352,11 @@ pub(crate) mod tp {
         ) -> anyhow::Result<()> {
             if self.world_size == 1 {
                 let r = &self.ranks[0];
-                return r.model.forward_prefill_paged(
-                    tokens,
-                    &r.kv_pool,
-                    &states[0],
-                    &r.prefill_bufs,
-                    &[],
+                r.forward.prefill_preamble(
+                    &r.model, tokens, &states[0], &r.prefill_bufs, &[],
+                )?;
+                return r.forward.forward_prefill(
+                    &r.model, tokens, &r.kv_pool, &states[0], &r.prefill_bufs,
                 );
             }
 
@@ -362,12 +367,12 @@ pub(crate) mod tp {
                     .zip(states.iter())
                     .map(|(rank, state)| {
                         s.spawn(move || {
-                            rank.model.forward_prefill_paged(
-                                tokens,
-                                &rank.kv_pool,
-                                state,
+                            rank.forward.prefill_preamble(
+                                &rank.model, tokens, state, &rank.prefill_bufs, &[],
+                            )?;
+                            rank.forward.forward_prefill(
+                                &rank.model, tokens, &rank.kv_pool, state,
                                 &rank.prefill_bufs,
-                                &[],
                             )
                         })
                     })

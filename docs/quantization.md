@@ -7,7 +7,7 @@ bandwidth-bound workloads.
 **Key files:**
 - `src/gpu/mod.rs` — Q4 block format, `quantize_bf16_to_q4()`, `q4_byte_count()`
 - `src/commands/quantize.rs` — CLI `rllm quantize` command
-- `src/model/loader.rs` — pre-quantized model detection and loading
+- `src/model/loader/` — pre-quantized model detection and loading
 - `src/gpu/metal/shaders/matmul.metal` — Metal Q4 dequantization kernels
 - `src/gpu/cuda/shaders/matmul.cu` — CUDA Q4 dequantization kernels
 - `src/gpu/cpu/mod.rs` — CPU reference Q4 implementation

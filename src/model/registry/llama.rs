@@ -4,49 +4,43 @@
 // LEARNING OVERVIEW
 //
 // What this file does:
-//   Implements the "vanilla" dense transformer pipeline:
+//   Implements the "vanilla" dense transformer pipeline via `LlamaForward`,
+//   which implements the `ModelForward` trait:
 //     embed → (norm → qkv → [bias?] → rope → attn → o_proj → ffn) × N → lm_head
 //
 //   Llama is the baseline — no QKV bias, no special features.  Variants
 //   that only differ in small ways (Qwen: QKV bias, Phi: fused weight
-//   loading) call into this file's implementation with their own ArchFeatures.
+//   loading) use `LlamaForward` with their own `ArchFeatures`.
 //
-// Llama 3.x family (1B, 3B, 8B, 70B):
-//   - RMSNorm + GQA attention + SwiGLU FFN + RoPE
-//   - NO bias on any projection (Q/K/V/O/FFN)
-//   - Chat template: <|start_header_id|> markers
-//   - RoPE theta: 500000
+// LlamaForward:
+//   The `ModelForward` trait implementor for Llama-like dense transformers.
+//   Constructed with `ArchFeatures` (e.g. has_qkv_bias) and used directly
+//   by Llama, Phi, Mistral, and Qwen.  engine/loader.rs creates the right
+//   `LlamaForward::new(has_qkv_bias)` for each architecture.
 //
 // ArchFeatures — the knobs that vary across Llama-like models:
 //   - has_qkv_bias: Qwen 2.5 adds bias after Q/K/V projections; Llama/Phi don't.
 //
-//   If a future standard-ish model needs a new knob (e.g. LayerNorm instead
-//   of RMSNorm), add it to ArchFeatures rather than copy-pasting the whole
-//   forward pass into a new file.
-//
 // What does NOT belong here:
-//   Models with fundamentally different pipelines should keep their own files:
-//     - Gemma 3: sandwich norms, GeGLU, sliding window, embed scaling
-//     - Qwen 3 MoE: QK-norm, MoE expert routing, q_dim ≠ hidden_size
-//     - Qwen 3.5: hybrid DeltaNet + GQA attention, MoE FFN
+//   Models with fundamentally different pipelines have their own files and
+//   their own ModelForward implementor structs:
+//     - Gemma 3: GemmaForward (sandwich norms, GeGLU, embed scaling)
+//     - Qwen 3 MoE: Qwen3MoeForward (QK-norm, MoE routing)
+//     - Qwen 3.5: Qwen35Forward (DeltaNet + GQA hybrid, MoE FFN)
 //
-//   Trying to parameterise all of those into ArchFeatures would make this
-//   file harder to read than the copy-paste it's replacing.
-//
-// Phi (Microsoft):
-//   Phi's forward pass is identical to Llama's — the difference is in weight
-//   loading (fused qkv_proj/gate_up_proj split on load in loader.rs).  Once
-//   weights are loaded, inference is the same.  phi.rs re-exports from here.
-//
-// Qwen 2.5:
-//   Differs by exactly one thing: QKV bias.  qwen.rs calls into the _impl
-//   functions here with `has_qkv_bias: true`.
+// Related files:
+//   model/forward.rs     — ModelForward trait definition
+//   engine/loader.rs     — constructs Box<dyn ModelForward<B>> at load time
+//   registry/phi.rs      — documentation only (uses LlamaForward)
+//   registry/mistral.rs  — documentation only (uses LlamaForward)
+//   registry/qwen.rs     — documentation only (uses LlamaForward)
 // ===========================================================================
 
 use crate::gpu::{
-    GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuMoe, GpuNorm,
-    GpuRope, GpuTurboQuant,
+    GpuAllReduce, GpuAttention, GpuBackend, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul,
+    GpuMoe, GpuNorm, GpuRope, GpuTurboQuant,
 };
+use crate::model::forward::ModelForward;
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives;
 use crate::model::profile::{self, Component};
@@ -68,75 +62,65 @@ pub(crate) struct ArchFeatures {
     pub has_qkv_bias: bool,
 }
 
-/// Llama features: the baseline.  No QKV bias, nothing extra.
-const FEATURES: ArchFeatures = ArchFeatures {
-    has_qkv_bias: false,
-};
-
 // ===========================================================================
-// Public entry points — called from model/mod.rs dispatch.
+// LlamaForward — ModelForward trait implementation.
+//
+// Wraps the shared _impl functions with a specific ArchFeatures.  Used
+// directly by Llama and via factory functions by Qwen, Phi, and Mistral.
 // ===========================================================================
 
-pub(crate) fn forward_single_paged<
-    B: GpuCore
-        + GpuNorm
-        + GpuMatmul
-        + GpuRope
-        + GpuAttention
-        + GpuElementwise
-        + GpuEmbed
-        + GpuAllReduce
-        + GpuTurboQuant
-        + GpuMoe,
->(
-    m: &Model<'_, B>,
-    token_id: u32,
-    pool: &KvPool<B>,
-    seq_state: &SeqKvState<B>,
-) -> anyhow::Result<()> {
-    forward_single_impl(m, token_id, pool, seq_state, &FEATURES)
+pub(crate) struct LlamaForward {
+    pub features: ArchFeatures,
 }
 
-pub(crate) fn forward_decode_batch_paged<
-    B: GpuCore
-        + GpuNorm
-        + GpuMatmul
-        + GpuRope
-        + GpuAttention
-        + GpuElementwise
-        + GpuEmbed
-        + GpuAllReduce
-        + GpuTurboQuant,
->(
-    m: &Model<'_, B>,
-    tokens: &[u32],
-    positions: &[u32],
-    pool: &KvPool<B>,
-    seq_states: &[&SeqKvState<B>],
-    bufs: &PrefillBuffers<B>,
-    logits_batch: &B::Tensor,
-) -> anyhow::Result<()> {
-    forward_decode_batch_impl(m, tokens, positions, pool, seq_states, bufs, logits_batch, &FEATURES)
+impl LlamaForward {
+    pub fn new(has_qkv_bias: bool) -> Self {
+        Self {
+            features: ArchFeatures { has_qkv_bias },
+        }
+    }
 }
 
-pub(crate) fn forward_prefill_paged<
-    B: GpuCore
-        + GpuNorm
-        + GpuMatmul
-        + GpuRope
-        + GpuAttention
-        + GpuElementwise
-        + GpuEmbed
-        + GpuAllReduce
-        + GpuTurboQuant,
->(
-    m: &Model<'_, B>,
-    tokens: &[u32],
-    pool: &KvPool<B>,
-    seq_state: &SeqKvState<B>,
-    bufs: &PrefillBuffers<B>,
-) -> anyhow::Result<()> {
-    forward_prefill_impl(m, tokens, pool, seq_state, bufs, &FEATURES)
+impl<B: GpuBackend> ModelForward<B> for LlamaForward {
+    fn forward_decode(
+        &self,
+        m: &Model<'_, B>,
+        token_id: u32,
+        pool: &KvPool<B>,
+        seq_state: &SeqKvState<B>,
+    ) -> anyhow::Result<()> {
+        forward_single_impl(m, token_id, pool, seq_state, &self.features)
+    }
+
+    fn forward_prefill(
+        &self,
+        m: &Model<'_, B>,
+        tokens: &[u32],
+        pool: &KvPool<B>,
+        seq_state: &SeqKvState<B>,
+        bufs: &PrefillBuffers<B>,
+    ) -> anyhow::Result<()> {
+        forward_prefill_impl(m, tokens, pool, seq_state, bufs, &self.features)
+    }
+
+    fn supports_batched_decode(&self) -> bool {
+        true
+    }
+
+    fn forward_decode_batch(
+        &self,
+        m: &Model<'_, B>,
+        tokens: &[u32],
+        positions: &[u32],
+        pool: &KvPool<B>,
+        seq_states: &[&SeqKvState<B>],
+        bufs: &PrefillBuffers<B>,
+        logits_batch: &B::Tensor,
+    ) -> anyhow::Result<()> {
+        forward_decode_batch_impl(
+            m, tokens, positions, pool, seq_states, bufs, logits_batch, &self.features,
+        )
+    }
 }
 
 // ===========================================================================

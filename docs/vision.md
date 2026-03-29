@@ -8,9 +8,9 @@ embedding vectors that slot into the LLM's token sequence, letting the model
 **Key files:**
 - `src/model/vision.rs` — ViT forward pass, image preprocessing
 - `src/model/config.rs` — `VisionConfig` (parsed from config.json)
-- `src/model/loader.rs` — vision weight loading (f32 to bf16 conversion, QKV fusion)
+- `src/model/loader/` — vision weight loading (f32 to bf16 conversion, QKV fusion)
 - `src/model/chat.rs` — chat templates with vision placeholders
-- `src/model/mod.rs` — integration point in `forward_prefill_paged()`
+- `src/model/forward.rs` — `prefill_preamble()` default impl (vision scatter integration)
 - `src/gpu/ops/vision.rs` — `GpuVision` trait (spatial merge, scatter)
 - `src/gpu/ops/attention.rs` — `prefill_attention_fused_qkv()`
 - `src/gpu/metal/shaders/vision.metal` — spatial merge + scatter kernels

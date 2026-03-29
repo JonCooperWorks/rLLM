@@ -32,7 +32,7 @@
 // Metal shaders: shaders/vision.metal
 // Metal impl:    gpu/metal/kernels/vision.rs
 // Vision encoder forward pass: model/vision.rs
-// Vision weight loading: model/loader.rs (load_vision_weights)
+// Vision weight loading: model/loader/ (load_vision_weights)
 // ---------------------------------------------------------------------------
 
 use super::core::GpuCore;

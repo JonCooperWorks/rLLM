@@ -1,98 +1,13 @@
 // ===========================================================================
 // Qwen 2.5 model family.
 //
-// Qwen 2.5 family (0.5B, 1.5B, 3B, 7B, 14B, 32B, 72B):
-//   - RMSNorm + GQA attention + SwiGLU FFN + RoPE
-//   - QKV projections have BIAS (output = W @ x + b)
-//   - O projection and FFN projections have NO bias
-//   - Chat template: ChatML (<|im_start|>/<|im_end|>)
-//   - RoPE theta: 10000
+// Qwen 2.5 differs from Llama by exactly one thing: QKV bias.  After
+// computing Q = W_q @ hidden, Qwen adds a learned bias: Q = W_q @ hidden + b_q.
+// Same for K and V.  Everything else is identical to Llama.
 //
-// LEARNING OVERVIEW
+// This file exists so ModelArch::Qwen2 has an obvious home in the registry.
+// At runtime, engine/loader.rs constructs a LlamaForward with has_qkv_bias:
+// true — no code in this file is needed.
 //
-// What makes Qwen different from Llama?
-//   Exactly one thing in the forward pass: bias-add after Q/K/V projections.
-//
-//   After computing Q = W_q @ hidden, Llama uses Q directly.  Qwen adds
-//   a learned bias vector: Q = W_q @ hidden + b_q.  Same for K and V.
-//   This is controlled by the `has_qkv_bias` flag in ArchFeatures.
-//
-//   Everything else — norm, RoPE, attention, FFN, residuals — is identical
-//   to Llama.  The shared forward pass in llama.rs handles both.
+// If future Qwen models diverge from Llama, add a QwenForward struct here.
 // ===========================================================================
-
-use crate::gpu::{
-    GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuMoe, GpuNorm,
-    GpuRope, GpuTurboQuant,
-};
-use crate::model::kv_cache::{KvPool, SeqKvState};
-use crate::model::{Model, PrefillBuffers};
-
-use super::llama::ArchFeatures;
-
-/// Qwen features: QKV bias is the only difference from Llama.
-const FEATURES: ArchFeatures = ArchFeatures { has_qkv_bias: true };
-
-pub(crate) fn forward_single_paged<
-    B: GpuCore
-        + GpuNorm
-        + GpuMatmul
-        + GpuRope
-        + GpuAttention
-        + GpuElementwise
-        + GpuEmbed
-        + GpuAllReduce
-        + GpuTurboQuant
-        + GpuMoe,
->(
-    m: &Model<'_, B>,
-    token_id: u32,
-    pool: &KvPool<B>,
-    seq_state: &SeqKvState<B>,
-) -> anyhow::Result<()> {
-    super::llama::forward_single_impl(m, token_id, pool, seq_state, &FEATURES)
-}
-
-pub(crate) fn forward_prefill_paged<
-    B: GpuCore
-        + GpuNorm
-        + GpuMatmul
-        + GpuRope
-        + GpuAttention
-        + GpuElementwise
-        + GpuEmbed
-        + GpuAllReduce
-        + GpuTurboQuant,
->(
-    m: &Model<'_, B>,
-    tokens: &[u32],
-    pool: &KvPool<B>,
-    seq_state: &SeqKvState<B>,
-    bufs: &PrefillBuffers<B>,
-) -> anyhow::Result<()> {
-    super::llama::forward_prefill_impl(m, tokens, pool, seq_state, bufs, &FEATURES)
-}
-
-pub(crate) fn forward_decode_batch_paged<
-    B: GpuCore
-        + GpuNorm
-        + GpuMatmul
-        + GpuRope
-        + GpuAttention
-        + GpuElementwise
-        + GpuEmbed
-        + GpuAllReduce
-        + GpuTurboQuant,
->(
-    m: &Model<'_, B>,
-    tokens: &[u32],
-    positions: &[u32],
-    pool: &KvPool<B>,
-    seq_states: &[&SeqKvState<B>],
-    bufs: &PrefillBuffers<B>,
-    logits_batch: &B::Tensor,
-) -> anyhow::Result<()> {
-    super::llama::forward_decode_batch_impl(
-        m, tokens, positions, pool, seq_states, bufs, logits_batch, &FEATURES,
-    )
-}

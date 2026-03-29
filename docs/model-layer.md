@@ -8,7 +8,7 @@ executes kernels).
 **Key files:**
 - `src/model/mod.rs` — `Model<B>` struct, forward dispatch, buffer allocation
 - `src/model/config.rs` — `ModelArch` enum, `ModelConfig` (from HF `config.json`)
-- `src/model/loader.rs` — safetensors weight loading, Q4 quantization on-load
+- `src/model/loader/` — safetensors weight loading, Q4 quantization on-load
 - `src/model/primitives.rs` — shared transformer building blocks
 - `src/model/registry/*.rs` — 9 model family forward passes
 - `src/model/chat.rs` — chat template formatting
@@ -42,7 +42,7 @@ The config provides all dimension info: `num_hidden_layers`, `hidden_size`,
 
 ## Weight Loading
 
-`src/model/loader.rs` loads weights from safetensors format:
+`src/model/loader/` loads weights from safetensors format:
 
 1. **TensorStore** abstracts single-file vs multi-shard models
 2. **LoaderHints** encodes per-architecture boolean flags:
@@ -80,20 +80,22 @@ eliminates per-step allocation overhead.
 
 ## Forward Pass Dispatch
 
-`Model::forward_single_paged()` (decode) and `forward_prefill_paged()`
-(prefill) dispatch on the `ModelArch` enum:
+The engine holds a `Box<dyn ModelForward<B>>` constructed once at load time in
+`engine/loader.rs::create_forward()`.  Each architecture implements the
+`ModelForward` trait (defined in `model/forward.rs`) with `forward_decode`,
+`forward_prefill`, and optionally `forward_decode_batch`.
 
 ```rust
-match self.config.arch {
-    ModelArch::Llama => llama::forward_decode(self, token, kv_state),
-    ModelArch::Qwen2 => qwen::forward_decode(self, token, kv_state),
-    ModelArch::Qwen3Moe => qwen3_moe::forward_decode(self, token, kv_state),
-    // ... 6 more variants
-}
+// engine/loader.rs — one match at construction time
+let forward: Box<dyn ModelForward<B>> = match arch {
+    ModelArch::Llama => Box::new(LlamaForward::new(false)),
+    ModelArch::Qwen2 => Box::new(LlamaForward::new(true)),  // QKV bias
+    ModelArch::Mixtral => Box::new(MixtralForward { moe }),
+    // ... etc
+};
 ```
 
-This is a simple exhaustive match — zero overhead, and the compiler ensures
-every architecture is handled.
+No match dispatch at runtime — the trait vtable handles it.
 
 ---
 
@@ -194,9 +196,9 @@ has a dedicated `load_mxfp4_experts()` path.
 ## Adding a New Model
 
 1. Add `ModelArch` variant in `config.rs` + `from_model_type()` match
-2. Set loader flags in `LoaderHints::new()` in `loader.rs`
-3. Create `registry/new_model.rs` with forward pass (or delegate to `llama.rs`)
-4. Add dispatch arms in `mod.rs` (`forward_single_paged` + `forward_prefill_paged`)
+2. Set loader flags in `LoaderHints::new()` in `loader/mod.rs`
+3. Create `registry/new_model.rs` implementing `ModelForward` trait (or use `LlamaForward`)
+4. Add match arm in `engine/loader.rs::create_forward()` to construct the Forward struct
 5. Add chat template in `chat.rs`
 6. Add tool-call format in `tools.rs` (if applicable)
 

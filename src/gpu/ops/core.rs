@@ -25,7 +25,11 @@ use super::super::TensorDtype;
 pub(crate) trait GpuCore: Send + Sync {
     /// Opaque tensor handle.  Each backend defines its own type wrapping
     /// the platform's buffer handle, tensor shape, and dtype metadata.
-    type Tensor;
+    ///
+    /// Send + Sync: tensor handles are safe to share across threads (they're
+    /// just IDs/pointers — the GPU manages the underlying memory).  Required
+    /// for ModelForward structs that hold arch-specific tensor buffers.
+    type Tensor: Send + Sync;
 
     /// Human-readable GPU device name (e.g. "Apple M4 Max").
     fn device_name(&self) -> &str;

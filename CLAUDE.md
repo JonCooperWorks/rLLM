@@ -40,24 +40,29 @@ metal/
 
 ### Models (`src/model/registry/`)
 
-Nine model families, each implementing a forward pass generic over `B: GpuBackend`:
+Ten model families, each implementing the `ModelForward` trait (defined in
+`src/model/forward.rs`).  The engine holds `Box<dyn ModelForward<B>>` — one
+match at construction time in `engine/loader.rs`, no match dispatch after that.
+
+Standard dense transformers (Llama, Phi, Qwen, Mistral) share `LlamaForward`
+parameterised by `ArchFeatures`.  Complex architectures have their own structs:
 
 ```
-llama.rs       — Llama 3.x
-qwen.rs        — Qwen 2.5
-qwen3_moe.rs   — Qwen 3 Mixture-of-Experts
-qwen3_5.rs     — Qwen 3.5 hybrid (DeltaNet + GQA)
-phi.rs         — Phi
-gemma.rs       — Gemma 3
-mistral.rs     — Mistral
-mixtral.rs     — Mixtral (MoE)
-gpt_oss.rs     — GPT Open Source
+llama.rs       — LlamaForward (Llama 3.x, also used by Phi/Qwen/Mistral)
+gemma.rs       — GemmaForward (sandwich norms, GeGLU, embed scaling)
+mixtral.rs     — MixtralForward (MoE FFN, holds MoeBuffers)
+qwen3_moe.rs   — Qwen3MoeForward (QK-norm + MoE, holds MoeBuffers)
+qwen3_5.rs     — Qwen35Forward (DeltaNet + GQA + MoE, holds DeltaNetBuffers + MoeBuffers)
+gpt_oss.rs     — GptOssForward (YaRN + MoE + biases, holds MoeBuffers)
+nemotron_h.rs  — NemotronForward (Mamba-2 + attention + MoE, holds Mamba2Buffers + MoeBuffers)
+qwen.rs        — documentation only (uses LlamaForward with has_qkv_bias: true)
+phi.rs         — documentation only (uses LlamaForward)
+mistral.rs     — documentation only (uses LlamaForward)
 ```
 
 Config parsing: `src/model/config.rs` (`ModelArch` enum + `VisionConfig` for VLMs).
-Weight loading: `src/model/loader.rs` (safetensors, single + multi-shard, pre-quantized Q4 auto-detection,
-  vision encoder weights with f32→bf16 conversion and fused QKV tensor handling — Qwen's
-  fused weights kept as-is, Gemma's separate Q/K/V concatenated into fused format).
+Weight loading: `src/model/loader/` (safetensors, single + multi-shard, pre-quantized Q4 auto-detection,
+  split into store, upload, mxfp4, vision, expert_index submodules).
 Expert streaming: `src/model/expert_stream.rs` (SSD-backed on-demand expert loading for large MoE models).
 Vision encoder: `src/model/vision.rs` (SigLIP ViT forward pass, image preprocessing with tiling, patch embedding).
 
@@ -147,16 +152,17 @@ API request (base64 image)
   → api/mod.rs: preprocess_images() on handler thread (CPU, rayon-parallel)
   → WorkerRequest.images: Vec<ProcessedImage>
   → engine: SequenceRequest.images → Sequence.images
-  → forward_prefill_paged: embed_lookup → vision_encode → scatter → transformer
+  → ModelForward::prefill_preamble: embed_lookup → vision_encode → scatter
+  → ModelForward::forward_prefill: transformer layers
 ```
 
 **Files:**
 ```
 model/vision.rs         — VisionWeights, VisionBuffers, preprocess_image(), vision_encode()
 model/config.rs         — VisionConfig (parsed from vision_config in config.json)
-model/loader.rs         — load_vision_weights() (handles f32→bf16, fused QKV concat, temporal avg)
+model/loader/vision.rs  — load_vision_weights() (handles f32→bf16, fused QKV concat, temporal avg)
 model/chat.rs           — ImageData, vision placeholder tokens in chat templates
-model/mod.rs            — forward_prefill_paged() vision scatter integration
+model/forward.rs        — prefill_preamble() default impl (vision scatter integration)
 gpu/ops/vision.rs       — GpuVision trait (spatial_merge, spatial_merge_norm, scatter_vision_tokens)
 gpu/ops/attention.rs    — prefill_attention_fused_qkv (interleaved QKV attention)
 gpu/ops/norm.rs         — layer_norm_batch (LayerNorm for ViT)
@@ -187,13 +193,14 @@ rllm serve  — HTTP API server (accepts images via OpenAI/Anthropic multimodal 
 
 1. **`src/model/config.rs`**: Add `ModelArch` variant + `from_model_type()` case + feature
    methods (e.g. `has_qkv_bias()`) if the new arch has novel traits.
-2. **`src/model/loader.rs`**: Set the right flags in `LoaderHints::new()`.  If the model
+2. **`src/model/loader/mod.rs`**: Set the right flags in `LoaderHints::new()`.  If the model
    uses standard weight formats, zero additional loader code is needed.  Novel formats
-   (like MXFP4) get their own helper function (see `load_mxfp4_experts()`).
-3. **`src/model/registry/new_model.rs`**: Forward pass implementation.  Standard dense
-   transformers can delegate to `registry/llama.rs` via `ArchFeatures`.
-4. **`src/model/mod.rs`**: Add dispatch arms in `forward_single_paged()` and
-   `forward_prefill_paged()`.
+   (like MXFP4) get their own helper function (see `loader/mxfp4.rs`).
+3. **`src/model/registry/new_model.rs`**: Implement the `ModelForward` trait
+   (`forward_decode`, `forward_prefill`, optionally `forward_decode_batch`).
+   Standard dense transformers can use `LlamaForward` from `registry/llama.rs`.
+4. **`src/engine/loader.rs`**: Add match arm in `create_forward()` to construct
+   the new `ModelForward` implementor (with any arch-specific buffers).
 5. **`src/model/chat.rs`**: Add chat template match arm (or reuse ChatML).
 6. **`src/model/tools.rs`**: Add tool-call format match arm if applicable.
 

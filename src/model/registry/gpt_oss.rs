@@ -28,19 +28,51 @@
 //
 // Related files:
 //   Config:      model/config.rs (GptOss variant)
-//   Loader:      model/loader.rs (MXFP4 dequant, expert biases, de-interleaving)
+//   Loader:      model/loader/ (MXFP4 dequant, expert biases, de-interleaving)
 //   Primitives:  model/primitives.rs (biased MoE dispatch, YaRN RoPE)
-//   Dispatch:    model/mod.rs (forward_single/prefill_paged arms)
+//   Forward:     model/forward.rs (ModelForward trait, MoeBuffers)
 // ===========================================================================
 
 use crate::gpu::{
-    GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuNorm, GpuRope,
-    GpuTurboQuant, TensorDtype,
+    GpuAllReduce, GpuAttention, GpuBackend, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul,
+    GpuNorm, GpuRope, GpuTurboQuant, TensorDtype,
 };
+use crate::model::forward::{MoeBuffers, ModelForward};
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives::{self, Dims};
 use crate::model::profile::{self, Component};
 use crate::model::{Model, PrefillBuffers};
+
+// ===========================================================================
+// GptOssForward — ModelForward trait implementation.
+// ===========================================================================
+
+pub(crate) struct GptOssForward<B: GpuCore> {
+    pub moe: MoeBuffers<B>,
+}
+
+impl<B: GpuBackend> ModelForward<B> for GptOssForward<B> {
+    fn forward_decode(
+        &self,
+        m: &Model<'_, B>,
+        token_id: u32,
+        pool: &KvPool<B>,
+        seq_state: &SeqKvState<B>,
+    ) -> anyhow::Result<()> {
+        forward_single_paged(m, token_id, pool, seq_state, &self.moe)
+    }
+
+    fn forward_prefill(
+        &self,
+        m: &Model<'_, B>,
+        tokens: &[u32],
+        pool: &KvPool<B>,
+        seq_state: &SeqKvState<B>,
+        bufs: &PrefillBuffers<B>,
+    ) -> anyhow::Result<()> {
+        forward_prefill_paged(m, tokens, pool, seq_state, bufs, &self.moe)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // MoE FFN block: biased dispatch with GPT-OSS gated activation.
@@ -54,6 +86,7 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
     num_experts: usize,
     num_experts_per_tok: usize,
     swiglu_limit: f32,
+    moe: &MoeBuffers<B>,
 ) {
     let layer = &m.weights.layers[layer_idx];
     primitives::moe_ffn_block_biased(
@@ -64,12 +97,45 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
         layer.experts.as_ref().unwrap(),
         &m.hidden,
         &m.norm_buf,
-        m.moe_gate_buf.as_ref().unwrap(),
-        m.moe_up_buf.as_ref().unwrap(),
-        m.moe_output.as_ref().unwrap(),
-        m.routing_output.as_ref().unwrap(),
+        &moe.moe_gate_buf,
+        &moe.moe_up_buf,
+        &moe.moe_output,
+        &moe.routing_output,
         &m.gate_buf,
         d.eps,
+        d.hidden_size,
+        moe_inter,
+        num_experts,
+        num_experts_per_tok,
+        swiglu_limit,
+    );
+}
+
+/// Pre-normed biased MoE FFN block — norm_buf already populated by fused residual+norm.
+/// Inspired by rvLLM (m0at).
+fn moe_ffn_block_pre_normed<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise>(
+    m: &Model<'_, B>,
+    layer_idx: usize,
+    d: &Dims,
+    moe_inter: u32,
+    num_experts: usize,
+    num_experts_per_tok: usize,
+    swiglu_limit: f32,
+    moe: &MoeBuffers<B>,
+) {
+    let layer = &m.weights.layers[layer_idx];
+    primitives::moe_ffn_block_biased_pre_normed(
+        m.backend,
+        layer.router_gate.as_ref().unwrap(),
+        layer.router_bias.as_ref(),
+        layer.experts.as_ref().unwrap(),
+        &m.hidden,
+        &m.norm_buf,
+        &moe.moe_gate_buf,
+        &moe.moe_up_buf,
+        &moe.moe_output,
+        &moe.routing_output,
+        &m.gate_buf,
         d.hidden_size,
         moe_inter,
         num_experts,
@@ -98,6 +164,7 @@ pub(crate) fn forward_single_paged<
     token_id: u32,
     pool: &KvPool<B>,
     seq_state: &SeqKvState<B>,
+    moe: &MoeBuffers<B>,
 ) -> anyhow::Result<()> {
     let d = m.dims();
     let pos = seq_state.seq_len as u32;
@@ -199,8 +266,9 @@ pub(crate) fn forward_single_paged<
             m.turbo_ctx.as_ref(),
         );
 
-        // O projection with bias + residual.
-        primitives::o_proj_residual_qdim_biased(
+        // Fused O-proj with bias + residual-add + post-attention RMSNorm: saves one
+        // full read of the hidden tensor.  Inspired by rvLLM (m0at).
+        primitives::o_proj_fused_residual_norm_qdim_biased(
             m.backend,
             layer,
             &m.attn_out,
@@ -208,12 +276,13 @@ pub(crate) fn forward_single_paged<
             &m.hidden,
             d.hidden_size,
             d.q_dim,
+            d.eps,
         );
         profile::record(m.backend, t, Component::Attention);
 
-        // --- MoE FFN sub-block ---
+        // --- MoE FFN sub-block (pre-normed: fused residual+norm already produced norm_buf) ---
         let t = profile::begin(m.backend);
-        moe_ffn_block(
+        moe_ffn_block_pre_normed(
             m,
             layer_idx,
             &d,
@@ -221,6 +290,7 @@ pub(crate) fn forward_single_paged<
             num_experts,
             num_experts_per_tok,
             swiglu_limit,
+            moe,
         );
         profile::record(m.backend, t, Component::Ffn);
     }
@@ -263,6 +333,7 @@ pub(crate) fn forward_prefill_paged<
     pool: &KvPool<B>,
     seq_state: &SeqKvState<B>,
     bufs: &PrefillBuffers<B>,
+    moe: &MoeBuffers<B>,
 ) -> anyhow::Result<()> {
     let d = m.dims();
     let bs = tokens.len() as u32;
@@ -396,6 +467,7 @@ pub(crate) fn forward_prefill_paged<
                 num_experts,
                 num_experts_per_tok,
                 swiglu_limit,
+                moe,
             );
 
             let mut token_hidden = vec![0u8; hidden_byte_size];

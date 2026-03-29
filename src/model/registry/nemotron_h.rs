@@ -49,13 +49,48 @@
 // ===========================================================================
 
 use crate::gpu::{
-    GpuAttention, GpuCore, GpuDeltaNet, GpuElementwise, GpuEmbed, GpuMamba2, GpuMatmul, GpuMoe,
-    GpuNorm, GpuRope, GpuAllReduce, GpuTurboQuant, TensorDtype,
+    GpuAttention, GpuBackend, GpuCore, GpuDeltaNet, GpuElementwise, GpuEmbed, GpuMamba2,
+    GpuMatmul, GpuMoe, GpuNorm, GpuRope, GpuAllReduce, GpuTurboQuant, TensorDtype,
 };
 use crate::model::config::ModelConfig;
+use crate::model::forward::{Mamba2Buffers, MoeBuffers, ModelForward};
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives;
 use crate::model::{Model, PrefillBuffers};
+
+// ===========================================================================
+// NemotronForward — ModelForward trait implementation.
+//
+// Holds MoE buffers (for MoE FFN layers) and Mamba-2 buffers (for SSM layers).
+// ===========================================================================
+
+pub(crate) struct NemotronForward<B: GpuCore> {
+    pub moe: MoeBuffers<B>,
+    pub mamba2: Mamba2Buffers<B>,
+}
+
+impl<B: GpuBackend> ModelForward<B> for NemotronForward<B> {
+    fn forward_decode(
+        &self,
+        m: &Model<'_, B>,
+        token_id: u32,
+        pool: &KvPool<B>,
+        seq_state: &SeqKvState<B>,
+    ) -> anyhow::Result<()> {
+        forward_single_paged(m, token_id, pool, seq_state, &self.moe, &self.mamba2)
+    }
+
+    fn forward_prefill(
+        &self,
+        m: &Model<'_, B>,
+        tokens: &[u32],
+        pool: &KvPool<B>,
+        seq_state: &SeqKvState<B>,
+        bufs: &PrefillBuffers<B>,
+    ) -> anyhow::Result<()> {
+        forward_prefill_paged(m, tokens, pool, seq_state, bufs, &self.moe, &self.mamba2)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Layer index mapping helpers.
@@ -152,6 +187,8 @@ pub(crate) fn forward_single_paged<
     token_id: u32,
     pool: &KvPool<B>,
     seq_state: &SeqKvState<B>,
+    moe: &MoeBuffers<B>,
+    mamba2: &Mamba2Buffers<B>,
 ) -> anyhow::Result<()> {
     let d = NemotronDims::from_config(&m.config);
     let pos = seq_state.seq_len as u32;
@@ -164,10 +201,10 @@ pub(crate) fn forward_single_paged<
         let layer_type = m.config.layer_types[layer_idx].as_str();
         match layer_type {
             "mamba2" => {
-                mamba2_block(m, layer_idx, &d);
+                mamba2_block(m, layer_idx, &d, mamba2);
             }
             "moe" => {
-                moe_block(m, layer_idx, &d);
+                moe_block(m, layer_idx, &d, moe);
             }
             "attention" => {
                 attention_block(m, layer_idx, &d, pos, pool, seq_state);
@@ -208,16 +245,17 @@ fn mamba2_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuDeltaNet 
     m: &Model<'_, B>,
     layer_idx: usize,
     d: &NemotronDims,
+    mamba2: &Mamba2Buffers<B>,
 ) {
     let layer = &m.weights.layers[layer_idx];
     let dn_idx = d.mamba2_state_map[layer_idx].expect("mamba2 layer must have state index");
 
     // Unwrap Mamba state and scratch buffers.
-    let states = m.mamba2_states.as_ref().expect("mamba2_states");
-    let conv_hist = m.mamba2_conv_history.as_ref().expect("mamba2_conv_history");
-    let in_proj_buf = m.m2_in_proj_buf.as_ref().expect("m2_in_proj_buf");
-    let conv_out = m.m2_conv_out.as_ref().expect("m2_conv_out");
-    let ssm_out = m.m2_ssm_out.as_ref().expect("m2_ssm_out");
+    let states = &mamba2.states;
+    let conv_hist = &mamba2.conv_history;
+    let in_proj_buf = &mamba2.in_proj_buf;
+    let conv_out = &mamba2.conv_out;
+    let ssm_out = &mamba2.ssm_out;
 
     let state = &states[dn_idx];
     let history = &conv_hist[dn_idx];
@@ -332,15 +370,16 @@ fn moe_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
     m: &Model<'_, B>,
     layer_idx: usize,
     d: &NemotronDims,
+    moe: &MoeBuffers<B>,
 ) {
     let layer = &m.weights.layers[layer_idx];
     let router_gate = layer.router_gate.as_ref().expect("router_gate");
     let experts = layer.experts.as_ref().expect("experts");
-    let router_logits = m.router_logits.as_ref().expect("router_logits");
-    let routing_output = m.routing_output.as_ref().expect("routing_output");
-    let moe_up_buf = m.moe_up_buf.as_ref().expect("moe_up_buf");
-    let moe_gate_buf = m.moe_gate_buf.as_ref().expect("moe_gate_buf");
-    let moe_output = m.moe_output.as_ref().expect("moe_output");
+    let router_logits = &moe.router_logits;
+    let routing_output = &moe.routing_output;
+    let moe_up_buf = &moe.moe_up_buf;
+    let moe_gate_buf = &moe.moe_gate_buf;
+    let moe_output = &moe.moe_output;
 
     let num_experts = m.config.num_experts as u32;
 
@@ -498,6 +537,8 @@ pub(crate) fn forward_prefill_paged<
     pool: &KvPool<B>,
     seq_state: &SeqKvState<B>,
     bufs: &PrefillBuffers<B>,
+    moe: &MoeBuffers<B>,
+    mamba2: &Mamba2Buffers<B>,
 ) -> anyhow::Result<()> {
     let d = NemotronDims::from_config(&m.config);
     let bs = tokens.len() as u32;
@@ -543,9 +584,9 @@ pub(crate) fn forward_prefill_paged<
                     );
 
                     if layer_type == "mamba2" {
-                        mamba2_block(m, layer_idx, &d);
+                        mamba2_block(m, layer_idx, &d, mamba2);
                     } else {
-                        moe_block(m, layer_idx, &d);
+                        moe_block(m, layer_idx, &d, moe);
                     }
 
                     m.backend.copy_to_host(&m.hidden, &mut token_hidden_buf);

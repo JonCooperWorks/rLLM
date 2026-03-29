@@ -31,7 +31,7 @@
 //   gets TP support.
 //
 // Related files:
-//   Weight loader:    model/loader.rs (consumes the plan)
+//   Weight loader:    model/loader/ (consumes the plan)
 //   Primitives:       model/primitives.rs (inserts AllReduce)
 //   AllReduce trait:  gpu/ops/allreduce.rs
 //   Model configs:    model/config.rs (input to derive)

@@ -37,7 +37,7 @@
 // Related files:
 //   gpu/mod.rs              — TensorDtype enum, Q4 quantise function
 //   gpu/ops/core.rs         — GpuCore::quantize_upload (calls into this trait)
-//   model/loader.rs         — weight loading, pre-quantized detection
+//   model/loader/         — weight loading, pre-quantized detection
 //   commands/quantize.rs    — offline quantization CLI
 //   metal/shaders/matmul.metal — GPU dequant-matmul kernels
 //   metal/kernels/matmul.rs    — pipeline dispatch by dtype

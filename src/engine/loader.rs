@@ -28,14 +28,156 @@
 use std::path::Path;
 use std::time::Instant;
 
-use crate::gpu::{self, GpuCore};
+use crate::gpu::{self, GpuBackend, GpuCore, GpuElementwise, TensorDtype};
 use crate::model;
-use crate::model::config::ModelArch;
+use crate::model::config::{ModelArch, ModelConfig};
+use crate::model::forward::{MoeBuffers, DeltaNetBuffers, Mamba2Buffers, ModelForward};
+use crate::model::registry;
 use crate::model::tokenizer::Tokenizer;
 use crate::model::turboquant::KvQuantMode;
 use crate::model::{kv_cache, loader};
 
 use super::InferenceEngine;
+
+/// Allocate MoE scratch buffers for MoE architectures.
+fn alloc_moe_buffers<B: GpuCore>(backend: &B, config: &ModelConfig, world_size: usize) -> MoeBuffers<B> {
+    let hidden = config.hidden_size;
+    let moe_inter = config.moe_intermediate_size / world_size;
+    let k = config.num_experts_per_tok;
+    MoeBuffers {
+        router_logits: backend.alloc_tensor(&[config.num_experts], TensorDtype::F32),
+        moe_gate_buf: backend.alloc_tensor(&[moe_inter], TensorDtype::BF16),
+        moe_up_buf: backend.alloc_tensor(&[moe_inter], TensorDtype::BF16),
+        moe_output: backend.alloc_tensor(&[hidden], TensorDtype::BF16),
+        routing_output: backend.alloc_tensor(&[2 * k], TensorDtype::F32),
+        expert_streamer: None,
+    }
+}
+
+/// Allocate DeltaNet recurrent state and scratch buffers (Qwen 3.5 only).
+fn alloc_deltanet_buffers<B: GpuCore + GpuElementwise>(backend: &B, config: &ModelConfig, world_size: usize) -> DeltaNetBuffers<B> {
+    let num_qk_heads = config.linear_num_key_heads / world_size;
+    let num_v_heads = config.linear_num_value_heads / world_size;
+    let hd = config.linear_key_head_dim;
+    let v_per_qk = num_v_heads / num_qk_heads;
+    let v_dim = num_v_heads * config.linear_value_head_dim;
+    let qk_dim = num_qk_heads * hd;
+    let conv_dim = qk_dim * 2 + v_dim;
+    let kernel_size = config.linear_conv_kernel_dim;
+
+    let num_dn_layers = config.layer_types.iter()
+        .filter(|t| t.as_str() == "linear_attention").count();
+    let state_size = num_qk_heads * v_per_qk * hd * hd;
+
+    let mut states = Vec::with_capacity(num_dn_layers);
+    let mut conv_history = Vec::with_capacity(num_dn_layers);
+    for _ in 0..num_dn_layers {
+        states.push(backend.alloc_tensor(&[state_size], TensorDtype::F32));
+        conv_history.push(backend.alloc_tensor(&[(kernel_size - 1) * conv_dim], TensorDtype::BF16));
+    }
+    for s in &states { backend.fill_zero(s, state_size as u32); }
+    for h in &conv_history { backend.fill_zero(h, ((kernel_size - 1) * conv_dim) as u32); }
+
+    DeltaNetBuffers {
+        states,
+        conv_history,
+        qkv_buf: backend.alloc_tensor(&[conv_dim], TensorDtype::BF16),
+        alpha_buf: backend.alloc_tensor(&[num_v_heads], TensorDtype::F32),
+        beta_buf: backend.alloc_tensor(&[num_v_heads], TensorDtype::F32),
+        z_buf: backend.alloc_tensor(&[v_dim], TensorDtype::BF16),
+        conv_out: backend.alloc_tensor(&[conv_dim], TensorDtype::BF16),
+        attn_out: backend.alloc_tensor(&[v_dim], TensorDtype::BF16),
+        norm_out: backend.alloc_tensor(&[v_dim], TensorDtype::BF16),
+    }
+}
+
+/// Allocate Mamba-2 SSM recurrent state and scratch buffers (Nemotron-H only).
+fn alloc_mamba2_buffers<B: GpuCore + GpuElementwise>(backend: &B, config: &ModelConfig) -> Mamba2Buffers<B> {
+    let d_inner = config.mamba2_d_inner();
+    let conv_dim = config.mamba2_conv_dim();
+    let in_proj_dim = config.mamba2_in_proj_dim();
+    let ks = config.mamba_conv_kernel;
+    let n_heads = config.mamba_num_heads;
+    let hd = config.mamba_head_dim;
+    let ss = config.ssm_state_size;
+
+    let num_m2_layers = config.layer_types.iter()
+        .filter(|t| t.as_str() == "mamba2").count();
+    let state_size = n_heads * hd * ss;
+
+    let mut states = Vec::with_capacity(num_m2_layers);
+    let mut conv_history = Vec::with_capacity(num_m2_layers);
+    for _ in 0..num_m2_layers {
+        states.push(backend.alloc_tensor(&[state_size], TensorDtype::F32));
+        conv_history.push(backend.alloc_tensor(&[(ks - 1) * conv_dim], TensorDtype::BF16));
+    }
+    for s in &states { backend.fill_zero(s, state_size as u32); }
+    for h in &conv_history { backend.fill_zero(h, ((ks - 1) * conv_dim) as u32); }
+
+    Mamba2Buffers {
+        states,
+        conv_history,
+        in_proj_buf: backend.alloc_tensor(&[in_proj_dim], TensorDtype::BF16),
+        conv_out: backend.alloc_tensor(&[conv_dim], TensorDtype::BF16),
+        ssm_out: backend.alloc_tensor(&[d_inner], TensorDtype::BF16),
+    }
+}
+
+/// Construct the architecture-specific forward pass from ModelArch.
+///
+/// Allocates arch-specific buffers (MoE, DeltaNet, Mamba-2) on the appropriate
+/// Forward struct.  The Model struct only holds universal buffers.
+pub(crate) fn create_forward<B: GpuBackend + 'static>(
+    arch: ModelArch,
+    config: &ModelConfig,
+    backend: &B,
+    world_size: usize,
+    expert_streamer: Option<model::expert_stream::ExpertStreamer<B>>,
+) -> Box<dyn ModelForward<B>> {
+    match arch {
+        ModelArch::Llama => Box::new(registry::llama::LlamaForward::new(false)),
+        ModelArch::Mistral => Box::new(registry::llama::LlamaForward::new(false)),
+        ModelArch::Phi => Box::new(registry::llama::LlamaForward::new(false)),
+        ModelArch::Qwen2 => Box::new(registry::llama::LlamaForward::new(true)),
+        ModelArch::Gemma3 => Box::new(registry::gemma::GemmaForward),
+        ModelArch::Mixtral => {
+            let mut moe = alloc_moe_buffers(backend, config, world_size);
+            moe.expert_streamer = expert_streamer;
+            Box::new(registry::mixtral::MixtralForward { moe })
+        }
+        ModelArch::Qwen3Moe => {
+            let mut moe = alloc_moe_buffers(backend, config, world_size);
+            moe.expert_streamer = expert_streamer;
+            Box::new(registry::qwen3_moe::Qwen3MoeForward { moe })
+        }
+        ModelArch::Qwen3_5 => {
+            let moe = if config.is_moe() {
+                let mut moe = alloc_moe_buffers(backend, config, world_size);
+                moe.expert_streamer = expert_streamer;
+                Some(moe)
+            } else {
+                None
+            };
+            Box::new(registry::qwen3_5::Qwen35Forward {
+                moe,
+                dn: alloc_deltanet_buffers(backend, config, world_size),
+            })
+        }
+        ModelArch::GptOss => {
+            let mut moe = alloc_moe_buffers(backend, config, world_size);
+            moe.expert_streamer = expert_streamer;
+            Box::new(registry::gpt_oss::GptOssForward { moe })
+        }
+        ModelArch::NemotronH => {
+            let mut moe = alloc_moe_buffers(backend, config, world_size);
+            moe.expert_streamer = expert_streamer;
+            Box::new(registry::nemotron_h::NemotronForward {
+                moe,
+                mamba2: alloc_mamba2_buffers(backend, config),
+            })
+        }
+    }
+}
 
 /// Load a model and run a function with the constructed InferenceEngine.
 ///
@@ -134,13 +276,6 @@ fn load_and_run_single_gpu(
         ));
     }
 
-    // Set up expert streamer if SSD streaming was requested.
-    if let Some(index) = expert_index {
-        let k = config.num_experts_per_tok;
-        let streamer = model::expert_stream::ExpertStreamer::new(&backend, index, k);
-        model.expert_streamer = Some(streamer);
-    }
-
     // Set up vision encoder if VLM weights were loaded.
     if let Some(vw) = vision_weights {
         if let Some(vc) = &config.vision {
@@ -188,7 +323,12 @@ fn load_and_run_single_gpu(
 
     on_ready(&tokenizer, arch);
 
-    let mut eng = super::Engine::new(model, kv_pool, tokenizer, &backend, max_active);
+    let expert_streamer = expert_index.map(|index| {
+        let k = config.num_experts_per_tok;
+        model::expert_stream::ExpertStreamer::new(&backend, index, k)
+    });
+    let forward = create_forward(arch, &config, &backend, 1, expert_streamer);
+    let mut eng = super::Engine::new(model, forward, kv_pool, tokenizer, &backend, max_active);
     run(&mut eng)
 }
 

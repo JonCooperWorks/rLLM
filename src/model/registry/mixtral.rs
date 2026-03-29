@@ -37,13 +37,45 @@
 // ===========================================================================
 
 use crate::gpu::{
-    GpuAllReduce, GpuAttention, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul, GpuMoe, GpuNorm,
-    GpuRope, GpuTurboQuant,
+    GpuAllReduce, GpuAttention, GpuBackend, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul,
+    GpuMoe, GpuNorm, GpuRope, GpuTurboQuant,
 };
+use crate::model::forward::{MoeBuffers, ModelForward};
 use crate::model::kv_cache::{KvPool, SeqKvState};
 use crate::model::primitives::{self, Dims};
 use crate::model::profile::{self, Component};
 use crate::model::{Model, PrefillBuffers};
+
+// ===========================================================================
+// MixtralForward — ModelForward trait implementation.
+// ===========================================================================
+
+pub(crate) struct MixtralForward<B: GpuCore> {
+    pub moe: MoeBuffers<B>,
+}
+
+impl<B: GpuBackend> ModelForward<B> for MixtralForward<B> {
+    fn forward_decode(
+        &self,
+        m: &Model<'_, B>,
+        token_id: u32,
+        pool: &KvPool<B>,
+        seq_state: &SeqKvState<B>,
+    ) -> anyhow::Result<()> {
+        forward_single_paged(m, token_id, pool, seq_state, &self.moe)
+    }
+
+    fn forward_prefill(
+        &self,
+        m: &Model<'_, B>,
+        tokens: &[u32],
+        pool: &KvPool<B>,
+        seq_state: &SeqKvState<B>,
+        bufs: &PrefillBuffers<B>,
+    ) -> anyhow::Result<()> {
+        forward_prefill_paged(m, tokens, pool, seq_state, bufs, &self.moe)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // MoE FFN block: delegates to primitives::moe_ffn_block.
@@ -55,6 +87,7 @@ use crate::model::{Model, PrefillBuffers};
 /// Run the MoE FFN block for a single token (delegates to shared primitive).
 fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
     m: &Model<'_, B>,
+    moe: &MoeBuffers<B>,
     layer_idx: usize,
     d: &Dims,
     moe_inter: u32,
@@ -62,7 +95,7 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
     num_experts_per_tok: usize,
 ) {
     let layer = &m.weights.layers[layer_idx];
-    if let Some(ref streamer) = m.expert_streamer {
+    if let Some(ref streamer) = moe.expert_streamer {
         primitives::moe_ffn_block_streamed(
             m.backend,
             streamer,
@@ -71,9 +104,9 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
             layer.router_gate.as_ref().unwrap(),
             &m.hidden,
             &m.norm_buf,
-            m.moe_gate_buf.as_ref().unwrap(),
-            m.moe_output.as_ref().unwrap(),
-            m.routing_output.as_ref().unwrap(),
+            &moe.moe_gate_buf,
+            &moe.moe_output,
+            &moe.routing_output,
             &m.gate_buf,
             d.eps,
             d.hidden_size,
@@ -89,12 +122,61 @@ fn moe_ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
             layer.experts.as_ref().unwrap(),
             &m.hidden,
             &m.norm_buf,
-            m.moe_gate_buf.as_ref().unwrap(),
-            m.moe_up_buf.as_ref().unwrap(),
-            m.moe_output.as_ref().unwrap(),
-            m.routing_output.as_ref().unwrap(),
+            &moe.moe_gate_buf,
+            &moe.moe_up_buf,
+            &moe.moe_output,
+            &moe.routing_output,
             &m.gate_buf,
             d.eps,
+            d.hidden_size,
+            moe_inter,
+            num_experts,
+            num_experts_per_tok,
+        );
+    }
+}
+
+/// Pre-normed MoE FFN block — norm_buf already populated by fused residual+norm.
+/// Inspired by rvLLM (m0at).
+fn moe_ffn_block_pre_normed<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
+    m: &Model<'_, B>,
+    moe: &MoeBuffers<B>,
+    layer_idx: usize,
+    d: &Dims,
+    moe_inter: u32,
+    num_experts: usize,
+    num_experts_per_tok: usize,
+) {
+    let layer = &m.weights.layers[layer_idx];
+    if let Some(ref streamer) = moe.expert_streamer {
+        primitives::moe_ffn_block_streamed_pre_normed(
+            m.backend,
+            streamer,
+            layer_idx,
+            layer.router_gate.as_ref().unwrap(),
+            &m.hidden,
+            &m.norm_buf,
+            &moe.moe_gate_buf,
+            &moe.moe_output,
+            &moe.routing_output,
+            &m.gate_buf,
+            d.hidden_size,
+            moe_inter,
+            num_experts,
+            num_experts_per_tok,
+        );
+    } else {
+        primitives::moe_ffn_block_pre_normed(
+            m.backend,
+            layer.router_gate.as_ref().unwrap(),
+            layer.experts.as_ref().unwrap(),
+            &m.hidden,
+            &m.norm_buf,
+            &moe.moe_gate_buf,
+            &moe.moe_up_buf,
+            &moe.moe_output,
+            &moe.routing_output,
+            &m.gate_buf,
             d.hidden_size,
             moe_inter,
             num_experts,
@@ -124,6 +206,7 @@ pub(crate) fn forward_single_paged<
     token_id: u32,
     pool: &KvPool<B>,
     seq_state: &SeqKvState<B>,
+    moe: &MoeBuffers<B>,
 ) -> anyhow::Result<()> {
     let d = m.dims();
     let pos = seq_state.seq_len as u32;
@@ -183,20 +266,24 @@ pub(crate) fn forward_single_paged<
             None,
             m.turbo_ctx.as_ref(),
         );
-        primitives::o_proj_residual(
+        // Fused O-proj + residual-add + post-attention RMSNorm: saves one
+        // full read of the hidden tensor.  Inspired by rvLLM (m0at).
+        primitives::o_proj_fused_residual_norm(
             m.backend,
             layer,
             &m.attn_out,
             &m.norm_buf,
             &m.hidden,
             d.hidden_size,
+            d.eps,
         );
         profile::record(m.backend, t, Component::Attention);
 
-        // --- MoE FFN sub-block ---
+        // --- MoE FFN sub-block (pre-normed: fused residual+norm already produced norm_buf) ---
         let t = profile::begin(m.backend);
-        moe_ffn_block(
+        moe_ffn_block_pre_normed(
             m,
+            moe,
             layer_idx,
             &d,
             moe_inter,
@@ -255,6 +342,7 @@ pub(crate) fn forward_prefill_paged<
     pool: &KvPool<B>,
     seq_state: &SeqKvState<B>,
     bufs: &PrefillBuffers<B>,
+    moe: &MoeBuffers<B>,
 ) -> anyhow::Result<()> {
     let d = m.dims();
     let bs = tokens.len() as u32;
@@ -321,6 +409,7 @@ pub(crate) fn forward_prefill_paged<
 
             moe_ffn_block(
                 m,
+                moe,
                 layer_idx,
                 &d,
                 moe_inter,

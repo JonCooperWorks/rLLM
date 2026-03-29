@@ -19,7 +19,7 @@
 // Related files:
 //   gpu/mod.rs          — quantize_bf16_to_q4(), quantize_bf16_to_q8()
 //   gpu/ops/quant.rs    — WeightQuantiser trait, QuantFormat enum
-//   model/loader.rs     — load_safetensors_files(), pre-quantized detection
+//   model/loader/     — load_safetensors_files(), pre-quantized detection
 //   model/config.rs     — ModelConfig parsing
 // ===========================================================================
 

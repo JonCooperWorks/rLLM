@@ -16,7 +16,7 @@
 //
 // Batched prefill:
 //   The engine drains ALL pending prefill tokens for a sequence in one call
-//   to forward_prefill_paged().  This uses GEMM (mat-mat) instead of mat-vec
+//   to ModelForward::forward_prefill().  This uses GEMM (mat-mat) instead of mat-vec
 //   for all projections, shifting from bandwidth-bound to compute-bound.
 //
 //   The flow for each prefilling sequence:
@@ -58,6 +58,7 @@ use std::collections::{HashMap, VecDeque};
 
 use self::dispatch::Dispatch;
 use crate::gpu::GpuBackend;
+use crate::model::forward::ModelForward;
 use crate::model::kv_cache::{self, BlockHandle, KvPool, PrefixCache, SeqKvState, BLOCK_SIZE};
 use crate::model::tokenizer::Tokenizer;
 use crate::model::{self, Model, PrefillBuffers};
@@ -570,6 +571,8 @@ fn sample_and_finish<D: Dispatch>(
 /// logits here instead of in the model's single-token logits_buf.
 pub(crate) struct SingleGpuDispatch<'a, B: GpuBackend> {
     pub model: Model<'a, B>,
+    /// Architecture-specific forward pass (eliminates match dispatch on ModelArch).
+    forward: Box<dyn ModelForward<B> + 'a>,
     pub kv_pool: KvPool<B>,
     prefill_bufs: PrefillBuffers<B>,
     /// Tokenizer vocab size — may be smaller than the model's embedding vocab
@@ -589,6 +592,7 @@ pub(crate) struct SingleGpuDispatch<'a, B: GpuBackend> {
 impl<'a, B: GpuBackend> SingleGpuDispatch<'a, B> {
     pub fn new(
         model: Model<'a, B>,
+        forward: Box<dyn ModelForward<B> + 'a>,
         kv_pool: KvPool<B>,
         backend: &'a B,
         max_active: usize,
@@ -605,6 +609,7 @@ impl<'a, B: GpuBackend> SingleGpuDispatch<'a, B> {
         let prefix_cache = PrefixCache::new(64);
         Self {
             model,
+            forward,
             kv_pool,
             prefill_bufs,
             logits_batch,
@@ -654,8 +659,8 @@ impl<'a, B: GpuBackend> Dispatch for SingleGpuDispatch<'a, B> {
         state: &SeqKvState<B>,
         images: &[crate::model::vision::ProcessedImage],
     ) -> anyhow::Result<()> {
-        self.model
-            .forward_prefill_paged(tokens, &self.kv_pool, state, &self.prefill_bufs, images)
+        self.forward.prefill_preamble(&self.model, tokens, state, &self.prefill_bufs, images)?;
+        self.forward.forward_prefill(&self.model, tokens, &self.kv_pool, state, &self.prefill_bufs)
     }
 
     fn finish_prefill(state: &mut SeqKvState<B>, token_count: usize) {
@@ -673,7 +678,7 @@ impl<'a, B: GpuBackend> Dispatch for SingleGpuDispatch<'a, B> {
     }
 
     fn forward_decode(&self, token: u32, state: &SeqKvState<B>) -> anyhow::Result<()> {
-        self.model.forward_single_paged(token, &self.kv_pool, state)
+        self.forward.forward_decode(&self.model, token, &self.kv_pool, state)
     }
 
     fn finish_decode(state: &mut SeqKvState<B>) {
@@ -739,7 +744,7 @@ impl<'a, B: GpuBackend> Dispatch for SingleGpuDispatch<'a, B> {
     }
 
     fn supports_batched_decode(&self) -> bool {
-        self.model.arch_supports_batched_decode()
+        self.forward.supports_batched_decode()
     }
 
     fn forward_decode_batch(
@@ -748,7 +753,8 @@ impl<'a, B: GpuBackend> Dispatch for SingleGpuDispatch<'a, B> {
         positions: &[u32],
         states: &[&SeqKvState<B>],
     ) -> anyhow::Result<()> {
-        self.model.forward_decode_batch_paged(
+        self.forward.forward_decode_batch(
+            &self.model,
             tokens,
             positions,
             &self.kv_pool,
@@ -794,13 +800,14 @@ pub(crate) struct Engine<'a, B: GpuBackend> {
 impl<'a, B: GpuBackend> Engine<'a, B> {
     pub fn new(
         model: Model<'a, B>,
+        forward: Box<dyn ModelForward<B> + 'a>,
         kv_pool: KvPool<B>,
         tokenizer: Tokenizer,
         backend: &'a B,
         max_active: usize,
     ) -> Self {
         let tokenizer_vocab_size = tokenizer.vocab_size();
-        let dispatch = SingleGpuDispatch::new(model, kv_pool, backend, max_active, tokenizer_vocab_size);
+        let dispatch = SingleGpuDispatch::new(model, forward, kv_pool, backend, max_active, tokenizer_vocab_size);
         let scheduler = Scheduler::new(max_active);
         Self {
             dispatch,

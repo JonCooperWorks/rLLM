@@ -648,7 +648,7 @@ impl<B: GpuCore> SeqKvState<B> {
 
     /// Advance seq_len by `count` after writing multiple tokens' KV (batched prefill).
     ///
-    /// After `forward_prefill_paged` writes K/V for the whole prompt chunk
+    /// After `forward_prefill` writes K/V for the whole prompt chunk
     /// into the paged cache, this records that those positions are now occupied.
     /// Future decode steps will attend to all these positions.
     pub fn advance_by(&mut self, count: usize) {
