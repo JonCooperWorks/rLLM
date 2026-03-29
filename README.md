@@ -63,7 +63,7 @@ All models support bf16 and Q4. Multi-GPU via `--tp N` requires CUDA + NCCL.
 | Nemotron-H 30B | 31.6B (3.6B active) | 5.6 tok/s | 36 tok/s | 24 tok/s | 40,173 ms | 727 ms |
 | Gemma 3 27B Instruct | 27.4B | 1.9 tok/s | 15 tok/s | 8.9 tok/s | 50,900 ms | 559 ms |
 | Mixtral 8x7B Instruct ⚡ | 46.7B (12.9B active) | 0.4 tok/s | 28 tok/s | 12 tok/s | 20,853 ms | 1,721 ms |
-| Qwen3.5 27B ⚡ | ~27B | 2.0 tok/s | 17 tok/s | — | 47,200 ms | 617 ms |
+| Qwen3.5 27B ⚡ | ~27B | 2.0 tok/s | 17 tok/s | 11 tok/s | 47,200 ms | 617 ms |
 | Qwen3.5 122B-A10B ⚡ | 122B (10B active) | — | — | — | 111,078 ms | 21,634 ms |
 | Qwen3.5 397B-A27B ⚡ | 397B (17B active) | — | — | — | — | 46,338 ms |
 
