@@ -62,6 +62,7 @@ pub(crate) fn exec(args: QuantizeArgs) -> anyhow::Result<()> {
     let input_dir = &args.model;
     let output_dir = &args.output;
 
+    #[allow(unused_mut)]
     let mut format = QuantFormat::from_name(&args.format).ok_or_else(|| {
         anyhow::anyhow!(
             "unknown quantization format '{}' (supported: q4, q8, fp8)",

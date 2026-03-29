@@ -1594,7 +1594,7 @@ impl GpuMamba2 for CpuBackend {
         b_offset: u32,
         c_offset: u32,
         dt_offset: u32,
-        eps: f32,
+        _eps: f32,
     ) {
         // Selective SSM step with grouped B/C, persistent state, and RMSNorm.
         let nh = num_heads as usize;
@@ -1614,7 +1614,7 @@ impl GpuMamba2 for CpuBackend {
         let a_log_data = read_f32(a_log, nh);
         let d_skip_data = read_f32(d_skip, nh);
         let dt_bias_data = read_f32(dt_bias, nh);
-        let nw_data = read_bf16(norm_weight, nh * hd);
+        let _nw_data = read_bf16(norm_weight, nh * hd);
 
         // Read mutable state as f32: [num_heads * head_dim * state_size]
         let mut st = read_f32(state, nh * hd * ss);

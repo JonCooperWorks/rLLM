@@ -22,11 +22,11 @@ pub(crate) mod tp {
 
     use crate::gpu::cuda::CudaBackend;
     use crate::gpu::parallel::{DeviceConfig, ParallelStrategy, ShardingPlan};
-    use crate::gpu::{GpuBackend, GpuCore, TensorDtype};
-    use crate::model::config::{ModelArch, ModelConfig};
+    use crate::gpu::GpuCore;
+    use crate::model::config::ModelConfig;
     use crate::model::forward::ModelForward;
     use crate::model::kv_cache::{KvPool, SeqKvState};
-    use crate::model::loader::{self, ModelWeights};
+    use crate::model::loader;
     use crate::model::{Model, PrefillBuffers};
 
     /// Per-rank inference state: backend, model, KV cache, prefill buffers.
@@ -34,6 +34,7 @@ pub(crate) mod tp {
     /// The backend is boxed for a stable heap address (Model borrows it).
     /// Safety: backend outlives model (both in RankState, drop order is
     /// fields top-down in declaration order).
+    #[allow(dead_code)]
     pub(crate) struct RankState {
         // Order matters for drop: model and forward must drop before backend.
         pub model: Model<'static, CudaBackend>,
@@ -46,12 +47,14 @@ pub(crate) mod tp {
     }
 
     /// Multi-GPU inference controller.
+    #[allow(dead_code)]
     pub(crate) struct MultiGpuInference {
         pub ranks: Vec<RankState>,
         pub config: ModelConfig,
         pub world_size: usize,
     }
 
+    #[allow(dead_code)]
     impl MultiGpuInference {
         /// Create multi-GPU inference with `world_size` GPUs.
         pub fn new(

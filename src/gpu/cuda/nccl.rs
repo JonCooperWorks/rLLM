@@ -16,6 +16,7 @@ use cudarc::nccl::sys as nccl_sys;
 ///
 /// Stores the `ncclComm_t` alongside the device ordinal and stream handle
 /// for use in allreduce operations.
+#[allow(dead_code)]
 pub(crate) struct NcclComm {
     pub(crate) comm: nccl_sys::ncclComm_t,
     pub(crate) rank: usize,

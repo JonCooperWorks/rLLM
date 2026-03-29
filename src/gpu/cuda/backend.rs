@@ -57,7 +57,7 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use cudarc::driver::{
-    CudaContext, CudaEvent, CudaFunction, CudaModule, CudaStream, LaunchConfig,
+    CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -87,6 +87,7 @@ const CUDA_SOURCE_TURBOQUANT: &str = include_str!("shaders/turboquant.cu");
 // are already committed to the GPU immediately.
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 pub(crate) struct CudaBackend {
     pub(crate) ctx: Arc<CudaContext>,
     pub(crate) stream: Arc<CudaStream>,
