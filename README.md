@@ -72,6 +72,32 @@ All models support bf16 and Q4. Multi-GPU via `--tp N` requires CUDA + NCCL.
 </details>
 
 <details>
+<summary><b>NVIDIA RTX 5090 32 GB</b> — 1.79 TB/s GDDR7X (March 29, 2026)</summary>
+
+Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Q8 uses FP8 E4M3 (native on SM 12.0).
+
+| Model | Params | bf16 | Q4 | Q8 (FP8) | TTFT (bf16) | TTFT (Q4) |
+|---|---|---|---|---|---|---|
+| Llama 3.2 3B Instruct | 3.2B | 108 tok/s | 129 tok/s | 97 tok/s | 100 ms | 102 ms |
+| Qwen 2.5 3B Instruct | 3.1B | 122 tok/s | 137 tok/s | 100 tok/s | 109 ms | 127 ms |
+| Gemma 3 4B Instruct | 4.3B | 60 tok/s | 68 tok/s | 58 tok/s | 119 ms | 121 ms |
+| Qwen 2.5 7B Instruct | 7.6B | 77 tok/s | 110 tok/s | 77 tok/s | 152 ms | 149 ms |
+| Mistral 7B Instruct | 7.2B | 67 tok/s | 89 tok/s | 67 tok/s | 158 ms | 162 ms |
+| Llama 3.1 8B Instruct | 8.0B | 65 tok/s | 86 tok/s | 65 tok/s | 164 ms | 165 ms |
+| Qwen3.5 9B † | ~9B | 55 tok/s | 76 tok/s | 62 tok/s | 2,323 ms | 1,679 ms |
+| Phi-4 | 14.7B | 39 tok/s | 57 tok/s | 40 tok/s | 254 ms | 253 ms |
+| Nemotron-H 30B | 31.6B (3.6B active) | — | 104 tok/s | — | — | 148 ms |
+| DeepSeek-R1-Distill-Qwen-32B | 32.8B | — | 31 tok/s | — | — | 597 ms |
+| Gemma 3 27B Instruct | 27.4B | — | 30 tok/s | — | — | 465 ms |
+| Qwen3.5 27B † | ~27B | — | 29 tok/s | 22 tok/s | — | 4,353 ms |
+| Qwen3.5 35B-A3B † | 35.1B (3.3B active) | 3.5 ⚡ | 58 tok/s | — | 38,442 ms | 2,219 ms |
+| Mixtral 8x7B Instruct | 46.7B (12.9B active) | 0.4 ⚡ | 59 tok/s | — | 21,756 ms | 251 ms |
+
+⚡ = SSD expert streaming (`--stream-experts`). † = thinking model (TTFT includes reasoning time). Q8 column uses FP8 E4M3 format (auto-selected on NVIDIA SM 89+). Q4 MoE models fit entirely in VRAM: Qwen3.5 35B-A3B Q4 at 22 GB, Mixtral Q4 at 25 GB, Nemotron-H Q4 at 19 GB. Benchmarked via `tests/bench.py` (HTTP API, 2 runs averaged).
+
+</details>
+
+<details>
 <summary><b>NVIDIA RTX 4080 SUPER 32 GB</b> — 736 GB/s GDDR6X (March 28, 2026)</summary>
 
 Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548).
