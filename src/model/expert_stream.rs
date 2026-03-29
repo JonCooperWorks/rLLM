@@ -346,6 +346,7 @@ impl<B: GpuCore> ExpertStreamer<B> {
         let dtype = match index.quant_format {
             Some(crate::gpu::ops::quant::QuantFormat::Q4) => TensorDtype::Q4,
             Some(crate::gpu::ops::quant::QuantFormat::Q8) => TensorDtype::Q8,
+            Some(crate::gpu::ops::quant::QuantFormat::FP8) => TensorDtype::FP8,
             None => TensorDtype::BF16,
         };
 
@@ -707,6 +708,10 @@ fn expert_byte_sizes(
         Some(crate::gpu::ops::quant::QuantFormat::Q8) => (
             crate::gpu::q8_byte_count(gate_up_rows, hidden),
             crate::gpu::q8_byte_count(hidden, moe_inter),
+        ),
+        Some(crate::gpu::ops::quant::QuantFormat::FP8) => (
+            crate::gpu::fp8_byte_count(gate_up_rows, hidden),
+            crate::gpu::fp8_byte_count(hidden, moe_inter),
         ),
         None => (
             gate_up_rows * hidden * 2, // bf16

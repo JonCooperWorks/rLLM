@@ -241,8 +241,19 @@ uv run python tests/bench.py --q4-only
 scripts/benchmark.sh
 ```
 
-## Q4 Quantization Format
+## Quantization Formats
 
+### Q4 (4-bit blocks)
 Block size 32 weights, 18 bytes per block: 2-byte bf16 scale + 16 bytes packed nibbles.
 Symmetric: `scale = max(abs) / 7`, `q = clamp(round(v / scale), -8, 7)`, stored as `q + 8`.
 bf16 scale (vs f32) saves 10% I/O per block — critical for NVMe-bound expert streaming.
+
+### Q8 (8-bit blocks)
+Block size 32 weights, 34 bytes per block: 2-byte bf16 scale + 32 signed int8 values.
+Symmetric: `scale = max(abs) / 127`, `q = clamp(round(v / scale), -128, 127)`.
+
+### FP8 E4M3 (NVIDIA SM 89+ only)
+IEEE 8-bit float: 1 sign + 4 exponent (bias 7) + 3 mantissa.  1 byte per weight,
+no block structure.  Range ±448.  Platform-aware dispatch: `--quant q8` automatically
+selects FP8 on NVIDIA Ada/Hopper, Q8 blocks on Metal or older NVIDIA GPUs.
+See `docs/fp8.md` for full documentation.

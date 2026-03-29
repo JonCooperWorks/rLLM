@@ -129,14 +129,20 @@ pub(crate) enum TensorDtype {
     /// Block-wise 8-bit quantization: 32 weights per block, each block is
     /// 34 bytes (2-byte bf16 scale + 32 signed int8 values).
     Q8,
+    /// FP8 E4M3 — IEEE 8-bit float (1 sign + 4 exponent + 3 mantissa).
+    /// 1 byte per weight, no block structure, no per-block scale.
+    /// Used on NVIDIA SM 89+ (Ada/Hopper) where hardware supports native FP8.
+    /// Range ±448, precision ~0.125.  On Metal, Q8 blocks are used instead.
+    FP8,
 }
 
 impl TensorDtype {
-    /// Bytes per element for fixed-size types.  Panics for Q4 (use q4_byte_count).
+    /// Bytes per element for fixed-size types.  Panics for block formats (use q4/q8_byte_count).
     pub fn byte_size(self) -> usize {
         match self {
             TensorDtype::BF16 => 2,
             TensorDtype::F32 => 4,
+            TensorDtype::FP8 => 1,
             TensorDtype::Q4 => panic!("Q4 has variable byte size; use q4_byte_count()"),
             TensorDtype::Q8 => panic!("Q8 has variable byte size; use q8_byte_count()"),
         }
@@ -163,6 +169,15 @@ pub(crate) fn q8_byte_count(m: usize, k: usize) -> usize {
     m.checked_mul(blocks_per_row)
         .and_then(|v| v.checked_mul(34))
         .expect("q8_byte_count overflow: tensor dimensions too large")
+}
+
+/// Compute total byte count for an FP8 weight tensor [m, k].
+///
+/// FP8 has no block structure — 1 byte per weight, so total is just m * k.
+/// Helper kept for consistency with q4_byte_count / q8_byte_count.
+pub(crate) fn fp8_byte_count(m: usize, k: usize) -> usize {
+    m.checked_mul(k)
+        .expect("fp8_byte_count overflow: tensor dimensions too large")
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +323,170 @@ pub(crate) fn quantize_bf16_to_q8(bf16_data: &[u8], m: usize, k: usize) -> Vec<u
                 out[dst_offset + 2 + i] = q as i8 as u8;
             }
         }
+    }
+
+    out
+}
+
+// ---------------------------------------------------------------------------
+// FP8 E4M3 quantisation — NVIDIA Ada/Hopper (SM 89+).
+//
+// Unlike Q4/Q8 block formats, FP8 E4M3 stores one IEEE 8-bit float per
+// weight with no block structure and no per-block scale.  The format is:
+//   1 sign bit + 4 exponent bits (bias 7) + 3 mantissa bits
+//   Range: ±448, min subnormal: 2^-9 ≈ 0.00195
+//   Special: no infinity representation; NaN = 0x7F (S=0, E=1111, M=111)
+//
+// Conversion: bf16 → f32 → clamp to ±448 → repack as E4M3.
+// Output: m * k bytes (one byte per weight).
+//
+// Related:
+//   gpu/ops/quant.rs                — FP8Quantiser (WeightQuantiser impl)
+//   gpu/cuda/shaders/matmul.cu      — matvec_fp8, gemm_fp8 CUDA kernels
+//   gpu/cuda/shaders/matmul_tc.cu   — gemm_fp8_tc tensor-core kernel
+//   gpu/metal/kernels/matmul.rs     — panic stub (FP8 not supported on Metal)
+// ---------------------------------------------------------------------------
+
+/// Convert a single f32 value to FP8 E4M3 format.
+///
+/// Algorithm:
+///   1. Extract sign, exponent, mantissa from f32 (IEEE 754)
+///   2. Handle special cases: zero, NaN/Inf, overflow (>448), underflow
+///   3. Rebias exponent from 127 (f32) to 7 (E4M3)
+///   4. Truncate mantissa from 23 bits to 3 bits with round-to-nearest-even
+///   5. Pack as: [sign:1][exp:4][man:3]
+fn f32_to_fp8_e4m3(val: f32) -> u8 {
+    let bits = val.to_bits();
+    let sign = (bits >> 31) & 1;
+    let exp = ((bits >> 23) & 0xFF) as i32; // biased exponent (bias 127)
+    let man = bits & 0x7FFFFF; // 23-bit mantissa
+
+    // Zero (positive or negative).
+    if exp == 0 && man == 0 {
+        return (sign << 7) as u8;
+    }
+
+    // NaN or Inf → FP8 NaN (0x7F).  E4M3 has no infinity representation.
+    if exp == 255 {
+        return 0x7F;
+    }
+
+    // Compute unbiased exponent.  f32 bias = 127, E4M3 bias = 7.
+    let unbiased = if exp == 0 {
+        // f32 subnormal: effective exponent is -126, value = 0.mantissa * 2^-126
+        -126_i32
+    } else {
+        exp - 127
+    };
+
+    // Reconstruct the absolute value as a normalised mantissa for rebias.
+    // For f32 normals: value = 1.mantissa * 2^unbiased
+    // For f32 subnormals: value = 0.mantissa * 2^-126
+    let abs_val = val.abs();
+
+    // Overflow: |val| > 448 (max representable E4M3 value) → clamp to 448.
+    // Max E4M3: S=0, E=1110, M=111 → (1 + 7/8) * 2^7 = 1.875 * 128 = 240
+    // Wait: E4M3 max exponent is 1110 (14-7=7), max mantissa 111 (7/8).
+    // max = (1 + 7/8) * 2^7 = 240.  But E=1111 with M<111 are also valid
+    // normals (no inf in E4M3): E=1111,M=110 → (1+6/8)*2^8 = 448.
+    // Actually: E=1111 (unbiased 8), M=110 → (1 + 6/8) * 2^8 = 1.75*256 = 448.
+    // E=1111, M=111 is NaN.  So max normal = 448.
+    if abs_val > 448.0 {
+        // Max E4M3 value: sign | E=1111 | M=110 = 0x7E (positive)
+        return ((sign << 7) | 0x7E) as u8;
+    }
+
+    // Underflow: too small for even the smallest E4M3 subnormal.
+    // Smallest E4M3 subnormal: E=0000, M=001 → 0.125 * 2^(-6) = 2^-9 ≈ 0.00195
+    let min_subnormal = f32::from_bits(0x3A00_0000); // 2^-9 * 0.5 (half for rounding)
+    if abs_val < min_subnormal {
+        return (sign << 7) as u8; // flush to signed zero
+    }
+
+    // General conversion: find the best E4M3 representation.
+    // E4M3 biased exponent range: 1..15 (normal), 0 (subnormal).
+    // E4M3 exponent bias = 7, so unbiased range: -6..8 (normal), -6 (subnormal with shift).
+    let fp8_biased_exp = unbiased + 7; // rebias from f32 to E4M3
+
+    if fp8_biased_exp >= 1 && fp8_biased_exp <= 15 {
+        // Normal E4M3 value.
+        // Round mantissa from 23 bits to 3 bits (round-to-nearest-even).
+        let shift = 23 - 3; // 20 bits to drop
+        let truncated = man >> shift;
+        let remainder = man & ((1 << shift) - 1);
+        let halfway = 1 << (shift - 1);
+
+        let rounded = if remainder > halfway {
+            truncated + 1
+        } else if remainder == halfway {
+            // Round to even.
+            if truncated & 1 == 1 {
+                truncated + 1
+            } else {
+                truncated
+            }
+        } else {
+            truncated
+        };
+
+        // Mantissa overflow from rounding → increment exponent.
+        let (final_exp, final_man) = if rounded >= 8 {
+            (fp8_biased_exp + 1, 0u32)
+        } else {
+            (fp8_biased_exp, rounded)
+        };
+
+        // Check for overflow after rounding.
+        if final_exp > 15 || (final_exp == 15 && final_man == 7) {
+            // Overflow to max or NaN boundary → clamp to max.
+            return ((sign << 7) | 0x7E) as u8;
+        }
+
+        ((sign << 7) | ((final_exp as u32) << 3) | final_man) as u8
+    } else if fp8_biased_exp <= 0 {
+        // Subnormal E4M3: E=0000, mantissa encodes 0.XXX * 2^(-6).
+        // value = mantissa/8 * 2^(-6), so mantissa = round(value * 8 * 2^6)
+        //       = round(value * 512)
+        let subnormal_man = (abs_val * 512.0).round() as u32;
+        let clamped = subnormal_man.min(7); // max subnormal mantissa
+        if clamped == 0 {
+            return (sign << 7) as u8; // too small, flush to zero
+        }
+        ((sign << 7) | clamped) as u8
+    } else {
+        // fp8_biased_exp > 15: overflow → max value.
+        ((sign << 7) | 0x7E) as u8
+    }
+}
+
+/// Quantise a bf16 weight matrix [m, k] to FP8 E4M3.
+///
+/// Unlike Q4/Q8, FP8 has no block structure: each weight is independently
+/// converted to a 1-byte IEEE FP8 E4M3 value.  Output size = m * k bytes.
+pub(crate) fn quantize_bf16_to_fp8(bf16_data: &[u8], m: usize, k: usize) -> Vec<u8> {
+    use half::bf16;
+
+    assert_eq!(bf16_data.len(), m * k * 2);
+
+    // Try zero-copy cast first; fall back to a copy if the mmap slice
+    // isn't 2-byte aligned (can happen with some safetensors packing).
+    let owned_buf: Vec<bf16>;
+    let values: &[bf16] = match bytemuck::try_cast_slice(bf16_data) {
+        Ok(v) => v,
+        Err(_) => {
+            owned_buf = bf16_data
+                .chunks_exact(2)
+                .map(|c| bf16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            &owned_buf
+        }
+    };
+    assert_eq!(values.len(), m * k);
+
+    let mut out = vec![0u8; fp8_byte_count(m, k)];
+
+    for i in 0..m * k {
+        out[i] = f32_to_fp8_e4m3(values[i].to_f32());
     }
 
     out
@@ -513,5 +692,101 @@ mod tests {
     #[should_panic(expected = "q8_byte_count overflow")]
     fn test_q8_byte_count_overflow_panics() {
         let _ = q8_byte_count(usize::MAX / 2, 64);
+    }
+
+    // FP8 byte count and dtype tests.
+
+    #[test]
+    fn test_tensor_dtype_byte_size_fp8() {
+        assert_eq!(TensorDtype::FP8.byte_size(), 1);
+    }
+
+    #[test]
+    fn test_fp8_byte_count() {
+        assert_eq!(fp8_byte_count(1, 32), 32);
+        assert_eq!(fp8_byte_count(1, 64), 64);
+        assert_eq!(fp8_byte_count(4, 64), 256);
+        assert_eq!(fp8_byte_count(2048, 2048), 2048 * 2048);
+    }
+
+    #[test]
+    #[should_panic(expected = "fp8_byte_count overflow")]
+    fn test_fp8_byte_count_overflow_panics() {
+        let _ = fp8_byte_count(usize::MAX, 2);
+    }
+
+    #[test]
+    fn test_f32_to_fp8_e4m3_zero() {
+        assert_eq!(f32_to_fp8_e4m3(0.0), 0x00);
+        assert_eq!(f32_to_fp8_e4m3(-0.0), 0x80);
+    }
+
+    #[test]
+    fn test_f32_to_fp8_e4m3_one() {
+        // 1.0 = 1.000 * 2^0, E4M3: sign=0, exp=0+7=7=0111, man=000
+        // Byte: 0_0111_000 = 0x38
+        assert_eq!(f32_to_fp8_e4m3(1.0), 0x38);
+    }
+
+    #[test]
+    fn test_f32_to_fp8_e4m3_negative_one() {
+        // -1.0: sign=1, exp=0111, man=000 → 1_0111_000 = 0xB8
+        assert_eq!(f32_to_fp8_e4m3(-1.0), 0xB8);
+    }
+
+    #[test]
+    fn test_f32_to_fp8_e4m3_max_value() {
+        // Max E4M3 = 448.0: sign=0, E=1111, M=110 → 0_1111_110 = 0x7E
+        assert_eq!(f32_to_fp8_e4m3(448.0), 0x7E);
+        // Values > 448 clamp to max.
+        assert_eq!(f32_to_fp8_e4m3(500.0), 0x7E);
+        assert_eq!(f32_to_fp8_e4m3(1000.0), 0x7E);
+    }
+
+    #[test]
+    fn test_f32_to_fp8_e4m3_nan_inf() {
+        assert_eq!(f32_to_fp8_e4m3(f32::NAN), 0x7F);
+        assert_eq!(f32_to_fp8_e4m3(f32::INFINITY), 0x7F);
+        assert_eq!(f32_to_fp8_e4m3(f32::NEG_INFINITY), 0x7F);
+    }
+
+    #[test]
+    fn test_f32_to_fp8_e4m3_round_trip_accuracy() {
+        // Test a range of values and verify round-trip accuracy.
+        // FP8 E4M3 dequant: reconstruct f32 from the 8-bit pattern.
+        fn fp8_to_f32(bits: u8) -> f32 {
+            let sign = (bits >> 7) & 1;
+            let exp = ((bits >> 3) & 0xF) as i32;
+            let man = (bits & 0x7) as f32;
+            if exp == 0xF && (bits & 0x7) == 0x7 {
+                return f32::NAN; // NaN
+            }
+            let val = if exp == 0 {
+                // Subnormal: 0.man * 2^(-6)
+                (man / 8.0) * (2.0_f32).powi(-6)
+            } else {
+                // Normal: (1 + man/8) * 2^(exp - 7)
+                (1.0 + man / 8.0) * (2.0_f32).powi(exp - 7)
+            };
+            if sign == 1 { -val } else { val }
+        }
+
+        // Values within FP8 E4M3 representable range (min subnormal ~0.00195).
+        // Very small values like 0.001 are below the smallest subnormal and
+        // cannot round-trip accurately.
+        let test_values = [0.5, 1.0, 2.0, -3.0, 0.125, 100.0, -200.0, 0.25];
+        for &v in &test_values {
+            let fp8 = f32_to_fp8_e4m3(v);
+            let reconstructed = fp8_to_f32(fp8);
+            if reconstructed.is_nan() {
+                continue;
+            }
+            // Relative error should be reasonable for 3-bit mantissa.
+            let rel_err = ((v - reconstructed) / v).abs();
+            assert!(
+                rel_err < 0.2,
+                "FP8 round-trip error too large for {v}: got {reconstructed}, rel_err={rel_err}"
+            );
+        }
     }
 }

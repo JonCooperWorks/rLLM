@@ -25,6 +25,11 @@
 //         scale = max(|w|) / 127, q = clamp(round(w/scale), -128, 127)
 //         GPU kernels: matvec_q8, gemm_q8, fused_gate_up_swiglu_q8
 //
+//   FP8 — IEEE FP8 E4M3, 1 byte per weight, no block structure.
+//          1 sign + 4 exponent (bias 7) + 3 mantissa bits.  Range ±448.
+//          Used on NVIDIA SM 89+ (Ada/Hopper); Metal uses Q8 blocks instead.
+//          GPU kernels: matvec_fp8, gemm_fp8, fused_gate_up_swiglu_fp8
+//
 // ADDING A NEW FORMAT
 //
 //   1. Add a variant to QuantFormat (below)
@@ -56,8 +61,9 @@ use super::super::TensorDtype;
 ///
 /// Each variant corresponds to a `WeightQuantiser` implementation and a
 /// `TensorDtype` variant.  The mapping is:
-///   Q4 → TensorDtype::Q4 (18 bytes per block of 32 weights)
-///   Q8 → TensorDtype::Q8 (34 bytes per block of 32 weights)
+///   Q4  → TensorDtype::Q4  (18 bytes per block of 32 weights)
+///   Q8  → TensorDtype::Q8  (34 bytes per block of 32 weights)
+///   FP8 → TensorDtype::FP8 (1 byte per weight, no blocks)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QuantFormat {
     /// Block-wise 4-bit symmetric quantisation.
@@ -66,6 +72,10 @@ pub(crate) enum QuantFormat {
     /// Block-wise 8-bit symmetric quantisation.
     /// 32 weights per block, 34 bytes per block (2-byte bf16 scale + 32 signed int8 values).
     Q8,
+    /// FP8 E4M3 — IEEE 8-bit float, 1 byte per weight, no block structure.
+    /// Used on NVIDIA SM 89+ (Ada/Hopper).  Transparent to user: `--quant q8`
+    /// automatically selects FP8 on supported hardware.
+    FP8,
 }
 
 impl QuantFormat {
@@ -74,6 +84,7 @@ impl QuantFormat {
         match name {
             "q4" | "Q4" => Some(Self::Q4),
             "q8" | "Q8" => Some(Self::Q8),
+            "fp8" | "FP8" => Some(Self::FP8),
             _ => None,
         }
     }
@@ -83,6 +94,7 @@ impl QuantFormat {
         match self {
             Self::Q4 => "q4",
             Self::Q8 => "q8",
+            Self::FP8 => "fp8",
         }
     }
 
@@ -92,6 +104,7 @@ impl QuantFormat {
         match self {
             Self::Q4 => TensorDtype::Q4,
             Self::Q8 => TensorDtype::Q8,
+            Self::FP8 => TensorDtype::FP8,
         }
     }
 
@@ -100,6 +113,7 @@ impl QuantFormat {
         match self {
             Self::Q4 => "rllm-q4",
             Self::Q8 => "rllm-q8",
+            Self::FP8 => "rllm-fp8",
         }
     }
 
@@ -108,6 +122,7 @@ impl QuantFormat {
         match self {
             Self::Q4 => "rllm_q4:",
             Self::Q8 => "rllm_q8:",
+            Self::FP8 => "rllm_fp8:",
         }
     }
 
@@ -116,6 +131,7 @@ impl QuantFormat {
         match tag {
             "rllm-q4" => Some(Self::Q4),
             "rllm-q8" => Some(Self::Q8),
+            "rllm-fp8" => Some(Self::FP8),
             _ => None,
         }
     }
@@ -235,6 +251,35 @@ impl WeightQuantiser for Q8Quantiser {
 }
 
 // ---------------------------------------------------------------------------
+// FP8 quantiser — IEEE FP8 E4M3 (NVIDIA SM 89+).
+//
+// No block structure: each weight is independently converted to a 1-byte
+// FP8 E4M3 value.  block_size and bytes_per_block are both 1 (degenerate
+// "block" of one weight), which makes the generic byte_count() method
+// compute m * (k/1) * 1 = m * k, the correct result.
+// ---------------------------------------------------------------------------
+
+pub(crate) struct FP8Quantiser;
+
+impl WeightQuantiser for FP8Quantiser {
+    fn format(&self) -> QuantFormat {
+        QuantFormat::FP8
+    }
+
+    fn block_size(&self) -> usize {
+        1
+    }
+
+    fn bytes_per_block(&self) -> usize {
+        1
+    }
+
+    fn quantise(&self, bf16_data: &[u8], m: usize, k: usize) -> Vec<u8> {
+        super::super::quantize_bf16_to_fp8(bf16_data, m, k)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Factory — get the quantiser for a given format.
 // ---------------------------------------------------------------------------
 
@@ -243,6 +288,7 @@ pub(crate) fn quantiser(format: QuantFormat) -> &'static dyn WeightQuantiser {
     match format {
         QuantFormat::Q4 => &Q4Quantiser,
         QuantFormat::Q8 => &Q8Quantiser,
+        QuantFormat::FP8 => &FP8Quantiser,
     }
 }
 
@@ -369,5 +415,58 @@ mod tests {
     fn test_byte_count_misaligned_k_panics() {
         let q = quantiser(QuantFormat::Q4);
         let _ = q.byte_count(1, 17); // not divisible by 32
+    }
+
+    // FP8 quantiser tests.
+
+    #[test]
+    fn test_fp8_byte_count_matches_legacy() {
+        let q = quantiser(QuantFormat::FP8);
+        assert_eq!(q.byte_count(1, 32), crate::gpu::fp8_byte_count(1, 32));
+        assert_eq!(q.byte_count(1, 64), crate::gpu::fp8_byte_count(1, 64));
+        assert_eq!(q.byte_count(4, 64), crate::gpu::fp8_byte_count(4, 64));
+        assert_eq!(q.byte_count(2048, 2048), crate::gpu::fp8_byte_count(2048, 2048));
+    }
+
+    #[test]
+    fn test_fp8_row_bytes() {
+        let q = quantiser(QuantFormat::FP8);
+        // 1 byte per weight, no block overhead.
+        assert_eq!(q.row_bytes(32), 32);
+        assert_eq!(q.row_bytes(2048), 2048);
+    }
+
+    #[test]
+    fn test_fp8_format_round_trip() {
+        let fmt = QuantFormat::from_name("fp8").unwrap();
+        assert_eq!(fmt.name(), "fp8");
+        assert_eq!(fmt.dtype(), TensorDtype::FP8);
+        assert_eq!(fmt.metadata_tag(), "rllm-fp8");
+
+        let fmt2 = QuantFormat::from_metadata_tag("rllm-fp8").unwrap();
+        assert_eq!(fmt, fmt2);
+    }
+
+    #[test]
+    fn test_fp8_format_from_name_case_insensitive() {
+        assert!(QuantFormat::from_name("FP8").is_some());
+        assert!(QuantFormat::from_name("fp8").is_some());
+    }
+
+    #[test]
+    fn test_fp8_quantise_output_size() {
+        use half::bf16;
+
+        let m = 2;
+        let k = 64;
+        let values: Vec<bf16> = (0..m * k)
+            .map(|i| bf16::from_f32((i % 17) as f32 * 0.1 - 0.8))
+            .collect();
+        let bf16_bytes: &[u8] = bytemuck::cast_slice(&values);
+
+        let q = quantiser(QuantFormat::FP8);
+        let fp8_data = q.quantise(bf16_bytes, m, k);
+        assert_eq!(fp8_data.len(), m * k); // 1 byte per weight
+        assert_eq!(fp8_data.len(), q.byte_count(m, k));
     }
 }

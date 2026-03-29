@@ -49,6 +49,9 @@ impl GpuMatmul for MetalBackend {
             // reduces register pressure enough to match bf16.
             TensorDtype::Q4 => (&self.pipeline_matvec_q4, 2u64),
             TensorDtype::Q8 => (&self.pipeline_matvec_q8, 2u64),
+            // FP8: not supported on Metal — no FP8 hardware.  Should never be
+            // reached because the loader selects Q8 blocks on Metal.
+            TensorDtype::FP8 => panic!("FP8 tensors not supported on Metal — use Q8 block format"),
             // BF16: multi-row SIMD (2 rows per SIMD group) — x loaded once,
             // used for both rows, giving free ILP via independent accumulators.
             _ => (&self.pipeline_matvec, ROWS_PER_SIMD_BF16),
@@ -76,6 +79,7 @@ impl GpuMatmul for MetalBackend {
         let pipeline = match weight.dtype {
             TensorDtype::Q4 => &self.pipeline_gemm_q4,
             TensorDtype::Q8 => &self.pipeline_gemm_q8,
+            TensorDtype::FP8 => panic!("FP8 tensors not supported on Metal — use Q8 block format"),
             _ => &self.pipeline_gemm_bf16,
         };
         self.dispatch_async(

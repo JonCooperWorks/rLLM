@@ -571,3 +571,153 @@ extern "C" __global__ void gemm_q8_tc(
 ) {
     gemm_q8_tc_impl(params, W_q8, X, Y);
 }
+
+// ===========================================================================
+// FP8 E4M3 tile loader and tensor-core GEMM.
+//
+// FP8 has no block structure — 1 byte per weight, linear addressing.
+// Dequant: each byte is an independent FP8 E4M3 value converted to bf16.
+// The conversion function is duplicated here (not shared with matmul.cu)
+// because NVRTC compiles each .cu file independently.
+// ===========================================================================
+
+// FP8 E4M3 → float conversion (same as in matmul.cu, duplicated for NVRTC).
+__device__ __forceinline__ float fp8_e4m3_to_float_tc(unsigned char bits) {
+    unsigned int sign = (bits >> 7) & 1;
+    unsigned int exp  = (bits >> 3) & 0xF;
+    unsigned int man  = bits & 0x7;
+    if (exp == 0xF && man == 0x7) return __uint_as_float(0x7FC00000);
+    float val;
+    if (exp == 0) {
+        val = ((float)man / 8.0f) * 0.015625f;
+    } else {
+        unsigned int f32_exp = (unsigned int)(exp - 7 + 127);
+        unsigned int f32_bits = (sign << 31) | (f32_exp << 23) | (man << 20);
+        return __uint_as_float(f32_bits);
+    }
+    return sign ? -val : val;
+}
+
+// ---------------------------------------------------------------------------
+// FP8 tile loader for tensor-core GEMM.
+//
+// Simpler than Q8 — no block headers or scale, just linear byte access.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void load_weight_tile_fp8(
+    __nv_bfloat16 A_shared[TILE_N][TILE_K],
+    const unsigned char* __restrict__ W_fp8,
+    unsigned int tile_n_start,
+    unsigned int k_start,
+    unsigned int M,
+    unsigned int K,
+    unsigned int tid
+) {
+    const unsigned int total_elems = TILE_N * TILE_K;
+    for (unsigned int idx = tid; idx < total_elems; idx += 256) {
+        unsigned int row = idx / TILE_K;
+        unsigned int col = idx % TILE_K;
+        unsigned int global_row = tile_n_start + row;
+        unsigned int global_col = k_start + col;
+
+        __nv_bfloat16 val;
+        if (global_row < M && global_col < K) {
+            float w = fp8_e4m3_to_float_tc(W_fp8[global_row * K + global_col]);
+            val = __float2bfloat16(w);
+        } else {
+            val = __float2bfloat16(0.0f);
+        }
+        A_shared[row][col] = val;
+    }
+}
+
+// FP8 tensor-core GEMM implementation.
+// Identical to Q8 TC but uses FP8 tile loader.
+__global__ void gemm_fp8_tc_impl(
+    const GemmParams params,
+    const unsigned char* __restrict__ W_fp8,
+    const __nv_bfloat16* __restrict__ X,
+    __nv_bfloat16* __restrict__ Y
+) {
+    const unsigned int batch_size = params.batch_size;
+    const unsigned int M = params.M;
+    const unsigned int K = params.K;
+
+    const unsigned int tile_n_start = blockIdx.x * TILE_N;
+    const unsigned int tile_m_start = blockIdx.y * TILE_M;
+
+    if (tile_n_start >= M && tile_m_start >= batch_size) return;
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int warp_id = tid / 32;
+    const unsigned int warp_row = warp_id / WARPS_N;
+    const unsigned int warp_col = warp_id % WARPS_N;
+
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag[WARP_TILES_M][WARP_TILES_N];
+    for (int i = 0; i < WARP_TILES_M; i++)
+        for (int j = 0; j < WARP_TILES_N; j++)
+            wmma::fill_fragment(c_frag[i][j], 0.0f);
+
+    __shared__ __nv_bfloat16 A_shared[2][TILE_N][TILE_K];
+    __shared__ __nv_bfloat16 B_shared[2][TILE_K][TILE_M];
+
+    const unsigned int num_k_tiles = (K + TILE_K - 1) / TILE_K;
+
+    for (unsigned int kt = 0; kt < num_k_tiles; kt++) {
+        int buf = kt % 2;
+        unsigned int k_start = kt * TILE_K;
+
+        load_weight_tile_fp8(A_shared[buf], W_fp8, tile_n_start, k_start, M, K, tid);
+        load_input_tile(B_shared[buf], X, tile_m_start, k_start, batch_size, K, tid);
+        __syncthreads();
+
+        for (int k_inner = 0; k_inner < TILE_K; k_inner += WMMA_K) {
+            for (int wi = 0; wi < WARP_TILES_M; wi++) {
+                unsigned int a_row = warp_row * (TILE_N / WARPS_M) + wi * WMMA_M;
+                wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K,
+                               __nv_bfloat16, wmma::row_major> a_frag;
+                wmma::load_matrix_sync(a_frag, &A_shared[buf][a_row][k_inner], TILE_K);
+
+                for (int wj = 0; wj < WARP_TILES_N; wj++) {
+                    unsigned int b_col = warp_col * (TILE_M / WARPS_N) + wj * WMMA_N;
+                    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K,
+                                   __nv_bfloat16, wmma::row_major> b_frag;
+                    wmma::load_matrix_sync(b_frag, &B_shared[buf][k_inner][b_col], TILE_M);
+                    wmma::mma_sync(c_frag[wi][wj], a_frag, b_frag, c_frag[wi][wj]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Epilogue: store f32 fragments to global memory as bf16.
+    float* warp_staging = (float*)&A_shared[0][0][0] + warp_id * WMMA_M * WMMA_N;
+    const unsigned int lane = tid % 32;
+
+    for (int wi = 0; wi < WARP_TILES_M; wi++) {
+        for (int wj = 0; wj < WARP_TILES_N; wj++) {
+            wmma::store_matrix_sync(warp_staging, c_frag[wi][wj], WMMA_N, wmma::mem_row_major);
+
+            unsigned int frag_m_start = tile_n_start + warp_row * (TILE_N / WARPS_M) + wi * WMMA_M;
+            unsigned int frag_batch_start = tile_m_start + warp_col * (TILE_M / WARPS_N) + wj * WMMA_N;
+
+            for (unsigned int idx = lane; idx < WMMA_M * WMMA_N; idx += 32) {
+                unsigned int r = idx / WMMA_N;
+                unsigned int c = idx % WMMA_N;
+                unsigned int global_m = frag_m_start + r;
+                unsigned int global_batch = frag_batch_start + c;
+                if (global_batch < batch_size && global_m < M) {
+                    Y[global_batch * M + global_m] = __float2bfloat16(warp_staging[idx]);
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void gemm_fp8_tc(
+    const GemmParams params,
+    const unsigned char* __restrict__ W_fp8,
+    const __nv_bfloat16* __restrict__ X,
+    __nv_bfloat16* __restrict__ Y
+) {
+    gemm_fp8_tc_impl(params, W_fp8, X, Y);
+}

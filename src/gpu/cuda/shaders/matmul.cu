@@ -442,3 +442,122 @@ extern "C" __global__ void gemm_q8(
         Y[batch * M + row] = __float2bfloat16(acc);
     }
 }
+
+// ===========================================================================
+// FP8 E4M3 kernels — IEEE 8-bit float, 1 byte per weight, no block structure.
+//
+// Used on NVIDIA SM 89+ (Ada/Hopper) where native FP8 hardware is available.
+// Unlike Q4/Q8, there is no per-block scale — each byte is an independent
+// FP8 E4M3 value that can be directly converted to float.
+//
+// FP8 E4M3: 1 sign + 4 exponent (bias 7) + 3 mantissa.  Range ±448.
+// No infinity; NaN = 0x7F.
+//
+// Dequantisation is a simple format conversion, not scale*quantized_int.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// fp8_e4m3_to_float — convert a single FP8 E4M3 byte to float.
+//
+// Manual bit manipulation for portability across CUDA versions.
+// On SM 89+ this could use __nv_cvt_fp8_to_halfraw but the manual path
+// avoids version-gating and compiles everywhere.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float fp8_e4m3_to_float(unsigned char bits) {
+    unsigned int sign = (bits >> 7) & 1;
+    unsigned int exp  = (bits >> 3) & 0xF;
+    unsigned int man  = bits & 0x7;
+
+    // NaN: E=1111, M=111
+    if (exp == 0xF && man == 0x7) return __uint_as_float(0x7FC00000); // quiet NaN
+
+    float val;
+    if (exp == 0) {
+        // Subnormal: 0.man * 2^(-6)
+        val = ((float)man / 8.0f) * 0.015625f; // 2^-6 = 0.015625
+    } else {
+        // Normal: (1 + man/8) * 2^(exp - 7)
+        // Build f32 directly: rebias exponent from 7 to 127.
+        unsigned int f32_exp = (unsigned int)(exp - 7 + 127);
+        unsigned int f32_bits = (sign << 31) | (f32_exp << 23) | (man << 20);
+        return __uint_as_float(f32_bits);
+    }
+    return sign ? -val : val;
+}
+
+// ---------------------------------------------------------------------------
+// matvec_fp8 — SIMD-cooperative matvec with inline FP8 dequantisation.
+//
+// Same warp-cooperative pattern as matvec_q8 but with linear addressing
+// (no block structure).  Each lane processes one weight per iteration,
+// 32 lanes cover 32 consecutive weights.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void matvec_fp8(
+    const MatvecParams params,
+    const unsigned char* __restrict__ W_fp8,
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ y
+) {
+    const unsigned int M = params.M;
+    const unsigned int K = params.K;
+    const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    unsigned int row = gid / 32;
+    unsigned int lane = gid % 32;
+    if (row >= M) return;
+
+    const unsigned char* row_data = W_fp8 + row * K;
+
+    float acc = 0.0f;
+
+    // 32 lanes cooperatively process 32 weights at a time.
+    const unsigned int iters = K / 32;
+    for (unsigned int i = 0; i < iters; i++) {
+        unsigned int col = i * 32 + lane;
+        float w = fp8_e4m3_to_float(row_data[col]);
+        acc += w * __bfloat162float(x[col]);
+    }
+
+    acc = warp_sum(acc);
+    if (lane == 0) {
+        y[row] = __float2bfloat16(acc);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// gemm_fp8 — batched GEMM with inline FP8 dequantisation.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void gemm_fp8(
+    const GemmParams params,
+    const unsigned char* __restrict__ W_fp8,
+    const __nv_bfloat16* __restrict__ X,
+    __nv_bfloat16* __restrict__ Y
+) {
+    const unsigned int M = params.M;
+    const unsigned int K = params.K;
+    const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    unsigned int elem = gid / 32;
+    unsigned int lane = gid % 32;
+    unsigned int batch = elem / M;
+    unsigned int row   = elem % M;
+
+    if (batch >= params.batch_size) return;
+
+    const unsigned char* row_data = W_fp8 + row * K;
+    const __nv_bfloat16* x_vec = X + batch * K;
+
+    float acc = 0.0f;
+
+    const unsigned int iters = K / 32;
+    for (unsigned int i = 0; i < iters; i++) {
+        unsigned int col = i * 32 + lane;
+        float w = fp8_e4m3_to_float(row_data[col]);
+        acc += w * __bfloat162float(x_vec[col]);
+    }
+
+    acc = warp_sum(acc);
+    if (lane == 0) {
+        Y[batch * M + row] = __float2bfloat16(acc);
+    }
+}

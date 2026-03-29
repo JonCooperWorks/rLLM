@@ -187,6 +187,15 @@ pub(crate) struct CudaBackend {
     // Q8 MoE kernel.
     pub(crate) fn_fused_gate_up_swiglu_q8: CudaFunction,
 
+    // FP8 E4M3 kernels — NVIDIA SM 89+ (Ada/Hopper).
+    // 1 byte per weight, no block structure, inline FP8→float dequantisation.
+    pub(crate) fn_matvec_fp8: CudaFunction,
+    pub(crate) fn_gemm_fp8: CudaFunction,
+    pub(crate) fn_gemm_fp8_tc: Option<CudaFunction>,
+
+    // FP8 MoE kernel.
+    pub(crate) fn_fused_gate_up_swiglu_fp8: CudaFunction,
+
     // Mamba2 kernels (Nemotron-H).
     pub(crate) fn_mamba2_conv1d_silu: CudaFunction,
     pub(crate) fn_mamba2_ssm_step: CudaFunction,
@@ -428,6 +437,14 @@ impl CudaBackend {
 
             // Q8 MoE kernel.
             fn_fused_gate_up_swiglu_q8: func(&mod_moe, "fused_gate_up_swiglu_q8")?,
+
+            // FP8 E4M3 kernels.
+            fn_matvec_fp8: func(&mod_matmul, "matvec_fp8")?,
+            fn_gemm_fp8: func(&mod_matmul, "gemm_fp8")?,
+            fn_gemm_fp8_tc: mod_matmul_tc.as_ref().map(|m| func(m, "gemm_fp8_tc")).transpose()?,
+
+            // FP8 MoE kernel.
+            fn_fused_gate_up_swiglu_fp8: func(&mod_moe, "fused_gate_up_swiglu_fp8")?,
 
             // Mamba2 kernels.
             fn_mamba2_conv1d_silu: func(&mod_mamba2, "mamba2_conv1d_silu")?,

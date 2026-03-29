@@ -329,3 +329,69 @@ extern "C" __global__ void fused_gate_up_swiglu_q8(
         output[row] = __float2bfloat16(silu * acc_up);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Fused gate+up+SwiGLU with FP8 E4M3 weights.
+//
+// FP8 has no block structure — 1 byte per weight, linear addressing.
+// Same warp-cooperative pattern as Q8 but with FP8 dequantisation.
+// The fp8 conversion function is duplicated here because NVRTC compiles
+// each .cu file independently.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ float fp8_e4m3_to_float_moe(unsigned char bits) {
+    unsigned int sign = (bits >> 7) & 1;
+    unsigned int exp  = (bits >> 3) & 0xF;
+    unsigned int man  = bits & 0x7;
+    if (exp == 0xF && man == 0x7) return __uint_as_float(0x7FC00000);
+    float val;
+    if (exp == 0) {
+        val = ((float)man / 8.0f) * 0.015625f;
+    } else {
+        unsigned int f32_exp = (unsigned int)(exp - 7 + 127);
+        unsigned int f32_bits = (sign << 31) | (f32_exp << 23) | (man << 20);
+        return __uint_as_float(f32_bits);
+    }
+    return sign ? -val : val;
+}
+
+extern "C" __global__ void fused_gate_up_swiglu_fp8(
+    const FusedGateUpParams params,
+    const unsigned char* __restrict__ W_gate_fp8,
+    const unsigned char* __restrict__ W_up_fp8,
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ output
+) {
+    const unsigned int M = params.M;
+    const unsigned int K = params.K;
+    const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    unsigned int row = gid / 32;
+    unsigned int lane = gid % 32;
+    if (row >= M) return;
+
+    const unsigned char* gate_row = W_gate_fp8 + row * K;
+    const unsigned char* up_row   = W_up_fp8   + row * K;
+
+    float acc_gate = 0.0f;
+    float acc_up   = 0.0f;
+
+    const unsigned int iters = K / 32;
+    for (unsigned int i = 0; i < iters; i++) {
+        unsigned int col = i * 32 + lane;
+        float g_val = fp8_e4m3_to_float_moe(gate_row[col]);
+        float u_val = fp8_e4m3_to_float_moe(up_row[col]);
+        float x_val = __bfloat162float(x[col]);
+
+        acc_gate += g_val * x_val;
+        acc_up   += u_val * x_val;
+    }
+
+    acc_gate = warp_sum(acc_gate);
+    acc_up   = warp_sum(acc_up);
+
+    if (lane == 0) {
+        float silu = acc_gate / (1.0f + expf(-acc_gate));
+        output[row] = __float2bfloat16(silu * acc_up);
+    }
+}

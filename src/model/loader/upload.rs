@@ -25,6 +25,7 @@ pub(crate) fn quant_byte_count(dtype: TensorDtype, m: usize, k: usize) -> usize 
     match dtype {
         TensorDtype::Q4 => crate::gpu::q4_byte_count(m, k),
         TensorDtype::Q8 => crate::gpu::q8_byte_count(m, k),
+        TensorDtype::FP8 => crate::gpu::fp8_byte_count(m, k),
         _ => panic!("quant_byte_count called for non-quantized dtype {dtype:?}"),
     }
 }
@@ -35,6 +36,7 @@ pub(crate) fn quant_row_bytes(dtype: Option<TensorDtype>, k: usize) -> usize {
     match dtype {
         Some(TensorDtype::Q4) => (k / 32) * 18,
         Some(TensorDtype::Q8) => (k / 32) * 34,
+        Some(TensorDtype::FP8) => k, // 1 byte per weight, no block overhead
         None => k * 2, // bf16
         _ => panic!("quant_row_bytes called for unsupported dtype {dtype:?}"),
     }
@@ -45,6 +47,7 @@ pub(crate) fn quant_dtype_name(dtype: TensorDtype) -> &'static str {
     match dtype {
         TensorDtype::Q4 => "Q4",
         TensorDtype::Q8 => "Q8",
+        TensorDtype::FP8 => "FP8",
         _ => "bf16",
     }
 }
@@ -59,14 +62,10 @@ pub(crate) fn upload_tensor<B: GpuCore>(
     name: &str,
     expected_shape: &[usize],
 ) -> anyhow::Result<B::Tensor> {
-    // Pre-quantized Q4/Q8: raw U8 bytes, upload directly.
+    // Pre-quantized Q4/Q8/FP8: raw U8 bytes, upload directly.
     if let Some((m, k, dtype)) = store.quant_shape(name) {
         let view = store.tensor(name)?;
-        let expected_bytes = match dtype {
-            TensorDtype::Q4 => crate::gpu::q4_byte_count(m, k),
-            TensorDtype::Q8 => crate::gpu::q8_byte_count(m, k),
-            _ => unreachable!(),
-        };
+        let expected_bytes = quant_byte_count(dtype, m, k);
         anyhow::ensure!(
             view.data().len() == expected_bytes,
             "pre-quantized tensor '{name}' byte count mismatch: expected {expected_bytes}, got {}",

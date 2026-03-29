@@ -1,23 +1,29 @@
 // ===========================================================================
 // `rllm quantize` — Offline weight quantization.
 //
-// Pre-quantizes bf16 safetensors weights to Q4 or Q8 format on disk, so that
-// subsequent loads (`rllm run`, `rllm serve`) skip the on-load quantization
-// step entirely.  This is a pure-CPU operation — no GPU backend needed.
+// Pre-quantizes bf16 safetensors weights to Q4, Q8, or FP8 format on disk,
+// so that subsequent loads (`rllm run`, `rllm serve`) skip the on-load
+// quantization step entirely.  This is a pure-CPU operation — no GPU needed.
+//
+// Platform-aware dispatch:
+//   `--format q8` produces FP8 E4M3 on NVIDIA SM 89+ (Ada/Hopper),
+//   and Q8 block format on Metal or older NVIDIA GPUs.  The user always
+//   types "q8" — FP8 selection is transparent.
 //
 // Output format:
 //   Standard safetensors files with quantized blocks stored as Dtype::U8 tensors.
 //   File-level metadata marks the file as quantized:
-//     "quantization" = "rllm-q4" | "rllm-q8"
+//     "quantization" = "rllm-q4" | "rllm-q8" | "rllm-fp8"
 //     "rllm_q4:<tensor_name>" = "m,k"   (Q4 original logical shape)
 //     "rllm_q8:<tensor_name>" = "m,k"   (Q8 original logical shape)
+//     "rllm_fp8:<tensor_name>" = "m,k"  (FP8 original logical shape)
 //
 //   Non-quantizable tensors (norms, embeddings, biases) pass through as bf16.
 //   The output directory is self-contained: includes config.json, tokenizer
 //   files, and the quantized safetensors.
 //
 // Related files:
-//   gpu/mod.rs          — quantize_bf16_to_q4(), quantize_bf16_to_q8()
+//   gpu/mod.rs          — quantize_bf16_to_q4(), quantize_bf16_to_q8(), quantize_bf16_to_fp8()
 //   gpu/ops/quant.rs    — WeightQuantiser trait, QuantFormat enum
 //   model/loader/     — load_safetensors_files(), pre-quantized detection
 //   model/config.rs     — ModelConfig parsing
@@ -41,7 +47,9 @@ pub(crate) struct QuantizeArgs {
     #[arg(long)]
     output: PathBuf,
 
-    /// Quantization format: "q4" (4-bit, default) or "q8" (8-bit).
+    /// Quantization format: "q4" (4-bit, default), "q8" (8-bit), or "fp8" (FP8 E4M3).
+    /// When "q8" is used on NVIDIA SM 89+ (Ada/Hopper), FP8 E4M3 is selected
+    /// automatically for better hardware utilisation.
     #[arg(long, default_value = "q4")]
     format: String,
 }
@@ -54,12 +62,30 @@ pub(crate) fn exec(args: QuantizeArgs) -> anyhow::Result<()> {
     let input_dir = &args.model;
     let output_dir = &args.output;
 
-    let format = QuantFormat::from_name(&args.format).ok_or_else(|| {
+    let mut format = QuantFormat::from_name(&args.format).ok_or_else(|| {
         anyhow::anyhow!(
-            "unknown quantization format '{}' (supported: q4, q8)",
+            "unknown quantization format '{}' (supported: q4, q8, fp8)",
             args.format
         )
     })?;
+
+    // Platform-aware dispatch: `--format q8` on NVIDIA SM 89+ → FP8 E4M3.
+    // FP8 has native hardware support on Ada/Hopper, giving better throughput
+    // than Q8 block format.  On Metal or older NVIDIA GPUs, Q8 is unchanged.
+    if format == QuantFormat::Q8 {
+        #[cfg(feature = "cuda")]
+        {
+            let cc = cudarc::driver::CudaContext::new(0)
+                .ok()
+                .and_then(|ctx| ctx.compute_capability().ok())
+                .unwrap_or((0, 0));
+            if cc.0 > 8 || (cc.0 == 8 && cc.1 >= 9) {
+                format = QuantFormat::FP8;
+                eprintln!("NVIDIA SM {}.{} detected — using FP8 (E4M3) instead of Q8 blocks", cc.0, cc.1);
+            }
+        }
+    }
+
     let quant = quantiser(format);
 
     // Validate input directory.

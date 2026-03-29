@@ -55,6 +55,7 @@ impl GpuMoe for CudaBackend {
         let func = match w_gate.dtype {
             TensorDtype::Q4 => &self.fn_fused_gate_up_swiglu_q4,
             TensorDtype::Q8 => &self.fn_fused_gate_up_swiglu_q8,
+            TensorDtype::FP8 => &self.fn_fused_gate_up_swiglu_fp8,
             _ => &self.fn_fused_gate_up_swiglu_bf16,
         };
         // M rows × 32 threads per row = M*32 total threads.

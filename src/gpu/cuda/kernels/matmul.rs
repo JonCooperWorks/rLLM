@@ -4,10 +4,12 @@
 // Trait contract: gpu/ops/matmul.rs
 // CUDA shader:    cuda/shaders/matmul.cu
 //
-// Two code paths based on weight dtype:
+// Code paths based on weight dtype:
 //   - BF16: standard warp-cooperative matvec (32 threads per output row,
 //     warp shuffle reduction, 4x unrolled inner loop)
-//   - Q4: dequantize-on-the-fly from 4-bit blocks (20 bytes per 32 weights)
+//   - Q4: dequantize-on-the-fly from 4-bit blocks (18 bytes per 32 weights)
+//   - Q8: dequantize-on-the-fly from 8-bit blocks (34 bytes per 32 weights)
+//   - FP8: inline FP8 E4M3 → float conversion (1 byte per weight, no blocks)
 //
 // Batched variants (gemm) are used during prefill; single-vector (matvec)
 // during token-by-token decode.  Both dispatch 256-thread blocks with 32
@@ -44,6 +46,7 @@ impl GpuMatmul for CudaBackend {
         let func = match weight.dtype {
             TensorDtype::Q4 => &self.fn_matvec_q4,
             TensorDtype::Q8 => &self.fn_matvec_q8,
+            TensorDtype::FP8 => &self.fn_matvec_fp8,
             _ => &self.fn_matvec_bf16,
         };
         // M rows × 32 threads per row = M*32 total threads.
@@ -81,6 +84,7 @@ impl GpuMatmul for CudaBackend {
             let func = match weight.dtype {
                 TensorDtype::Q4 => self.fn_gemm_q4_tc.as_ref().unwrap(),
                 TensorDtype::Q8 => self.fn_gemm_q8_tc.as_ref().unwrap(),
+                TensorDtype::FP8 => self.fn_gemm_fp8_tc.as_ref().unwrap(),
                 _ => self.fn_gemm_bf16_tc.as_ref().unwrap(),
             };
             // 2D grid: tiles over (M, batch_size), 256 threads (8 warps) per tile.
@@ -103,6 +107,7 @@ impl GpuMatmul for CudaBackend {
             let func = match weight.dtype {
                 TensorDtype::Q4 => &self.fn_gemm_q4,
                 TensorDtype::Q8 => &self.fn_gemm_q8,
+                TensorDtype::FP8 => &self.fn_gemm_fp8,
                 _ => &self.fn_gemm_bf16,
             };
             // Scalar path: batch × M rows × 32 threads per row.

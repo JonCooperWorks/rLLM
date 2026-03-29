@@ -97,6 +97,20 @@ pub(crate) trait GpuCore: Send + Sync {
         self.upload_tensor(&q8_data, shape, TensorDtype::Q8)
     }
 
+    /// Quantise bf16 weight data to FP8 E4M3 and upload to the GPU.
+    ///
+    /// FP8 has no block structure — each weight is independently converted to
+    /// a 1-byte IEEE FP8 E4M3 value.  Used on NVIDIA SM 89+ (Ada/Hopper).
+    #[allow(dead_code)] // used by CUDA backend on SM 89+
+    fn quantize_upload_fp8(&self, bf16_data: &[u8], shape: &[usize]) -> Self::Tensor {
+        assert!(
+            shape.len() == 2,
+            "quantize_upload_fp8 requires 2D shape, got {shape:?}"
+        );
+        let fp8_data = super::super::quantize_bf16_to_fp8(bf16_data, shape[0], shape[1]);
+        self.upload_tensor(&fp8_data, shape, TensorDtype::FP8)
+    }
+
     /// Copy a contiguous region of bytes between two GPU tensors.
     ///
     /// This is the primitive that enables batched decode: when we have a

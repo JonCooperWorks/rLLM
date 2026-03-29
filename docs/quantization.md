@@ -210,5 +210,26 @@ Available as `gpu::q4_byte_count(m, k)` in code.
 
 ---
 
+## Platform-Aware Q8 Format Selection
+
+When the user specifies `--quant q8` or `--format q8`, the actual storage format
+depends on the hardware:
+
+| Platform | SM Version | Physical Format | Bytes/Weight |
+|----------|-----------|-----------------|-------------|
+| NVIDIA Ada/Hopper | SM 89+ | FP8 E4M3 | 1 |
+| NVIDIA Ampere and older | SM < 89 | Q8 blocks | 34/32 ≈ 1.06 |
+| Apple Silicon (Metal) | — | Q8 blocks | 34/32 ≈ 1.06 |
+
+FP8 E4M3 (IEEE 8-bit float: 1 sign + 4 exponent + 3 mantissa) has native
+hardware support on Ada/Hopper, providing better throughput than Q8 blocks.
+On Metal and older NVIDIA GPUs, Q8 block format is used instead because
+there is no FP8 hardware.  The selection is transparent — the user always
+types "q8".
+
+See [FP8 Weight Quantization](fp8.md) for details on the FP8 E4M3 format.
+
+---
+
 See also: [GPU Backend](gpu-backend.md) · [Expert Streaming](expert-streaming.md) ·
-[Production Considerations](production-considerations.md)
+[FP8 Quantization](fp8.md) · [Production Considerations](production-considerations.md)

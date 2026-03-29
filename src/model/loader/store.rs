@@ -32,6 +32,9 @@ pub(crate) struct TensorStore<'a> {
     pub(crate) q4_map: HashMap<String, (usize, usize)>,
     /// Pre-quantized Q8 tensors: name → original (m, k) shape.
     pub(crate) q8_map: HashMap<String, (usize, usize)>,
+    /// Pre-quantized FP8 tensors: name → original (m, k) shape.
+    /// Populated when loading NVIDIA FP8 E4M3 models produced by `rllm quantize`.
+    pub(crate) fp8_map: HashMap<String, (usize, usize)>,
 }
 
 impl<'a> TensorStore<'a> {
@@ -58,12 +61,19 @@ impl<'a> TensorStore<'a> {
         self.q8_map.get(name).copied()
     }
 
-    /// Check if a tensor is pre-quantized (Q4 or Q8), returning (m, k, dtype).
+    /// Check if a tensor is pre-quantized FP8, returning its original shape.
+    pub(crate) fn fp8_shape(&self, name: &str) -> Option<(usize, usize)> {
+        self.fp8_map.get(name).copied()
+    }
+
+    /// Check if a tensor is pre-quantized (Q4, Q8, or FP8), returning (m, k, dtype).
     pub(crate) fn quant_shape(&self, name: &str) -> Option<(usize, usize, crate::gpu::TensorDtype)> {
         if let Some((m, k)) = self.q4_shape(name) {
             Some((m, k, crate::gpu::TensorDtype::Q4))
         } else if let Some((m, k)) = self.q8_shape(name) {
             Some((m, k, crate::gpu::TensorDtype::Q8))
+        } else if let Some((m, k)) = self.fp8_shape(name) {
+            Some((m, k, crate::gpu::TensorDtype::FP8))
         } else {
             None
         }
