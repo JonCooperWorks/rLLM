@@ -276,13 +276,16 @@ pub(crate) fn forward_single_paged<
         );
         // Fused O-proj + residual-add + post-attention RMSNorm: saves one
         // full read of the hidden tensor.  Inspired by rvLLM (m0at).
-        primitives::o_proj_fused_residual_norm(
+        // Uses q_dim variant because TP divides q_dim (even though q_dim ==
+        // hidden_size on single-GPU Mixtral).
+        primitives::o_proj_fused_residual_norm_qdim(
             m.backend,
             layer,
             &m.attn_out,
             &m.norm_buf,
             &m.hidden,
             d.hidden_size,
+            d.q_dim,
             d.eps,
         );
         profile::record(m.backend, t, Component::Attention);
@@ -299,6 +302,7 @@ pub(crate) fn forward_single_paged<
             num_experts_per_tok,
         );
         profile::record(m.backend, t, Component::Ffn);
+
     }
 
     let t = profile::begin(m.backend);
@@ -403,7 +407,7 @@ pub(crate) fn forward_prefill_paged<
             None,
             m.turbo_ctx.as_ref(),
         );
-        primitives::o_proj_residual_batch(m.backend, layer, bufs, bs, d.hidden_size);
+        primitives::o_proj_residual_batch_qdim(m.backend, layer, bufs, bs, d.hidden_size, d.q_dim);
 
         // --- MoE FFN: process each token independently ---
         //

@@ -453,7 +453,8 @@ pub(crate) fn ffn_block<B: GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce +
 /// O projection + fused residual-add + RMSNorm (q_dim == hidden_size variant).
 ///
 /// Same as `o_proj_fused_residual_norm_qdim` but for models where the attention
-/// dimension equals hidden_size (e.g. Mixtral).  Inspired by rvLLM (m0at).
+/// dimension equals hidden_size.  Prefer the `_qdim` variant for TP safety.
+#[allow(dead_code)]
 pub(crate) fn o_proj_fused_residual_norm<B: GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce>(
     backend: &B,
     layer: &LayerWeights<B>,
@@ -1240,6 +1241,11 @@ pub(crate) fn paged_kv_and_prefill_attention_maybe_quantized<
 }
 
 /// Batched O projection + residual.
+///
+/// Note: this assumes q_dim == hidden_size.  For models where q_dim differs
+/// (or under tensor parallelism where q_dim is divided), use
+/// `o_proj_residual_batch_qdim` instead.
+#[allow(dead_code)]
 pub(crate) fn o_proj_residual_batch<B: GpuMatmul + GpuElementwise + GpuAllReduce>(
     backend: &B,
     layer: &LayerWeights<B>,
