@@ -103,6 +103,7 @@ pub(crate) trait Dispatch {
     /// token ID) are transferred.  Used when temperature == 0.0.
     ///
     /// Inspired by rvLLM (Andy Norris / m0at).
+    #[allow(dead_code)] // engine uses batched version; kept as trait building block
     fn sample_greedy_gpu(&self) -> anyhow::Result<u32> {
         anyhow::bail!("GPU greedy sampling not supported by this Dispatch implementation")
     }

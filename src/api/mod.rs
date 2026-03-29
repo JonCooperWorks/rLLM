@@ -478,6 +478,7 @@ struct WorkerHandle {
     request_tx: std::sync::mpsc::SyncSender<WorkerRequest>,
     tokenizer: Arc<tokenizer::Tokenizer>,
     arch: config::ModelArch,
+    #[allow(dead_code)] // populated by worker thread; will be used for handler-side vision preprocessing
     vision_config: Option<crate::model::config::VisionConfig>,
 }
 
@@ -553,6 +554,7 @@ struct RequestContext {
     /// Used to inject literal `<think>`/`</think>` markers when the model
     /// generates these as special tokens (which `decode(skip_special=true)`
     /// would otherwise strip).
+    #[allow(dead_code)] // stored for future per-sequence thinking control
     thinking: bool,
     /// Suffix to inject before the next decode.
     ///

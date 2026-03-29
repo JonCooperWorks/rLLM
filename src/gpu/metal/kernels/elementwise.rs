@@ -64,6 +64,7 @@ struct SigmoidParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // matches Metal shader struct; silu_mul_clamp trait method not yet called
 struct SiluMulClampParams {
     size: u32,
     limit: f32,

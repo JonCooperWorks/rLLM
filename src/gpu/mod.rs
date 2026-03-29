@@ -44,13 +44,14 @@
 
 pub(crate) mod multi_gpu;
 pub(crate) mod ops;
+#[allow(dead_code)] // CUDA multi-GPU tensor parallelism; unused on macOS
 pub(crate) mod parallel;
 
 pub(crate) use ops::{
     GpuAllReduce, GpuAttention, GpuCore, GpuDeltaNet, GpuElementwise, GpuEmbed, GpuMamba2, GpuMatmul,
     GpuMoe, GpuNorm, GpuRope, GpuTurboQuant, GpuVision,
 };
-pub(crate) use ops::quant::{QuantFormat, WeightQuantiser, quantiser};
+pub(crate) use ops::quant::QuantFormat;
 
 // ---------------------------------------------------------------------------
 // GpuBackend — the supertrait combining all kernel families.
@@ -340,6 +341,7 @@ pub(crate) struct PinnedBuf {
 unsafe impl Send for PinnedBuf {}
 unsafe impl Sync for PinnedBuf {}
 
+#[allow(dead_code)] // CUDA-only: pinned host memory for async GPU transfers
 impl PinnedBuf {
     pub fn as_ptr(&self) -> *const u8 {
         self.ptr

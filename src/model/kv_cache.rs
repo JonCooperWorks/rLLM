@@ -359,6 +359,7 @@ impl PrefixCache {
     }
 
     /// Total blocks held by the cache (not on the free list).
+    #[allow(dead_code)] // used by tests; useful diagnostic accessor
     pub fn blocks_held(&self) -> usize {
         self.entries.values().map(|e| e.block_handles.len()).sum()
     }
@@ -447,6 +448,7 @@ impl<B: GpuCore> KvPool<B> {
     }
 
     /// Number of physical blocks in the pool.
+    #[allow(dead_code)] // used by tests; useful diagnostic accessor
     pub fn total_blocks(&self) -> usize {
         self.num_physical_blocks
     }
@@ -623,6 +625,7 @@ impl<B: GpuCore> SeqKvState<B> {
     ///
     /// Used when no pool reference is available (e.g. multi-GPU paths where
     /// each rank has its own pool).
+    #[allow(dead_code)] // CUDA multi-GPU path
     pub fn sync_block_table(&mut self, backend: &B) {
         if !self.dirty {
             return;

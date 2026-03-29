@@ -87,6 +87,7 @@ impl QuantFormat {
     }
 
     /// The `TensorDtype` variant that GPU kernels use to dispatch.
+    #[allow(dead_code)] // useful accessor; callers currently use TensorDtype directly
     pub fn dtype(&self) -> TensorDtype {
         match self {
             Self::Q4 => TensorDtype::Q4,
@@ -167,6 +168,7 @@ pub(crate) trait WeightQuantiser: Send + Sync {
     }
 
     /// Row stride in bytes (bytes per row in the quantised layout).
+    #[allow(dead_code)] // trait accessor; callers use byte_count() directly
     fn row_bytes(&self, k: usize) -> usize {
         (k / self.block_size()) * self.bytes_per_block()
     }
@@ -178,6 +180,7 @@ pub(crate) trait WeightQuantiser: Send + Sync {
     fn quantise(&self, bf16_data: &[u8], m: usize, k: usize) -> Vec<u8>;
 
     /// The `TensorDtype` for GPU kernel dispatch.
+    #[allow(dead_code)] // used by tests and quantise command
     fn dtype(&self) -> TensorDtype {
         self.format().dtype()
     }

@@ -153,9 +153,11 @@ pub(crate) struct MetalBackend {
     pub(crate) pipeline_fused_gate_up_swiglu: metal::ComputePipelineState,
     pub(crate) pipeline_fused_gate_up_swiglu_q4: metal::ComputePipelineState,
     pub(crate) pipeline_fused_gate_up_swiglu_q8: metal::ComputePipelineState,
+    #[allow(dead_code)] // compiled pipeline; callers use explicit loops for now
     pub(crate) pipeline_moe_combine_residual: metal::ComputePipelineState,
 
     // GPT-OSS kernels.
+    #[allow(dead_code)] // compiled pipeline; GPT-OSS uses gpt_oss_gated_act instead
     pub(crate) pipeline_silu_mul_clamp: metal::ComputePipelineState,
     pub(crate) pipeline_gpt_oss_gated_act: metal::ComputePipelineState,
     pub(crate) pipeline_rope_yarn: metal::ComputePipelineState,
@@ -181,6 +183,7 @@ pub(crate) struct MetalBackend {
 
     // Fused residual-add + RMSNorm (rvLLM-inspired).
     pub(crate) pipeline_fused_residual_rms_norm: metal::ComputePipelineState,
+    #[allow(dead_code)] // compiled pipeline; batched prefill uses separate ops for now
     pub(crate) pipeline_fused_residual_rms_norm_batch: metal::ComputePipelineState,
 
     // TurboQuant KV cache quantization kernels (arXiv:2504.19874).

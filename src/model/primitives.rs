@@ -185,6 +185,7 @@ pub(crate) fn qkv_projection_qdim<B: GpuMatmul>(
 }
 
 /// Apply QKV bias (for architectures that have it, e.g. Qwen).
+#[allow(dead_code)] // building block; registry models use apply_qkv_bias_qdim variant
 pub(crate) fn apply_qkv_bias<B: GpuElementwise>(
     backend: &B,
     layer: &LayerWeights<B>,
@@ -335,6 +336,7 @@ pub(crate) fn paged_kv_and_attention_maybe_quantized<B: GpuAttention + GpuTurboQ
 ///
 /// For models where q_dim == hidden_size, pass hidden_size for both args.
 /// For models where q_dim ≠ hidden_size (Qwen3 MoE), use o_proj_residual_qdim.
+#[allow(dead_code)] // building block; registry models use _qdim or _batch variants
 pub(crate) fn o_proj_residual<B: GpuMatmul + GpuElementwise + GpuAllReduce>(
     backend: &B,
     layer: &LayerWeights<B>,
@@ -350,6 +352,7 @@ pub(crate) fn o_proj_residual<B: GpuMatmul + GpuElementwise + GpuAllReduce>(
 
 /// O projection + residual for models where q_dim ≠ hidden_size.
 /// o_proj weight is [hidden_size, q_dim], input attn_out is [q_dim].
+#[allow(dead_code)] // building block; registry models use batched variant
 pub(crate) fn o_proj_residual_qdim<B: GpuMatmul + GpuElementwise + GpuAllReduce>(
     backend: &B,
     layer: &LayerWeights<B>,
@@ -412,6 +415,7 @@ pub(crate) fn o_proj_fused_residual_norm_qdim<B: GpuNorm + GpuMatmul + GpuElemen
 /// dispatch.  This reads the input vector once instead of twice and saves
 /// two kernel launch overheads per layer per token (~64 fewer dispatches
 /// across a 32-layer model).
+#[allow(dead_code)] // building block; decode path now uses ffn_block_pre_normed
 pub(crate) fn ffn_block<B: GpuNorm + GpuMatmul + GpuElementwise + GpuAllReduce + GpuMoe>(
     backend: &B,
     layer: &LayerWeights<B>,
@@ -1011,6 +1015,7 @@ pub(crate) fn qkv_projection_batch_qdim<B: GpuMatmul>(
 }
 
 /// Apply QKV bias in batched mode (broadcast-add).
+#[allow(dead_code)] // building block; registry models use apply_qkv_bias_batch_qdim variant
 pub(crate) fn apply_qkv_bias_batch<B: GpuElementwise>(
     backend: &B,
     layer: &LayerWeights<B>,
@@ -1056,6 +1061,7 @@ pub(crate) fn apply_rope_batch<B: GpuRope>(
 ///
 /// `window_size`: sliding window size (0 = full context).
 /// `attn_scale`: custom attention scale (0.0 = default 1/sqrt(head_dim)).
+#[allow(dead_code)] // building block; callers use _maybe_quantized variant
 pub(crate) fn paged_kv_and_prefill_attention<B: GpuAttention>(
     backend: &B,
     bufs: &PrefillBuffers<B>,
@@ -1343,6 +1349,7 @@ pub(crate) fn final_norm_and_lm_head_prefill<B: GpuCore + GpuNorm + GpuMatmul>(
 /// O projection + O-proj bias + residual add.
 /// For models with q_dim ≠ hidden_size and O-proj bias (GPT-OSS).
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // building block for GPT-OSS; decode path uses batched variant
 pub(crate) fn o_proj_residual_qdim_biased<B: GpuMatmul + GpuElementwise + GpuAllReduce>(
     backend: &B,
     layer: &LayerWeights<B>,

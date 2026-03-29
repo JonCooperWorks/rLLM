@@ -13,7 +13,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use memmap2::Mmap;
 use safetensors::SafeTensors;
 
 use crate::model::config::ModelConfig;
@@ -141,7 +140,7 @@ pub(crate) fn build_expert_index_from_safetensors(
 
         // Detect per-expert naming pattern.
         let test_qwen = format!("{test_prefix}.mlp.experts.0.gate_proj.weight");
-        let test_mixtral = format!("{test_prefix}.block_sparse_moe.experts.0.w1.weight");
+        let _test_mixtral = format!("{test_prefix}.block_sparse_moe.experts.0.w1.weight");
         let is_qwen_naming = store.tensor(&test_qwen).is_ok();
 
         for layer_idx in 0..num_layers {

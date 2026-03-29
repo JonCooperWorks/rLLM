@@ -208,6 +208,7 @@ impl Tokenizer {
     /// Used by the API server where messages arrive already structured
     /// (system/user/assistant roles from the HTTP request).  Delegates to
     /// `encode_messages_with_thinking()` with no thinking control.
+    #[allow(dead_code)] // convenience wrapper; callers use encode_messages_with_thinking directly
     pub fn encode_messages(
         &self,
         messages: &[chat::Message],

@@ -60,6 +60,7 @@ pub(crate) trait GpuMoe: GpuCore {
     ///   output[j] = residual[j] + sum_i(weights[i] * expert_outs[i * hidden + j])
     ///
     /// Replaces k separate scale_add calls + 1 add call with a single kernel.
+    #[allow(dead_code)] // trait method implemented by Metal; callers use explicit loops for now
     fn moe_combine_residual(
         &self,
         residual: &Self::Tensor,

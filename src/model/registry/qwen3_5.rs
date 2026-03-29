@@ -463,6 +463,7 @@ fn moe_ffn_block_pre_normed<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + 
 // gate_proj/up_proj/down_proj per layer.
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)] // superseded by ffn_block_pre_normed; kept as reference
 fn ffn_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe + GpuAllReduce>(
     m: &Model<'_, B>,
     layer_idx: usize,

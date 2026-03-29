@@ -70,7 +70,7 @@ use crate::model::tools::{self, ToolDefinition};
 
 /// Anthropic tool definition (slightly different field names from OpenAI).
 #[derive(serde::Deserialize)]
-struct AnthropicToolDef {
+pub(crate) struct AnthropicToolDef {
     name: String,
     #[serde(default)]
     description: Option<String>,
@@ -114,7 +114,7 @@ pub(crate) struct MessagesRequest {
 /// accept a boolean for simplicity (e.g. `"thinking": true`).
 #[derive(serde::Deserialize)]
 #[serde(untagged)]
-enum ThinkingConfig {
+pub(crate) enum ThinkingConfig {
     /// Full Anthropic format: `{"type": "enabled", "budget_tokens": 1024}`.
     Structured {
         #[serde(rename = "type")]

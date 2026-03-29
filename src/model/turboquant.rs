@@ -179,6 +179,7 @@ const CENTROIDS_4BIT: [f32; 16] = [
 /// each coordinate of Pi*x (where ||x||=1) is approximately N(0, 1/sqrt(d)),
 /// so we scale the standard Gaussian centroids by 1/sqrt(head_dim).
 pub(crate) struct TurboQuantConfig {
+    #[allow(dead_code)] // stored for diagnostics and future per-layer mode selection
     pub mode: KvQuantMode,
     pub bits: u32,
     pub num_centroids: u32,
@@ -188,6 +189,7 @@ pub(crate) struct TurboQuantConfig {
     /// Bytes per KV head per position: 2 (bf16 norm) + ceil(head_dim × bits / 8).
     pub bytes_per_head_pos: usize,
     /// Head dimension (for validation and kernel dispatch).
+    #[allow(dead_code)] // stored for validation; kernel uses bytes_per_head_pos for sizing
     pub head_dim: usize,
 }
 
@@ -272,7 +274,7 @@ pub(crate) fn bytes_per_kv_position(
 /// Returns the matrix in row-major order: element [i, j] = result[i * dim + j].
 pub(crate) fn generate_rotation_matrix(dim: usize, seed: u64) -> Vec<f32> {
     use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
+    use rand::SeedableRng;
 
     let mut rng = StdRng::seed_from_u64(seed);
     let n = dim;

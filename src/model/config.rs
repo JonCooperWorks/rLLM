@@ -666,6 +666,7 @@ pub(crate) struct VisionConfig {
     /// Hidden activation function in the vision FFN.
     /// Typically "gelu_pytorch_tanh" — both Qwen and Gemma vision encoders use
     /// plain GELU (not SwiGLU), unlike the text transformer.
+    #[allow(dead_code)] // deserialized from config.json; kept for future activation dispatch
     pub hidden_act: String,
     /// Vision weight tensor prefix in safetensors (e.g. "visual." for Qwen,
     /// "vision_tower.vision_model." for Gemma).  Used by the loader to find
@@ -1331,22 +1332,26 @@ impl ModelConfig {
 
     /// Whether this model uses the hybrid Nemotron-H (Mamba-2 + MoE + attention)
     /// architecture.
+    #[allow(dead_code)] // Nemotron-H architecture support (future)
     pub fn is_hybrid_mamba2(&self) -> bool {
         !self.layer_types.is_empty() && self.layer_types.iter().any(|t| t == "mamba2")
     }
 
     /// Whether a given layer is a Mamba-2 SSM layer.
+    #[allow(dead_code)] // Nemotron-H architecture support (future)
     pub fn is_mamba2_layer(&self, layer_idx: usize) -> bool {
         layer_idx < self.layer_types.len() && self.layer_types[layer_idx] == "mamba2"
     }
 
     /// Whether a given layer is a standalone MoE FFN layer (Nemotron-H).
     /// Distinct from `is_moe()` which checks if the model has any MoE layers.
+    #[allow(dead_code)] // Nemotron-H architecture support (future)
     pub fn is_moe_layer(&self, layer_idx: usize) -> bool {
         layer_idx < self.layer_types.len() && self.layer_types[layer_idx] == "moe"
     }
 
     /// Whether a given layer is an attention layer in Nemotron-H.
+    #[allow(dead_code)] // Nemotron-H architecture support (future)
     pub fn is_nemotron_attention_layer(&self, layer_idx: usize) -> bool {
         layer_idx < self.layer_types.len() && self.layer_types[layer_idx] == "attention"
     }

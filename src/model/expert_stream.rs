@@ -246,6 +246,7 @@ pub(crate) struct ExpertStreamer<B: GpuCore> {
     /// Used by active_slot() to find the cached expert for each selected slot.
     active_indices: UnsafeCell<Vec<usize>>,
     /// Number of experts selected per token (K).
+    #[allow(dead_code)] // stored for diagnostics; active_indices.len() used at runtime
     k: usize,
     /// Per-slot CPU read buffers for parallel pread → GPU upload.
     ///
@@ -409,7 +410,7 @@ impl<B: GpuCore> ExpertStreamer<B> {
         // Phase 0: Classify each selected expert as hit or miss.
         // Collect misses that need loading.
         struct MissInfo {
-            slot_idx: usize,      // position in selected[] (0..K)
+            _slot_idx: usize,     // position in selected[] (0..K)
             expert_idx: usize,    // global expert index
             cache_slot: usize,    // cache slot to load into
         }
@@ -431,7 +432,7 @@ impl<B: GpuCore> ExpertStreamer<B> {
                 timestamps[cache_slot] = clock;
                 active_indices[slot_idx] = cache_slot;
                 misses.push(MissInfo {
-                    slot_idx,
+                    _slot_idx: slot_idx,
                     expert_idx,
                     cache_slot,
                 });

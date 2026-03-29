@@ -81,6 +81,7 @@ pub(crate) trait GpuNorm: GpuCore {
     /// Batched fused residual-add + RMSNorm: operates on [batch_size, hidden_size].
     ///
     /// Each row independently: hidden[row] += residual[row], then normalise.
+    #[allow(dead_code)] // trait method implemented by Metal; batched prefill uses separate ops for now
     fn fused_residual_rms_norm_batch(
         &self,
         hidden: &Self::Tensor,

@@ -57,6 +57,7 @@ pub(crate) trait GpuAllReduce: GpuCore {
     /// of the vocabulary.
     ///
     /// No-op when world_size=1 (tensor and output are the same buffer).
+    #[allow(dead_code)] // CUDA multi-GPU path only
     fn all_gather(
         &self,
         tensor: &Self::Tensor,

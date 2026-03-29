@@ -27,6 +27,7 @@ struct FusedGateUpParams {
 // Must match the Metal shader's MoeCombineParams.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // matches Metal shader struct; moe_combine_residual trait method not yet called
 struct MoeCombineParams {
     hidden_size: u32,
     k: u32,

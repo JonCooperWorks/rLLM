@@ -92,7 +92,9 @@ pub(crate) mod upload;
 pub(crate) mod vision;
 
 // Re-export everything from submodules so external callers don't change.
-pub(crate) use mxfp4::{FP4_E2M1_LUT, dequantize_mxfp4, e8m0_to_f32};
+pub(crate) use mxfp4::dequantize_mxfp4;
+#[cfg(test)]
+pub(crate) use mxfp4::{FP4_E2M1_LUT, e8m0_to_f32};
 pub(crate) use store::{TensorStore, is_prequantized_model, load_safetensors_files};
 pub(crate) use upload::{
     upload_tensor, upload_norm_residual, upload_raw_bf16, upload_sharded,
@@ -101,10 +103,8 @@ pub(crate) use upload::{
 pub(crate) use self::vision::load_vision_weights;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use half::bf16;
-use memmap2::Mmap;
 use safetensors::SafeTensors;
 
 use super::config::{ModelArch, ModelConfig};

@@ -11,7 +11,6 @@
 //   gpu/ops/vision.rs         — GpuVision trait (spatial merge, scatter)
 // ===========================================================================
 
-use half::bf16;
 
 use crate::gpu::{GpuCore, TensorDtype};
 use crate::model::config::ModelConfig;
@@ -324,7 +323,7 @@ fn load_qwen_vision_block<B: GpuCore>(
     vp: &str,
     idx: usize,
     hd: usize,
-    inter: usize,
+    _inter: usize,
 ) -> Option<VisionBlockWeights<B>> {
     let bp = format!("{}blocks.{}", vp, idx);
     let tv = |name: &str| -> B::Tensor {
@@ -395,7 +394,7 @@ fn load_gemma_vision_block<B: GpuCore>(
         let v = store.tensor(name).unwrap_or_else(|e| panic!("missing {name}: {e}"));
         upload_vision(backend, &v, v.shape())
     };
-    let tb = |name: &str| -> Option<B::Tensor> {
+    let _tb = |name: &str| -> Option<B::Tensor> {
         store.tensor(name).ok().map(|v| upload_vision(backend, &v, v.shape()))
     };
 

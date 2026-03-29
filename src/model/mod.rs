@@ -225,6 +225,7 @@ impl<'a, B: GpuCore> Model<'a, B> {
     /// For `world_size > 1`, Q/KV/attention/FFN scratch buffers are sized
     /// for the per-rank dimensions (heads / world_size, inter / world_size),
     /// while hidden and logits buffers remain full-sized.
+    #[allow(dead_code)] // CUDA multi-GPU path
     pub fn new_tp(
         config: ModelConfig,
         weights: ModelWeights<B>,
@@ -326,6 +327,7 @@ impl<'a, B: GpuCore> Model<'a, B> {
     ///
     /// Identical to `new_with_kv_mode` but Q/KV/attn/FFN buffers are sized
     /// for `world_size`-way tensor parallelism.
+    #[allow(dead_code)] // CUDA multi-GPU path
     fn new_with_kv_mode_tp(
         config: ModelConfig,
         weights: ModelWeights<B>,

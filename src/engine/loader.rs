@@ -183,22 +183,6 @@ pub(crate) fn create_forward<B: GpuBackend + 'static>(
 ///
 /// Handles both single-GPU (`tp == 1`) and multi-GPU (`tp > 1`) paths.
 /// The caller doesn't need to know which path is taken.
-///
-/// - `on_ready` is called after the model is loaded but before the loop starts.
-///   The API server uses this to send the tokenizer/arch back to the main thread.
-/// - `run` is called with the engine — this is the caller's inference loop.
-pub(crate) fn load_and_run(
-    model_dir: &Path,
-    tp: usize,
-    kv_quant: KvQuantMode,
-    max_active: usize,
-    on_ready: impl FnOnce(&Tokenizer, ModelArch),
-    run: impl FnOnce(&mut dyn InferenceEngine) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    load_and_run_ext(model_dir, false, tp, kv_quant, max_active, on_ready, run)
-}
-
-/// Extended version with expert streaming and KV quantization support.
 pub(crate) fn load_and_run_ext(
     model_dir: &Path,
     stream_experts: bool,

@@ -61,6 +61,7 @@ pub(crate) trait GpuElementwise: GpuCore {
 
     /// Clamped SwiGLU: out[i] = clamp(silu(gate[i]) * up[i], -limit, limit).
     /// Used by GPT-OSS which applies swiglu_limit=7.0 to stabilize MoE training.
+    #[allow(dead_code)] // GPT-OSS uses gpt_oss_gated_act instead; kept for future model support
     fn silu_mul_clamp(
         &self,
         gate: &Self::Tensor,

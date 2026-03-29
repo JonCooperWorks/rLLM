@@ -73,6 +73,7 @@ pub(crate) trait GpuCore: Send + Sync {
     ///
     /// Backends with a different quantisation format (e.g. CUDA with
     /// CUTLASS INT4) override this to produce their own layout.
+    #[allow(dead_code)] // used by CUDA backend; Metal uses pre-quantized weights
     fn quantize_upload(&self, bf16_data: &[u8], shape: &[usize]) -> Self::Tensor {
         assert!(
             shape.len() == 2 && shape[1] % 32 == 0,
@@ -86,6 +87,7 @@ pub(crate) trait GpuCore: Send + Sync {
     ///
     /// Same as `quantize_upload` but produces Q8 (8-bit) blocks instead of Q4.
     /// Used when loading Q8-quantized models.
+    #[allow(dead_code)] // used by CUDA backend; Metal uses pre-quantized weights
     fn quantize_upload_q8(&self, bf16_data: &[u8], shape: &[usize]) -> Self::Tensor {
         assert!(
             shape.len() == 2 && shape[1] % 32 == 0,

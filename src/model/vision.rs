@@ -114,7 +114,6 @@ pub(crate) fn expand_vision_placeholders(
             let n = images[img_idx].num_vision_tokens;
             // Replace 1 placeholder with N copies.
             if n > 1 {
-                let extra = n - 1;
                 tokens.splice(i..=i, std::iter::repeat(image_token_id).take(n));
             }
             img_idx += 1;

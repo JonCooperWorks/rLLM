@@ -378,7 +378,7 @@ fn moe_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe>(
     let router_logits = &moe.router_logits;
     let routing_output = &moe.routing_output;
     let moe_up_buf = &moe.moe_up_buf;
-    let moe_gate_buf = &moe.moe_gate_buf;
+    let _moe_gate_buf = &moe.moe_gate_buf;
     let moe_output = &moe.moe_output;
 
     let num_experts = m.config.num_experts as u32;

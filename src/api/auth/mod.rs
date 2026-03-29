@@ -89,6 +89,7 @@ pub(crate) struct AuthUser {
     pub sub: String,
     /// Optional display name or email — not used for logging or access
     /// control.  Available for providers that surface it from token claims.
+    #[allow(dead_code)] // populated from token claims for future audit/logging use
     pub name: Option<String>,
 }
 

@@ -339,6 +339,7 @@ pub(crate) fn sample_greedy<B: GpuBackend>(backend: &B, logits: &B::Tensor, voca
 ///
 /// Technique from rvLLM (Andy Norris / m0at): the single most impactful
 /// optimization for greedy decode.  See: https://github.com/m0at/rvllm
+#[allow(dead_code)] // engine uses batched version; kept as building block
 pub(crate) fn sample_greedy_gpu<B: GpuBackend>(
     backend: &B,
     logits: &B::Tensor,
