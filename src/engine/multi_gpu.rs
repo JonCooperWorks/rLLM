@@ -81,10 +81,9 @@ mod imp {
             &self,
             tokens: &[u32],
             state: &Self::SeqState,
-            _images: &[crate::model::vision::ProcessedImage],
+            images: &[crate::model::vision::ProcessedImage],
         ) -> anyhow::Result<()> {
-            // TODO: vision encoding for multi-GPU not yet implemented.
-            self.multi.forward_prefill_paged_with(tokens, state)
+            self.multi.forward_prefill_paged_with(tokens, state, images)
         }
 
         fn finish_prefill(state: &mut Self::SeqState, token_count: usize) {
@@ -166,7 +165,7 @@ mod imp {
                 max_gen_tokens,
                 temperature,
                 top_p,
-                images: Vec::new(),
+                images,
                 seed,
             })
         }
