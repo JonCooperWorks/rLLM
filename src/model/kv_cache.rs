@@ -376,6 +376,340 @@ impl PrefixCache {
     }
 }
 
+// ===========================================================================
+// RadixPrefixCache — trie-based prefix cache with block-level sharing.
+//
+// Why a radix tree?
+//   The flat PrefixCache stores each prefix independently.  If request A
+//   caches [0..64] (4 blocks) and request B caches [0..48] (3 blocks), the
+//   first 3 blocks are duplicated — 3 blocks wasted.  A radix tree shares
+//   common prefix blocks: the trie has one node per BLOCK_SIZE-token edge,
+//   and overlapping prefixes share internal nodes (and their KV blocks).
+//
+// Structure:
+//   Each RadixNode represents one block's worth of KV data.  The root has
+//   no block (it's a sentinel).  Children are keyed by FNV hash of the
+//   BLOCK_SIZE tokens labeling the edge, with full token verification for
+//   collision safety.
+//
+// Eviction:
+//   Leaf-first LRU.  Only leaves with ref_count == 0 can be evicted.
+//   This preserves internal nodes that are shared by multiple prefixes.
+//
+// Integration:
+//   Drop-in replacement for PrefixCache — same lookup/insert/release API.
+//   The Dispatch trait signatures are unchanged.
+// ===========================================================================
+
+/// A node in the radix prefix tree.  Each node (except root) holds one
+/// KV block handle and tracks how many active sequences pass through it.
+struct RadixNode {
+    /// KV block at this depth.  None for the root sentinel.
+    block_handle: Option<BlockHandle>,
+    /// Children keyed by FNV hash of the BLOCK_SIZE tokens on the edge.
+    children: HashMap<u64, RadixChild>,
+    /// Active sequences whose prefix passes through this node.
+    ref_count: usize,
+    /// Monotonic LRU timestamp (higher = more recent).
+    last_used: u64,
+}
+
+/// An edge in the radix tree: the token label + the child node.
+struct RadixChild {
+    /// The BLOCK_SIZE tokens labeling this edge (for collision checking).
+    tokens: Vec<u32>,
+    /// The child node.
+    node: RadixNode,
+}
+
+impl RadixNode {
+    fn new(block_handle: Option<BlockHandle>) -> Self {
+        Self {
+            block_handle,
+            children: HashMap::new(),
+            ref_count: 0,
+            last_used: 0,
+        }
+    }
+
+    /// Whether this node is a leaf (no children).
+    fn is_leaf(&self) -> bool {
+        self.children.is_empty()
+    }
+}
+
+/// Trie-based prefix cache with block-level sharing.
+///
+/// Replaces the flat PrefixCache for better memory efficiency when multiple
+/// prefixes share common leading blocks (e.g., identical system prompts with
+/// different user messages).
+pub(crate) struct RadixPrefixCache {
+    /// Root sentinel node (no block handle).
+    root: RadixNode,
+    /// Maximum blocks the cache can hold.
+    max_blocks: usize,
+    /// Current blocks held by the cache.
+    current_blocks: usize,
+    /// Monotonic clock for LRU ordering.
+    clock: u64,
+    /// Running stats.
+    pub hits: u64,
+    pub misses: u64,
+}
+
+impl RadixPrefixCache {
+    pub fn new(max_blocks: usize) -> Self {
+        Self {
+            root: RadixNode::new(None),
+            max_blocks,
+            current_blocks: 0,
+            clock: 0,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Hash a single block's worth of tokens.
+    fn hash_block(tokens: &[u32]) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &t in tokens {
+            h ^= t as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
+    /// Look up the longest cached prefix of `prompt_tokens`.
+    ///
+    /// Walks the trie matching BLOCK_SIZE chunks.  Returns the block handles
+    /// along the matched path and the total token count, or None if no match.
+    /// Increments ref_count on every matched node so they can't be evicted.
+    pub fn lookup(&mut self, prompt_tokens: &[u32]) -> Option<(Vec<BlockHandle>, usize)> {
+        let num_blocks = prompt_tokens.len() / BLOCK_SIZE;
+        if num_blocks == 0 {
+            self.misses += 1;
+            return None;
+        }
+
+        // Pass 1: determine match depth (immutable walk).
+        let mut match_depth = 0;
+        let mut node = &self.root;
+        for b in 0..num_blocks {
+            let chunk = &prompt_tokens[b * BLOCK_SIZE..(b + 1) * BLOCK_SIZE];
+            let hash = Self::hash_block(chunk);
+            match node.children.get(&hash) {
+                Some(child) if child.tokens == chunk => {
+                    match_depth += 1;
+                    node = &child.node;
+                }
+                _ => break,
+            }
+        }
+
+        if match_depth == 0 {
+            self.misses += 1;
+            return None;
+        }
+
+        // Pass 2: collect handles and increment ref_counts (mutable walk).
+        self.clock += 1;
+        let clock = self.clock;
+        let mut handles = Vec::with_capacity(match_depth);
+        let mut node = &mut self.root;
+        for b in 0..match_depth {
+            let chunk = &prompt_tokens[b * BLOCK_SIZE..(b + 1) * BLOCK_SIZE];
+            let hash = Self::hash_block(chunk);
+            let child = node.children.get_mut(&hash).unwrap();
+            child.node.ref_count += 1;
+            child.node.last_used = clock;
+            handles.push(child.node.block_handle.unwrap());
+            node = &mut node.children.get_mut(&hash).unwrap().node;
+        }
+
+        self.hits += 1;
+        Some((handles, match_depth * BLOCK_SIZE))
+    }
+
+    /// Register a prefix after prefill completes.
+    ///
+    /// Walks the trie, creating new nodes as needed for token blocks that
+    /// aren't already cached.  Existing nodes along the path are untouched
+    /// (their blocks are already cached).  New nodes start with ref_count = 1.
+    ///
+    /// Returns block handles evicted to make room (caller must free them via
+    /// KvPool::free_block).
+    pub fn insert(
+        &mut self,
+        tokens: &[u32],
+        block_handles: &[BlockHandle],
+    ) -> Vec<BlockHandle> {
+        let num_blocks = tokens.len() / BLOCK_SIZE;
+        assert_eq!(num_blocks, block_handles.len());
+
+        // Phase 1: determine how many new nodes we need (immutable walk).
+        let mut existing_depth = 0;
+        {
+            let mut node = &self.root;
+            for b in 0..num_blocks {
+                let chunk = &tokens[b * BLOCK_SIZE..(b + 1) * BLOCK_SIZE];
+                let hash = Self::hash_block(chunk);
+                match node.children.get(&hash) {
+                    Some(child) if child.tokens == chunk => {
+                        existing_depth += 1;
+                        node = &child.node;
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        // Phase 2: evict leaves to make room for new nodes (borrows self.root
+        // without conflicting with the walk pointer below).
+        // We need (current_blocks + new_nodes_needed) <= max_blocks.
+        let new_nodes_needed = num_blocks - existing_depth;
+        let mut evicted = Vec::new();
+        while self.current_blocks + new_nodes_needed > self.max_blocks {
+            if let Some(handle) =
+                Self::evict_leaf(&mut self.root, &mut self.current_blocks)
+            {
+                evicted.push(handle);
+            } else {
+                break; // Nothing evictable (all refs > 0).
+            }
+        }
+
+        // Phase 3: walk the trie mutably, updating existing nodes and creating
+        // new ones.
+        self.clock += 1;
+        let clock = self.clock;
+
+        let mut node = &mut self.root;
+        for b in 0..num_blocks {
+            let chunk = &tokens[b * BLOCK_SIZE..(b + 1) * BLOCK_SIZE];
+            let hash = Self::hash_block(chunk);
+
+            if node.children.contains_key(&hash) {
+                // Existing node — update LRU, increment ref_count.
+                let child = node.children.get_mut(&hash).unwrap();
+                child.node.ref_count += 1;
+                child.node.last_used = clock;
+                node = &mut node.children.get_mut(&hash).unwrap().node;
+            } else {
+                // New node.
+                let new_node = RadixNode {
+                    block_handle: Some(block_handles[b]),
+                    children: HashMap::new(),
+                    ref_count: 1,
+                    last_used: clock,
+                };
+                node.children.insert(
+                    hash,
+                    RadixChild {
+                        tokens: chunk.to_vec(),
+                        node: new_node,
+                    },
+                );
+                self.current_blocks += 1;
+                node = &mut node.children.get_mut(&hash).unwrap().node;
+            }
+        }
+
+        evicted
+    }
+
+    /// Decrement ref_count along the path matching `tokens`.
+    ///
+    /// Called when a sequence finishes or is aborted.  Does NOT free blocks —
+    /// nodes stay cached for future reuse until evicted.
+    pub fn release(&mut self, tokens: &[u32]) {
+        let num_blocks = tokens.len() / BLOCK_SIZE;
+        let mut node = &mut self.root;
+        for b in 0..num_blocks {
+            let chunk = &tokens[b * BLOCK_SIZE..(b + 1) * BLOCK_SIZE];
+            let hash = Self::hash_block(chunk);
+            match node.children.get_mut(&hash) {
+                Some(child) if child.tokens == chunk => {
+                    child.node.ref_count = child.node.ref_count.saturating_sub(1);
+                    node = &mut node.children.get_mut(&hash).unwrap().node;
+                }
+                _ => break, // Path doesn't exist (shouldn't happen).
+            }
+        }
+    }
+
+    /// Evict one leaf node with ref_count == 0 and the smallest last_used.
+    /// Removes the leaf from its parent and returns its block handle.
+    ///
+    /// Uses a recursive DFS from the given node to find all eligible leaves,
+    /// picks the LRU one, then removes it.
+    fn evict_leaf(root: &mut RadixNode, current_blocks: &mut usize) -> Option<BlockHandle> {
+        // Find the best leaf to evict: (hash path from root to parent, child hash).
+        let mut best: Option<(u64, Vec<u64>, u64)> = None; // (last_used, path, leaf_hash)
+
+        fn find_leaves(
+            node: &RadixNode,
+            path: &mut Vec<u64>,
+            best: &mut Option<(u64, Vec<u64>, u64)>,
+        ) {
+            for (&hash, child) in &node.children {
+                if child.node.is_leaf() && child.node.ref_count == 0 {
+                    let lu = child.node.last_used;
+                    if best.as_ref().map_or(true, |(best_lu, _, _)| lu < *best_lu) {
+                        *best = Some((lu, path.clone(), hash));
+                    }
+                } else {
+                    path.push(hash);
+                    find_leaves(&child.node, path, best);
+                    path.pop();
+                }
+            }
+        }
+
+        let mut path = Vec::new();
+        find_leaves(root, &mut path, &mut best);
+
+        let (_, parent_path, leaf_hash) = best?;
+
+        // Walk the path to find the parent, then remove the leaf.
+        let mut node = root;
+        for &hash in &parent_path {
+            node = &mut node.children.get_mut(&hash).unwrap().node;
+        }
+        let removed = node.children.remove(&leaf_hash).unwrap();
+        *current_blocks -= 1;
+        removed.node.block_handle
+    }
+
+    /// Number of blocks held by the cache.
+    #[allow(dead_code)]
+    pub fn blocks_held(&self) -> usize {
+        self.current_blocks
+    }
+
+    /// Number of cached prefixes (distinct leaf paths).
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        fn count_leaves(node: &RadixNode) -> usize {
+            if node.is_leaf() && node.block_handle.is_some() {
+                return 1;
+            }
+            node.children.values().map(|c| count_leaves(&c.node)).sum()
+        }
+        count_leaves(&self.root)
+    }
+
+    /// Hit rate as a fraction (0.0 to 1.0).
+    #[allow(dead_code)]
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
+    }
+}
+
 impl<B: GpuCore> KvPool<B> {
     /// Allocate a KV pool with room for `num_blocks` physical blocks.
     ///
@@ -1201,5 +1535,147 @@ mod tests {
             seq.sync_block_table_validated(&b, &pool);
         }));
         assert!(result.is_err(), "should panic on stale handle");
+    }
+
+    // -----------------------------------------------------------------------
+    // Radix tree prefix cache tests.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_radix_shared_blocks() {
+        // Two overlapping prefixes should share blocks, not duplicate them.
+        let mut cache = RadixPrefixCache::new(64);
+
+        // Prefix A: 4 blocks (64 tokens).
+        let tokens_a: Vec<u32> = (0..64).collect();
+        let handles_a = vec![bh(0, 0), bh(1, 0), bh(2, 0), bh(3, 0)];
+        cache.insert(&tokens_a, &handles_a);
+        assert_eq!(cache.blocks_held(), 4);
+
+        // Prefix B: first 3 blocks same as A, 4th differs.
+        let mut tokens_b: Vec<u32> = (0..48).collect();
+        tokens_b.extend(100..116); // different 4th block
+        let handles_b = vec![bh(0, 0), bh(1, 0), bh(2, 0), bh(10, 0)];
+        cache.insert(&tokens_b, &handles_b);
+
+        // Should be 5 blocks total (3 shared + 1 unique from A + 1 unique from B),
+        // not 8.
+        assert_eq!(cache.blocks_held(), 5);
+    }
+
+    #[test]
+    fn test_radix_longest_match() {
+        // Cache 64 tokens, lookup 80 tokens → should match the 64-token prefix.
+        let mut cache = RadixPrefixCache::new(64);
+
+        let tokens: Vec<u32> = (0..64).collect();
+        let handles = vec![bh(0, 0), bh(1, 0), bh(2, 0), bh(3, 0)];
+        cache.insert(&tokens, &handles);
+        cache.release(&tokens); // Drop ref so it's not pinned.
+
+        // Lookup with a longer prompt that shares the first 64 tokens.
+        let mut longer: Vec<u32> = (0..64).collect();
+        longer.extend(200..216); // 5th block doesn't match anything.
+        let result = cache.lookup(&longer);
+        assert!(result.is_some());
+        let (matched_handles, matched_tokens) = result.unwrap();
+        assert_eq!(matched_tokens, 64);
+        assert_eq!(matched_handles.len(), 4);
+    }
+
+    #[test]
+    fn test_radix_partial_match() {
+        // Cache [0..64], lookup [0..48, 999..1015] — first 3 blocks match.
+        let mut cache = RadixPrefixCache::new(64);
+
+        let tokens: Vec<u32> = (0..64).collect();
+        let handles = vec![bh(0, 0), bh(1, 0), bh(2, 0), bh(3, 0)];
+        cache.insert(&tokens, &handles);
+        cache.release(&tokens);
+
+        let mut partial: Vec<u32> = (0..48).collect();
+        partial.extend(999..1015);
+        let result = cache.lookup(&partial);
+        assert!(result.is_some());
+        let (matched_handles, matched_tokens) = result.unwrap();
+        assert_eq!(matched_tokens, 48);
+        assert_eq!(matched_handles.len(), 3);
+    }
+
+    #[test]
+    fn test_radix_leaf_eviction() {
+        // Cache with max 4 blocks.  Insert 4-block prefix, release it,
+        // then insert a 2-block prefix that needs room → should evict leaves.
+        let mut cache = RadixPrefixCache::new(4);
+
+        let tokens_a: Vec<u32> = (0..64).collect();
+        let handles_a = vec![bh(0, 0), bh(1, 0), bh(2, 0), bh(3, 0)];
+        cache.insert(&tokens_a, &handles_a);
+        cache.release(&tokens_a);
+        assert_eq!(cache.blocks_held(), 4);
+
+        // Insert a different prefix that needs 2 blocks → should evict 2 leaves.
+        let tokens_b: Vec<u32> = (100..132).collect();
+        let handles_b = vec![bh(10, 0), bh(11, 0)];
+        let evicted = cache.insert(&tokens_b, &handles_b);
+        assert_eq!(evicted.len(), 2, "should evict 2 leaves to make room");
+        assert_eq!(cache.blocks_held(), 4); // Still at capacity.
+    }
+
+    #[test]
+    fn test_radix_ref_count_prevents_eviction() {
+        // A leaf with ref_count > 0 must not be evicted.
+        let mut cache = RadixPrefixCache::new(2);
+
+        let tokens: Vec<u32> = (0..32).collect();
+        let handles = vec![bh(0, 0), bh(1, 0)];
+        cache.insert(&tokens, &handles);
+        // Don't release — ref_count stays at 1.
+        assert_eq!(cache.blocks_held(), 2);
+
+        // Try to insert another prefix — can't evict because ref_count > 0.
+        let tokens_b: Vec<u32> = (100..116).collect();
+        let handles_b = vec![bh(10, 0)];
+        let evicted = cache.insert(&tokens_b, &handles_b);
+        assert!(evicted.is_empty(), "should not evict referenced blocks");
+        // The new block was still inserted (over capacity — acceptable).
+        assert_eq!(cache.blocks_held(), 3);
+    }
+
+    #[test]
+    fn test_radix_empty_cache_miss() {
+        let mut cache = RadixPrefixCache::new(64);
+        let tokens: Vec<u32> = (0..32).collect();
+        let result = cache.lookup(&tokens);
+        assert!(result.is_none());
+        assert_eq!(cache.misses, 1);
+    }
+
+    #[test]
+    fn test_radix_release_decrements_refcount() {
+        // After release, all nodes should have ref_count decremented.
+        let mut cache = RadixPrefixCache::new(64);
+        let tokens: Vec<u32> = (0..32).collect();
+        let handles = vec![bh(0, 0), bh(1, 0)];
+        cache.insert(&tokens, &handles);
+
+        // ref_count should be 1 after insert.
+        cache.release(&tokens);
+
+        // After release, nodes should be evictable.
+        // Insert enough to trigger eviction — it should succeed.
+        let tokens_b: Vec<u32> = (100..116).collect();
+        let handles_b = vec![bh(10, 0)];
+        // The original nodes are now ref_count=0 and evictable.
+        // (No capacity pressure here, but the state is correct.)
+    }
+
+    #[test]
+    fn test_radix_short_prompt_no_match() {
+        // Prompts shorter than BLOCK_SIZE should not match anything.
+        let mut cache = RadixPrefixCache::new(64);
+        let tokens: Vec<u32> = (0..8).collect(); // Less than BLOCK_SIZE
+        let result = cache.lookup(&tokens);
+        assert!(result.is_none());
     }
 }

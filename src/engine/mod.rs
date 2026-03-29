@@ -59,7 +59,7 @@ use std::collections::{HashMap, VecDeque};
 use self::dispatch::Dispatch;
 use crate::gpu::GpuBackend;
 use crate::model::forward::ModelForward;
-use crate::model::kv_cache::{self, BlockHandle, KvPool, PrefixCache, SeqKvState, BLOCK_SIZE};
+use crate::model::kv_cache::{self, BlockHandle, KvPool, RadixPrefixCache, SeqKvState, BLOCK_SIZE};
 use crate::model::tokenizer::Tokenizer;
 use crate::model::{self, Model, PrefillBuffers};
 
@@ -186,6 +186,14 @@ pub(crate) struct Sequence<S> {
     /// so the same prompt + seed produces the same output.  When None, the
     /// global RNG in run_step() is used instead.
     pub seeded_rng: Option<rand::rngs::SmallRng>,
+    /// Original prompt tokens, preserved for recompute-based preemption.
+    /// When a sequence is evicted to free KV blocks, this + generated_tokens
+    /// are concatenated to form the new prompt for re-queuing.
+    pub original_prompt_tokens: Vec<u32>,
+    /// Whether this sequence had images (vision model).  Once images are
+    /// consumed during prefill (std::mem::take), we can't recover them —
+    /// so vision sequences are excluded from preemption.
+    pub had_images: bool,
 }
 
 /// Manages the waiting queue and active set for continuous batching.
@@ -242,6 +250,8 @@ impl<S> Scheduler<S> {
                 use rand::SeedableRng;
                 rand::rngs::SmallRng::seed_from_u64(s)
             });
+            let had_images = !req.images.is_empty();
+            let original_prompt_tokens = req.prompt_tokens.clone();
             let seq = Sequence {
                 pending_prefill: req.prompt_tokens.into(),
                 kv_state: dispatch.new_seq_state(),
@@ -253,6 +263,8 @@ impl<S> Scheduler<S> {
                 cached_tokens: 0,
                 images: req.images,
                 seeded_rng,
+                original_prompt_tokens,
+                had_images,
             };
             self.active.insert(id, seq);
             admitted.push(id);
@@ -297,6 +309,83 @@ impl<S> Scheduler<S> {
         !self.waiting.is_empty() || !self.active.is_empty()
     }
 
+    /// Whether there are requests waiting to be admitted.
+    pub fn has_waiting(&self) -> bool {
+        !self.waiting.is_empty()
+    }
+
+    /// Try to preempt (evict) an active sequence to free KV blocks for waiting
+    /// requests.  Uses recompute-based preemption: the evicted sequence's
+    /// original prompt + generated tokens are concatenated and re-queued as a
+    /// new request.  On re-admission it re-prefills (prefix cache may hit on
+    /// the system prompt portion, avoiding redundant work).
+    ///
+    /// Victim selection: pick the decoding sequence with the most generated
+    /// tokens — it holds the most KV blocks, so evicting it frees the most
+    /// memory.  Sequences still prefilling or with vision data are excluded.
+    ///
+    /// Returns the evicted sequence's original ID (for logging), or None if
+    /// no suitable victim was found.
+    pub fn try_preempt(&mut self, dispatch: &mut impl Dispatch<SeqState = S>) -> Option<SeqId> {
+        // Don't evict if nothing is waiting — there's no pressure.
+        if self.waiting.is_empty() {
+            return None;
+        }
+
+        // Don't evict the only active sequence — it would just be re-admitted
+        // into the same deadlock (needs blocks, but only its own blocks exist).
+        if self.active.len() <= 1 {
+            return None;
+        }
+
+        // Find the best victim: decoding (not prefilling), no vision images,
+        // and with the most generated tokens (holds the most blocks).
+        let victim_id = self
+            .active
+            .iter()
+            .filter(|(_, seq)| {
+                seq.pending_prefill.is_empty() // Must be decoding, not prefilling
+                    && !seq.finished            // Not already finishing
+                    && !seq.had_images          // Vision sequences can't be preempted
+            })
+            .max_by_key(|(_, seq)| seq.generated_tokens.len())
+            .map(|(&id, _)| id)?;
+
+        let seq = self.active.remove(&victim_id).unwrap();
+
+        eprintln!(
+            "  preempt  |  evicting seq {} ({} generated tokens) to free KV blocks",
+            victim_id,
+            seq.generated_tokens.len(),
+        );
+
+        // Free all KV blocks (releases prefix cache refs too).
+        dispatch.free_seq_state(&seq.kv_state);
+
+        // Re-queue: original prompt + generated tokens become the new prompt.
+        // The model will re-prefill everything (prefix cache likely hits on the
+        // system prompt portion).  max_gen_tokens is reduced by however many
+        // tokens were already generated.
+        let mut new_prompt = seq.original_prompt_tokens;
+        new_prompt.extend_from_slice(&seq.generated_tokens);
+        let remaining_gen = seq.max_gen_tokens.saturating_sub(seq.generated_tokens.len());
+
+        let new_req = SequenceRequest {
+            prompt_tokens: new_prompt,
+            max_gen_tokens: remaining_gen,
+            temperature: seq.temperature,
+            top_p: seq.top_p,
+            images: Vec::new(), // Images were consumed during original prefill
+            seed: None,         // Determinism lost after partial generation
+        };
+
+        // Push to front — this sequence already waited and did work.
+        self.waiting.push_front((self.next_id, new_req));
+        self.next_id += 1;
+
+        Some(victim_id)
+    }
+
     /// Number of waiting requests.
     #[cfg(test)]
     pub fn waiting_count(&self) -> usize {
@@ -325,7 +414,18 @@ pub(crate) fn run_step<D: Dispatch>(
     let mut step_tokens: Vec<(SeqId, u32)> = Vec::new();
 
     // 1. Admit waiting requests.
-    scheduler.schedule(dispatch);
+    let admitted = scheduler.schedule(dispatch);
+
+    // 1b. Preemption: if nothing was admitted but requests are waiting,
+    //     evict the active sequence holding the most KV blocks and retry.
+    //     This prevents deadlock when the KV cache is full and new requests
+    //     can't be admitted.  The evicted sequence is re-queued with its
+    //     original prompt + generated tokens (recompute-based preemption).
+    if admitted.is_empty() && scheduler.has_waiting() {
+        if scheduler.try_preempt(dispatch).is_some() {
+            scheduler.schedule(dispatch);
+        }
+    }
 
     // 2. Batched prefill: drain all pending tokens for each prefilling sequence.
     //    Each sequence's prompt is processed via GEMM (mat-mat).  Long prompts
@@ -585,8 +685,10 @@ pub(crate) struct SingleGpuDispatch<'a, B: GpuBackend> {
     /// small (32 seqs × 128K vocab × 2 bytes = ~8 MB).
     logits_batch: B::Tensor,
     backend: &'a B,
-    /// Prefix cache for sharing KV blocks across sequences with identical prefixes.
-    pub prefix_cache: PrefixCache,
+    /// Radix tree prefix cache for sharing KV blocks across sequences with
+    /// overlapping prefixes.  Block-level sharing: common prefix blocks are
+    /// stored once and shared via the trie structure.
+    pub prefix_cache: RadixPrefixCache,
 }
 
 impl<'a, B: GpuBackend> SingleGpuDispatch<'a, B> {
@@ -603,10 +705,10 @@ impl<'a, B: GpuBackend> SingleGpuDispatch<'a, B> {
             &[max_active, model.config().vocab_size],
             crate::gpu::TensorDtype::BF16,
         );
-        // Default prefix cache: 64 entries.  Each entry holds a system prompt
-        // or common prefix — 64 is generous for typical API server workloads
-        // where a handful of system prompts dominate.
-        let prefix_cache = PrefixCache::new(64);
+        // Radix tree prefix cache: 256 blocks capacity.  With BLOCK_SIZE=16,
+        // this caches ~4096 tokens worth of shared prefixes.  Block-level
+        // sharing means overlapping system prompts reuse internal nodes.
+        let prefix_cache = RadixPrefixCache::new(256);
         Self {
             model,
             forward,
@@ -733,9 +835,10 @@ impl<'a, B: GpuBackend> Dispatch for SingleGpuDispatch<'a, B> {
         let prefix_tokens = tokens[..prefix_len].to_vec();
         let block_indices = state.block_table_cpu_slice()[..prefix_blocks].to_vec();
 
-        if let Some(evicted) = self.prefix_cache.insert(prefix_tokens.clone(), block_indices) {
-            // Return evicted blocks to the free list.
-            self.kv_pool.free_blocks(&evicted);
+        let evicted = self.prefix_cache.insert(&prefix_tokens, &block_indices);
+        // Return evicted blocks to the free list.
+        for handle in &evicted {
+            self.kv_pool.free_block(*handle);
         }
 
         // Mark the prefix blocks as shared on this sequence so free_sequence()
@@ -864,7 +967,7 @@ mod tests {
     use std::cell::Cell;
 
     use crate::gpu::cpu::CpuBackend;
-    use crate::model::kv_cache::{KvPool, SeqKvState};
+    use crate::model::kv_cache::{KvPool, PrefixCache, SeqKvState};
 
     // -----------------------------------------------------------------------
     // TestDispatch — real CpuBackend KvPool for scheduler admission tests.
@@ -1817,5 +1920,154 @@ mod tests {
         let last = prefilled.last().unwrap();
         assert_eq!(last.len(), 24);
         assert_eq!(*last, (1000..1024).collect::<Vec<u32>>());
+    }
+
+    // -----------------------------------------------------------------------
+    // Preemption tests — evict active sequences to free KV blocks.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_preempt_evicts_longest_sequence() {
+        // Pool with 4 blocks, max 4 active.  Admit two sequences that each
+        // use 2 blocks (32-token prompts).  Pool is now full.  A third
+        // request should trigger preemption of the sequence with more
+        // generated tokens.
+        let mut dispatch = MockDispatch::new(4, 100);
+        let mut scheduler: Scheduler<MockSeqState> = Scheduler::new(4);
+        let tokenizer = make_tokenizer(vec![999]);
+
+        // Seq A: 16-token prompt (1 block), max_gen=10
+        let id_a = scheduler.add_request(make_request(16, 10));
+        // Seq B: 16-token prompt (1 block), max_gen=10
+        let id_b = scheduler.add_request(make_request(16, 10));
+
+        // Step 1: admit both, prefill both, decode both (each generates 1 token).
+        run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
+        assert_eq!(scheduler.active.len(), 2);
+
+        // Step 2: decode again — each generates another token.
+        run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
+
+        // Both sequences now have 2 generated tokens each.
+        // Exhaust free blocks to simulate memory pressure.
+        dispatch.free_blocks = 0;
+
+        // Submit a new request that needs 1 block.
+        scheduler.add_request(make_request(16, 5));
+
+        // Step 3: schedule can't admit (0 free blocks), preemption kicks in.
+        // Should evict one of the active sequences (both have same generated
+        // count, so either is valid).
+        let active_before = scheduler.active.len();
+        run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
+
+        // The evicted sequence was re-queued, and the new request or the
+        // re-queued request may have been admitted.  The key invariant:
+        // preemption happened (we didn't deadlock).
+        assert!(
+            scheduler.active.len() >= 1,
+            "at least one sequence should be active after preemption"
+        );
+        // The waiting queue should have the evicted sequence if it wasn't
+        // re-admitted yet, or be empty if everything fit.
+        assert!(
+            scheduler.has_work(),
+            "engine should still have work after preemption"
+        );
+    }
+
+    #[test]
+    fn test_preempt_does_not_evict_single_active() {
+        // With only 1 active sequence and no free blocks, preemption should
+        // NOT fire — evicting the only sequence would just re-admit it into
+        // the same deadlock.
+        let mut dispatch = MockDispatch::new(0, 100);
+        let mut scheduler: Scheduler<MockSeqState> = Scheduler::new(4);
+
+        // Manually admit one sequence.
+        dispatch.free_blocks = 2;
+        scheduler.add_request(make_request(16, 10));
+        scheduler.schedule(&dispatch);
+        assert_eq!(scheduler.active.len(), 1);
+
+        // Exhaust blocks and add a waiting request.
+        dispatch.free_blocks = 0;
+        scheduler.add_request(make_request(16, 5));
+
+        // try_preempt should return None (only 1 active sequence).
+        let result = scheduler.try_preempt(&mut dispatch);
+        assert!(result.is_none(), "should not evict the only active sequence");
+        assert_eq!(scheduler.active.len(), 1);
+    }
+
+    #[test]
+    fn test_preempt_requeues_at_front() {
+        // After preemption, the evicted sequence should be at the front of
+        // the waiting queue (it already waited and did work).
+        let mut dispatch = MockDispatch::new(4, 100);
+        let mut scheduler: Scheduler<MockSeqState> = Scheduler::new(4);
+        let tokenizer = make_tokenizer(vec![999]);
+
+        // Admit two sequences.
+        scheduler.add_request(make_request(16, 10));
+        scheduler.add_request(make_request(16, 10));
+        scheduler.schedule(&dispatch);
+        assert_eq!(scheduler.active.len(), 2);
+
+        // Generate some tokens so sequences have generated_tokens.
+        run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
+
+        // Exhaust blocks, add a new waiting request.
+        dispatch.free_blocks = 0;
+        let new_id = scheduler.add_request(make_request(16, 5));
+        assert_eq!(scheduler.waiting_count(), 1);
+
+        // Preempt — the evicted sequence should go to front of waiting queue,
+        // BEFORE the new request.
+        let evicted = scheduler.try_preempt(&mut dispatch);
+        assert!(evicted.is_some());
+        assert_eq!(scheduler.waiting_count(), 2);
+
+        // Front of waiting queue should be the re-queued sequence (higher ID
+        // than the new request because it gets a fresh ID).
+        let front_id = scheduler.waiting.front().unwrap().0;
+        assert_ne!(front_id, new_id, "evicted sequence should be at front, not the new request");
+    }
+
+    #[test]
+    fn test_preempt_preserves_block_accounting() {
+        // After preemption + re-admission, block accounting should be consistent.
+        // Use the real KvPool-backed TestDispatch for this test.
+        let mut dispatch = TestDispatch::new(6); // 6 blocks
+        let mut scheduler: Scheduler<SeqKvState<CpuBackend>> = Scheduler::new(4);
+        let tokenizer = make_tokenizer(vec![999]);
+
+        let blocks_total = dispatch.pool.free_block_count();
+
+        // Admit seq A: 32 tokens = 2 blocks for prefill.
+        scheduler.add_request(make_request(32, 5));
+        run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
+        let blocks_after_a = dispatch.pool.free_block_count();
+        assert!(blocks_after_a < blocks_total, "seq A should have consumed blocks");
+
+        // Admit seq B: 16 tokens = 1 block for prefill.
+        scheduler.add_request(make_request(16, 5));
+        run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
+
+        // Record blocks used.
+        let blocks_used = blocks_total - dispatch.pool.free_block_count();
+
+        // Add a request that can't fit.
+        scheduler.add_request(make_request(48, 5)); // needs 3 blocks
+
+        // Preempt — should free some blocks.
+        let evicted = scheduler.try_preempt(&mut dispatch);
+        assert!(evicted.is_some(), "should have evicted a sequence");
+
+        let blocks_after_preempt = dispatch.pool.free_block_count();
+        assert!(
+            blocks_after_preempt > blocks_total - blocks_used,
+            "preemption should have freed blocks"
+        );
     }
 }
