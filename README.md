@@ -293,16 +293,7 @@ cargo run --release -- serve --model models/llama-3.2-1b-instruct \
 | Expert streaming | NVMe pread on demand with GPU-side LRU cache | [expert-streaming](docs/expert-streaming.md) |
 | Multi-GPU | NCCL tensor parallelism + expert parallelism for MoE | [multi-gpu-moe](docs/multi-gpu-moe.md) |
 
-## Expert Streaming
-
-rLLM can run MoE models that far exceed GPU memory by streaming expert weights from NVMe on demand. The 397B Qwen3.5 (213 GB Q4) runs on a 64 GB MacBook or 48 GB RTX 4090 using ~20 GB GPU memory.
-
-**How it works:** Expert weight file offsets are recorded at load time. At inference, after the router selects K experts per token, weights are `pread()`'d from disk in parallel and copied into GPU buffer slots with LRU eviction. Cache hits skip NVMe reads and PCIe transfers entirely.
-
-**Both backends:** Metal (unified memory, direct `memcpy`) and CUDA (async DMA via dedicated transfer stream with pinned host memory). Approach inspired by [flash-moe](https://github.com/danveloper/flash-moe).
-
-<details>
-<summary>Landscape comparison</summary>
+## Landscape
 
 | System | Expert offload | Backends | Status |
 |---|---|---|---|
@@ -311,8 +302,6 @@ rLLM can run MoE models that far exceed GPU memory by streaming expert weights f
 | vLLM | CPU memory offload | CUDA only | Production |
 | llama.cpp | CPU-side expert compute | CPU (no GPU streaming) | Production |
 | SGLang / TensorRT-LLM | No expert offloading | CUDA only | — |
-
-</details>
 
 ## Scripts
 
