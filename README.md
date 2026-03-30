@@ -1,6 +1,6 @@
 # rLLM
 
-**This is a learning project.** I'm an appsec engineer who wanted to understand how LLM inference actually works — the GPU kernels, the memory management, the scheduling — so I built one from scratch in Rust with Claude as a teaching partner. It is not rated for production use. Every file is annotated with architectural rationale explaining *why* things work the way they do. See [docs/framework-comparison.md](docs/framework-comparison.md) for how this compares to real inference engines like vLLM, llama.cpp, and Ollama.
+**This is a learning project.** I'm an appsec engineer who wanted to understand how LLM inference actually works — the GPU kernels, the memory management, the scheduling — so I built one from scratch in Rust with Claude as a teaching partner. It is not rated for production use. Every file is annotated with architectural rationale explaining *why* things work the way they do. It builds on ideas from [vLLM](https://github.com/vllm-project/vllm), [llama.cpp](https://github.com/ggerganov/llama.cpp), [Ollama](https://github.com/ollama/ollama), and [flash-moe](https://github.com/danveloper/flash-moe) — reimplemented from scratch so I can understand how they work. See [docs/framework-comparison.md](docs/framework-comparison.md) for a detailed comparison.
 
 Runs models up to 397B parameters on a MacBook via NVMe expert streaming. 13 architectures, two GPU backends (Metal + CUDA), continuous batching, paged KV cache, and an OpenAI/Anthropic-compatible API server.
 
