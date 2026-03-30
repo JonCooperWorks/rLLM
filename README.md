@@ -277,32 +277,7 @@ cargo run --release -- serve --model models/llama-3.2-1b-instruct \
 
 </details>
 
-## Architecture
-
-```
-src/
-├── main.rs              — CLI entry point
-├── commands/            — run, batch, bench, serve, quantize (shared ModelArgs)
-├── model/
-│   ├── mod.rs           — Transformer forward pass (single-token + batched prefill)
-│   ├── config.rs        — HuggingFace config.json parsing, ModelArch detection
-│   ├── loader.rs        — Safetensors loading, pre-quantized Q4 detection
-│   ├── tokenizer.rs     — BPE tokenizer with per-model special tokens
-│   ├── chat.rs          — Chat template formatter
-│   ├── vision.rs        — SigLIP ViT encoder, image preprocessing
-│   ├── kv_cache.rs      — Paged KV cache + prefix caching
-│   ├── expert_stream.rs — SSD expert streaming (pread-based on-demand loading)
-│   └── sampler.rs       — Temperature + top-p sampling
-├── engine/              — Continuous batching loop + FCFS scheduler
-├── api/                 — axum HTTP server, OpenAI + Anthropic handlers, TLS
-└── gpu/
-    ├── mod.rs           — GpuBackend trait (platform-generic interface)
-    ├── metal/           — Metal backend + .metal compute shaders
-    ├── cuda/            — CUDA backend + .cu shader ports
-    └── multi_gpu/       — Tensor parallelism (NCCL all-reduce, weight sharding)
-```
-
-### Optimisation Stack
+## Optimisation Stack
 
 | Layer | Technique | Docs |
 |---|---|---|
