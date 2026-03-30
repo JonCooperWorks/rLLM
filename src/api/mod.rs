@@ -54,6 +54,7 @@ pub(crate) mod openai;
 pub(crate) mod tls;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -149,11 +150,31 @@ pub(crate) struct ServerState {
     pub auth: auth::AuthProviderKind,
     /// Prometheus metrics (shared with the worker thread via Arc).
     pub metrics: Arc<metrics::Metrics>,
+    /// Set to true when a shutdown signal (SIGTERM/SIGINT) is received.
+    /// The health endpoint returns 503 during shutdown so load balancers
+    /// stop sending traffic before the server stops accepting connections.
+    pub shutting_down: Arc<AtomicBool>,
 }
 
 // ---------------------------------------------------------------------------
 // Helpers.
 // ---------------------------------------------------------------------------
+
+/// GET /health — returns 200 when ready, 503 during shutdown.
+///
+/// Since the server only binds after model loading completes (spawn_worker
+/// blocks until the engine is ready), a reachable /health endpoint implies
+/// the model is loaded and serving.  During shutdown, it returns 503 so
+/// load balancers stop routing traffic before connections are closed.
+async fn health_handler(
+    axum::extract::State(state): axum::extract::State<Arc<ServerState>>,
+) -> impl axum::response::IntoResponse {
+    if state.shutting_down.load(Ordering::Relaxed) {
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "shutting down")
+    } else {
+        (axum::http::StatusCode::OK, "ok")
+    }
+}
 
 /// Preprocess images from the last user message for vision models.
 ///
@@ -412,6 +433,8 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     eprintln!("  metrics   : {scheme}://{addr}/metrics");
     eprintln!();
 
+    let shutting_down = Arc::new(AtomicBool::new(false));
+
     let state = Arc::new(ServerState {
         request_tx,
         model_name,
@@ -421,6 +444,7 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         image_token_id,
         auth: auth_provider,
         metrics: server_metrics,
+        shutting_down: shutting_down.clone(),
     });
 
     // Build axum router with all API endpoints.
@@ -434,8 +458,9 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .route("/v1/models", axum::routing::get(openai::list_models))
         // Anthropic-compatible endpoint.
         .route("/v1/messages", axum::routing::post(anthropic::messages))
-        // Health check and metrics.
-        .route("/health", axum::routing::get(|| async { "ok" }))
+        // Health check: returns 200 when healthy, 503 during shutdown so
+        // load balancers drain traffic before the server stops.
+        .route("/health", axum::routing::get(health_handler))
         .route("/metrics", axum::routing::get(metrics::metrics_handler))
         // Auth middleware — inside CORS so preflight OPTIONS get CORS headers
         // even when auth denies them.
@@ -457,12 +482,42 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     });
 
     rt.block_on(async {
+        // Shutdown signal: SIGINT (Ctrl-C) or SIGTERM (container orchestrators).
+        // Sets the shutting_down flag first (so /health returns 503 for
+        // load balancer draining), then signals the server to stop accepting
+        // new connections and drain in-flight requests.
+        let shutdown_flag = shutting_down.clone();
+        let shutdown_signal = async move {
+            let ctrl_c = tokio::signal::ctrl_c();
+            #[cfg(unix)]
+            {
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("failed to install SIGTERM handler");
+                tokio::select! {
+                    _ = ctrl_c => {},
+                    _ = sigterm.recv() => {},
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                ctrl_c.await.ok();
+            }
+            eprintln!("shutdown signal received, draining in-flight requests...");
+            shutdown_flag.store(true, Ordering::Relaxed);
+        };
+
         match tls_mode {
             tls::TlsMode::None => {
                 let listener = tokio::net::TcpListener::bind(&addr).await?;
-                axum::serve(listener, app).await?;
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(shutdown_signal)
+                    .await?;
             }
             tls::TlsMode::Manual { cert, key } => {
+                // TLS paths handle their own accept loop; graceful shutdown
+                // is not yet wired for TLS (would require refactoring the
+                // custom accept loops in tls.rs).
                 tls::serve_manual_tls(app, &addr, &cert, &key).await?;
             }
             tls::TlsMode::LetsEncrypt {

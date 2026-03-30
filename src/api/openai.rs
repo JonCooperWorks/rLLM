@@ -104,6 +104,25 @@ pub(crate) struct ChatCompletionRequest {
     /// counts are included in the final streaming chunk.
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
+    /// Response format constraint.  `{"type": "json_object"}` instructs the
+    /// model to produce valid JSON.  The system prompt is augmented with a
+    /// JSON instruction, and the output is validated before returning.
+    #[serde(default)]
+    pub response_format: Option<ResponseFormat>,
+}
+
+/// Response format constraint (OpenAI `response_format` parameter).
+///
+/// `{"type": "text"}` is the default (no constraint).
+/// `{"type": "json_object"}` instructs the model to produce valid JSON.
+///
+/// Implementation: when json_object is requested, the system prompt is
+/// augmented with a JSON instruction and the output is validated.  This
+/// matches OpenAI's approach — prompt-guided, not grammar-constrained.
+#[derive(serde::Deserialize, Clone)]
+pub(crate) struct ResponseFormat {
+    #[serde(rename = "type")]
+    pub format_type: String,
 }
 
 /// Options that control streaming behaviour.
@@ -275,6 +294,35 @@ fn inject_tools(
 }
 
 // ---------------------------------------------------------------------------
+// JSON mode helper: augment the system prompt with a JSON instruction.
+// ---------------------------------------------------------------------------
+
+/// Prepend a JSON instruction to the system message so the model produces
+/// valid JSON output.  Creates a system message if none exists.
+///
+/// This matches OpenAI's prompt-guided approach — no grammar-constrained
+/// decoding, just a clear instruction + post-validation.
+fn inject_json_instruction(messages: &mut Vec<Message>) {
+    const JSON_INSTRUCTION: &str =
+        "\n\nRespond with valid JSON only. Do not include any text outside the JSON object.";
+
+    if let Some(sys_msg) = messages.iter_mut().find(|m| m.role == "system") {
+        sys_msg.content.push_str(JSON_INSTRUCTION);
+    } else {
+        messages.insert(
+            0,
+            Message {
+                role: "system".into(),
+                content: JSON_INSTRUCTION.trim_start().to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                images: None,
+            },
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // POST /v1/chat/completions
 // ---------------------------------------------------------------------------
 
@@ -302,12 +350,22 @@ pub(crate) async fn chat_completions(
         Vec::new()
     };
 
+    let json_mode = req
+        .response_format
+        .as_ref()
+        .is_some_and(|f| f.format_type == "json_object");
+
     // Inject tool definitions into the system message.
-    let messages = if has_tools && !tools_disabled {
+    let mut messages = if has_tools && !tools_disabled {
         inject_tools(req.messages, req.tools.as_ref().unwrap(), state.arch)
     } else {
         req.messages
     };
+
+    // JSON mode: augment the system prompt so the model produces valid JSON.
+    if json_mode {
+        inject_json_instruction(&mut messages);
+    }
 
     // Tokenize on the async handler thread (CPU-only, doesn't block GPU).
     // Use thinking-aware encoding if thinking was requested.
@@ -390,7 +448,11 @@ pub(crate) async fn chat_completions(
     //   - Plain streaming: tokens emitted as they arrive.
     //   - Streaming with tools: collect then emit (tool markers span tokens).
     //   - Streaming with thinking: collect then emit (thinking blocks span tokens).
-    let mut response = if req.stream {
+    let mut response = if req.stream && !json_mode {
+        // JSON mode forces the blocking path even when streaming is requested,
+        // because the output must be validated as valid JSON before returning.
+        // (Streaming JSON mode could emit tokens then error on the final chunk,
+        // but that's a worse UX than collecting and validating first.)
         if thinking_enabled && check_tools {
             chat_completions_stream_with_thinking_and_tools(
                 state, response_rx, tools_required, tool_defs,
@@ -412,6 +474,7 @@ pub(crate) async fn chat_completions(
             thinking_enabled,
             tools_required,
             tool_defs,
+            json_mode,
         )
         .await
     };
@@ -435,6 +498,7 @@ async fn chat_completions_blocking(
     check_thinking: bool,
     tools_required: bool,
     tool_defs: Vec<ToolDefinition>,
+    json_mode: bool,
 ) -> Response {
     let mut text = String::new();
     let mut prompt_tokens = 0usize;
@@ -458,6 +522,20 @@ async fn chat_completions_blocking(
                 return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e);
             }
         }
+    }
+
+    // JSON mode: validate that the output is valid JSON.  If not, return a
+    // 400 error rather than silently returning malformed JSON.
+    if json_mode {
+        let trimmed = text.trim();
+        if serde_json::from_str::<serde_json::Value>(trimmed).is_err() {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "model output is not valid JSON (response_format was json_object)",
+            );
+        }
+        // Use the trimmed text so leading/trailing whitespace is stripped.
+        text = trimmed.to_string();
     }
 
     // Parse thinking blocks first (they wrap the entire output including
