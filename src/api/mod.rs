@@ -968,11 +968,6 @@ fn run_worker_loop(
                     StopReason::MaxTokens => "max_tokens",
                     StopReason::ToolCalls => "tool_calls",
                 };
-                let cache_label = if ctx.cached_tokens > 0 {
-                    format!(" ({} cached)", ctx.cached_tokens)
-                } else {
-                    String::new()
-                };
                 let user_sub = ctx.user.as_ref().map(|u| u.sub.as_str()).unwrap_or("-");
                 tracing::info!(
                     request_id = %ctx.request_id,
@@ -1051,6 +1046,7 @@ fn run_worker_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt; // for .oneshot()
 
     /// Build a minimal RequestContext for testing metrics recording.
     fn test_ctx(prompt_tokens: usize, generated: usize, cached: usize) -> RequestContext {
@@ -1214,5 +1210,156 @@ mod tests {
         m.request_timeouts.inc_by(3);
         let output = m.encode();
         assert!(output.contains("rllm_request_timeouts_total 3"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Health handler
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal ServerState for testing (no real tokenizer or engine).
+    fn test_server_state() -> Arc<ServerState> {
+        // Channel that we never read — just need a valid SyncSender.
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(1);
+        Arc::new(ServerState {
+            request_tx: tx,
+            model_name: "test".into(),
+            // Safety: tokenizer is never called in these tests — we just
+            // need a valid Arc to satisfy the struct.  Using a zeroed pointer
+            // would be UB, so we use a real but empty-ish construction.
+            tokenizer: Arc::new(tokenizer::Tokenizer::for_test(vec![0])),
+            arch: config::ModelArch::Llama,
+            vision_config: None,
+            image_token_id: None,
+            auth: auth::AuthProviderKind::None,
+            metrics: Arc::new(metrics::Metrics::new()),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    #[tokio::test]
+    async fn health_returns_200_when_healthy() {
+        let state = test_server_state();
+        let app = axum::Router::new()
+            .route("/health", axum::routing::get(health_handler))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["active_sequences"], 0);
+        assert_eq!(json["waiting_sequences"], 0);
+    }
+
+    #[tokio::test]
+    async fn health_returns_503_during_shutdown() {
+        let state = test_server_state();
+        state.shutting_down.store(true, Ordering::Relaxed);
+
+        let app = axum::Router::new()
+            .route("/health", axum::routing::get(health_handler))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "shutting_down");
+    }
+
+    #[tokio::test]
+    async fn health_reflects_sequence_gauges() {
+        let state = test_server_state();
+        state.metrics.active_sequences.set(5);
+        state.metrics.waiting_sequences.set(12);
+
+        let app = axum::Router::new()
+            .route("/health", axum::routing::get(health_handler))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["active_sequences"], 5);
+        assert_eq!(json["waiting_sequences"], 12);
+    }
+
+    // -----------------------------------------------------------------------
+    // Shutdown watch channel
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn shutdown_watch_resolves_on_signal() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+
+        // shutdown_from_watch is defined inside serve(), so replicate its logic.
+        let fut = {
+            let mut rx = rx;
+            async move {
+                while !*rx.borrow_and_update() {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+        };
+
+        // Signal shutdown after a short delay.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tx.send(true).unwrap();
+        });
+
+        // The future should resolve within 100ms.
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), fut).await;
+        assert!(result.is_ok(), "shutdown watch did not resolve in time");
+    }
+
+    #[tokio::test]
+    async fn shutdown_watch_does_not_resolve_without_signal() {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+
+        let fut = {
+            let mut rx = rx;
+            async move {
+                while !*rx.borrow_and_update() {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+        };
+
+        // Should NOT resolve within 50ms.
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), fut).await;
+        assert!(result.is_err(), "shutdown watch resolved without a signal");
     }
 }

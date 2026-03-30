@@ -49,6 +49,7 @@ cudarc = { version = "0.19", features = ["std", "driver", "nvrtc", "nccl", "f16"
 
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5.3", features = ["util"] }
 
 [profile.release]
 lto = "thin"

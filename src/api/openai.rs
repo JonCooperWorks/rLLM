@@ -1722,4 +1722,141 @@ mod tests {
         assert_eq!(req.seed, Some(123));
         assert_eq!(req.stop, vec!["END"]);
     }
+
+    // -----------------------------------------------------------------------
+    // response_format deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_response_format_json_object() {
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Hi"}],
+            "response_format": {"type": "json_object"}
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        let rf = req.response_format.unwrap();
+        assert_eq!(rf.format_type, "json_object");
+    }
+
+    #[test]
+    fn test_response_format_text() {
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Hi"}],
+            "response_format": {"type": "text"}
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        let rf = req.response_format.unwrap();
+        assert_eq!(rf.format_type, "text");
+    }
+
+    #[test]
+    fn test_response_format_defaults_to_none() {
+        let json = r#"{"messages": [{"role": "user", "content": "Hi"}]}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(req.response_format.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // inject_json_instruction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_inject_json_appends_to_existing_system() {
+        let mut messages = vec![
+            Message {
+                role: "system".into(),
+                content: "You are a helpful assistant.".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                images: None,
+            },
+            Message {
+                role: "user".into(),
+                content: "Give me data".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                images: None,
+            },
+        ];
+        inject_json_instruction(&mut messages);
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].content.starts_with("You are a helpful assistant."));
+        assert!(messages[0].content.contains("valid JSON"));
+    }
+
+    #[test]
+    fn test_inject_json_creates_system_when_absent() {
+        let mut messages = vec![Message {
+            role: "user".into(),
+            content: "Give me data".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            images: None,
+        }];
+        inject_json_instruction(&mut messages);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        assert!(messages[0].content.contains("valid JSON"));
+        assert_eq!(messages[1].role, "user");
+    }
+
+    #[test]
+    fn test_inject_json_no_duplicate_system() {
+        let mut messages = vec![
+            Message {
+                role: "system".into(),
+                content: "Original system.".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                images: None,
+            },
+        ];
+        inject_json_instruction(&mut messages);
+        // Should have exactly one system message, not two.
+        assert_eq!(messages.iter().filter(|m| m.role == "system").count(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // JSON mode validation logic (extracted from chat_completions_blocking)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_json_validation_accepts_valid_json() {
+        let text = r#"  {"key": "value", "count": 42}  "#;
+        let trimmed = text.trim();
+        assert!(serde_json::from_str::<serde_json::Value>(trimmed).is_ok());
+        // Trimming removes whitespace.
+        assert_eq!(trimmed, r#"{"key": "value", "count": 42}"#);
+    }
+
+    #[test]
+    fn test_json_validation_accepts_array() {
+        let text = r#"[1, 2, 3]"#;
+        assert!(serde_json::from_str::<serde_json::Value>(text.trim()).is_ok());
+    }
+
+    #[test]
+    fn test_json_validation_rejects_plain_text() {
+        let text = "This is not JSON at all";
+        assert!(serde_json::from_str::<serde_json::Value>(text.trim()).is_err());
+    }
+
+    #[test]
+    fn test_json_validation_rejects_partial_json() {
+        let text = r#"{"key": "value""#; // missing closing brace
+        assert!(serde_json::from_str::<serde_json::Value>(text.trim()).is_err());
+    }
+
+    #[test]
+    fn test_json_validation_rejects_json_with_preamble() {
+        // Model sometimes produces "Here is the JSON: {...}"
+        let text = r#"Here is your data: {"key": "value"}"#;
+        assert!(serde_json::from_str::<serde_json::Value>(text.trim()).is_err());
+    }
+
+    #[test]
+    fn test_json_validation_accepts_nested() {
+        let text = r#"{"users": [{"name": "Alice", "age": 30}], "total": 1}"#;
+        assert!(serde_json::from_str::<serde_json::Value>(text.trim()).is_ok());
+    }
 }
