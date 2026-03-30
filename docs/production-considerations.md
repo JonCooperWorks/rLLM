@@ -429,7 +429,7 @@ counts, latency, and timestamp.  The audit log is ground truth for:
 - **Forensics** — trace harmful output to the exact request and customer
 
 When auth is enabled, rLLM logs the authenticated user identity (JWT `sub`
-claim) alongside token counts and latency in its per-request stderr output —
+claim) alongside token counts and latency in structured log fields —
 inference-side audit logging without additional infrastructure.
 
 Both streams (inference-side and gateway-side) ship to a **log gateway**
@@ -551,20 +551,106 @@ just produces JSON.
 
 ---
 
-## What This Means for rLLM
+## What rLLM Provides
 
 rLLM is the inference server in the diagram: model loading, Q4 quantization,
 continuous batching, GPU dispatch, streaming generation, and an
-OpenAI/Anthropic-compatible API.
+OpenAI/Anthropic-compatible API.  Billing, routing, rate limiting, and
+tiering belong in the gateway.
 
-Billing, routing, rate limiting, and tiering belong in the gateway.
-Authentication is shared: the gateway authenticates the end user and mints a
-scoped token; rLLM verifies it via its pluggable auth hook system
-(`--auth-config`).  The built-in OIDC provider handles standard JWT
-validation; the `AuthProvider` trait can be extended to support an org's
-specific auth infrastructure without modifying rLLM's core.  When auth is
-enabled, per-user identity is logged to stderr alongside token counts and
-latency — audit logging at the inference layer for free.
+### Observability
+
+**Structured logging.**  All logs use the `tracing` crate with machine-parseable
+structured fields (request ID, sequence, token counts, latency, user identity).
+Default level is `info`; override with `RUST_LOG` (e.g. `RUST_LOG=debug` or
+`RUST_LOG=rllm::api=debug,rllm::engine=info`).  Output goes to stderr — log
+collectors (journald, Datadog Agent, Fluentd) parse fields directly without
+regex.
+
+**Prometheus metrics.**  `GET /metrics` exposes counters, histograms, and gauges
+in Prometheus text format.  Exempted from auth so scrapers don't need credentials.
+
+| Metric | Type | What it tells you |
+|--------|------|-------------------|
+| `rllm_request_duration_seconds` | Histogram | End-to-end latency distribution |
+| `rllm_time_to_first_token_seconds` | Histogram | TTFT for SLO monitoring |
+| `rllm_decode_tokens_per_second` | Histogram | GPU throughput per request |
+| `rllm_prompt_tokens_total` | Counter | Input token volume (billing reconciliation) |
+| `rllm_completion_tokens_total` | Counter | Output token volume |
+| `rllm_requests_total{endpoint}` | Counter | Traffic per API endpoint |
+| `rllm_active_sequences` | Gauge | Sequences in flight (capacity monitoring) |
+| `rllm_waiting_sequences` | Gauge | Admission queue depth |
+| `rllm_prefix_cache_hits_total` | Counter | Cache effectiveness |
+| `rllm_errors_total` | Counter | Engine failures |
+| `rllm_request_timeouts_total` | Counter | Timeout aborts |
+
+**Request IDs.**  Every request gets a unique hex ID at the handler, returned in
+`X-Request-Id`, the response body `id` field, and the structured log.  Trace a
+client-reported issue to the exact server-side log line.
+
+**Health endpoint.**  `GET /health` returns 200 with a JSON body containing
+`active_sequences` and `waiting_sequences`.  Returns 503 during shutdown.
+Load balancers use the status code; dashboards can parse the body.
+
+### Reliability
+
+**Graceful shutdown.**  SIGTERM or SIGINT triggers:
+1. `/health` returns 503 — load balancers stop routing
+2. Server stops accepting new connections
+3. In-flight requests drain to completion
+4. Server exits cleanly
+
+Works for plain HTTP and both TLS modes (manual certs, Let's Encrypt).
+
+**Request timeouts.**  `--request-timeout` (default 300s) sets a per-request
+deadline.  After each engine step, the worker aborts sequences past their
+deadline and sends an error to the client.  Prevents one stuck request from
+blocking the entire server.
+
+**Panic recovery.**  The worker thread is wrapped in `catch_unwind`.  A GPU
+backend or model panic is captured and logged instead of silently killing the
+thread.  Without this, a panic leaves all in-flight requests hanging and the
+server appears alive but cannot process work.
+
+**Backpressure.**  The request channel between HTTP handlers and the worker
+thread has a configurable depth (`--max-pending`, default 8).  When full,
+new requests immediately get 503.  The scheduler caps concurrent sequences
+at `--max-active` (default 32).  Both prevent memory exhaustion under load.
+
+### Authentication
+
+The gateway authenticates end users and mints scoped tokens.  rLLM verifies
+them via `--auth-config` with two built-in providers:
+
+- **OIDC** — validates JWTs against the issuer's published JWKS (auto-refreshed)
+- **Static API key** — argon2 hash comparison with hot reload (file mtime polling)
+
+The `AuthProvider` trait extends to custom token formats without modifying
+rLLM's core.  When auth is enabled, per-user identity appears in structured
+logs alongside token counts and latency — audit logging at the inference layer.
+
+See [Authentication](authentication.md) for the full design.
+
+### Configuration
+
+```
+rllm serve --model <PATH> [OPTIONS]
+
+Concurrency:
+  --max-pending <N>       Handler→worker queue depth (default: 8)
+  --max-active <N>        Max concurrent sequences (default: 32)
+  --request-timeout <S>   Per-request deadline in seconds (default: 300)
+
+TLS:
+  --cert / --private-key  Manual TLS certificate
+  --letsencrypt --domain  Automatic Let's Encrypt
+
+Auth:
+  --auth-config <PATH>    OIDC or static API key config (JSON)
+
+Logging:
+  RUST_LOG=<filter>       Tracing level filter (default: info)
+```
 
 ---
 
@@ -577,6 +663,6 @@ latency — audit logging at the inference layer for free.
 - [Quantization](quantization.md) — Q4 format, pre-quantization, kernel dequantization
 - [TurboQuant](turboquant.md) — KV cache vector quantization, ~4× compression, quality-neutral
 - [Expert Streaming](expert-streaming.md) — SSD-backed MoE, LRU cache, pread I/O
-- [API Server](api-server.md) — HTTP endpoints, worker thread, streaming
+- [API Server](api-server.md) — HTTP endpoints, worker thread, streaming, CLI flags
 - [Tool Calling](tool-calling.md) — per-architecture formats, parsing, API surface
 - [Threat Model](threat-model.md) — STRIDE analysis, weight theft, customer data, residual risks
