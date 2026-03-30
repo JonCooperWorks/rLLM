@@ -104,6 +104,10 @@ pub(crate) struct WorkerRequest {
     /// Stop sequences — generation stops when any of these strings appear
     /// in the output.  The stop sequence itself is excluded from the response.
     pub stop: Vec<String>,
+    /// Precompiled grammar for structured output (None for unconstrained generation).
+    /// Built on the async handler thread from a JSON schema, passed to the engine
+    /// for per-token constraint enforcement.
+    pub grammar: Option<std::sync::Arc<crate::model::grammar::CompiledGrammar>>,
 }
 
 /// Events sent from the inference worker back to an HTTP handler.
@@ -768,6 +772,7 @@ fn run_worker_loop(
             req.top_p,
             req.images,
             req.seed,
+            req.grammar,
         );
         registry.insert(
             seq_id,
@@ -1439,6 +1444,7 @@ mod tests {
             _top_p: f32,
             _images: Vec<crate::model::vision::ProcessedImage>,
             _seed: Option<u64>,
+            _grammar: Option<std::sync::Arc<crate::model::grammar::CompiledGrammar>>,
         ) -> SeqId {
             let id = self.next_id;
             self.next_id += 1;
@@ -1487,6 +1493,7 @@ mod tests {
             user: None,
             seed: None,
             stop: Vec::new(),
+            grammar: None,
         };
         (req, rx)
     }

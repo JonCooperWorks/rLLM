@@ -69,7 +69,7 @@ pub(crate) fn exec(args: BenchArgs) -> anyhow::Result<()> {
                 super::encode_prompt(eng, arch, user_prompt, true, &system, None, None, &[])?;
             let prompt_len = prompt_tokens.len();
 
-            eng.add_request(prompt_tokens, max_tokens, 0.0, 1.0, Vec::new(), None);
+            eng.add_request(prompt_tokens, max_tokens, 0.0, 1.0, Vec::new(), None, None);
 
             let start = Instant::now();
             let mut ttft = None;

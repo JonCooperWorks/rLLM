@@ -284,6 +284,7 @@ pub(crate) async fn messages(
         user: user.map(|Extension(u)| u),
         seed: None, // Anthropic API does not expose a seed parameter.
         stop: req.stop.unwrap_or_default(),
+        grammar: None, // Anthropic API does not expose structured output.
     };
 
     state.request_tx.try_send(worker_req).map_err(|e| match e {

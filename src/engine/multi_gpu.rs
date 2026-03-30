@@ -112,6 +112,7 @@ mod imp {
             temperature: f32,
             top_p: f32,
             rng: &mut impl rand::Rng,
+            allowed_tokens: Option<&[u32]>,
         ) -> anyhow::Result<u32> {
             crate::model::sampler::sample(
                 self.multi.backend(),
@@ -120,6 +121,7 @@ mod imp {
                 top_p,
                 rng,
                 self.tokenizer_vocab_size,
+                allowed_tokens,
             )
         }
     }
@@ -159,6 +161,7 @@ mod imp {
             top_p: f32,
             images: Vec<crate::model::vision::ProcessedImage>,
             seed: Option<u64>,
+            grammar: Option<std::sync::Arc<crate::model::grammar::CompiledGrammar>>,
         ) -> SeqId {
             self.scheduler.add_request(SequenceRequest {
                 prompt_tokens,
@@ -167,6 +170,7 @@ mod imp {
                 top_p,
                 images,
                 seed,
+                grammar,
             })
         }
 

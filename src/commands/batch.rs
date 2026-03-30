@@ -47,7 +47,7 @@ pub(crate) fn exec(args: BatchArgs) -> anyhow::Result<()> {
         // Submit all prompts.
         for prompt_text in &prompts {
             let tokens = super::encode_prompt(eng, arch, prompt_text, chat, &system, None, None, &[])?;
-            eng.add_request(tokens, max_tokens, temperature, top_p, Vec::new(), None);
+            eng.add_request(tokens, max_tokens, temperature, top_p, Vec::new(), None, None);
         }
 
         // Run engine loop.

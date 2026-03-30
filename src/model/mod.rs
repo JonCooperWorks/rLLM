@@ -56,6 +56,7 @@ pub(crate) mod chat;
 pub(crate) mod config;
 pub(crate) mod expert_stream;
 pub(crate) mod forward;
+pub(crate) mod grammar;
 pub(crate) mod kv_cache;
 pub(crate) mod loader;
 pub(crate) mod primitives;

@@ -35,6 +35,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 prometheus = "0.13"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
+outlines-core = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.33.0"

@@ -114,15 +114,31 @@ pub(crate) struct ChatCompletionRequest {
 /// Response format constraint (OpenAI `response_format` parameter).
 ///
 /// `{"type": "text"}` is the default (no constraint).
-/// `{"type": "json_object"}` instructs the model to produce valid JSON.
-///
-/// Implementation: when json_object is requested, the system prompt is
-/// augmented with a JSON instruction and the output is validated.  This
-/// matches OpenAI's approach — prompt-guided, not grammar-constrained.
+/// `{"type": "json_object"}` instructs the model to produce valid JSON
+///   (prompt-guided with post-validation).
+/// `{"type": "json_schema"}` constrains generation to a JSON schema using
+///   grammar-based token masking (every token is guaranteed schema-valid).
 #[derive(serde::Deserialize, Clone)]
 pub(crate) struct ResponseFormat {
     #[serde(rename = "type")]
     pub format_type: String,
+    /// JSON schema definition (only when format_type == "json_schema").
+    #[serde(default)]
+    pub json_schema: Option<JsonSchemaSpec>,
+}
+
+/// JSON schema specification for structured output.
+///
+/// Matches OpenAI's API format:
+///   `{"name": "my_schema", "strict": true, "schema": {...}}`
+#[derive(serde::Deserialize, Clone)]
+pub(crate) struct JsonSchemaSpec {
+    #[allow(dead_code)]
+    pub name: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub strict: Option<bool>,
+    pub schema: serde_json::Value,
 }
 
 /// Options that control streaming behaviour.
@@ -355,6 +371,34 @@ pub(crate) async fn chat_completions(
         .as_ref()
         .is_some_and(|f| f.format_type == "json_object");
 
+    // JSON schema mode: compile the schema into a grammar for token-level
+    // constrained generation.  This is CPU-intensive (50-500ms) but runs on
+    // the async handler thread, not the GPU worker.
+    let json_schema_mode = req
+        .response_format
+        .as_ref()
+        .is_some_and(|f| f.format_type == "json_schema");
+
+    let compiled_grammar = if json_schema_mode {
+        let spec = req
+            .response_format
+            .as_ref()
+            .and_then(|f| f.json_schema.as_ref())
+            .ok_or_else(|| {
+                tracing::warn!("json_schema response_format missing json_schema field");
+                StatusCode::BAD_REQUEST
+            })?;
+        Some(
+            crate::model::grammar::compile_json_schema(&spec.schema, &state.tokenizer)
+                .map_err(|e| {
+                    tracing::warn!("failed to compile JSON schema: {e}");
+                    StatusCode::BAD_REQUEST
+                })?,
+        )
+    } else {
+        None
+    };
+
     // Inject tool definitions into the system message.
     let mut messages = if has_tools && !tools_disabled {
         inject_tools(req.messages, req.tools.as_ref().unwrap(), state.arch)
@@ -362,8 +406,11 @@ pub(crate) async fn chat_completions(
         req.messages
     };
 
-    // JSON mode: augment the system prompt so the model produces valid JSON.
-    if json_mode {
+    // JSON mode / JSON schema mode: augment the system prompt so the model
+    // cooperates with the constraint.  For json_schema, correctness is
+    // guaranteed by token masking, but the instruction helps the model
+    // produce better-structured output within the grammar constraints.
+    if json_mode || json_schema_mode {
         inject_json_instruction(&mut messages);
     }
 
@@ -422,6 +469,7 @@ pub(crate) async fn chat_completions(
         user: user.map(|Extension(u)| u),
         seed: req.seed,
         stop: req.stop,
+        grammar: compiled_grammar,
     };
 
     state.request_tx.try_send(worker_req).map_err(|e| match e {
@@ -448,7 +496,7 @@ pub(crate) async fn chat_completions(
     //   - Plain streaming: tokens emitted as they arrive.
     //   - Streaming with tools: collect then emit (tool markers span tokens).
     //   - Streaming with thinking: collect then emit (thinking blocks span tokens).
-    let mut response = if req.stream && !json_mode {
+    let mut response = if req.stream && (!json_mode || json_schema_mode) {
         // JSON mode forces the blocking path even when streaming is requested,
         // because the output must be validated as valid JSON before returning.
         // (Streaming JSON mode could emit tokens then error on the final chunk,
@@ -1017,6 +1065,7 @@ pub(crate) async fn completions(
         user: user.map(|Extension(u)| u),
         seed: req.seed,
         stop: req.stop,
+        grammar: None,
     };
 
     state.request_tx.try_send(worker_req).map_err(|e| match e {

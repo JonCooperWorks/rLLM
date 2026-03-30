@@ -62,6 +62,7 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
             top_p,
             processed_images.to_vec(),
             None,
+            None,
         );
 
         // Stream tokens to stdout as they're generated.

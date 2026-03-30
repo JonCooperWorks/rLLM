@@ -76,10 +76,13 @@ pub(crate) fn sample<B: GpuBackend>(
     top_p: f32,
     rng: &mut impl Rng,
     vocab_size: usize,
+    allowed_tokens: Option<&[u32]>,
 ) -> anyhow::Result<u32> {
     // Temperature = 0 is the convention for "be greedy / deterministic".
     // Mathematically, lim(T→0) of softmax(logits/T) is a one-hot on the argmax.
-    if temperature == 0.0 {
+    // When grammar constraints are active, we can't use GPU argmax (the mask
+    // lives on CPU), so fall through to the CPU path.
+    if temperature == 0.0 && allowed_tokens.is_none() {
         return sample_greedy(backend, logits, vocab_size);
     }
 
@@ -100,6 +103,23 @@ pub(crate) fn sample<B: GpuBackend>(
     // that decode to empty strings.
     let effective = vocab_size.min(bf16_values.len());
     let mut logits_f32: Vec<f32> = bf16_values[..effective].iter().map(|v| v.to_f32()).collect();
+
+    // --- Step 2b: Grammar constraint masking ---
+    // Set disallowed tokens to -infinity before temperature scaling.
+    // After softmax, these become probability 0 — they can never be sampled.
+    if let Some(allowed) = allowed_tokens {
+        apply_token_mask(&mut logits_f32, allowed);
+    }
+
+    // Greedy with grammar: after masking, just argmax on CPU.
+    if temperature == 0.0 {
+        return Ok(logits_f32
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0));
+    }
 
     // --- Step 3: Temperature scaling ---
     // Divide every logit by T.  This is equivalent to raising the softmax
@@ -221,6 +241,7 @@ pub(crate) fn sample_batch<B: GpuBackend>(
     top_ps: &[f32],
     rng: &mut impl Rng,
     tokenizer_vocab_size: usize,
+    allowed_tokens_per_seq: &[Option<Vec<u32>>],
 ) -> anyhow::Result<Vec<u32>> {
     assert_eq!(temperatures.len(), batch_size);
     assert_eq!(top_ps.len(), batch_size);
@@ -237,12 +258,17 @@ pub(crate) fn sample_batch<B: GpuBackend>(
 
     for i in 0..batch_size {
         let row_data = &buf[i * row_bytes..i * row_bytes + effective_row_bytes];
-        let token = if temperatures[i] == 0.0 {
+        let allowed = if i < allowed_tokens_per_seq.len() {
+            allowed_tokens_per_seq[i].as_deref()
+        } else {
+            None
+        };
+        let token = if temperatures[i] == 0.0 && allowed.is_none() {
             // Greedy: argmax on this row.
             argmax_bf16(row_data)
         } else {
-            // Temperature + top-p sampling on this row.
-            sample_row(row_data, temperatures[i], top_ps[i], rng)
+            // Temperature + top-p sampling on this row (with optional grammar mask).
+            sample_row(row_data, temperatures[i], top_ps[i], rng, allowed)
         };
         results.push(token);
     }
@@ -254,9 +280,24 @@ pub(crate) fn sample_batch<B: GpuBackend>(
 ///
 /// Extracted from `sample()` so it can be reused by `sample_batch()` without
 /// needing a GPU tensor — it operates directly on a byte slice already on the CPU.
-fn sample_row(logits_bytes: &[u8], temperature: f32, top_p: f32, rng: &mut impl Rng) -> u32 {
+fn sample_row(logits_bytes: &[u8], temperature: f32, top_p: f32, rng: &mut impl Rng, allowed_tokens: Option<&[u32]>) -> u32 {
     let bf16_values: &[bf16] = bytemuck::cast_slice(logits_bytes);
     let mut logits_f32: Vec<f32> = bf16_values.iter().map(|v| v.to_f32()).collect();
+
+    // Grammar constraint masking (before temperature scaling).
+    if let Some(allowed) = allowed_tokens {
+        apply_token_mask(&mut logits_f32, allowed);
+    }
+
+    // Greedy with grammar: after masking, argmax on CPU.
+    if temperature == 0.0 {
+        return logits_f32
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0);
+    }
 
     // Temperature scaling.
     let inv_temp = 1.0 / temperature;
@@ -390,6 +431,29 @@ fn argmax_bf16(data: &[u8]) -> u32 {
         .unwrap_or(0)
 }
 
+/// Mask disallowed tokens to negative infinity.
+///
+/// Sets all logits NOT in the `allowed_tokens` set to `f32::NEG_INFINITY`.
+/// After softmax, these become probability 0 — they can never be sampled.
+/// This is the standard approach used by vLLM, SGLang, and other inference
+/// servers for grammar-constrained generation.
+fn apply_token_mask(logits: &mut [f32], allowed_tokens: &[u32]) {
+    // Build a quick lookup of which token IDs are allowed.
+    // For typical JSON schemas the allowed set is small (10-1000 tokens),
+    // so building a bitset over vocab_size is efficient.
+    let mut allowed = vec![false; logits.len()];
+    for &id in allowed_tokens {
+        if (id as usize) < allowed.len() {
+            allowed[id as usize] = true;
+        }
+    }
+    for (i, logit) in logits.iter_mut().enumerate() {
+        if !allowed[i] {
+            *logit = f32::NEG_INFINITY;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,7 +510,7 @@ mod tests {
         let mut rng = rand::rngs::SmallRng::seed_from_u64(42);
         // Run multiple times — should always pick index 1.
         for _ in 0..20 {
-            let token = sample_row(&data, 0.01, 1.0, &mut rng);
+            let token = sample_row(&data, 0.01, 1.0, &mut rng, None);
             assert_eq!(token, 1, "Very low temperature should pick argmax");
         }
     }
@@ -458,8 +522,8 @@ mod tests {
         let mut rng1 = rand::rngs::SmallRng::seed_from_u64(123);
         let mut rng2 = rand::rngs::SmallRng::seed_from_u64(123);
         for _ in 0..50 {
-            let t1 = sample_row(&data, 1.0, 1.0, &mut rng1);
-            let t2 = sample_row(&data, 1.0, 1.0, &mut rng2);
+            let t1 = sample_row(&data, 1.0, 1.0, &mut rng1, None);
+            let t2 = sample_row(&data, 1.0, 1.0, &mut rng2, None);
             assert_eq!(t1, t2, "Same seed should produce same token");
         }
     }
@@ -472,7 +536,7 @@ mod tests {
         let mut rng = rand::rngs::SmallRng::seed_from_u64(99);
         // With top_p=0.5, only the dominant token should be sampled.
         for _ in 0..50 {
-            let token = sample_row(&data, 1.0, 0.5, &mut rng);
+            let token = sample_row(&data, 1.0, 0.5, &mut rng, None);
             assert_eq!(token, 0, "Top-p should filter to dominant token");
         }
     }
@@ -481,7 +545,7 @@ mod tests {
     fn test_sample_row_single_token_vocab() {
         let data = bf16_bytes(&[42.0]);
         let mut rng = rand::rngs::SmallRng::seed_from_u64(0);
-        let token = sample_row(&data, 1.0, 1.0, &mut rng);
+        let token = sample_row(&data, 1.0, 1.0, &mut rng, None);
         assert_eq!(token, 0);
     }
 
@@ -493,7 +557,7 @@ mod tests {
         let mut rng = rand::rngs::SmallRng::seed_from_u64(7);
         let mut counts = [0u32; 4];
         for _ in 0..1000 {
-            let token = sample_row(&data, 1.0, 1.0, &mut rng);
+            let token = sample_row(&data, 1.0, 1.0, &mut rng, None);
             counts[token as usize] += 1;
         }
         // Each token should be sampled at least once (expected ~250 each).
@@ -512,7 +576,7 @@ mod tests {
         let mut rng_low = rand::rngs::SmallRng::seed_from_u64(42);
         let mut count_low = 0u32;
         for _ in 0..500 {
-            if sample_row(&data, 0.5, 1.0, &mut rng_low) == 0 {
+            if sample_row(&data, 0.5, 1.0, &mut rng_low, None) == 0 {
                 count_low += 1;
             }
         }
@@ -521,7 +585,7 @@ mod tests {
         let mut rng_high = rand::rngs::SmallRng::seed_from_u64(42);
         let mut count_high = 0u32;
         for _ in 0..500 {
-            if sample_row(&data, 3.0, 1.0, &mut rng_high) == 0 {
+            if sample_row(&data, 3.0, 1.0, &mut rng_high, None) == 0 {
                 count_high += 1;
             }
         }
@@ -539,7 +603,7 @@ mod tests {
         let mut rng = rand::rngs::SmallRng::seed_from_u64(55);
         let mut seen = std::collections::HashSet::new();
         for _ in 0..200 {
-            seen.insert(sample_row(&data, 1.0, 1.0, &mut rng));
+            seen.insert(sample_row(&data, 1.0, 1.0, &mut rng, None));
         }
         assert_eq!(seen.len(), 5, "top_p=1.0 should allow all 5 tokens");
     }

@@ -248,6 +248,22 @@ impl Tokenizer {
         }
     }
 
+    /// Get the full vocabulary as (token_bytes, token_id) pairs plus the EOS token ID.
+    ///
+    /// Used by the grammar module to build an outlines-core `Vocabulary` for
+    /// grammar-constrained generation.  Returns raw byte representations of
+    /// each token (outlines-core operates on bytes, not strings).
+    pub fn get_vocabulary(&self) -> (Vec<(Vec<u8>, u32)>, u32) {
+        let vocab = self.inner.get_vocab(true);
+        let entries: Vec<(Vec<u8>, u32)> = vocab
+            .into_iter()
+            .map(|(token_str, token_id)| (token_str.into_bytes(), token_id))
+            .collect();
+        // Use the first EOS token ID for the outlines-core vocabulary.
+        let eos = self.eos_token_ids.first().copied().unwrap_or(0);
+        (entries, eos)
+    }
+
     /// Check if a token ID is an end-of-sequence signal.
     /// Used to stop the generation loop.
     pub fn is_eos(&self, token_id: u32) -> bool {

@@ -94,7 +94,10 @@ pub(crate) trait Dispatch {
     fn finish_decode(state: &mut Self::SeqState);
 
     /// Sample a token from the current logits.
-    fn sample(&self, temperature: f32, top_p: f32, rng: &mut impl rand::Rng)
+    ///
+    /// `allowed_tokens` constrains sampling to only the specified token IDs
+    /// (grammar-based structured output).  When None, all tokens are allowed.
+    fn sample(&self, temperature: f32, top_p: f32, rng: &mut impl rand::Rng, allowed_tokens: Option<&[u32]>)
     -> anyhow::Result<u32>;
 
     /// GPU-resident greedy sampling: argmax entirely on device.
@@ -192,12 +195,14 @@ pub(crate) trait Dispatch {
     /// Sample N tokens from the batched logits produced by `forward_decode_batch`.
     ///
     /// Each sequence gets its own temperature and top_p — different concurrent
-    /// requests can have different sampling parameters.
+    /// requests can have different sampling parameters.  `allowed_tokens_per_seq`
+    /// provides optional per-sequence grammar constraints.
     fn sample_batch(
         &self,
         _temperatures: &[f32],
         _top_ps: &[f32],
         _rng: &mut impl rand::Rng,
+        _allowed_tokens_per_seq: &[Option<Vec<u32>>],
     ) -> anyhow::Result<Vec<u32>> {
         anyhow::bail!("batched sampling not supported by this Dispatch implementation")
     }
