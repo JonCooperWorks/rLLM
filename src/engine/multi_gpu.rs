@@ -185,6 +185,14 @@ mod imp {
         fn tokenizer(&self) -> &Tokenizer {
             &self.tokenizer
         }
+
+        fn active_count(&self) -> usize {
+            self.scheduler.active_count()
+        }
+
+        fn waiting_count(&self) -> usize {
+            self.scheduler.waiting_count()
+        }
     }
 
     #[cfg(test)]

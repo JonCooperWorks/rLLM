@@ -49,6 +49,7 @@
 
 pub(crate) mod anthropic;
 pub(crate) mod auth;
+pub(crate) mod metrics;
 pub(crate) mod openai;
 pub(crate) mod tls;
 
@@ -72,6 +73,9 @@ use crate::model::{config, tokenizer};
 /// Tokenization happens on the async handler thread (CPU-only work) so the
 /// worker's Engine step loop is never stalled by tokenization.
 pub(crate) struct WorkerRequest {
+    /// Unique request ID generated at the handler, used for correlation
+    /// across logs, metrics, and API responses.
+    pub request_id: String,
     /// Pre-tokenized prompt (already includes BOS, chat template, etc.).
     pub prompt_tokens: Vec<u32>,
     /// Maximum tokens to generate.
@@ -143,6 +147,8 @@ pub(crate) struct ServerState {
     pub image_token_id: Option<u32>,
     /// Auth provider (None variant when auth is disabled).
     pub auth: auth::AuthProviderKind,
+    /// Prometheus metrics (shared with the worker thread via Arc).
+    pub metrics: Arc<metrics::Metrics>,
 }
 
 // ---------------------------------------------------------------------------
@@ -310,12 +316,14 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
             std::process::exit(1);
         });
 
+    let server_metrics = Arc::new(metrics::Metrics::new());
+
     let WorkerHandle {
         request_tx,
         tokenizer,
         arch,
         vision_config: _,
-    } = spawn_worker(args.model.clone(), args.stream_experts, tp, kv_quant)?;
+    } = spawn_worker(args.model.clone(), args.stream_experts, tp, kv_quant, server_metrics.clone())?;
 
     // Parse vision config + image token ID from config.json for handler-side preprocessing.
     let parsed_config = config::ModelConfig::from_file(&args.model.join("config.json")).ok();
@@ -401,6 +409,7 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     eprintln!("  ----------------------------------------");
     eprintln!("  endpoint  : {scheme}://{addr}/v1/chat/completions");
     eprintln!("  health    : {scheme}://{addr}/health");
+    eprintln!("  metrics   : {scheme}://{addr}/metrics");
     eprintln!();
 
     let state = Arc::new(ServerState {
@@ -411,6 +420,7 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         vision_config,
         image_token_id,
         auth: auth_provider,
+        metrics: server_metrics,
     });
 
     // Build axum router with all API endpoints.
@@ -424,8 +434,9 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .route("/v1/models", axum::routing::get(openai::list_models))
         // Anthropic-compatible endpoint.
         .route("/v1/messages", axum::routing::post(anthropic::messages))
-        // Health check.
+        // Health check and metrics.
         .route("/health", axum::routing::get(|| async { "ok" }))
+        .route("/metrics", axum::routing::get(metrics::metrics_handler))
         // Auth middleware — inside CORS so preflight OPTIONS get CORS headers
         // even when auth denies them.
         .layer(axum::middleware::from_fn_with_state(
@@ -491,6 +502,7 @@ fn spawn_worker(
     stream_experts: bool,
     tp: usize,
     kv_quant: crate::model::turboquant::KvQuantMode,
+    metrics: Arc<metrics::Metrics>,
 ) -> anyhow::Result<WorkerHandle> {
     let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
     type ReadyPayload = (Arc<tokenizer::Tokenizer>, config::ModelArch, Option<crate::model::config::VisionConfig>);
@@ -510,7 +522,7 @@ fn spawn_worker(
             |tok, arch| {
                 let _ = ready_tx.send(Ok((Arc::new(tok.clone()), arch, None)));
             },
-            |eng| run_worker_loop(eng, request_rx),
+            |eng| run_worker_loop(eng, request_rx, metrics),
         );
 
         if let Err(e) = result {
@@ -533,6 +545,8 @@ fn spawn_worker(
 /// Per-request context tracked by the worker's request registry.
 /// Maps an Engine SeqId to the HTTP response channel.
 struct RequestContext {
+    /// Request ID for log correlation (generated at the HTTP handler).
+    request_id: String,
     response_tx: tokio::sync::mpsc::Sender<InferenceEvent>,
     prompt_token_count: usize,
     generated_count: usize,
@@ -595,6 +609,7 @@ struct RequestContext {
 fn run_worker_loop(
     engine: &mut dyn engine::InferenceEngine,
     request_rx: std::sync::mpsc::Receiver<WorkerRequest>,
+    metrics: Arc<metrics::Metrics>,
 ) -> anyhow::Result<()> {
     let mut registry: HashMap<SeqId, RequestContext> = HashMap::new();
 
@@ -619,6 +634,7 @@ fn run_worker_loop(
         registry.insert(
             seq_id,
             RequestContext {
+                request_id: req.request_id,
                 response_tx: req.response_tx,
                 prompt_token_count,
                 generated_count: 0,
@@ -656,6 +672,7 @@ fn run_worker_loop(
         let step_output = match engine.step() {
             Ok(output) => output,
             Err(e) => {
+                metrics.errors.inc();
                 let error_msg = format!("{e:#}");
                 for (_, ctx) in registry.drain() {
                     let _ = ctx
@@ -665,6 +682,10 @@ fn run_worker_loop(
                 continue;
             }
         };
+
+        // Update sequence gauges after each step.
+        metrics.active_sequences.set(engine.active_count() as i64);
+        metrics.waiting_sequences.set(engine.waiting_count() as i64);
 
         // 4. Stream tokens to response channels.
         let mut to_abort: Vec<SeqId> = Vec::new();
@@ -821,7 +842,8 @@ fn run_worker_loop(
                     format!("  {}  |", u.sub)
                 }).unwrap_or_default();
                 eprintln!(
-                    "  seq {:>3}  |{} {} prompt{} + {} gen  |  TTFT {:.0} ms  |  {:.1} tok/s  |  {:.2}s  |  {}",
+                    "  req {}  |  seq {:>3}  |{} {} prompt{} + {} gen  |  TTFT {:.0} ms  |  {:.1} tok/s  |  {:.2}s  |  {}",
+                    ctx.request_id,
                     finished.id,
                     user_label,
                     ctx.prompt_token_count,
@@ -832,6 +854,22 @@ fn run_worker_loop(
                     total_secs,
                     stop_label,
                 );
+
+                // Record Prometheus metrics.
+                metrics.request_duration.observe(total_secs);
+                if let Some(ttft_secs) = ctx.first_token_at.map(|t| {
+                    t.duration_since(ctx.created_at).as_secs_f64()
+                }) {
+                    metrics.time_to_first_token.observe(ttft_secs);
+                }
+                if tok_per_sec > 0.0 {
+                    metrics.decode_tokens_per_second.observe(tok_per_sec);
+                }
+                metrics.prompt_tokens.inc_by(ctx.prompt_token_count as u64);
+                metrics.completion_tokens.inc_by(ctx.generated_count as u64);
+                if ctx.cached_tokens > 0 {
+                    metrics.prefix_cache_hits.inc();
+                }
 
                 let _ = ctx.response_tx.blocking_send(InferenceEvent::Done {
                     stop_reason,

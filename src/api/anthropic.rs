@@ -269,7 +269,11 @@ pub(crate) async fn messages(
     const MAX_TOKENS_CAP: usize = 131_072;
     let max_tokens = req.max_tokens.min(MAX_TOKENS_CAP);
 
+    let request_id = super::generate_id();
+    state.metrics.requests_total.with_label_values(&["messages"]).inc();
+
     let worker_req = WorkerRequest {
+        request_id: request_id.clone(),
         prompt_tokens,
         max_tokens,
         temperature: req.temperature.unwrap_or(1.0),
@@ -296,23 +300,27 @@ pub(crate) async fn messages(
     // when the model produces <think> blocks.
     let thinking_enabled = thinking_requested
         .unwrap_or_else(|| thinking::defaults_to_thinking(state.arch));
-    if req.stream {
+    let mut response = if req.stream {
         if thinking_enabled || has_tools {
-            // Both thinking and tools need full-text collection before parsing.
-            // Use the tool-aware streaming handler (it also handles thinking).
-            Ok(messages_stream_with_tools(state, response_rx, thinking_enabled).await)
+            messages_stream_with_tools(state, response_rx, thinking_enabled).await
         } else {
-            Ok(messages_stream(state, response_rx).await)
+            messages_stream(state, response_rx).await
         }
     } else {
-        Ok(messages_blocking(
+        messages_blocking(
             state,
             response_rx,
             has_tools,
             thinking_enabled,
         )
-        .await)
-    }
+        .await
+    };
+
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-request-id"),
+        axum::http::HeaderValue::from_str(&request_id).unwrap(),
+    );
+    Ok(response)
 }
 
 /// Non-streaming: collect all tokens, parse thinking blocks and tool calls,

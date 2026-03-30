@@ -103,6 +103,12 @@ pub(crate) trait InferenceEngine {
 
     /// Access the tokenizer (for incremental text decoding in the worker loop).
     fn tokenizer(&self) -> &Tokenizer;
+
+    /// Number of sequences currently being processed.
+    fn active_count(&self) -> usize;
+
+    /// Number of sequences waiting to be admitted.
+    fn waiting_count(&self) -> usize;
 }
 
 /// Why a sequence stopped generating.
@@ -387,9 +393,13 @@ impl<S> Scheduler<S> {
     }
 
     /// Number of waiting requests.
-    #[cfg(test)]
     pub fn waiting_count(&self) -> usize {
         self.waiting.len()
+    }
+
+    /// Number of active (in-flight) sequences.
+    pub fn active_count(&self) -> usize {
+        self.active.len()
     }
 }
 
@@ -954,6 +964,14 @@ impl<'a, B: GpuBackend> InferenceEngine for Engine<'a, B> {
 
     fn tokenizer(&self) -> &Tokenizer {
         &self.tokenizer
+    }
+
+    fn active_count(&self) -> usize {
+        self.scheduler.active_count()
+    }
+
+    fn waiting_count(&self) -> usize {
+        self.scheduler.waiting_count()
     }
 }
 

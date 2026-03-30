@@ -349,7 +349,11 @@ pub(crate) async fn chat_completions(
         .as_ref()
         .is_some_and(|o| o.include_usage);
 
+    let request_id = super::generate_id();
+    state.metrics.requests_total.with_label_values(&["chat_completions"]).inc();
+
     let worker_req = WorkerRequest {
+        request_id: request_id.clone(),
         prompt_tokens,
         max_tokens,
         temperature: req.temperature,
@@ -386,22 +390,22 @@ pub(crate) async fn chat_completions(
     //   - Plain streaming: tokens emitted as they arrive.
     //   - Streaming with tools: collect then emit (tool markers span tokens).
     //   - Streaming with thinking: collect then emit (thinking blocks span tokens).
-    if req.stream {
+    let mut response = if req.stream {
         if thinking_enabled && check_tools {
-            Ok(chat_completions_stream_with_thinking_and_tools(
+            chat_completions_stream_with_thinking_and_tools(
                 state, response_rx, tools_required, tool_defs,
             )
-            .await)
+            .await
         } else if thinking_enabled {
-            Ok(chat_completions_stream_with_thinking(state, response_rx).await)
+            chat_completions_stream_with_thinking(state, response_rx).await
         } else if check_tools {
-            Ok(chat_completions_stream_with_tools(state, response_rx, tools_required, tool_defs)
-                .await)
+            chat_completions_stream_with_tools(state, response_rx, tools_required, tool_defs)
+                .await
         } else {
-            Ok(chat_completions_stream(state, response_rx, include_usage).await)
+            chat_completions_stream(state, response_rx, include_usage).await
         }
     } else {
-        Ok(chat_completions_blocking(
+        chat_completions_blocking(
             state,
             response_rx,
             check_tools,
@@ -409,8 +413,14 @@ pub(crate) async fn chat_completions(
             tools_required,
             tool_defs,
         )
-        .await)
-    }
+        .await
+    };
+
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-request-id"),
+        axum::http::HeaderValue::from_str(&request_id).unwrap(),
+    );
+    Ok(response)
 }
 
 /// Non-streaming: collect all tokens, detect thinking blocks and tool calls,
@@ -914,7 +924,11 @@ pub(crate) async fn completions(
 
     let (response_tx, response_rx) = tokio::sync::mpsc::channel(64);
 
+    let request_id = super::generate_id();
+    state.metrics.requests_total.with_label_values(&["completions"]).inc();
+
     let worker_req = WorkerRequest {
+        request_id: request_id.clone(),
         prompt_tokens,
         max_tokens: req.max_tokens,
         temperature: req.temperature,
@@ -932,11 +946,17 @@ pub(crate) async fn completions(
         std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
     })?;
 
-    if req.stream {
-        Ok(completions_stream(state, response_rx).await)
+    let mut response = if req.stream {
+        completions_stream(state, response_rx).await
     } else {
-        Ok(completions_blocking(state, response_rx).await)
-    }
+        completions_blocking(state, response_rx).await
+    };
+
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-request-id"),
+        axum::http::HeaderValue::from_str(&request_id).unwrap(),
+    );
+    Ok(response)
 }
 
 /// Non-streaming text completions.
