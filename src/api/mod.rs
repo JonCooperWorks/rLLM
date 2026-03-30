@@ -483,11 +483,12 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
 
     rt.block_on(async {
         // Shutdown signal: SIGINT (Ctrl-C) or SIGTERM (container orchestrators).
-        // Sets the shutting_down flag first (so /health returns 503 for
-        // load balancer draining), then signals the server to stop accepting
-        // new connections and drain in-flight requests.
+        // A watch channel broadcasts the signal so all server paths (plain HTTP,
+        // manual TLS, Let's Encrypt) can share the same shutdown trigger.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let shutdown_flag = shutting_down.clone();
-        let shutdown_signal = async move {
+
+        tokio::spawn(async move {
             let ctrl_c = tokio::signal::ctrl_c();
             #[cfg(unix)]
             {
@@ -505,27 +506,40 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
             }
             eprintln!("shutdown signal received, draining in-flight requests...");
             shutdown_flag.store(true, Ordering::Relaxed);
-        };
+            let _ = shutdown_tx.send(true);
+        });
+
+        /// Create a future that resolves when the shutdown watch fires.
+        fn shutdown_from_watch(mut rx: tokio::sync::watch::Receiver<bool>) -> impl std::future::Future<Output = ()> + Send + 'static {
+            async move {
+                while !*rx.borrow_and_update() {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
 
         match tls_mode {
             tls::TlsMode::None => {
                 let listener = tokio::net::TcpListener::bind(&addr).await?;
                 axum::serve(listener, app)
-                    .with_graceful_shutdown(shutdown_signal)
+                    .with_graceful_shutdown(shutdown_from_watch(shutdown_rx))
                     .await?;
             }
             tls::TlsMode::Manual { cert, key } => {
-                // TLS paths handle their own accept loop; graceful shutdown
-                // is not yet wired for TLS (would require refactoring the
-                // custom accept loops in tls.rs).
-                tls::serve_manual_tls(app, &addr, &cert, &key).await?;
+                tls::serve_manual_tls(app, &addr, &cert, &key, shutdown_from_watch(shutdown_rx))
+                    .await?;
             }
             tls::TlsMode::LetsEncrypt {
                 domain,
                 email,
                 cache_dir,
             } => {
-                tls::serve_letsencrypt(app, &addr, &domain, email.as_deref(), &cache_dir).await?;
+                tls::serve_letsencrypt(
+                    app, &addr, &domain, email.as_deref(), &cache_dir,
+                    shutdown_from_watch(shutdown_rx),
+                ).await?;
             }
         }
         Ok::<(), anyhow::Error>(())

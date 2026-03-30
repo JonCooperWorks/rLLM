@@ -10,15 +10,21 @@
 //    We use rustls-acme to automatically provision and renew certificates
 //    via the TLS-ALPN-01 challenge (no separate port 80 needed).
 //
-// Both modes share the same accept loop: TCP accept → TLS handshake →
-// serve each connection with hyper (bridging axum's tower service).
+// Both modes build a TlsAcceptor and delegate to serve_tls_loop(), which
+// handles TCP accept → TLS handshake → hyper/axum request serving.
+//
+// Graceful shutdown: both modes accept a shutdown future.  When it resolves,
+// the accept loop stops taking new connections and waits for in-flight
+// requests to complete before returning.
 // ===========================================================================
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::Router;
 use tokio::net::TcpListener;
+use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
 /// TLS configuration mode, determined from CLI args.
@@ -45,7 +51,15 @@ pub(crate) async fn serve_manual_tls(
     addr: &str,
     cert_path: &Path,
     key_path: &Path,
+    shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    let acceptor = build_manual_acceptor(cert_path, key_path)?;
+    let listener = TcpListener::bind(addr).await?;
+    serve_tls_loop(listener, acceptor, app, shutdown).await
+}
+
+/// Load PEM certificate and key files into a TlsAcceptor.
+fn build_manual_acceptor(cert_path: &Path, key_path: &Path) -> anyhow::Result<TlsAcceptor> {
     // Load certificate chain from PEM file.
     let cert_file = std::fs::File::open(cert_path)?;
     let mut cert_reader = std::io::BufReader::new(cert_file);
@@ -68,10 +82,7 @@ pub(crate) async fn serve_manual_tls(
         .with_single_cert(certs, key)?;
     server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
-    let acceptor = TlsAcceptor::from(Arc::new(server_config));
-    let listener = TcpListener::bind(addr).await?;
-
-    serve_tls_loop(listener, acceptor, app).await
+    Ok(TlsAcceptor::from(Arc::new(server_config)))
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +100,7 @@ pub(crate) async fn serve_letsencrypt(
     domain: &str,
     email: Option<&str>,
     cache_dir: &Path,
+    shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     use rustls_acme::AcmeConfig;
     use rustls_acme::caches::DirCache;
@@ -129,55 +141,84 @@ pub(crate) async fn serve_letsencrypt(
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
     let listener = TcpListener::bind(addr).await?;
 
-    serve_tls_loop(listener, acceptor, app).await
+    serve_tls_loop(listener, acceptor, app, shutdown).await
 }
 
 // ---------------------------------------------------------------------------
-// Shared TLS accept loop.
+// Shared TLS accept loop with graceful shutdown.
 // ---------------------------------------------------------------------------
 
 /// Accept loop shared by both manual and Let's Encrypt TLS modes.
 ///
 /// For each incoming TCP connection: perform TLS handshake, then serve
 /// the connection with hyper (bridging axum's tower::Service).
+///
+/// When the `shutdown` future resolves, the loop stops accepting new
+/// connections and waits for all in-flight requests to complete.
 async fn serve_tls_loop(
     listener: TcpListener,
     acceptor: TlsAcceptor,
     app: Router,
+    shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use tower_service::Service;
 
-    loop {
-        let (tcp_stream, remote_addr) = listener.accept().await?;
-        let acceptor = acceptor.clone();
-        let app = app.clone();
+    let mut connections = JoinSet::new();
+    let shutdown = std::pin::pin!(shutdown);
 
-        tokio::spawn(async move {
-            // TLS handshake.
-            let tls_stream = match acceptor.accept(tcp_stream).await {
-                Ok(stream) => stream,
-                Err(err) => {
-                    eprintln!("TLS handshake failed from {remote_addr}: {err}");
-                    return;
+    tokio::select! {
+        // Accept loop — runs until shutdown signal.
+        _ = async {
+            loop {
+                match listener.accept().await {
+                    Ok((tcp_stream, remote_addr)) => {
+                        let acceptor = acceptor.clone();
+                        let app = app.clone();
+
+                        connections.spawn(async move {
+                            // TLS handshake.
+                            let tls_stream = match acceptor.accept(tcp_stream).await {
+                                Ok(stream) => stream,
+                                Err(err) => {
+                                    eprintln!("TLS handshake failed from {remote_addr}: {err}");
+                                    return;
+                                }
+                            };
+
+                            // Serve the connection via hyper, bridging to axum's Router.
+                            let stream = TokioIo::new(tls_stream);
+                            let hyper_service = hyper::service::service_fn(
+                                move |request: hyper::Request<hyper::body::Incoming>| {
+                                    let mut app = app.clone();
+                                    async move { app.call(request.map(axum::body::Body::new)).await }
+                                },
+                            );
+
+                            if let Err(err) =
+                                hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                                    .serve_connection(stream, hyper_service)
+                                    .await
+                            {
+                                eprintln!("error serving {remote_addr}: {err}");
+                            }
+                        });
+                    }
+                    Err(err) => {
+                        eprintln!("TCP accept error: {err}");
+                    }
                 }
-            };
-
-            // Serve the connection via hyper, bridging to axum's Router.
-            let stream = TokioIo::new(tls_stream);
-            let hyper_service = hyper::service::service_fn(
-                move |request: hyper::Request<hyper::body::Incoming>| {
-                    let mut app = app.clone();
-                    async move { app.call(request.map(axum::body::Body::new)).await }
-                },
-            );
-
-            if let Err(err) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-                .serve_connection(stream, hyper_service)
-                .await
-            {
-                eprintln!("error serving {remote_addr}: {err}");
             }
-        });
+        } => {},
+
+        // Shutdown signal — stop accepting, drain in-flight connections.
+        _ = shutdown => {
+            eprintln!("TLS server shutting down, draining {} in-flight connections...", connections.len());
+        },
     }
+
+    // Wait for all in-flight connections to finish.
+    while connections.join_next().await.is_some() {}
+
+    Ok(())
 }
