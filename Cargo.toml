@@ -23,7 +23,7 @@ tokio-rustls = "0.26"
 rustls-pemfile = "2"
 rustls-acme = "0.12"
 hyper = "1"
-hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "server-graceful", "http1", "http2"] }
 tower-service = "0.3"
 tokio-stream = "0.1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }

@@ -174,7 +174,7 @@ pub(crate) struct ServerState {
 async fn health_handler(
     axum::extract::State(state): axum::extract::State<Arc<ServerState>>,
 ) -> axum::response::Response {
-    let status = if state.shutting_down.load(Ordering::Relaxed) {
+    let status = if state.shutting_down.load(Ordering::SeqCst) {
         axum::http::StatusCode::SERVICE_UNAVAILABLE
     } else {
         axum::http::StatusCode::OK
@@ -286,6 +286,12 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     //    Fail fast on missing TLS config, bad cert paths, etc.
     // ------------------------------------------------------------------
     let tls_mode = validate_tls_args(&args)?;
+
+    anyhow::ensure!(
+        args.max_pending >= 1,
+        "--max-pending must be at least 1 (got {})",
+        args.max_pending,
+    );
 
     let model_name = args
         .model
@@ -510,7 +516,7 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 ctrl_c.await.ok();
             }
             tracing::info!("shutdown signal received, draining in-flight requests");
-            shutdown_flag.store(true, Ordering::Relaxed);
+            shutdown_flag.store(true, Ordering::SeqCst);
             let _ = shutdown_tx.send(true);
         });
 
@@ -808,12 +814,17 @@ fn run_worker_loop(
             Ok(output) => output,
             Err(e) => {
                 metrics.errors.inc();
-                let error_msg = format!("{e:#}");
+                // Log the full error chain for debugging, but send a generic
+                // message to the client to avoid leaking internal details
+                // (file paths, GPU memory addresses, Metal/CUDA error codes).
+                tracing::error!(error = %format_args!("{e:#}"), "engine step failed");
                 let seq_ids: Vec<SeqId> = registry.keys().copied().collect();
                 for (_, ctx) in registry.drain() {
                     let _ = ctx
                         .response_tx
-                        .blocking_send(InferenceEvent::Error(error_msg.clone()));
+                        .blocking_send(InferenceEvent::Error(
+                            "internal inference error".to_string(),
+                        ));
                 }
                 for id in seq_ids {
                     engine.abort_sequence(id);
@@ -1269,7 +1280,7 @@ mod tests {
     #[tokio::test]
     async fn health_returns_503_during_shutdown() {
         let state = test_server_state();
-        state.shutting_down.store(true, Ordering::Relaxed);
+        state.shutting_down.store(true, Ordering::SeqCst);
 
         let app = axum::Router::new()
             .route("/health", axum::routing::get(health_handler))
@@ -1584,8 +1595,8 @@ mod tests {
         }
 
         assert!(
-            events.iter().any(|e| matches!(e, InferenceEvent::Error(msg) if msg.contains("GPU exploded"))),
-            "expected engine error event, got: {events:?}",
+            events.iter().any(|e| matches!(e, InferenceEvent::Error(msg) if msg.contains("internal inference error"))),
+            "expected sanitized engine error event, got: {events:?}",
         );
         assert_eq!(m.errors.get(), 1);
     }

@@ -148,13 +148,24 @@ pub(crate) async fn serve_letsencrypt(
 // Shared TLS accept loop with graceful shutdown.
 // ---------------------------------------------------------------------------
 
+/// Maximum time to wait for in-flight connections to finish after shutdown.
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Backoff delay after a transient TCP accept error (e.g. EMFILE).  Prevents
+/// tight error-logging loops that waste CPU and flood logs.
+const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Accept loop shared by both manual and Let's Encrypt TLS modes.
 ///
 /// For each incoming TCP connection: perform TLS handshake, then serve
 /// the connection with hyper (bridging axum's tower::Service).
 ///
-/// When the `shutdown` future resolves, the loop stops accepting new
-/// connections and waits for all in-flight requests to complete.
+/// When the `shutdown` future resolves:
+/// 1. The accept loop stops taking new connections.
+/// 2. Each in-flight connection is signalled to stop accepting new HTTP
+///    requests (via `hyper_util::server::graceful::GracefulShutdown`).
+/// 3. Connections have up to 30 s to finish in-flight requests, after
+///    which remaining connections are dropped.
 async fn serve_tls_loop(
     listener: TcpListener,
     acceptor: TlsAcceptor,
@@ -162,8 +173,10 @@ async fn serve_tls_loop(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::graceful::GracefulShutdown;
     use tower_service::Service;
 
+    let graceful = GracefulShutdown::new();
     let mut connections = JoinSet::new();
     let shutdown = std::pin::pin!(shutdown);
 
@@ -175,6 +188,7 @@ async fn serve_tls_loop(
                     Ok((tcp_stream, remote_addr)) => {
                         let acceptor = acceptor.clone();
                         let app = app.clone();
+                        let watcher = graceful.watcher();
 
                         connections.spawn(async move {
                             // TLS handshake.
@@ -195,17 +209,23 @@ async fn serve_tls_loop(
                                 },
                             );
 
-                            if let Err(err) =
-                                hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-                                    .serve_connection(stream, hyper_service)
-                                    .await
-                            {
+                            let builder =
+                                hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+                            let conn = builder
+                                    .serve_connection_with_upgrades(stream, hyper_service);
+
+                            // Wrap the connection so the graceful shutdown signal
+                            // tells hyper to stop accepting new HTTP requests on it.
+                            if let Err(err) = watcher.watch(conn).await {
                                 tracing::error!(%remote_addr, %err, "error serving connection");
                             }
                         });
                     }
                     Err(err) => {
                         tracing::error!(%err, "TCP accept error");
+                        // Backoff to prevent tight spin on transient errors
+                        // (e.g. EMFILE — too many open files).
+                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                     }
                 }
             }
@@ -217,8 +237,21 @@ async fn serve_tls_loop(
         },
     }
 
-    // Wait for all in-flight connections to finish.
-    while connections.join_next().await.is_some() {}
+    // Signal all connections to stop accepting new HTTP requests, then wait
+    // for in-flight requests to complete — with a hard deadline.
+    tokio::select! {
+        _ = graceful.shutdown() => {
+            tracing::info!("all TLS connections drained");
+        }
+        _ = tokio::time::sleep(DRAIN_TIMEOUT) => {
+            tracing::warn!(
+                remaining = connections.len(),
+                timeout_secs = DRAIN_TIMEOUT.as_secs(),
+                "drain timeout reached, dropping remaining connections",
+            );
+        }
+    }
 
+    // Any connections still running are dropped when JoinSet goes out of scope.
     Ok(())
 }
