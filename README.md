@@ -1,18 +1,17 @@
 # rLLM
 
-Rust LLM inference engine. Runs models up to 397B parameters on a MacBook via NVMe expert streaming — 12 architectures, two GPU backends (Metal + CUDA), continuous batching, paged KV cache, TurboQuant KV compression, and an OpenAI/Anthropic-compatible API server. Built from scratch in Rust with no frameworks or GGML.
+**This is a learning project.** I'm an appsec engineer who wanted to understand how LLM inference actually works — the GPU kernels, the memory management, the scheduling — so I built one from scratch in Rust with Claude as a teaching partner. It is not rated for production use. Every file is annotated with architectural rationale explaining *why* things work the way they do. See [docs/framework-comparison.md](docs/framework-comparison.md) for how this compares to real inference engines like vLLM, llama.cpp, and Ollama.
+
+Runs models up to 397B parameters on a MacBook via NVMe expert streaming. 13 architectures, two GPU backends (Metal + CUDA), continuous batching, paged KV cache, and an OpenAI/Anthropic-compatible API server.
 
 ### Highlights
 
-- **Expert streaming** — stream hundreds of GB of expert weights from NVMe on demand with GPU-side LRU caching, on both Metal and CUDA
+- **Expert streaming** — stream hundreds of GB of expert weights from NVMe on demand with GPU-side LRU caching, on both Metal and CUDA ([docs](docs/expert-streaming.md))
 - **13 architectures** — Llama 3.x, Qwen 2.5/3/3.5, Mistral, Mixtral, Gemma 3, Phi-4, DeepSeek-R1-Distill, GPT-OSS, Nemotron-H
-- **Vision-language models** — SigLIP ViT encoder for Qwen 3.5 VL and Gemma 3 VLMs
-- **TurboQuant KV cache** — ~4× KV compression via random orthogonal rotation + Max-Lloyd quantization, quality-neutral at 4-bit
-- **bf16 and Q4 weights** — 18-byte block format with bf16 scales; Q4 expert streaming cuts NVMe I/O 3.5×
-- **Multi-GPU tensor parallelism** — NCCL-based weight sharding across GPUs
+- **Vision-language models** — SigLIP ViT encoder for Qwen 3.5 VL and Gemma 3 VLMs ([docs](docs/vision.md))
+- **Three quantization formats** — Q4 block, Q8 block, and FP8 E4M3 (auto-selected on NVIDIA Ada/Hopper) ([docs](docs/quantization.md), [FP8 docs](docs/fp8.md))
+- **Multi-GPU tensor parallelism** — NCCL-based weight sharding + expert parallelism for MoE models ([docs](docs/multi-gpu-moe.md))
 - **Hand-written Metal and CUDA shaders** — SIMD-cooperative matmul, WMMA tensor-core GEMM, fused attention, DeltaNet linear attention
-
-**This is an educational codebase.** Every file includes architectural rationale explaining *why* things work the way they do. It builds on ideas from [vLLM](https://github.com/vllm-project/vllm), [llama.cpp](https://github.com/ggerganov/llama.cpp), [Ollama](https://github.com/ollama/ollama), and [flash-moe](https://github.com/danveloper/flash-moe) — reimplemented from scratch so I can understand how they work, with Claude as a teaching partner. See [docs/framework-comparison.md](docs/framework-comparison.md).
 
 ## Backends
 
@@ -183,38 +182,6 @@ Benchmarked on [RunPod](https://runpod.io?ref=249k2lel). Tensor parallelism acro
 </details>
 
 
-### TurboQuant KV Cache Quantization
-
-TurboQuant ([Zandieh et al.](https://arxiv.org/abs/2504.19874)) compresses the KV cache ~4× by applying a random orthogonal rotation followed by Max-Lloyd scalar quantization. On by default at 4-bit (`--kv-quant turbo4`). Quality-neutral for head_dim ≥ 128. Override with `--kv-quant none`.
-
-| Model | Params | KV (none) | KV (turbo4) | Decode (none) | Decode (turbo4) |
-|---|---|---|---|---|---|
-| Llama 3.2 1B Instruct | 1.2B | 4,096 MB | 1,088 MB (3.8×) | 161 tok/s | 134 tok/s † |
-| Llama 3.2 3B Instruct | 3.2B | 14,336 MB | 3,696 MB (3.9×) | 70 tok/s | 52 tok/s |
-| Qwen 2.5 3B Instruct | 3.1B | 4,608 MB | 1,188 MB (3.9×) | 67 tok/s | 48 tok/s |
-| Llama 3.1 8B Instruct | 8.0B | 16,384 MB | 4,224 MB (3.9×) | 33 tok/s | 28 tok/s |
-| Qwen3.5 9B Q4 | ~9B | 4,096 MB | 1,040 MB (3.9×) | 57.6 tok/s | 49.6 tok/s |
-| Qwen3.5 9B | ~9B | 4,096 MB | 1,040 MB (3.9×) | 26.7 tok/s | 24.8 tok/s |
-| Qwen3.5 27B Q4 | ~27B | 6,753 MB | 2,080 MB (3.2×) | 19.6 tok/s | 18.0 tok/s |
-| Qwen3.5 27B | ~27B | 1,147 MB | 1,148 MB (1.0×) | 8.4 tok/s | 7.4 tok/s |
-| Gemma 3 27B Q4 | 27.4B | 27,110 MB | 16,368 MB (1.7×) | 17.8 tok/s | 14.9 tok/s |
-| Qwen3.5 122B-A10B ⚡ | 122B | 96 MB | 24 MB (3.9×) | 1.5 tok/s | 1.5 tok/s |
-| Qwen3.5 122B-A10B Q4 ⚡ | 122B | 96 MB | 24 MB (3.9×) | 14.0 tok/s | 13.1 tok/s |
-
-† 1B models have head_dim=64 where rotation overhead dominates — TurboQuant is recommended for models ≥ 3B (head_dim ≥ 128). For models ≤ 9B, TurboQuant provides ~4× KV memory savings with minimal decode overhead (~10–15%). Qwen3.5 27B bf16 shows no KV compression because memory pressure already limits the KV pool to ~1 GB. See [docs/turboquant.md](docs/turboquant.md).
-
-### Prompt Prefix Caching
-
-When multiple requests share the same system prompt, KV cache blocks from the first prefill are reused — subsequent requests skip prefill for the cached prefix. Always on, no configuration needed.
-
-| Model | Params | Quant | TTFT (cold) | TTFT (cached) | Speedup | Decode |
-|---|---|---|---|---|---|---|
-| Qwen3.5 9B | ~9B | bf16 | 5,427 ms | 616 ms | **8.81×** | 25.3 tok/s |
-| Qwen3.5 122B-A10B ⚡ | 122B (10B active) | Q4 | 3,665 ms | 1,089 ms | **3.37×** | 13.6 tok/s |
-| Qwen3.5 397B-A17B ⚡ | 397B (17B active) | Q4 | 5,676 ms | 1,817 ms | **3.12×** | 7.9 tok/s |
-
-Measured via `rllm bench` — requests sharing the same system prompt. First request is a cache miss, subsequent requests are hits.
-
 ## Usage
 
 ### CLI
@@ -324,7 +291,6 @@ src/
 │   ├── chat.rs          — Chat template formatter
 │   ├── vision.rs        — SigLIP ViT encoder, image preprocessing
 │   ├── kv_cache.rs      — Paged KV cache + prefix caching
-│   ├── turboquant.rs    — TurboQuant KV cache quantization
 │   ├── expert_stream.rs — SSD expert streaming (pread-based on-demand loading)
 │   └── sampler.rs       — Temperature + top-p sampling
 ├── engine/              — Continuous batching loop + FCFS scheduler
@@ -338,18 +304,19 @@ src/
 
 ### Optimisation Stack
 
-| Layer | Technique | Impact |
+| Layer | Technique | Docs |
 |---|---|---|
-| Matmul | SIMD-cooperative (32 threads/row, `simd_sum`) | ~2× |
-| Dispatch | Async command buffers (no GPU syncs per token) | ~4× |
-| Weights | Q4 quantization (3.2× less bandwidth) | ~1.5× |
-| KV cache | TurboQuant 4-bit (~4× compression) | 1.5–10× on large models |
-| Prefill | Batched GEMM (load weights once, compute B times) | 3–10× |
-| Prefix caching | Shared KV blocks across sequences | TTFT → ~0 for cached prefix |
-| Attention | Fused single-pass softmax+V, head_dim-specialised | 1.3–2.8× |
-| Batching | Continuous batching (N sequences share the GPU) | ~N× |
-| Expert streaming | SSD pread on demand, fused gate+up+SwiGLU | runs models that don't fit in VRAM |
-| Tensor parallelism | NCCL all-reduce across GPUs | ~N× bandwidth |
+| Matmul | SIMD-cooperative (32 threads/row, `simd_sum`), WMMA tensor-core GEMM | — |
+| Weights | Q4/Q8 block quantization, FP8 E4M3 on NVIDIA SM 89+ | [quantization](docs/quantization.md), [fp8](docs/fp8.md) |
+| KV cache | Paged allocation (vLLM-style), TurboQuant 4-bit compression (~4×) | [kv-cache](docs/kv-cache.md), [turboquant](docs/turboquant.md) |
+| Prefill | Tiled prefill (Flash Attention v2 style), batched GEMM | [tiled_prefill](docs/tiled_prefill.md) |
+| Prefix caching | Shared KV blocks across sequences with common prefixes | [prompt-caching](docs/prompt-caching.md) |
+| Attention | Fused single-pass softmax+V, head_dim-specialised kernels | — |
+| FFN | Fused gate+up+SwiGLU (single kernel, halves input bandwidth) | [fused_dense_ffn](docs/fused_dense_ffn.md) |
+| Decode | GPU-resident argmax, fused residual+RMSNorm | [rvllm_optimizations](docs/rvllm_optimizations.md) |
+| Batching | Continuous batching (N sequences share the GPU) | [inference-engine](docs/inference-engine.md) |
+| Expert streaming | NVMe pread on demand with GPU-side LRU cache | [expert-streaming](docs/expert-streaming.md) |
+| Multi-GPU | NCCL tensor parallelism + expert parallelism for MoE | [multi-gpu-moe](docs/multi-gpu-moe.md) |
 
 ## Expert Streaming
 
@@ -377,8 +344,9 @@ rLLM can run MoE models that far exceed GPU memory by streaming expert weights f
 | Script | Description |
 |---|---|
 | `scripts/install-rust.sh` | Install Rust via rustup |
+| `scripts/install-hf.sh` | Install the HuggingFace CLI |
 | `scripts/download-models.sh` | Download model weights from HuggingFace |
-| `scripts/benchmark.sh` | Benchmark all downloaded models (bf16 + Q4) |
+| `scripts/quantize-models.sh` | Pre-quantize downloaded models to Q4 |
 
 ```bash
 # Quick setup on a fresh machine
@@ -391,6 +359,8 @@ Gated models (Llama, Gemma, Mistral) require a HuggingFace token — set `HF_TOK
 
 ### Test & Benchmark
 
+Tests and benchmarks use [uv](https://github.com/astral-sh/uv). Dependencies are in `tests/requirements.txt`.
+
 ```bash
 # Unit tests (CPU backend, no GPU required)
 cargo test                     # All tests
@@ -402,10 +372,8 @@ tests/run.sh                              # build + download small tier + test
 tests/run.sh --skip-download -k llama     # filter by family
 uv run pytest tests/ -v                   # run directly (models must be present)
 
-# Benchmarks — throughput + TTFT + quality validation (coherence, language detection)
+# Benchmarks — throughput + TTFT + quality validation
 uv run python tests/bench.py --models-dir models
 uv run python tests/bench.py --filter qwen3.5 --runs 3
 tests/run.sh --bench                      # all-in-one (build + bench)
 ```
-
-The benchmark suite validates output quality alongside performance — every model's response is checked for coherent English generation (language detection, repetition, encoding integrity) so regressions in model output are caught alongside throughput changes.
