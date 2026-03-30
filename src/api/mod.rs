@@ -107,6 +107,7 @@ pub(crate) struct WorkerRequest {
 }
 
 /// Events sent from the inference worker back to an HTTP handler.
+#[derive(Debug)]
 pub(crate) enum InferenceEvent {
     /// A new token was generated.
     Token { text: String },
@@ -123,7 +124,7 @@ pub(crate) enum InferenceEvent {
 }
 
 /// Why generation stopped.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum StopReason {
     /// Hit an end-of-sequence token (EOS/EOT).
     EndOfSequence,
@@ -808,10 +809,14 @@ fn run_worker_loop(
             Err(e) => {
                 metrics.errors.inc();
                 let error_msg = format!("{e:#}");
+                let seq_ids: Vec<SeqId> = registry.keys().copied().collect();
                 for (_, ctx) in registry.drain() {
                     let _ = ctx
                         .response_tx
                         .blocking_send(InferenceEvent::Error(error_msg.clone()));
+                }
+                for id in seq_ids {
+                    engine.abort_sequence(id);
                 }
                 continue;
             }
@@ -1361,5 +1366,255 @@ mod tests {
         // Should NOT resolve within 50ms.
         let result = tokio::time::timeout(std::time::Duration::from_millis(50), fut).await;
         assert!(result.is_err(), "shutdown watch resolved without a signal");
+    }
+
+    // -----------------------------------------------------------------------
+    // Mock engine + worker loop integration tests
+    // -----------------------------------------------------------------------
+
+    use std::collections::{HashSet, VecDeque};
+    use crate::engine::{FinishReason, FinishedSequence, StepOutput};
+
+    /// A mock InferenceEngine that returns pre-programmed step results.
+    struct MockEngine {
+        tokenizer: tokenizer::Tokenizer,
+        next_id: SeqId,
+        active: HashSet<SeqId>,
+        /// Pre-programmed results for each step() call.
+        step_results: VecDeque<Box<dyn FnMut(&mut MockEngine) -> anyhow::Result<StepOutput> + Send>>,
+        aborted: Vec<SeqId>,
+    }
+
+    impl MockEngine {
+        fn new() -> Self {
+            Self {
+                tokenizer: tokenizer::Tokenizer::for_test(vec![2]), // EOS = 2
+                next_id: 1,
+                active: HashSet::new(),
+                step_results: VecDeque::new(),
+                aborted: Vec::new(),
+            }
+        }
+
+        /// Queue a step that emits one token for each active sequence.
+        fn push_token_step(&mut self, token_id: u32) {
+            self.step_results.push_back(Box::new(move |eng: &mut MockEngine| {
+                let tokens: Vec<_> = eng.active.iter().map(|&id| (id, token_id)).collect();
+                Ok(StepOutput { tokens, finished: Vec::new() })
+            }));
+        }
+
+        /// Queue a step that finishes all active sequences.
+        fn push_finish_step(&mut self) {
+            self.step_results.push_back(Box::new(|eng: &mut MockEngine| {
+                let finished: Vec<_> = eng.active.drain().map(|id| FinishedSequence {
+                    id,
+                    tokens: Vec::new(),
+                    text: String::new(),
+                    reason: FinishReason::Eos,
+                    cached_tokens: 0,
+                }).collect();
+                Ok(StepOutput { tokens: Vec::new(), finished })
+            }));
+        }
+    }
+
+    impl engine::InferenceEngine for MockEngine {
+        fn add_request(
+            &mut self,
+            _prompt_tokens: Vec<u32>,
+            _max_gen_tokens: usize,
+            _temperature: f32,
+            _top_p: f32,
+            _images: Vec<crate::model::vision::ProcessedImage>,
+            _seed: Option<u64>,
+        ) -> SeqId {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.active.insert(id);
+            id
+        }
+
+        fn step(&mut self) -> anyhow::Result<StepOutput> {
+            if let Some(mut f) = self.step_results.pop_front() {
+                f(self)
+            } else {
+                // No more programmed steps — return empty (no tokens, no finished).
+                Ok(StepOutput { tokens: Vec::new(), finished: Vec::new() })
+            }
+        }
+
+        fn abort_sequence(&mut self, id: SeqId) {
+            self.active.remove(&id);
+            self.aborted.push(id);
+        }
+
+        fn has_work(&self) -> bool {
+            !self.active.is_empty() || !self.step_results.is_empty()
+        }
+
+        fn tokenizer(&self) -> &tokenizer::Tokenizer {
+            &self.tokenizer
+        }
+
+        fn active_count(&self) -> usize { self.active.len() }
+        fn waiting_count(&self) -> usize { 0 }
+    }
+
+    /// Helper: build a WorkerRequest with a response channel.
+    fn mock_worker_request() -> (WorkerRequest, tokio::sync::mpsc::Receiver<InferenceEvent>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let req = WorkerRequest {
+            request_id: "test-req".into(),
+            prompt_tokens: vec![1],
+            max_tokens: 10,
+            temperature: 0.0,
+            top_p: 1.0,
+            response_tx: tx,
+            thinking: None,
+            images: Vec::new(),
+            user: None,
+            seed: None,
+            stop: Vec::new(),
+        };
+        (req, rx)
+    }
+
+    #[test]
+    fn worker_loop_generates_tokens_and_finishes() {
+        let mut engine = MockEngine::new();
+        engine.push_token_step(42); // step 1: emit token (decode may produce empty text)
+        engine.push_finish_step();  // step 2: finish
+
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
+        let m = Arc::new(metrics::Metrics::new());
+
+        let (req, mut response_rx) = mock_worker_request();
+        request_tx.send(req).unwrap();
+        // Drop sender so the loop exits after processing.
+        drop(request_tx);
+
+        run_worker_loop(
+            &mut engine,
+            request_rx,
+            m.clone(),
+            std::time::Duration::from_secs(300),
+        ).unwrap();
+
+        // Collect all events.
+        let mut events = Vec::new();
+        while let Ok(ev) = response_rx.try_recv() {
+            events.push(ev);
+        }
+
+        // Should receive a Done event (Token events depend on tokenizer vocabulary).
+        assert!(
+            events.iter().any(|e| matches!(e, InferenceEvent::Done { .. })),
+            "expected Done event, got: {events:?}",
+        );
+
+        // Metrics should be recorded.
+        assert!(m.prompt_tokens.get() > 0);
+        assert!(m.completion_tokens.get() > 0);
+    }
+
+    #[test]
+    fn worker_loop_aborts_timed_out_request() {
+        let mut engine = MockEngine::new();
+        // Queue enough steps that the timeout fires during processing.
+        for _ in 0..5 {
+            engine.push_token_step(42);
+        }
+        engine.push_finish_step(); // in case timeout doesn't fire
+
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
+        let m = Arc::new(metrics::Metrics::new());
+
+        let (req, mut response_rx) = mock_worker_request();
+        request_tx.send(req).unwrap();
+        drop(request_tx);
+
+        // Zero timeout — deadline is already expired on first check.
+        run_worker_loop(
+            &mut engine,
+            request_rx,
+            m.clone(),
+            std::time::Duration::from_nanos(1),
+        ).unwrap();
+
+        // Collect all events — should contain an Error about timeout.
+        let mut events = Vec::new();
+        while let Ok(ev) = response_rx.try_recv() {
+            events.push(ev);
+        }
+
+        assert!(
+            events.iter().any(|e| matches!(e, InferenceEvent::Error(msg) if msg.contains("timed out"))),
+            "expected a timeout error event, got: {events:?}",
+        );
+        assert_eq!(m.request_timeouts.get(), 1);
+        // The sequence should have been aborted in the engine.
+        assert!(engine.aborted.len() >= 1);
+    }
+
+    #[test]
+    fn worker_loop_handles_engine_step_error() {
+        let mut engine = MockEngine::new();
+        engine.step_results.push_back(Box::new(|_eng: &mut MockEngine| {
+            anyhow::bail!("GPU exploded")
+        }));
+
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
+        let m = Arc::new(metrics::Metrics::new());
+
+        let (req, mut response_rx) = mock_worker_request();
+        request_tx.send(req).unwrap();
+        drop(request_tx);
+
+        run_worker_loop(
+            &mut engine,
+            request_rx,
+            m.clone(),
+            std::time::Duration::from_secs(300),
+        ).unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(ev) = response_rx.try_recv() {
+            events.push(ev);
+        }
+
+        assert!(
+            events.iter().any(|e| matches!(e, InferenceEvent::Error(msg) if msg.contains("GPU exploded"))),
+            "expected engine error event, got: {events:?}",
+        );
+        assert_eq!(m.errors.get(), 1);
+    }
+
+    #[test]
+    fn worker_loop_aborts_disconnected_client() {
+        let mut engine = MockEngine::new();
+        engine.push_token_step(42);
+        engine.push_token_step(42);
+        engine.push_token_step(42);
+        engine.push_finish_step();
+
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
+        let m = Arc::new(metrics::Metrics::new());
+
+        let (req, response_rx) = mock_worker_request();
+        request_tx.send(req).unwrap();
+        drop(request_tx);
+        // Drop the receiver — simulates client disconnect.
+        drop(response_rx);
+
+        run_worker_loop(
+            &mut engine,
+            request_rx,
+            m.clone(),
+            std::time::Duration::from_secs(300),
+        ).unwrap();
+
+        // The sequence should have been aborted.
+        assert!(!engine.aborted.is_empty());
     }
 }
