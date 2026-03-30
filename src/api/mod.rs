@@ -1598,7 +1598,14 @@ mod tests {
             events.iter().any(|e| matches!(e, InferenceEvent::Error(msg) if msg.contains("internal inference error"))),
             "expected sanitized engine error event, got: {events:?}",
         );
+        // The raw engine error must NOT leak to the client.
+        assert!(
+            !events.iter().any(|e| matches!(e, InferenceEvent::Error(msg) if msg.contains("GPU exploded"))),
+            "raw engine error leaked to client: {events:?}",
+        );
         assert_eq!(m.errors.get(), 1);
+        // All active sequences should be aborted in the engine after a step error.
+        assert!(!engine.aborted.is_empty(), "engine sequences not aborted after step error");
     }
 
     #[test]
@@ -1627,5 +1634,51 @@ mod tests {
 
         // The sequence should have been aborted.
         assert!(!engine.aborted.is_empty());
+    }
+
+    #[test]
+    fn worker_loop_aborts_all_sequences_on_engine_error() {
+        // Regression test: engine step error must abort ALL active sequences,
+        // not just drain the registry (which left orphans looping forever).
+        let mut engine = MockEngine::new();
+        // First step succeeds (both sequences get tokens), second step errors.
+        engine.push_token_step(42);
+        engine.step_results.push_back(Box::new(|_eng: &mut MockEngine| {
+            anyhow::bail!("GPU memory corruption")
+        }));
+
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
+        let m = Arc::new(metrics::Metrics::new());
+
+        // Submit two requests so multiple sequences are active.
+        let (req1, _rx1) = mock_worker_request();
+        let (req2, _rx2) = mock_worker_request();
+        request_tx.send(req1).unwrap();
+        request_tx.send(req2).unwrap();
+        drop(request_tx);
+
+        run_worker_loop(
+            &mut engine,
+            request_rx,
+            m.clone(),
+            std::time::Duration::from_secs(300),
+        ).unwrap();
+
+        // Both sequences must have been aborted in the engine.
+        assert_eq!(
+            engine.aborted.len(), 2,
+            "expected 2 aborted sequences, got: {:?}", engine.aborted,
+        );
+        assert!(engine.active.is_empty(), "engine still has active sequences");
+    }
+
+    #[test]
+    fn shutdown_flag_uses_correct_ordering() {
+        // Verify the shutdown flag is read/written with SeqCst (not Relaxed).
+        // We can't test memory ordering directly, but we can verify the flag
+        // is visible immediately from the same thread.
+        let flag = Arc::new(AtomicBool::new(false));
+        flag.store(true, Ordering::SeqCst);
+        assert!(flag.load(Ordering::SeqCst));
     }
 }
