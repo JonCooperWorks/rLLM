@@ -48,6 +48,8 @@
 //   gpu/metal/shaders/mamba2.metal — Metal kernel implementations
 // ===========================================================================
 
+use tracing::debug;
+
 use crate::gpu::{
     GpuAttention, GpuBackend, GpuCore, GpuDeltaNet, GpuElementwise, GpuEmbed, GpuMamba2,
     GpuMatmul, GpuMoe, GpuNorm, GpuRope, GpuAllReduce, GpuTurboQuant, TensorDtype,
@@ -893,10 +895,11 @@ pub(crate) fn load_layer<B: GpuCore>(
             )?);
 
             if layer_idx == 0 {
-                eprintln!(
-                    "  mamba2: d_inner={d_inner}, conv_dim={conv_dim}, in_proj={in_proj_dim}, \
-                     conv_k={ks}, state={}, groups={}, heads={n_heads}",
-                    config.ssm_state_size, config.mamba_n_groups
+                debug!(
+                    d_inner = d_inner, conv_dim = conv_dim, in_proj = in_proj_dim,
+                    conv_k = ks, state = config.ssm_state_size,
+                    groups = config.mamba_n_groups, heads = n_heads,
+                    "mamba2 layer config"
                 );
             }
         }
@@ -948,10 +951,11 @@ pub(crate) fn load_layer<B: GpuCore>(
             }
 
             if layer_idx <= 1 {
-                eprintln!(
-                    "  moe: {n_experts} experts x inter={moe_inter}, shared={shared_inter}, \
-                     top_k={}, scale={:.1}",
-                    config.num_experts_per_tok, config.routed_scaling_factor
+                debug!(
+                    experts = n_experts, inter = moe_inter, shared = shared_inter,
+                    top_k = config.num_experts_per_tok,
+                    scale = format_args!("{:.1}", config.routed_scaling_factor),
+                    "moe layer config"
                 );
             }
         }
@@ -965,9 +969,11 @@ pub(crate) fn load_layer<B: GpuCore>(
             lw.o_proj = upload_tensor(store, backend, &format!("{prefix}.mixer.o_proj.weight"), &[hidden, q_dim])?;
 
             if layer_idx <= 5 {
-                eprintln!(
-                    "  attention: q_dim={q_dim}, kv_dim={kv_dim}, heads={}/{}kv",
-                    config.num_attention_heads, config.num_key_value_heads
+                debug!(
+                    q_dim = q_dim, kv_dim = kv_dim,
+                    heads = config.num_attention_heads,
+                    kv_heads = config.num_key_value_heads,
+                    "attention layer config"
                 );
             }
         }

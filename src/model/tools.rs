@@ -485,9 +485,9 @@ pub(crate) fn validate_tool_calls(
                 .iter()
                 .any(|t| t.function.name == call.function.name);
             if !valid {
-                eprintln!(
-                    "  warning: model produced tool call '{}' which is not in the defined tools — skipping",
-                    call.function.name
+                tracing::warn!(
+                    tool = %call.function.name,
+                    "model produced tool call which is not in the defined tools — skipping"
                 );
             }
             valid

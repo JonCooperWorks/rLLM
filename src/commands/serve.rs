@@ -79,6 +79,21 @@ pub(crate) struct ServeArgs {
     /// coordinate.  See `rllm run --help` for details.
     #[arg(long, default_value = "turbo4")]
     pub kv_quant: String,
+
+    /// Maximum number of requests queued between HTTP handlers and the worker.
+    /// When the queue is full, new requests receive 503 Service Unavailable.
+    #[arg(long, default_value = "8")]
+    pub max_pending: usize,
+
+    /// Maximum number of sequences actively being processed by the engine.
+    /// Additional sequences wait in the scheduler queue until a slot opens.
+    #[arg(long, default_value = "32")]
+    pub max_active: usize,
+
+    /// Per-request timeout in seconds.  Requests that exceed this deadline are
+    /// aborted and the client receives an error.  0 = no timeout (not recommended).
+    #[arg(long, default_value = "300")]
+    pub request_timeout: u64,
 }
 
 pub(crate) fn exec(args: ServeArgs) -> anyhow::Result<()> {

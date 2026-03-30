@@ -241,8 +241,9 @@ pub(crate) async fn auth_middleware(
     mut request: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> Response {
-    // Skip auth entirely when disabled or for health checks.
-    if !state.auth.is_enabled() || request.uri().path() == "/health" {
+    // Skip auth entirely when disabled or for health/metrics endpoints.
+    let path = request.uri().path();
+    if !state.auth.is_enabled() || path == "/health" || path == "/metrics" {
         return next.run(request).await;
     }
 

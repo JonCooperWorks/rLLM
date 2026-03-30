@@ -87,14 +87,14 @@ pub(crate) fn tick() {
         } else {
             0.0
         };
-        eprintln!(
-            "[profile] {} tokens @ {:.1} tok/s | embed: {:.1}ms, attn: {:.1}ms, ffn: {:.1}ms, other: {:.1}ms (per-token avg)",
-            p.token_count,
-            tok_s,
-            p.embed_us as f64 / p.token_count as f64 / 1000.0,
-            p.attn_us as f64 / p.token_count as f64 / 1000.0,
-            p.ffn_us as f64 / p.token_count as f64 / 1000.0,
-            p.other_us as f64 / p.token_count as f64 / 1000.0,
+        tracing::debug!(
+            tokens = p.token_count,
+            tok_per_sec = format_args!("{:.1}", tok_s),
+            embed_ms = format_args!("{:.1}", p.embed_us as f64 / p.token_count as f64 / 1000.0),
+            attn_ms = format_args!("{:.1}", p.attn_us as f64 / p.token_count as f64 / 1000.0),
+            ffn_ms = format_args!("{:.1}", p.ffn_us as f64 / p.token_count as f64 / 1000.0),
+            other_ms = format_args!("{:.1}", p.other_us as f64 / p.token_count as f64 / 1000.0),
+            "profile (per-token avg)",
         );
     }
 }

@@ -104,6 +104,25 @@ pub(crate) struct ChatCompletionRequest {
     /// counts are included in the final streaming chunk.
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
+    /// Response format constraint.  `{"type": "json_object"}` instructs the
+    /// model to produce valid JSON.  The system prompt is augmented with a
+    /// JSON instruction, and the output is validated before returning.
+    #[serde(default)]
+    pub response_format: Option<ResponseFormat>,
+}
+
+/// Response format constraint (OpenAI `response_format` parameter).
+///
+/// `{"type": "text"}` is the default (no constraint).
+/// `{"type": "json_object"}` instructs the model to produce valid JSON.
+///
+/// Implementation: when json_object is requested, the system prompt is
+/// augmented with a JSON instruction and the output is validated.  This
+/// matches OpenAI's approach — prompt-guided, not grammar-constrained.
+#[derive(serde::Deserialize, Clone)]
+pub(crate) struct ResponseFormat {
+    #[serde(rename = "type")]
+    pub format_type: String,
 }
 
 /// Options that control streaming behaviour.
@@ -275,6 +294,35 @@ fn inject_tools(
 }
 
 // ---------------------------------------------------------------------------
+// JSON mode helper: augment the system prompt with a JSON instruction.
+// ---------------------------------------------------------------------------
+
+/// Prepend a JSON instruction to the system message so the model produces
+/// valid JSON output.  Creates a system message if none exists.
+///
+/// This matches OpenAI's prompt-guided approach — no grammar-constrained
+/// decoding, just a clear instruction + post-validation.
+fn inject_json_instruction(messages: &mut Vec<Message>) {
+    const JSON_INSTRUCTION: &str =
+        "\n\nRespond with valid JSON only. Do not include any text outside the JSON object.";
+
+    if let Some(sys_msg) = messages.iter_mut().find(|m| m.role == "system") {
+        sys_msg.content.push_str(JSON_INSTRUCTION);
+    } else {
+        messages.insert(
+            0,
+            Message {
+                role: "system".into(),
+                content: JSON_INSTRUCTION.trim_start().to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                images: None,
+            },
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // POST /v1/chat/completions
 // ---------------------------------------------------------------------------
 
@@ -302,12 +350,22 @@ pub(crate) async fn chat_completions(
         Vec::new()
     };
 
+    let json_mode = req
+        .response_format
+        .as_ref()
+        .is_some_and(|f| f.format_type == "json_object");
+
     // Inject tool definitions into the system message.
-    let messages = if has_tools && !tools_disabled {
+    let mut messages = if has_tools && !tools_disabled {
         inject_tools(req.messages, req.tools.as_ref().unwrap(), state.arch)
     } else {
         req.messages
     };
+
+    // JSON mode: augment the system prompt so the model produces valid JSON.
+    if json_mode {
+        inject_json_instruction(&mut messages);
+    }
 
     // Tokenize on the async handler thread (CPU-only, doesn't block GPU).
     // Use thinking-aware encoding if thinking was requested.
@@ -349,7 +407,11 @@ pub(crate) async fn chat_completions(
         .as_ref()
         .is_some_and(|o| o.include_usage);
 
+    let request_id = super::generate_id();
+    state.metrics.requests_total.with_label_values(&["chat_completions"]).inc();
+
     let worker_req = WorkerRequest {
+        request_id: request_id.clone(),
         prompt_tokens,
         max_tokens,
         temperature: req.temperature,
@@ -386,31 +448,42 @@ pub(crate) async fn chat_completions(
     //   - Plain streaming: tokens emitted as they arrive.
     //   - Streaming with tools: collect then emit (tool markers span tokens).
     //   - Streaming with thinking: collect then emit (thinking blocks span tokens).
-    if req.stream {
+    let mut response = if req.stream && !json_mode {
+        // JSON mode forces the blocking path even when streaming is requested,
+        // because the output must be validated as valid JSON before returning.
+        // (Streaming JSON mode could emit tokens then error on the final chunk,
+        // but that's a worse UX than collecting and validating first.)
         if thinking_enabled && check_tools {
-            Ok(chat_completions_stream_with_thinking_and_tools(
+            chat_completions_stream_with_thinking_and_tools(
                 state, response_rx, tools_required, tool_defs,
             )
-            .await)
+            .await
         } else if thinking_enabled {
-            Ok(chat_completions_stream_with_thinking(state, response_rx).await)
+            chat_completions_stream_with_thinking(state, response_rx).await
         } else if check_tools {
-            Ok(chat_completions_stream_with_tools(state, response_rx, tools_required, tool_defs)
-                .await)
+            chat_completions_stream_with_tools(state, response_rx, tools_required, tool_defs)
+                .await
         } else {
-            Ok(chat_completions_stream(state, response_rx, include_usage).await)
+            chat_completions_stream(state, response_rx, include_usage).await
         }
     } else {
-        Ok(chat_completions_blocking(
+        chat_completions_blocking(
             state,
             response_rx,
             check_tools,
             thinking_enabled,
             tools_required,
             tool_defs,
+            json_mode,
         )
-        .await)
-    }
+        .await
+    };
+
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-request-id"),
+        axum::http::HeaderValue::from_str(&request_id).unwrap(),
+    );
+    Ok(response)
 }
 
 /// Non-streaming: collect all tokens, detect thinking blocks and tool calls,
@@ -425,6 +498,7 @@ async fn chat_completions_blocking(
     check_thinking: bool,
     tools_required: bool,
     tool_defs: Vec<ToolDefinition>,
+    json_mode: bool,
 ) -> Response {
     let mut text = String::new();
     let mut prompt_tokens = 0usize;
@@ -448,6 +522,20 @@ async fn chat_completions_blocking(
                 return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e);
             }
         }
+    }
+
+    // JSON mode: validate that the output is valid JSON.  If not, return a
+    // 400 error rather than silently returning malformed JSON.
+    if json_mode {
+        let trimmed = text.trim();
+        if serde_json::from_str::<serde_json::Value>(trimmed).is_err() {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "model output is not valid JSON (response_format was json_object)",
+            );
+        }
+        // Use the trimmed text so leading/trailing whitespace is stripped.
+        text = trimmed.to_string();
     }
 
     // Parse thinking blocks first (they wrap the entire output including
@@ -914,7 +1002,11 @@ pub(crate) async fn completions(
 
     let (response_tx, response_rx) = tokio::sync::mpsc::channel(64);
 
+    let request_id = super::generate_id();
+    state.metrics.requests_total.with_label_values(&["completions"]).inc();
+
     let worker_req = WorkerRequest {
+        request_id: request_id.clone(),
         prompt_tokens,
         max_tokens: req.max_tokens,
         temperature: req.temperature,
@@ -932,11 +1024,17 @@ pub(crate) async fn completions(
         std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
     })?;
 
-    if req.stream {
-        Ok(completions_stream(state, response_rx).await)
+    let mut response = if req.stream {
+        completions_stream(state, response_rx).await
     } else {
-        Ok(completions_blocking(state, response_rx).await)
-    }
+        completions_blocking(state, response_rx).await
+    };
+
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-request-id"),
+        axum::http::HeaderValue::from_str(&request_id).unwrap(),
+    );
+    Ok(response)
 }
 
 /// Non-streaming text completions.
@@ -1623,5 +1721,142 @@ mod tests {
         let req: CompletionRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.seed, Some(123));
         assert_eq!(req.stop, vec!["END"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // response_format deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_response_format_json_object() {
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Hi"}],
+            "response_format": {"type": "json_object"}
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        let rf = req.response_format.unwrap();
+        assert_eq!(rf.format_type, "json_object");
+    }
+
+    #[test]
+    fn test_response_format_text() {
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Hi"}],
+            "response_format": {"type": "text"}
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        let rf = req.response_format.unwrap();
+        assert_eq!(rf.format_type, "text");
+    }
+
+    #[test]
+    fn test_response_format_defaults_to_none() {
+        let json = r#"{"messages": [{"role": "user", "content": "Hi"}]}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(req.response_format.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // inject_json_instruction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_inject_json_appends_to_existing_system() {
+        let mut messages = vec![
+            Message {
+                role: "system".into(),
+                content: "You are a helpful assistant.".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                images: None,
+            },
+            Message {
+                role: "user".into(),
+                content: "Give me data".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                images: None,
+            },
+        ];
+        inject_json_instruction(&mut messages);
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].content.starts_with("You are a helpful assistant."));
+        assert!(messages[0].content.contains("valid JSON"));
+    }
+
+    #[test]
+    fn test_inject_json_creates_system_when_absent() {
+        let mut messages = vec![Message {
+            role: "user".into(),
+            content: "Give me data".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            images: None,
+        }];
+        inject_json_instruction(&mut messages);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        assert!(messages[0].content.contains("valid JSON"));
+        assert_eq!(messages[1].role, "user");
+    }
+
+    #[test]
+    fn test_inject_json_no_duplicate_system() {
+        let mut messages = vec![
+            Message {
+                role: "system".into(),
+                content: "Original system.".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                images: None,
+            },
+        ];
+        inject_json_instruction(&mut messages);
+        // Should have exactly one system message, not two.
+        assert_eq!(messages.iter().filter(|m| m.role == "system").count(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // JSON mode validation logic (extracted from chat_completions_blocking)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_json_validation_accepts_valid_json() {
+        let text = r#"  {"key": "value", "count": 42}  "#;
+        let trimmed = text.trim();
+        assert!(serde_json::from_str::<serde_json::Value>(trimmed).is_ok());
+        // Trimming removes whitespace.
+        assert_eq!(trimmed, r#"{"key": "value", "count": 42}"#);
+    }
+
+    #[test]
+    fn test_json_validation_accepts_array() {
+        let text = r#"[1, 2, 3]"#;
+        assert!(serde_json::from_str::<serde_json::Value>(text.trim()).is_ok());
+    }
+
+    #[test]
+    fn test_json_validation_rejects_plain_text() {
+        let text = "This is not JSON at all";
+        assert!(serde_json::from_str::<serde_json::Value>(text.trim()).is_err());
+    }
+
+    #[test]
+    fn test_json_validation_rejects_partial_json() {
+        let text = r#"{"key": "value""#; // missing closing brace
+        assert!(serde_json::from_str::<serde_json::Value>(text.trim()).is_err());
+    }
+
+    #[test]
+    fn test_json_validation_rejects_json_with_preamble() {
+        // Model sometimes produces "Here is the JSON: {...}"
+        let text = r#"Here is your data: {"key": "value"}"#;
+        assert!(serde_json::from_str::<serde_json::Value>(text.trim()).is_err());
+    }
+
+    #[test]
+    fn test_json_validation_accepts_nested() {
+        let text = r#"{"users": [{"name": "Alice", "age": 30}], "total": 1}"#;
+        assert!(serde_json::from_str::<serde_json::Value>(text.trim()).is_ok());
     }
 }

@@ -12,6 +12,8 @@
 // ===========================================================================
 
 
+use tracing::{info, warn};
+
 use crate::gpu::{GpuCore, TensorDtype};
 use crate::model::config::ModelConfig;
 use crate::model::vision::{VisionBlockWeights, VisionWeights};
@@ -109,7 +111,7 @@ pub(crate) fn load_vision_weights<B: GpuCore>(
     };
     match store.tensor(&probe) {
         Err(_) => {
-            eprintln!("vision weights not found ({}), skipping vision encoder", probe);
+            info!(probe = %probe, "vision weights not found, skipping vision encoder");
             return None;
         }
         Ok(view) => {
@@ -117,13 +119,13 @@ pub(crate) fn load_vision_weights<B: GpuCore>(
             // quantized vision weights in some Q4 model distributions).
             let dt = view.dtype();
             if !matches!(dt, safetensors::Dtype::F32 | safetensors::Dtype::F16 | safetensors::Dtype::BF16) {
-                eprintln!("vision weights have unsupported dtype {:?}, skipping vision encoder", dt);
+                warn!(dtype = ?dt, "vision weights have unsupported dtype, skipping vision encoder");
                 return None;
             }
         }
     }
 
-    eprintln!("loading vision encoder weights ({} blocks, hidden_size={})", vc.depth, hd);
+    info!(blocks = vc.depth, hidden_size = hd, "loading vision encoder weights");
 
     // Patch embedding — stored as conv2d [out_channels, in_channels, kH, kW].
     // Reshape to [hidden_size, patch_dim] for matmul-based patch embedding.
@@ -240,10 +242,9 @@ pub(crate) fn load_vision_weights<B: GpuCore>(
     let fc1_view = match fc1_view {
         Some(v) => v,
         None => {
-            eprintln!(
-                "WARNING: vision projector weight not found under any known name \
-                 (tried: {}), skipping vision encoder",
-                fc1_candidates.join(", ")
+            warn!(
+                candidates = %fc1_candidates.join(", "),
+                "vision projector weight not found under any known name, skipping vision encoder"
             );
             return None;
         }
@@ -298,7 +299,7 @@ pub(crate) fn load_vision_weights<B: GpuCore>(
         upload_vision(backend, &v, v.shape())
     });
 
-    eprintln!("vision encoder weights loaded ({} blocks)", vc.depth);
+    info!(blocks = vc.depth, "vision encoder weights loaded");
 
     Some(VisionWeights {
         patch_embed_weight,

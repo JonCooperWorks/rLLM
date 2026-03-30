@@ -23,7 +23,7 @@ tokio-rustls = "0.26"
 rustls-pemfile = "2"
 rustls-acme = "0.12"
 hyper = "1"
-hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "server-graceful", "http1", "http2"] }
 tower-service = "0.3"
 tokio-stream = "0.1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
@@ -32,6 +32,9 @@ base64 = "0.22"
 jsonwebtoken = "9"
 argon2 = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+prometheus = "0.13"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.33.0"
@@ -46,6 +49,7 @@ cudarc = { version = "0.19", features = ["std", "driver", "nvrtc", "nccl", "f16"
 
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5.3", features = ["util"] }
 
 [profile.release]
 lto = "thin"

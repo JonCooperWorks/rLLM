@@ -73,6 +73,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::sync::Arc;
 
+use tracing::info;
+
 use crate::gpu::{GpuCore, PinnedBuf, TensorDtype};
 
 /// Wrapper to send raw pointers across thread boundaries.
@@ -319,12 +321,12 @@ impl<B: GpuCore> ExpertStreamer<B> {
         );
 
         let expert_bytes = gate_up_bytes + down_bytes;
-        eprintln!(
-            "expert streaming: {} cache slots ({} MB), {} experts/tok, {} MB per expert load",
-            cache_slots,
-            cache_slots * expert_bytes / (1024 * 1024),
-            k,
-            expert_bytes / (1024 * 1024),
+        info!(
+            cache_slots = cache_slots,
+            cache_mb = cache_slots * expert_bytes / (1024 * 1024),
+            experts_per_tok = k,
+            mb_per_expert = expert_bytes / (1024 * 1024),
+            "expert streaming initialized",
         );
 
         ExpertStreamer {

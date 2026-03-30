@@ -34,6 +34,7 @@ use std::path::PathBuf;
 
 use safetensors::tensor::TensorView;
 use safetensors::SafeTensors;
+use tracing::{info, debug};
 
 use crate::gpu::ops::quant::{QuantFormat, quantiser};
 
@@ -71,7 +72,7 @@ fn platform_adjusted_format(format: QuantFormat) -> QuantFormat {
                 .and_then(|ctx| ctx.compute_capability().ok())
                 .unwrap_or((0, 0));
             if cc.0 > 8 || (cc.0 == 8 && cc.1 >= 9) {
-                eprintln!("NVIDIA SM {}.{} detected — using FP8 (E4M3) instead of Q8 blocks", cc.0, cc.1);
+                info!(sm_major = cc.0, sm_minor = cc.1, "NVIDIA SM detected — using FP8 (E4M3) instead of Q8 blocks");
                 return QuantFormat::FP8;
             }
         }
@@ -132,7 +133,7 @@ pub(crate) fn exec(args: QuantizeArgs) -> anyhow::Result<()> {
     let all_tensors = collect_all_tensors(&shards, &weight_map);
 
     let num_tensors = all_tensors.len();
-    eprintln!("found {num_tensors} tensors across {} shard(s)", mmaps.len());
+    info!(tensors = num_tensors, shards = mmaps.len(), "found tensors");
 
     // Process and write tensors incrementally to avoid holding all Q4 data
     // in memory.  For large MoE models (397B = 751 GB bf16 → 235 GB Q4),
@@ -170,8 +171,8 @@ pub(crate) fn exec(args: QuantizeArgs) -> anyhow::Result<()> {
             quantized_count += 1;
 
             if tensor_idx % 10 == 0 || quant_data.len() > 100_000_000 {
-                eprintln!(
-                    "  [{}/{}] quantized {} ({:.0} MB → {:.0} MB)",
+                debug!(
+                    "[{}/{}] quantized {} ({:.0} MB → {:.0} MB)",
                     tensor_idx + 1, num_tensors, name,
                     data.len() as f64 / 1e6, quant_data.len() as f64 / 1e6,
                 );
@@ -238,16 +239,19 @@ pub(crate) fn exec(args: QuantizeArgs) -> anyhow::Result<()> {
     } else {
         1.0
     };
-    eprintln!(
-        "quantized {quantized_count}/{num_tensors} tensors across {output_shard_count} shard(s)"
+    info!(
+        quantized = quantized_count,
+        total = num_tensors,
+        shards = output_shard_count,
+        "quantized tensors"
     );
-    eprintln!(
+    info!(
         "size: {:.1} GB → {:.1} GB ({:.1}x compression)",
         original_bytes as f64 / 1e9,
         quantized_bytes as f64 / 1e9,
         ratio
     );
-    eprintln!("output: {}", output_dir.display());
+    info!(output = %output_dir.display(), "output directory");
 
     Ok(())
 }
@@ -404,7 +408,7 @@ fn write_single_shard(
 
     let tmp_name = format!(".tmp.{shard_idx}.safetensors");
     let output_path = output_dir.join(&tmp_name);
-    eprintln!("writing shard {} ({} tensors)...", shard_idx + 1, tensors.len());
+    info!(shard = shard_idx + 1, tensors = tensors.len(), "writing shard");
 
     safetensors::tensor::serialize_to_file(views, &Some(metadata), &output_path)
         .map_err(|e| anyhow::anyhow!("failed to write shard {shard_idx}: {e}"))?;
@@ -440,7 +444,7 @@ fn finalize_shards(
         let index = serde_json::json!({ "weight_map": weight_map });
         let index_path = output_dir.join("model.safetensors.index.json");
         std::fs::write(&index_path, serde_json::to_string_pretty(&index)?)?;
-        eprintln!("wrote index file");
+        info!("wrote index file");
     }
 
     Ok(())
@@ -459,7 +463,7 @@ fn copy_support_files(
         let src = input_dir.join(name);
         if src.exists() {
             std::fs::copy(&src, output_dir.join(name))?;
-            eprintln!("copied {name}");
+            debug!(file = name, "copied");
         }
     }
     Ok(())

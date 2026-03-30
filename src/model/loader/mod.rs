@@ -106,6 +106,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use safetensors::SafeTensors;
+use tracing::{info, debug};
 
 use super::config::{ModelArch, ModelConfig};
 use super::tokenizer::Tokenizer;
@@ -640,9 +641,10 @@ fn load_weights_inner<B: GpuCore>(
         let q8_count = q8_map.len();
         let fp8_count = fp8_map.len();
         let fmt = if fp8_count > 0 { "FP8" } else if q8_count > 0 { "Q8" } else { "Q4" };
-        eprintln!(
-            "detected pre-quantized model ({} {} tensors), skipping on-load quantization",
-            q4_count + q8_count + fp8_count, fmt
+        info!(
+            count = q4_count + q8_count + fp8_count,
+            format = fmt,
+            "detected pre-quantized model, skipping on-load quantization"
         );
     }
 
@@ -741,7 +743,7 @@ fn load_weights_inner<B: GpuCore>(
         upload_tensor(&store, backend, &norm_name, &[hidden])?
     };
 
-    eprintln!("loaded {} layers", layers.len());
+    info!(layers = layers.len(), "loaded layers");
     Ok(ModelWeights {
         embed_tokens,
         layers,
@@ -1219,9 +1221,9 @@ pub(crate) fn load_deltanet_attention<B: GpuCore>(
     );
 
     if layer_idx == 0 {
-        eprintln!(
-            "  DeltaNet layers: qk_dim={}, v_dim={}, kernel_size={}",
-            qk_dim, v_dim, kernel_size
+        debug!(
+            qk_dim = qk_dim, v_dim = v_dim, kernel_size = kernel_size,
+            "DeltaNet layers"
         );
     }
 
@@ -1660,10 +1662,10 @@ pub(crate) fn load_moe_ffn_weights<B: GpuCore>(
 
     let expert_vec = if skip_experts {
         if layer_idx == 0 {
-            eprintln!(
-                "  skipping {} experts per layer (streaming from SSD){}",
-                num_experts,
-                if is_fused { " [fused format]" } else { "" },
+            debug!(
+                num_experts = num_experts,
+                fused = is_fused,
+                "skipping experts per layer (streaming from SSD)"
             );
         }
         Vec::new()
@@ -1765,8 +1767,8 @@ pub(crate) fn load_moe_ffn_weights<B: GpuCore>(
         } else {
             String::new()
         };
-        eprintln!(
-            "  loading {} experts per layer (moe_inter={}){}",
+        debug!(
+            "loading {} experts per layer (moe_inter={}){}",
             loaded_count, moe_inter, ep_suffix,
         );
     }
@@ -1799,7 +1801,7 @@ pub(crate) fn load_moe_ffn_weights<B: GpuCore>(
             &[1, hidden],
         )?;
         if layer_idx == 0 {
-            eprintln!("  shared expert: inter={}", shared_inter);
+            debug!(inter = shared_inter, "shared expert");
         }
         (Some(gp), Some(up), Some(dp), Some(sg))
     } else {
@@ -2102,22 +2104,25 @@ pub(crate) fn load_model<B: GpuCore>(
 ) -> anyhow::Result<LoadedModel<B>> {
     let config = ModelConfig::from_file(&model_dir.join("config.json"))?;
     let arch = config.arch()?;
-    eprintln!(
-        "loaded config: {:?}, {} layers, {} heads, hidden_size={}",
-        arch, config.num_hidden_layers, config.num_attention_heads, config.hidden_size
+    info!(
+        arch = ?arch,
+        layers = config.num_hidden_layers,
+        heads = config.num_attention_heads,
+        hidden_size = config.hidden_size,
+        "loaded config"
     );
 
     let tokenizer = Tokenizer::from_file(&model_dir.join("tokenizer.json"), arch)?;
-    eprintln!("tokenizer loaded");
+    info!("tokenizer loaded");
 
     let is_quantized = is_prequantized_model(model_dir);
     let (weights, expert_index) = load_weights_maybe_streamed(
         backend, model_dir, &config, stream_experts, None,
     )?;
-    eprintln!(
-        "weights loaded{}{}",
-        if is_quantized { " (pre-quantized)" } else { "" },
-        if expert_index.is_some() { " (experts streaming from SSD)" } else { "" },
+    info!(
+        pre_quantized = is_quantized,
+        expert_streaming = expert_index.is_some(),
+        "weights loaded"
     );
 
     // Load vision encoder weights if this is a VLM.

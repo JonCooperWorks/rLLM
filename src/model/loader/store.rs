@@ -20,6 +20,7 @@ use std::path::Path;
 
 use memmap2::Mmap;
 use safetensors::SafeTensors;
+use tracing::info;
 
 pub(crate) struct TensorStore<'a> {
     pub(crate) shards: Vec<SafeTensors<'a>>,
@@ -121,7 +122,7 @@ pub(crate) fn load_safetensors_files(model_dir: &Path) -> anyhow::Result<(Vec<Mm
     // Case 1: single model.safetensors file.
     let single = model_dir.join("model.safetensors");
     if single.exists() {
-        eprintln!("loading from {}", single.display());
+        info!(path = %single.display(), "loading safetensors");
         let file = std::fs::File::open(&single)?;
         let mmap = unsafe { Mmap::map(&file)? };
         return Ok((vec![mmap], HashMap::new()));
@@ -177,10 +178,10 @@ pub(crate) fn load_safetensors_files(model_dir: &Path) -> anyhow::Result<(Vec<Mm
     }
 
     // Memory-map each shard file.
-    eprintln!(
-        "loading from {} shard files in {}",
-        shard_files.len(),
-        model_dir.display()
+    info!(
+        shards = shard_files.len(),
+        dir = %model_dir.display(),
+        "loading safetensors shards"
     );
     let mmaps: Vec<Mmap> = shard_files
         .iter()

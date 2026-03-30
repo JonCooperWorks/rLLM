@@ -581,7 +581,7 @@ pub(crate) fn create_backends(world_size: usize) -> anyhow::Result<Vec<Backend>>
 
 #[cfg(not(any(target_os = "macos", feature = "cuda")))]
 pub(crate) fn create_backend() -> anyhow::Result<cpu::CpuBackend> {
-    eprintln!("warning: no GPU backend available, using CPU (slow)");
+    tracing::warn!("no GPU backend available, using CPU (slow)");
     Ok(cpu::CpuBackend)
 }
 

@@ -8,6 +8,8 @@
 
 use std::io::{self, Write};
 
+use tracing::{info, debug};
+
 use super::ModelArgs;
 
 #[derive(clap::Args)]
@@ -48,9 +50,9 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
             processed_images,
         )?;
         if chat {
-            eprintln!("chat template applied ({:?})", arch);
+            debug!(arch = ?arch, "chat template applied");
         }
-        eprintln!("prompt tokens: {:?} ({})", &tokens, tokens.len());
+        debug!(count = tokens.len(), tokens = ?&tokens, "prompt tokens");
 
         let prompt_len = tokens.len();
         eng.add_request(
@@ -75,9 +77,11 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
             if !prefill_reported && !output.tokens.is_empty() {
                 let ttft = start.elapsed();
                 let prefill_tps = prompt_len as f64 / ttft.as_secs_f64();
-                eprintln!(
-                    "prefill: {} tokens in {:.1?} ({:.1} tok/s)",
-                    prompt_len, ttft, prefill_tps
+                info!(
+                    tokens = prompt_len,
+                    elapsed = ?ttft,
+                    tok_per_sec = format_args!("{:.1}", prefill_tps),
+                    "prefill"
                 );
                 prefill_reported = true;
             }
@@ -102,9 +106,11 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
 
         let elapsed = start.elapsed();
         let tps = gen_count as f64 / elapsed.as_secs_f64();
-        eprintln!(
-            "generation: {} tokens in {:.1?} ({:.1} tok/s)",
-            gen_count, elapsed, tps
+        info!(
+            tokens = gen_count,
+            elapsed = ?elapsed,
+            tok_per_sec = format_args!("{:.1}", tps),
+            "generation"
         );
 
         Ok(())

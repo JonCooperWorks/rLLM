@@ -9,6 +9,8 @@
 
 use std::path::PathBuf;
 
+use tracing::info;
+
 use super::ModelArgs;
 
 #[derive(clap::Args)]
@@ -28,10 +30,10 @@ pub(crate) fn exec(args: BatchArgs) -> anyhow::Result<()> {
         .filter(|l| !l.trim().is_empty())
         .map(|l| l.to_string())
         .collect();
-    eprintln!(
-        "batch: {} prompts from {}",
-        prompts.len(),
-        args.batch_file.display()
+    info!(
+        prompts = prompts.len(),
+        file = %args.batch_file.display(),
+        "batch loaded"
     );
 
     let max_active = prompts.len();
@@ -63,12 +65,12 @@ pub(crate) fn exec(args: BatchArgs) -> anyhow::Result<()> {
 
         let elapsed = start.elapsed();
         let tps = total_generated as f64 / elapsed.as_secs_f64();
-        eprintln!(
-            "batch complete: {} tokens from {} sequences in {:.1?} ({:.1} tok/s total throughput)",
-            total_generated,
-            prompts.len(),
-            elapsed,
-            tps
+        info!(
+            tokens = total_generated,
+            sequences = prompts.len(),
+            elapsed = ?elapsed,
+            tok_per_sec = format_args!("{:.1}", tps),
+            "batch complete"
         );
 
         Ok(())

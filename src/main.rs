@@ -22,6 +22,7 @@ pub(crate) use commands::ServeArgs;
 
 use clap::Parser;
 use std::process::ExitCode;
+use tracing::error;
 
 #[derive(Parser)]
 #[command(name = "rllm", about = "Rust LLM inference engine")]
@@ -31,9 +32,18 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .without_time()
+        .init();
+
     let cli = Cli::parse();
     if let Err(e) = cli.command.exec() {
-        eprintln!("error: {e:#}");
+        error!("{e:#}");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS

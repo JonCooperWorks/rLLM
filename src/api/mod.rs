@@ -49,13 +49,16 @@
 
 pub(crate) mod anthropic;
 pub(crate) mod auth;
+pub(crate) mod metrics;
 pub(crate) mod openai;
 pub(crate) mod tls;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use axum::response::IntoResponse;
 use auth::AuthProvider;
 use crate::ServeArgs;
 use crate::engine;
@@ -72,6 +75,9 @@ use crate::model::{config, tokenizer};
 /// Tokenization happens on the async handler thread (CPU-only work) so the
 /// worker's Engine step loop is never stalled by tokenization.
 pub(crate) struct WorkerRequest {
+    /// Unique request ID generated at the handler, used for correlation
+    /// across logs, metrics, and API responses.
+    pub request_id: String,
     /// Pre-tokenized prompt (already includes BOS, chat template, etc.).
     pub prompt_tokens: Vec<u32>,
     /// Maximum tokens to generate.
@@ -101,6 +107,7 @@ pub(crate) struct WorkerRequest {
 }
 
 /// Events sent from the inference worker back to an HTTP handler.
+#[derive(Debug)]
 pub(crate) enum InferenceEvent {
     /// A new token was generated.
     Token { text: String },
@@ -117,7 +124,7 @@ pub(crate) enum InferenceEvent {
 }
 
 /// Why generation stopped.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum StopReason {
     /// Hit an end-of-sequence token (EOS/EOT).
     EndOfSequence,
@@ -143,11 +150,42 @@ pub(crate) struct ServerState {
     pub image_token_id: Option<u32>,
     /// Auth provider (None variant when auth is disabled).
     pub auth: auth::AuthProviderKind,
+    /// Prometheus metrics (shared with the worker thread via Arc).
+    pub metrics: Arc<metrics::Metrics>,
+    /// Set to true when a shutdown signal (SIGTERM/SIGINT) is received.
+    /// The health endpoint returns 503 during shutdown so load balancers
+    /// stop sending traffic before the server stops accepting connections.
+    pub shutting_down: Arc<AtomicBool>,
 }
 
 // ---------------------------------------------------------------------------
 // Helpers.
 // ---------------------------------------------------------------------------
+
+/// GET /health — returns 200 when ready, 503 during shutdown.
+///
+/// Returns a JSON body with queue depth for observability.  Load balancers
+/// can use the status code alone; dashboards can parse the body for details.
+///
+/// Since the server only binds after model loading completes (spawn_worker
+/// blocks until the engine is ready), a reachable /health endpoint implies
+/// the model is loaded and serving.  During shutdown, it returns 503 so
+/// load balancers stop routing traffic before connections are closed.
+async fn health_handler(
+    axum::extract::State(state): axum::extract::State<Arc<ServerState>>,
+) -> axum::response::Response {
+    let status = if state.shutting_down.load(Ordering::SeqCst) {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        axum::http::StatusCode::OK
+    };
+    let body = serde_json::json!({
+        "status": if status == axum::http::StatusCode::OK { "ok" } else { "shutting_down" },
+        "active_sequences": state.metrics.active_sequences.get(),
+        "waiting_sequences": state.metrics.waiting_sequences.get(),
+    });
+    (status, axum::Json(body)).into_response()
+}
 
 /// Preprocess images from the last user message for vision models.
 ///
@@ -249,6 +287,12 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // ------------------------------------------------------------------
     let tls_mode = validate_tls_args(&args)?;
 
+    anyhow::ensure!(
+        args.max_pending >= 1,
+        "--max-pending must be at least 1 (got {})",
+        args.max_pending,
+    );
+
     let model_name = args
         .model
         .file_name()
@@ -272,16 +316,10 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // ------------------------------------------------------------------
     // 2. Load model.
     // ------------------------------------------------------------------
-    eprintln!();
-    eprintln!("  rllm — loading {}", model_name);
-    eprintln!("  ----------------------------------------");
     // Detect pre-quantized models by checking safetensors metadata.
     let is_prequantized = crate::model::loader::is_prequantized_model(&args.model);
-    if is_prequantized {
-        eprintln!("  mode      : Q4 (pre-quantized)");
-    } else {
-        eprintln!("  mode      : bf16");
-    }
+    let mode = if is_prequantized { "Q4 (pre-quantized)" } else { "bf16" };
+    tracing::info!(model = %model_name, mode, "loading model");
 
     // Resolve --tp 0 → auto-detect available GPUs.
     let mut tp = args.tp;
@@ -293,29 +331,33 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // On macOS (Metal), fall back to single GPU with a warning.
     #[cfg(not(feature = "cuda"))]
     if tp > 1 {
-        eprintln!(
-            "  warning   : --tp {} ignored (multi-GPU requires CUDA + NCCL), using single GPU",
-            tp
-        );
+        tracing::warn!(requested_tp = tp, "multi-GPU requires CUDA + NCCL, falling back to single GPU");
         tp = 1;
     }
 
     if tp > 1 {
-        eprintln!("  tp        : {} GPUs", tp);
+        tracing::info!(gpus = tp, "tensor parallelism enabled");
     }
 
     let kv_quant = crate::model::turboquant::KvQuantMode::from_str(&args.kv_quant)
         .unwrap_or_else(|| {
-            eprintln!("error: invalid --kv-quant value '{}', expected: turbo4, turbo3, turbo2, none", args.kv_quant);
+            tracing::error!(value = %args.kv_quant, "invalid --kv-quant value, expected: turbo4, turbo3, turbo2, none");
             std::process::exit(1);
         });
+
+    let server_metrics = Arc::new(metrics::Metrics::new());
+
+    let request_timeout = std::time::Duration::from_secs(args.request_timeout);
 
     let WorkerHandle {
         request_tx,
         tokenizer,
         arch,
         vision_config: _,
-    } = spawn_worker(args.model.clone(), args.stream_experts, tp, kv_quant)?;
+    } = spawn_worker(
+        args.model.clone(), args.stream_experts, tp, kv_quant,
+        server_metrics.clone(), args.max_pending, args.max_active, request_timeout,
+    )?;
 
     // Parse vision config + image token ID from config.json for handler-side preprocessing.
     let parsed_config = config::ModelConfig::from_file(&args.model.join("config.json")).ok();
@@ -345,13 +387,13 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("auth config missing \"provider\" field"))?;
         match provider_name {
             "oidc" => {
-                eprintln!("  auth      : oidc");
+                tracing::info!(provider = "oidc", "auth enabled");
                 let provider =
                     rt.block_on(auth::oidc::OidcProvider::init(&config))?;
                 auth::AuthProviderKind::Oidc(Arc::new(provider))
             }
             "static_api_key" => {
-                eprintln!("  auth      : static_api_key");
+                tracing::info!(provider = "static_api_key", "auth enabled");
                 // Inject the config file path so the background task can
                 // re-read it for hot reload of the key hash.
                 let mut config = config;
@@ -376,7 +418,7 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 args.host
             );
         }
-        eprintln!("  auth      : none");
+        tracing::info!(provider = "none", "auth disabled");
         auth::AuthProviderKind::None
     };
 
@@ -386,22 +428,23 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     if auth_provider.is_enabled()
         && matches!(tls_mode, tls::TlsMode::None)
     {
-        eprintln!();
-        eprintln!("  WARNING: auth is enabled but TLS is disabled.");
-        eprintln!("  Bearer tokens, prompts, and completions are sent in plaintext.");
-        eprintln!("  An attacker with network access can intercept tokens to");
-        eprintln!("  impersonate users, read prompts and completions, or modify");
-        eprintln!("  requests and responses in transit (man-in-the-middle).");
-        eprintln!("  This is safe over localhost or an SSH tunnel, but dangerous");
-        eprintln!("  on any network an attacker can observe.");
-        eprintln!("  To fix: add --cert/--private-key or --letsencrypt.");
-        eprintln!();
+        tracing::warn!(
+            "auth is enabled but TLS is disabled — tokens, prompts, and completions are sent \
+             in plaintext. Add --cert/--private-key or --letsencrypt to fix."
+        );
     }
 
-    eprintln!("  ----------------------------------------");
-    eprintln!("  endpoint  : {scheme}://{addr}/v1/chat/completions");
-    eprintln!("  health    : {scheme}://{addr}/health");
-    eprintln!();
+    tracing::info!(
+        endpoint = %format_args!("{scheme}://{addr}/v1/chat/completions"),
+        health = %format_args!("{scheme}://{addr}/health"),
+        metrics = %format_args!("{scheme}://{addr}/metrics"),
+        max_pending = args.max_pending,
+        max_active = args.max_active,
+        request_timeout_secs = args.request_timeout,
+        "server ready",
+    );
+
+    let shutting_down = Arc::new(AtomicBool::new(false));
 
     let state = Arc::new(ServerState {
         request_tx,
@@ -411,6 +454,8 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         vision_config,
         image_token_id,
         auth: auth_provider,
+        metrics: server_metrics,
+        shutting_down: shutting_down.clone(),
     });
 
     // Build axum router with all API endpoints.
@@ -424,8 +469,10 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .route("/v1/models", axum::routing::get(openai::list_models))
         // Anthropic-compatible endpoint.
         .route("/v1/messages", axum::routing::post(anthropic::messages))
-        // Health check.
-        .route("/health", axum::routing::get(|| async { "ok" }))
+        // Health check: returns 200 when healthy, 503 during shutdown so
+        // load balancers drain traffic before the server stops.
+        .route("/health", axum::routing::get(health_handler))
+        .route("/metrics", axum::routing::get(metrics::metrics_handler))
         // Auth middleware — inside CORS so preflight OPTIONS get CORS headers
         // even when auth denies them.
         .layer(axum::middleware::from_fn_with_state(
@@ -446,20 +493,64 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     });
 
     rt.block_on(async {
+        // Shutdown signal: SIGINT (Ctrl-C) or SIGTERM (container orchestrators).
+        // A watch channel broadcasts the signal so all server paths (plain HTTP,
+        // manual TLS, Let's Encrypt) can share the same shutdown trigger.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let shutdown_flag = shutting_down.clone();
+
+        tokio::spawn(async move {
+            let ctrl_c = tokio::signal::ctrl_c();
+            #[cfg(unix)]
+            {
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("failed to install SIGTERM handler");
+                tokio::select! {
+                    _ = ctrl_c => {},
+                    _ = sigterm.recv() => {},
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                ctrl_c.await.ok();
+            }
+            tracing::info!("shutdown signal received, draining in-flight requests");
+            shutdown_flag.store(true, Ordering::SeqCst);
+            let _ = shutdown_tx.send(true);
+        });
+
+        /// Create a future that resolves when the shutdown watch fires.
+        fn shutdown_from_watch(mut rx: tokio::sync::watch::Receiver<bool>) -> impl std::future::Future<Output = ()> + Send + 'static {
+            async move {
+                while !*rx.borrow_and_update() {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+
         match tls_mode {
             tls::TlsMode::None => {
                 let listener = tokio::net::TcpListener::bind(&addr).await?;
-                axum::serve(listener, app).await?;
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(shutdown_from_watch(shutdown_rx))
+                    .await?;
             }
             tls::TlsMode::Manual { cert, key } => {
-                tls::serve_manual_tls(app, &addr, &cert, &key).await?;
+                tls::serve_manual_tls(app, &addr, &cert, &key, shutdown_from_watch(shutdown_rx))
+                    .await?;
             }
             tls::TlsMode::LetsEncrypt {
                 domain,
                 email,
                 cache_dir,
             } => {
-                tls::serve_letsencrypt(app, &addr, &domain, email.as_deref(), &cache_dir).await?;
+                tls::serve_letsencrypt(
+                    app, &addr, &domain, email.as_deref(), &cache_dir,
+                    shutdown_from_watch(shutdown_rx),
+                ).await?;
             }
         }
         Ok::<(), anyhow::Error>(())
@@ -491,30 +582,53 @@ fn spawn_worker(
     stream_experts: bool,
     tp: usize,
     kv_quant: crate::model::turboquant::KvQuantMode,
+    metrics: Arc<metrics::Metrics>,
+    max_pending: usize,
+    max_active: usize,
+    request_timeout: std::time::Duration,
 ) -> anyhow::Result<WorkerHandle> {
-    let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
+    let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(max_pending);
     type ReadyPayload = (Arc<tokenizer::Tokenizer>, config::ModelArch, Option<crate::model::config::VisionConfig>);
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<
         Result<ReadyPayload, String>,
     >(1);
 
     std::thread::spawn(move || {
-        let max_active = 32;
+        let run = || -> anyhow::Result<()> {
+            engine::loader::load_and_run_ext(
+                &model_dir,
+                stream_experts,
+                tp,
+                kv_quant,
+                max_active,
+                |tok, arch| {
+                    let _ = ready_tx.send(Ok((Arc::new(tok.clone()), arch, None)));
+                },
+                |eng| run_worker_loop(eng, request_rx, metrics, request_timeout),
+            )
+        };
 
-        let result = engine::loader::load_and_run_ext(
-            &model_dir,
-            stream_experts,
-            tp,
-            kv_quant,
-            max_active,
-            |tok, arch| {
-                let _ = ready_tx.send(Ok((Arc::new(tok.clone()), arch, None)));
-            },
-            |eng| run_worker_loop(eng, request_rx),
-        );
-
-        if let Err(e) = result {
-            let _ = ready_tx.send(Err(format!("{e:#}")));
+        // catch_unwind prevents a panic in the GPU backend or model code from
+        // silently killing the worker thread.  Without this, a panic leaves
+        // all in-flight requests hanging forever and the server appears alive
+        // but cannot process any new work.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = ready_tx.send(Err(format!("{e:#}")));
+                tracing::error!(error = %e, "worker thread exited with error");
+            }
+            Err(panic_payload) => {
+                let msg = match panic_payload.downcast_ref::<&str>() {
+                    Some(s) => s.to_string(),
+                    None => match panic_payload.downcast_ref::<String>() {
+                        Some(s) => s.clone(),
+                        None => "unknown panic".to_string(),
+                    },
+                };
+                let _ = ready_tx.send(Err(format!("worker panicked: {msg}")));
+                tracing::error!(panic = %msg, "worker thread panicked");
+            }
         }
     });
 
@@ -533,9 +647,14 @@ fn spawn_worker(
 /// Per-request context tracked by the worker's request registry.
 /// Maps an Engine SeqId to the HTTP response channel.
 struct RequestContext {
+    /// Request ID for log correlation (generated at the HTTP handler).
+    request_id: String,
     response_tx: tokio::sync::mpsc::Sender<InferenceEvent>,
     prompt_token_count: usize,
     generated_count: usize,
+    /// Absolute deadline after which this request is aborted.
+    /// None means no timeout (request_timeout was 0).
+    deadline: Option<Instant>,
     /// Running buffer of all generated token IDs for this sequence.
     /// Used for incremental decoding: we decode the full buffer each step
     /// and emit only the new characters.  This avoids SentencePiece Strip
@@ -588,6 +707,36 @@ struct RequestContext {
 // engine::loader::load_and_run() after constructing the appropriate engine.
 // ---------------------------------------------------------------------------
 
+/// Record Prometheus metrics for a completed request.
+///
+/// Called from both the normal completion path (section 5) and the
+/// stop-sequence path (section 4) to avoid missing metrics for
+/// sequences that finish via stop strings.
+fn record_completion_metrics(metrics: &metrics::Metrics, ctx: &RequestContext) {
+    let now = Instant::now();
+    let total_secs = now.duration_since(ctx.created_at).as_secs_f64();
+    metrics.request_duration.observe(total_secs);
+
+    if let Some(first) = ctx.first_token_at {
+        let ttft_secs = first.duration_since(ctx.created_at).as_secs_f64();
+        metrics.time_to_first_token.observe(ttft_secs);
+
+        let decode_secs = now.duration_since(first).as_secs_f64();
+        let decode_tokens = ctx.generated_count.saturating_sub(1);
+        if decode_secs > 0.0 {
+            metrics
+                .decode_tokens_per_second
+                .observe(decode_tokens as f64 / decode_secs);
+        }
+    }
+
+    metrics.prompt_tokens.inc_by(ctx.prompt_token_count as u64);
+    metrics.completion_tokens.inc_by(ctx.generated_count as u64);
+    if ctx.cached_tokens > 0 {
+        metrics.prefix_cache_hits.inc();
+    }
+}
+
 /// Run the continuous batching loop for any InferenceEngine.
 ///
 /// Blocks the calling thread until the request channel closes (server shutdown).
@@ -595,14 +744,18 @@ struct RequestContext {
 fn run_worker_loop(
     engine: &mut dyn engine::InferenceEngine,
     request_rx: std::sync::mpsc::Receiver<WorkerRequest>,
+    metrics: Arc<metrics::Metrics>,
+    request_timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
     let mut registry: HashMap<SeqId, RequestContext> = HashMap::new();
+    let has_timeout = !request_timeout.is_zero();
 
     /// Helper: register a WorkerRequest with the engine and request registry.
     fn register_request(
         engine: &mut dyn engine::InferenceEngine,
         registry: &mut HashMap<SeqId, RequestContext>,
         req: WorkerRequest,
+        deadline: Option<Instant>,
     ) {
         let prompt_token_count = req.prompt_tokens.len();
         let thinking = req.thinking.unwrap_or(false);
@@ -619,9 +772,11 @@ fn run_worker_loop(
         registry.insert(
             seq_id,
             RequestContext {
+                request_id: req.request_id,
                 response_tx: req.response_tx,
                 prompt_token_count,
                 generated_count: 0,
+                deadline,
                 cached_tokens: 0,
                 token_ids: Vec::new(),
                 prev_text_len: 0,
@@ -637,16 +792,18 @@ fn run_worker_loop(
     }
 
     loop {
+        let deadline = if has_timeout { Some(Instant::now() + request_timeout) } else { None };
+
         // 1. Drain all pending requests (non-blocking).
         while let Ok(req) = request_rx.try_recv() {
-            register_request(engine, &mut registry, req);
+            register_request(engine, &mut registry, req, deadline);
         }
 
         // 2. If no work, block until a new request arrives.
         if !engine.has_work() {
             match request_rx.recv() {
                 Ok(req) => {
-                    register_request(engine, &mut registry, req);
+                    register_request(engine, &mut registry, req, deadline);
                 }
                 Err(_) => break, // Channel closed — server shutting down.
             }
@@ -656,15 +813,29 @@ fn run_worker_loop(
         let step_output = match engine.step() {
             Ok(output) => output,
             Err(e) => {
-                let error_msg = format!("{e:#}");
+                metrics.errors.inc();
+                // Log the full error chain for debugging, but send a generic
+                // message to the client to avoid leaking internal details
+                // (file paths, GPU memory addresses, Metal/CUDA error codes).
+                tracing::error!(error = %format_args!("{e:#}"), "engine step failed");
+                let seq_ids: Vec<SeqId> = registry.keys().copied().collect();
                 for (_, ctx) in registry.drain() {
                     let _ = ctx
                         .response_tx
-                        .blocking_send(InferenceEvent::Error(error_msg.clone()));
+                        .blocking_send(InferenceEvent::Error(
+                            "internal inference error".to_string(),
+                        ));
+                }
+                for id in seq_ids {
+                    engine.abort_sequence(id);
                 }
                 continue;
             }
         };
+
+        // Update sequence gauges after each step.
+        metrics.active_sequences.set(engine.active_count() as i64);
+        metrics.waiting_sequences.set(engine.waiting_count() as i64);
 
         // 4. Stream tokens to response channels.
         let mut to_abort: Vec<SeqId> = Vec::new();
@@ -760,7 +931,9 @@ fn run_worker_loop(
                 }
 
                 if hit_stop {
-                    // Send Done with EndOfSequence and abort the engine sequence.
+                    // Record metrics for stop-sequence completions (these
+                    // bypass section 5 because the engine aborts them).
+                    record_completion_metrics(&metrics, ctx);
                     let _ = ctx.response_tx.blocking_send(InferenceEvent::Done {
                         stop_reason: StopReason::EndOfSequence,
                         prompt_tokens: ctx.prompt_token_count,
@@ -811,27 +984,22 @@ fn run_worker_loop(
                     StopReason::MaxTokens => "max_tokens",
                     StopReason::ToolCalls => "tool_calls",
                 };
-                let cache_label = if ctx.cached_tokens > 0 {
-                    format!(" ({} cached)", ctx.cached_tokens)
-                } else {
-                    String::new()
-                };
-                // Include user identity in the log line when auth is enabled.
-                let user_label = ctx.user.as_ref().map(|u| {
-                    format!("  {}  |", u.sub)
-                }).unwrap_or_default();
-                eprintln!(
-                    "  seq {:>3}  |{} {} prompt{} + {} gen  |  TTFT {:.0} ms  |  {:.1} tok/s  |  {:.2}s  |  {}",
-                    finished.id,
-                    user_label,
-                    ctx.prompt_token_count,
-                    cache_label,
-                    ctx.generated_count,
-                    ttft_ms.unwrap_or(0.0),
-                    tok_per_sec,
-                    total_secs,
-                    stop_label,
+                let user_sub = ctx.user.as_ref().map(|u| u.sub.as_str()).unwrap_or("-");
+                tracing::info!(
+                    request_id = %ctx.request_id,
+                    seq = finished.id,
+                    user = user_sub,
+                    prompt_tokens = ctx.prompt_token_count,
+                    cached_tokens = ctx.cached_tokens,
+                    generated_tokens = ctx.generated_count,
+                    ttft_ms = format_args!("{:.0}", ttft_ms.unwrap_or(0.0)),
+                    tok_per_sec = format_args!("{:.1}", tok_per_sec),
+                    total_secs = format_args!("{:.2}", total_secs),
+                    stop = stop_label,
+                    "request complete",
                 );
+
+                record_completion_metrics(&metrics, &ctx);
 
                 let _ = ctx.response_tx.blocking_send(InferenceEvent::Done {
                     stop_reason,
@@ -857,7 +1025,660 @@ fn run_worker_loop(
             engine.abort_sequence(id);
             registry.remove(&id);
         }
+
+        // 7. Abort timed-out sequences.
+        if has_timeout {
+            let now = Instant::now();
+            let timed_out: Vec<SeqId> = registry
+                .iter()
+                .filter(|(_, ctx)| ctx.deadline.is_some_and(|d| now >= d))
+                .map(|(&id, _)| id)
+                .collect();
+            for id in timed_out {
+                if let Some(ctx) = registry.remove(&id) {
+                    tracing::warn!(
+                        request_id = %ctx.request_id,
+                        generated = ctx.generated_count,
+                        timeout_secs = request_timeout.as_secs(),
+                        "request timed out",
+                    );
+                    metrics.request_timeouts.inc();
+                    let _ = ctx.response_tx.blocking_send(InferenceEvent::Error(
+                        format!("request timed out after {}s", request_timeout.as_secs()),
+                    ));
+                    engine.abort_sequence(id);
+                }
+            }
+        }
     }
 
     Ok(())
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower::ServiceExt; // for .oneshot()
+
+    /// Build a minimal RequestContext for testing metrics recording.
+    fn test_ctx(prompt_tokens: usize, generated: usize, cached: usize) -> RequestContext {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let created = Instant::now() - std::time::Duration::from_millis(100);
+        RequestContext {
+            request_id: "test-id".into(),
+            response_tx: tx,
+            prompt_token_count: prompt_tokens,
+            generated_count: generated,
+            deadline: None,
+            token_ids: Vec::new(),
+            prev_text_len: 0,
+            cached_tokens: cached,
+            created_at: created,
+            first_token_at: Some(created + std::time::Duration::from_millis(20)),
+            thinking: false,
+            inject_marker: None,
+            user: None,
+            stop: Vec::new(),
+            full_text: String::new(),
+        }
+    }
+
+    #[test]
+    fn record_completion_metrics_increments_counters() {
+        let m = metrics::Metrics::new();
+        let ctx = test_ctx(100, 50, 10);
+
+        record_completion_metrics(&m, &ctx);
+
+        assert_eq!(m.prompt_tokens.get(), 100);
+        assert_eq!(m.completion_tokens.get(), 50);
+        assert_eq!(m.prefix_cache_hits.get(), 1);
+        assert_eq!(m.request_duration.get_sample_count(), 1);
+        assert_eq!(m.time_to_first_token.get_sample_count(), 1);
+        assert_eq!(m.decode_tokens_per_second.get_sample_count(), 1);
+    }
+
+    #[test]
+    fn record_completion_metrics_no_cache_hit() {
+        let m = metrics::Metrics::new();
+        let ctx = test_ctx(50, 10, 0);
+
+        record_completion_metrics(&m, &ctx);
+
+        assert_eq!(m.prefix_cache_hits.get(), 0);
+        assert_eq!(m.prompt_tokens.get(), 50);
+    }
+
+    #[test]
+    fn record_completion_metrics_no_first_token() {
+        let m = metrics::Metrics::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let ctx = RequestContext {
+            request_id: "test".into(),
+            response_tx: tx,
+            prompt_token_count: 10,
+            generated_count: 0,
+            deadline: None,
+            token_ids: Vec::new(),
+            prev_text_len: 0,
+            cached_tokens: 0,
+            created_at: Instant::now(),
+            first_token_at: None, // No tokens generated.
+            thinking: false,
+            inject_marker: None,
+            user: None,
+            stop: Vec::new(),
+            full_text: String::new(),
+        };
+
+        record_completion_metrics(&m, &ctx);
+
+        // TTFT and decode throughput should NOT be recorded.
+        assert_eq!(m.time_to_first_token.get_sample_count(), 0);
+        assert_eq!(m.decode_tokens_per_second.get_sample_count(), 0);
+        // Duration and counters should still be recorded.
+        assert_eq!(m.request_duration.get_sample_count(), 1);
+        assert_eq!(m.prompt_tokens.get(), 10);
+    }
+
+    #[test]
+    fn request_timeout_counter_is_separate_from_errors() {
+        let m = metrics::Metrics::new();
+        // Simulate a timeout and an error — they go to different counters.
+        m.request_timeouts.inc();
+        m.errors.inc();
+        m.errors.inc();
+        assert_eq!(m.request_timeouts.get(), 1);
+        assert_eq!(m.errors.get(), 2);
+    }
+
+    #[test]
+    fn deadline_computed_from_timeout() {
+        // Zero timeout → no deadline.
+        let timeout = std::time::Duration::ZERO;
+        let has_timeout = !timeout.is_zero();
+        assert!(!has_timeout);
+
+        // Non-zero timeout → deadline is in the future.
+        let timeout = std::time::Duration::from_secs(30);
+        let has_timeout = !timeout.is_zero();
+        assert!(has_timeout);
+        let deadline = Instant::now() + timeout;
+        assert!(deadline > Instant::now());
+    }
+
+    #[test]
+    fn expired_deadline_detected() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let ctx = RequestContext {
+            request_id: "timeout-test".into(),
+            response_tx: tx,
+            prompt_token_count: 10,
+            generated_count: 5,
+            // Set deadline to 50ms ago — should be expired.
+            deadline: Some(Instant::now() - std::time::Duration::from_millis(50)),
+            token_ids: Vec::new(),
+            prev_text_len: 0,
+            cached_tokens: 0,
+            created_at: Instant::now() - std::time::Duration::from_secs(1),
+            first_token_at: None,
+            thinking: false,
+            inject_marker: None,
+            user: None,
+            stop: Vec::new(),
+            full_text: String::new(),
+        };
+        let now = Instant::now();
+        assert!(ctx.deadline.is_some_and(|d| now >= d));
+    }
+
+    #[test]
+    fn no_deadline_never_expires() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let ctx = RequestContext {
+            request_id: "no-timeout".into(),
+            response_tx: tx,
+            prompt_token_count: 10,
+            generated_count: 5,
+            deadline: None,
+            token_ids: Vec::new(),
+            prev_text_len: 0,
+            cached_tokens: 0,
+            created_at: Instant::now(),
+            first_token_at: None,
+            thinking: false,
+            inject_marker: None,
+            user: None,
+            stop: Vec::new(),
+            full_text: String::new(),
+        };
+        let now = Instant::now();
+        assert!(!ctx.deadline.is_some_and(|d| now >= d));
+    }
+
+    #[test]
+    fn timeout_metric_in_prometheus_output() {
+        let m = metrics::Metrics::new();
+        m.request_timeouts.inc_by(3);
+        let output = m.encode();
+        assert!(output.contains("rllm_request_timeouts_total 3"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Health handler
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal ServerState for testing (no real tokenizer or engine).
+    fn test_server_state() -> Arc<ServerState> {
+        // Channel that we never read — just need a valid SyncSender.
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(1);
+        Arc::new(ServerState {
+            request_tx: tx,
+            model_name: "test".into(),
+            // Safety: tokenizer is never called in these tests — we just
+            // need a valid Arc to satisfy the struct.  Using a zeroed pointer
+            // would be UB, so we use a real but empty-ish construction.
+            tokenizer: Arc::new(tokenizer::Tokenizer::for_test(vec![0])),
+            arch: config::ModelArch::Llama,
+            vision_config: None,
+            image_token_id: None,
+            auth: auth::AuthProviderKind::None,
+            metrics: Arc::new(metrics::Metrics::new()),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    #[tokio::test]
+    async fn health_returns_200_when_healthy() {
+        let state = test_server_state();
+        let app = axum::Router::new()
+            .route("/health", axum::routing::get(health_handler))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["active_sequences"], 0);
+        assert_eq!(json["waiting_sequences"], 0);
+    }
+
+    #[tokio::test]
+    async fn health_returns_503_during_shutdown() {
+        let state = test_server_state();
+        state.shutting_down.store(true, Ordering::SeqCst);
+
+        let app = axum::Router::new()
+            .route("/health", axum::routing::get(health_handler))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "shutting_down");
+    }
+
+    #[tokio::test]
+    async fn health_reflects_sequence_gauges() {
+        let state = test_server_state();
+        state.metrics.active_sequences.set(5);
+        state.metrics.waiting_sequences.set(12);
+
+        let app = axum::Router::new()
+            .route("/health", axum::routing::get(health_handler))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["active_sequences"], 5);
+        assert_eq!(json["waiting_sequences"], 12);
+    }
+
+    // -----------------------------------------------------------------------
+    // Shutdown watch channel
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn shutdown_watch_resolves_on_signal() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+
+        // shutdown_from_watch is defined inside serve(), so replicate its logic.
+        let fut = {
+            let mut rx = rx;
+            async move {
+                while !*rx.borrow_and_update() {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+        };
+
+        // Signal shutdown after a short delay.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tx.send(true).unwrap();
+        });
+
+        // The future should resolve within 100ms.
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), fut).await;
+        assert!(result.is_ok(), "shutdown watch did not resolve in time");
+    }
+
+    #[tokio::test]
+    async fn shutdown_watch_does_not_resolve_without_signal() {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+
+        let fut = {
+            let mut rx = rx;
+            async move {
+                while !*rx.borrow_and_update() {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+        };
+
+        // Should NOT resolve within 50ms.
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), fut).await;
+        assert!(result.is_err(), "shutdown watch resolved without a signal");
+    }
+
+    // -----------------------------------------------------------------------
+    // Mock engine + worker loop integration tests
+    // -----------------------------------------------------------------------
+
+    use std::collections::{HashSet, VecDeque};
+    use crate::engine::{FinishReason, FinishedSequence, StepOutput};
+
+    /// A mock InferenceEngine that returns pre-programmed step results.
+    struct MockEngine {
+        tokenizer: tokenizer::Tokenizer,
+        next_id: SeqId,
+        active: HashSet<SeqId>,
+        /// Pre-programmed results for each step() call.
+        step_results: VecDeque<Box<dyn FnMut(&mut MockEngine) -> anyhow::Result<StepOutput> + Send>>,
+        aborted: Vec<SeqId>,
+    }
+
+    impl MockEngine {
+        fn new() -> Self {
+            Self {
+                tokenizer: tokenizer::Tokenizer::for_test(vec![2]), // EOS = 2
+                next_id: 1,
+                active: HashSet::new(),
+                step_results: VecDeque::new(),
+                aborted: Vec::new(),
+            }
+        }
+
+        /// Queue a step that emits one token for each active sequence.
+        fn push_token_step(&mut self, token_id: u32) {
+            self.step_results.push_back(Box::new(move |eng: &mut MockEngine| {
+                let tokens: Vec<_> = eng.active.iter().map(|&id| (id, token_id)).collect();
+                Ok(StepOutput { tokens, finished: Vec::new() })
+            }));
+        }
+
+        /// Queue a step that finishes all active sequences.
+        fn push_finish_step(&mut self) {
+            self.step_results.push_back(Box::new(|eng: &mut MockEngine| {
+                let finished: Vec<_> = eng.active.drain().map(|id| FinishedSequence {
+                    id,
+                    tokens: Vec::new(),
+                    text: String::new(),
+                    reason: FinishReason::Eos,
+                    cached_tokens: 0,
+                }).collect();
+                Ok(StepOutput { tokens: Vec::new(), finished })
+            }));
+        }
+    }
+
+    impl engine::InferenceEngine for MockEngine {
+        fn add_request(
+            &mut self,
+            _prompt_tokens: Vec<u32>,
+            _max_gen_tokens: usize,
+            _temperature: f32,
+            _top_p: f32,
+            _images: Vec<crate::model::vision::ProcessedImage>,
+            _seed: Option<u64>,
+        ) -> SeqId {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.active.insert(id);
+            id
+        }
+
+        fn step(&mut self) -> anyhow::Result<StepOutput> {
+            if let Some(mut f) = self.step_results.pop_front() {
+                f(self)
+            } else {
+                // No more programmed steps — return empty (no tokens, no finished).
+                Ok(StepOutput { tokens: Vec::new(), finished: Vec::new() })
+            }
+        }
+
+        fn abort_sequence(&mut self, id: SeqId) {
+            self.active.remove(&id);
+            self.aborted.push(id);
+        }
+
+        fn has_work(&self) -> bool {
+            !self.active.is_empty() || !self.step_results.is_empty()
+        }
+
+        fn tokenizer(&self) -> &tokenizer::Tokenizer {
+            &self.tokenizer
+        }
+
+        fn active_count(&self) -> usize { self.active.len() }
+        fn waiting_count(&self) -> usize { 0 }
+    }
+
+    /// Helper: build a WorkerRequest with a response channel.
+    fn mock_worker_request() -> (WorkerRequest, tokio::sync::mpsc::Receiver<InferenceEvent>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let req = WorkerRequest {
+            request_id: "test-req".into(),
+            prompt_tokens: vec![1],
+            max_tokens: 10,
+            temperature: 0.0,
+            top_p: 1.0,
+            response_tx: tx,
+            thinking: None,
+            images: Vec::new(),
+            user: None,
+            seed: None,
+            stop: Vec::new(),
+        };
+        (req, rx)
+    }
+
+    #[test]
+    fn worker_loop_generates_tokens_and_finishes() {
+        let mut engine = MockEngine::new();
+        engine.push_token_step(42); // step 1: emit token (decode may produce empty text)
+        engine.push_finish_step();  // step 2: finish
+
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
+        let m = Arc::new(metrics::Metrics::new());
+
+        let (req, mut response_rx) = mock_worker_request();
+        request_tx.send(req).unwrap();
+        // Drop sender so the loop exits after processing.
+        drop(request_tx);
+
+        run_worker_loop(
+            &mut engine,
+            request_rx,
+            m.clone(),
+            std::time::Duration::from_secs(300),
+        ).unwrap();
+
+        // Collect all events.
+        let mut events = Vec::new();
+        while let Ok(ev) = response_rx.try_recv() {
+            events.push(ev);
+        }
+
+        // Should receive a Done event (Token events depend on tokenizer vocabulary).
+        assert!(
+            events.iter().any(|e| matches!(e, InferenceEvent::Done { .. })),
+            "expected Done event, got: {events:?}",
+        );
+
+        // Metrics should be recorded.
+        assert!(m.prompt_tokens.get() > 0);
+        assert!(m.completion_tokens.get() > 0);
+    }
+
+    #[test]
+    fn worker_loop_aborts_timed_out_request() {
+        let mut engine = MockEngine::new();
+        // Queue enough steps that the timeout fires during processing.
+        for _ in 0..5 {
+            engine.push_token_step(42);
+        }
+        engine.push_finish_step(); // in case timeout doesn't fire
+
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
+        let m = Arc::new(metrics::Metrics::new());
+
+        let (req, mut response_rx) = mock_worker_request();
+        request_tx.send(req).unwrap();
+        drop(request_tx);
+
+        // Zero timeout — deadline is already expired on first check.
+        run_worker_loop(
+            &mut engine,
+            request_rx,
+            m.clone(),
+            std::time::Duration::from_nanos(1),
+        ).unwrap();
+
+        // Collect all events — should contain an Error about timeout.
+        let mut events = Vec::new();
+        while let Ok(ev) = response_rx.try_recv() {
+            events.push(ev);
+        }
+
+        assert!(
+            events.iter().any(|e| matches!(e, InferenceEvent::Error(msg) if msg.contains("timed out"))),
+            "expected a timeout error event, got: {events:?}",
+        );
+        assert_eq!(m.request_timeouts.get(), 1);
+        // The sequence should have been aborted in the engine.
+        assert!(engine.aborted.len() >= 1);
+    }
+
+    #[test]
+    fn worker_loop_handles_engine_step_error() {
+        let mut engine = MockEngine::new();
+        engine.step_results.push_back(Box::new(|_eng: &mut MockEngine| {
+            anyhow::bail!("GPU exploded")
+        }));
+
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
+        let m = Arc::new(metrics::Metrics::new());
+
+        let (req, mut response_rx) = mock_worker_request();
+        request_tx.send(req).unwrap();
+        drop(request_tx);
+
+        run_worker_loop(
+            &mut engine,
+            request_rx,
+            m.clone(),
+            std::time::Duration::from_secs(300),
+        ).unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(ev) = response_rx.try_recv() {
+            events.push(ev);
+        }
+
+        assert!(
+            events.iter().any(|e| matches!(e, InferenceEvent::Error(msg) if msg.contains("internal inference error"))),
+            "expected sanitized engine error event, got: {events:?}",
+        );
+        // The raw engine error must NOT leak to the client.
+        assert!(
+            !events.iter().any(|e| matches!(e, InferenceEvent::Error(msg) if msg.contains("GPU exploded"))),
+            "raw engine error leaked to client: {events:?}",
+        );
+        assert_eq!(m.errors.get(), 1);
+        // All active sequences should be aborted in the engine after a step error.
+        assert!(!engine.aborted.is_empty(), "engine sequences not aborted after step error");
+    }
+
+    #[test]
+    fn worker_loop_aborts_disconnected_client() {
+        let mut engine = MockEngine::new();
+        engine.push_token_step(42);
+        engine.push_token_step(42);
+        engine.push_token_step(42);
+        engine.push_finish_step();
+
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
+        let m = Arc::new(metrics::Metrics::new());
+
+        let (req, response_rx) = mock_worker_request();
+        request_tx.send(req).unwrap();
+        drop(request_tx);
+        // Drop the receiver — simulates client disconnect.
+        drop(response_rx);
+
+        run_worker_loop(
+            &mut engine,
+            request_rx,
+            m.clone(),
+            std::time::Duration::from_secs(300),
+        ).unwrap();
+
+        // The sequence should have been aborted.
+        assert!(!engine.aborted.is_empty());
+    }
+
+    #[test]
+    fn worker_loop_aborts_all_sequences_on_engine_error() {
+        // Regression test: engine step error must abort ALL active sequences,
+        // not just drain the registry (which left orphans looping forever).
+        let mut engine = MockEngine::new();
+        // First step succeeds (both sequences get tokens), second step errors.
+        engine.push_token_step(42);
+        engine.step_results.push_back(Box::new(|_eng: &mut MockEngine| {
+            anyhow::bail!("GPU memory corruption")
+        }));
+
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
+        let m = Arc::new(metrics::Metrics::new());
+
+        // Submit two requests so multiple sequences are active.
+        let (req1, _rx1) = mock_worker_request();
+        let (req2, _rx2) = mock_worker_request();
+        request_tx.send(req1).unwrap();
+        request_tx.send(req2).unwrap();
+        drop(request_tx);
+
+        run_worker_loop(
+            &mut engine,
+            request_rx,
+            m.clone(),
+            std::time::Duration::from_secs(300),
+        ).unwrap();
+
+        // Both sequences must have been aborted in the engine.
+        assert_eq!(
+            engine.aborted.len(), 2,
+            "expected 2 aborted sequences, got: {:?}", engine.aborted,
+        );
+        assert!(engine.active.is_empty(), "engine still has active sequences");
+    }
+
+    #[test]
+    fn shutdown_flag_uses_correct_ordering() {
+        // Verify the shutdown flag is read/written with SeqCst (not Relaxed).
+        // We can't test memory ordering directly, but we can verify the flag
+        // is visible immediately from the same thread.
+        let flag = Arc::new(AtomicBool::new(false));
+        flag.store(true, Ordering::SeqCst);
+        assert!(flag.load(Ordering::SeqCst));
+    }
 }

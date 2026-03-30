@@ -12,6 +12,8 @@
 
 use std::time::Instant;
 
+use tracing::info;
+
 use super::ModelArgs;
 
 /// Diverse user prompts — short questions that exercise different domains.
@@ -52,17 +54,15 @@ pub(crate) fn exec(args: BenchArgs) -> anyhow::Result<()> {
     let max_tokens = args.model.max_tokens;
     let num_prompts = args.prompts.min(BENCH_PROMPTS.len());
 
-    eprintln!("=== rllm prefix cache benchmark ===");
-    eprintln!("model: {}", args.model.model.display());
-    eprintln!("system prompt: {:?}", &system[..system.len().min(80)]);
-    eprintln!("prompts: {}", num_prompts);
-    eprintln!("max_tokens: {}", max_tokens);
-    eprintln!();
+    info!("=== rllm prefix cache benchmark ===");
+    info!(model = %args.model.model.display(), "model");
+    info!(system_prompt = ?&system[..system.len().min(80)], "system prompt");
+    info!(prompts = num_prompts, max_tokens = max_tokens, "benchmark config");
 
     super::load_model_and_run(&args.model, 1, |eng, arch, _images, _image_token_id| {
         let mut results: Vec<RequestResult> = Vec::new();
 
-        eprintln!("--- per-request results ---");
+        info!("--- per-request results ---");
 
         for (i, &user_prompt) in BENCH_PROMPTS[..num_prompts].iter().enumerate() {
             let prompt_tokens =
@@ -104,8 +104,8 @@ pub(crate) fn exec(args: BenchArgs) -> anyhow::Result<()> {
                 0.0
             };
 
-            eprintln!(
-                "  [{}/{}] {} | prompt {} tok, cached {} tok | TTFT {:.1?} ({:.0} tok/s) | gen {} tok {:.1} tok/s | {:?}",
+            info!(
+                "[{}/{}] {} | prompt {} tok, cached {} tok | TTFT {:.1?} ({:.0} tok/s) | gen {} tok {:.1} tok/s | {:?}",
                 i + 1,
                 num_prompts,
                 hit,
@@ -129,8 +129,7 @@ pub(crate) fn exec(args: BenchArgs) -> anyhow::Result<()> {
         }
 
         // --- Aggregate stats ---
-        eprintln!();
-        eprintln!("--- aggregate ---");
+        info!("--- aggregate ---");
 
         let cold: Vec<&RequestResult> = results.iter().filter(|r| r.cached_tokens == 0).collect();
         let warm: Vec<&RequestResult> = results.iter().filter(|r| r.cached_tokens > 0).collect();
@@ -145,41 +144,40 @@ pub(crate) fn exec(args: BenchArgs) -> anyhow::Result<()> {
         let cold_avg = avg_ttft(&cold);
         let warm_avg = avg_ttft(&warm);
 
-        eprintln!("  cold requests (miss): {}", cold.len());
-        eprintln!("  warm requests (hit):  {}", warm.len());
-        eprintln!("  avg TTFT cold: {:.1}ms", cold_avg * 1000.0);
+        info!(cold = cold.len(), warm = warm.len(), "request counts");
+        info!(avg_ttft_cold_ms = format_args!("{:.1}", cold_avg * 1000.0), "cold TTFT");
         if !warm.is_empty() {
-            eprintln!("  avg TTFT warm: {:.1}ms", warm_avg * 1000.0);
+            info!(avg_ttft_warm_ms = format_args!("{:.1}", warm_avg * 1000.0), "warm TTFT");
             if cold_avg > 0.0 {
-                eprintln!("  TTFT speedup:  {:.2}x", cold_avg / warm_avg);
+                info!(speedup = format_args!("{:.2}x", cold_avg / warm_avg), "TTFT speedup");
             }
         }
 
         let total_gen: usize = results.iter().map(|r| r.gen_tokens).sum();
         let total_gen_time: f64 = results.iter().map(|r| r.gen_duration.as_secs_f64()).sum();
         if total_gen_time > 0.0 {
-            eprintln!(
-                "  decode throughput: {:.1} tok/s (avg across {} requests)",
-                total_gen as f64 / total_gen_time,
-                results.len()
+            info!(
+                tok_per_sec = format_args!("{:.1}", total_gen as f64 / total_gen_time),
+                requests = results.len(),
+                "decode throughput (avg)"
             );
         }
 
         let hit_rate = warm.len() as f64 / results.len() as f64 * 100.0;
-        eprintln!("  cache hit rate: {:.0}%", hit_rate);
+        info!(hit_rate_pct = format_args!("{:.0}", hit_rate), "cache hit rate");
 
         if let Some(first_warm) = warm.first() {
-            eprintln!(
-                "  prefix tokens cached: {} (of {} prompt tokens)",
-                first_warm.cached_tokens, first_warm.prompt_tokens
+            info!(
+                cached = first_warm.cached_tokens,
+                total = first_warm.prompt_tokens,
+                "prefix tokens cached"
             );
         }
 
         // Suppress unused field warning.
         let _ = results.iter().map(|r| r.prompt_idx).count();
 
-        eprintln!();
-        eprintln!("=== benchmark complete ===");
+        info!("=== benchmark complete ===");
 
         Ok(())
     })
