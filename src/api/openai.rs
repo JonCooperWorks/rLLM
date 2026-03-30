@@ -48,6 +48,7 @@
 //   exactly, rLLM becomes a drop-in replacement — just change the base URL.
 // ===========================================================================
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -58,6 +59,7 @@ use axum::Extension;
 use super::auth::AuthUser;
 use super::{InferenceEvent, ServerState, StopReason, WorkerRequest};
 use crate::model::chat::Message;
+use crate::model::sampler::SampleParams;
 use crate::model::thinking;
 use crate::model::tools::{self, ToolDefinition};
 
@@ -109,6 +111,30 @@ pub(crate) struct ChatCompletionRequest {
     /// JSON instruction, and the output is validated before returning.
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
+    /// Top-k sampling: keep only the k highest-scoring tokens.  0 = disabled.
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    /// Min-p sampling: discard tokens with prob < min_p × max_prob.
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    /// Frequency penalty: penalise tokens proportional to their occurrence count.
+    /// Range: -2.0 to 2.0 (OpenAI convention).  0.0 = disabled.
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    /// Presence penalty: flat penalty for any token that appeared at least once.
+    /// Range: -2.0 to 2.0 (OpenAI convention).  0.0 = disabled.
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    /// Per-token logit bias.  Keys are token IDs as strings (OpenAI convention),
+    /// values are additive adjustments (typically -100 to 100).
+    #[serde(default)]
+    pub logit_bias: Option<HashMap<String, f32>>,
+    /// Whether to return log-probabilities for each generated token.
+    #[serde(default)]
+    pub logprobs: Option<bool>,
+    /// Number of top alternative tokens to include in logprob output (max 20).
+    #[serde(default)]
+    pub top_logprobs: Option<u8>,
 }
 
 /// Response format constraint (OpenAI `response_format` parameter).
@@ -457,12 +483,31 @@ pub(crate) async fn chat_completions(
     let request_id = super::generate_id();
     state.metrics.requests_total.with_label_values(&["chat_completions"]).inc();
 
+    // Build SampleParams from the request fields.
+    let sample_params = SampleParams {
+        temperature: req.temperature,
+        top_p: req.top_p,
+        top_k: req.top_k.unwrap_or(0),
+        min_p: req.min_p.unwrap_or(0.0),
+        frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
+        presence_penalty: req.presence_penalty.unwrap_or(0.0),
+        logprobs: req.logprobs.unwrap_or(false),
+        top_logprobs: req.top_logprobs.unwrap_or(0).min(20),
+    };
+
+    // Convert logit_bias from string keys to u32 keys.
+    let logit_bias: HashMap<u32, f32> = req
+        .logit_bias
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(k, v)| k.parse::<u32>().ok().map(|id| (id, v)))
+        .collect();
+
     let worker_req = WorkerRequest {
         request_id: request_id.clone(),
         prompt_tokens,
         max_tokens,
-        temperature: req.temperature,
-        top_p: req.top_p,
+        params: sample_params,
         response_tx,
         thinking: thinking_requested,
         images,
@@ -470,6 +515,7 @@ pub(crate) async fn chat_completions(
         seed: req.seed,
         stop: req.stop,
         grammar: compiled_grammar,
+        logit_bias,
     };
 
     state.request_tx.try_send(worker_req).map_err(|e| match e {
@@ -527,10 +573,7 @@ pub(crate) async fn chat_completions(
         .await
     };
 
-    response.headers_mut().insert(
-        axum::http::HeaderName::from_static("x-request-id"),
-        axum::http::HeaderValue::from_str(&request_id).unwrap(),
-    );
+    super::finalize_response(&mut response, &request_id, !req.stream);
     Ok(response)
 }
 
@@ -541,36 +584,18 @@ pub(crate) async fn chat_completions(
 /// to "tool_calls" even if the model didn't produce recognisable tool markers.
 async fn chat_completions_blocking(
     state: Arc<ServerState>,
-    mut response_rx: tokio::sync::mpsc::Receiver<InferenceEvent>,
+    response_rx: tokio::sync::mpsc::Receiver<InferenceEvent>,
     check_tools: bool,
     check_thinking: bool,
     tools_required: bool,
     tool_defs: Vec<ToolDefinition>,
     json_mode: bool,
 ) -> Response {
-    let mut text = String::new();
-    let mut prompt_tokens = 0usize;
-    let mut completion_tokens = 0usize;
-    let mut stop_reason = StopReason::MaxTokens;
-
-    while let Some(event) = response_rx.recv().await {
-        match event {
-            InferenceEvent::Token { text: t } => text.push_str(&t),
-            InferenceEvent::Done {
-                stop_reason: sr,
-                prompt_tokens: pt,
-                completion_tokens: ct,
-                cached_tokens: _cached,
-            } => {
-                prompt_tokens = pt;
-                completion_tokens = ct;
-                stop_reason = sr;
-            }
-            InferenceEvent::Error(e) => {
-                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e);
-            }
-        }
-    }
+    let (mut text, prompt_tokens, completion_tokens, stop_reason) =
+        match super::collect_response(response_rx).await {
+            Ok(result) => result,
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
+        };
 
     // JSON mode: validate that the output is valid JSON.  If not, return a
     // 400 error rather than silently returning malformed JSON.
@@ -678,7 +703,7 @@ async fn chat_completions_stream_with_tools(
 
         while let Some(event) = response_rx.recv().await {
             match event {
-                InferenceEvent::Token { text: t } => text.push_str(&t),
+                InferenceEvent::Token { text: t, .. } => text.push_str(&t),
                 InferenceEvent::Done {
                     stop_reason: sr,
                     prompt_tokens: pt,
@@ -805,7 +830,7 @@ async fn chat_completions_stream(
     let stream = async_stream::stream! {
         while let Some(event) = response_rx.recv().await {
             match event {
-                InferenceEvent::Token { text } => {
+                InferenceEvent::Token { text, .. } => {
                     let chunk = serde_json::json!({
                         "id": &id,
                         "object": "chat.completion.chunk",
@@ -879,7 +904,7 @@ async fn chat_completions_stream_with_thinking(
 
         while let Some(event) = response_rx.recv().await {
             match event {
-                InferenceEvent::Token { text: t } => text.push_str(&t),
+                InferenceEvent::Token { text: t, .. } => text.push_str(&t),
                 InferenceEvent::Done { stop_reason: sr, prompt_tokens: pt, completion_tokens: ct, .. } => {
                     prompt_tokens = pt;
                     completion_tokens = ct;
@@ -957,7 +982,7 @@ async fn chat_completions_stream_with_thinking_and_tools(
 
         while let Some(event) = response_rx.recv().await {
             match event {
-                InferenceEvent::Token { text: t } => text.push_str(&t),
+                InferenceEvent::Token { text: t, .. } => text.push_str(&t),
                 InferenceEvent::Done { stop_reason: sr, prompt_tokens: pt, completion_tokens: ct, .. } => {
                     prompt_tokens = pt;
                     completion_tokens = ct;
@@ -1057,8 +1082,11 @@ pub(crate) async fn completions(
         request_id: request_id.clone(),
         prompt_tokens,
         max_tokens: req.max_tokens,
-        temperature: req.temperature,
-        top_p: req.top_p,
+        params: SampleParams {
+            temperature: req.temperature,
+            top_p: req.top_p,
+            ..SampleParams::default()
+        },
         response_tx,
         thinking: None,
         images: Vec::new(), // Text completions don't support images.
@@ -1066,6 +1094,7 @@ pub(crate) async fn completions(
         seed: req.seed,
         stop: req.stop,
         grammar: None,
+        logit_bias: HashMap::new(),
     };
 
     state.request_tx.try_send(worker_req).map_err(|e| match e {
@@ -1073,47 +1102,28 @@ pub(crate) async fn completions(
         std::sync::mpsc::TrySendError::Disconnected(_) => StatusCode::INTERNAL_SERVER_ERROR,
     })?;
 
-    let mut response = if req.stream {
+    let streaming = req.stream;
+    let mut response = if streaming {
         completions_stream(state, response_rx).await
     } else {
         completions_blocking(state, response_rx).await
     };
 
-    response.headers_mut().insert(
-        axum::http::HeaderName::from_static("x-request-id"),
-        axum::http::HeaderValue::from_str(&request_id).unwrap(),
-    );
+    super::finalize_response(&mut response, &request_id, !streaming);
     Ok(response)
 }
 
 /// Non-streaming text completions.
 async fn completions_blocking(
     state: Arc<ServerState>,
-    mut response_rx: tokio::sync::mpsc::Receiver<InferenceEvent>,
+    response_rx: tokio::sync::mpsc::Receiver<InferenceEvent>,
 ) -> Response {
-    let mut text = String::new();
-    let mut prompt_tokens = 0usize;
-    let mut completion_tokens = 0usize;
-    let mut finish_reason = "length";
-
-    while let Some(event) = response_rx.recv().await {
-        match event {
-            InferenceEvent::Token { text: t } => text.push_str(&t),
-            InferenceEvent::Done {
-                stop_reason,
-                prompt_tokens: pt,
-                completion_tokens: ct,
-                cached_tokens: _cached,
-            } => {
-                prompt_tokens = pt;
-                completion_tokens = ct;
-                finish_reason = finish_reason_str(stop_reason);
-            }
-            InferenceEvent::Error(e) => {
-                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e);
-            }
-        }
-    }
+    let (text, prompt_tokens, completion_tokens, stop_reason) =
+        match super::collect_response(response_rx).await {
+            Ok(result) => result,
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
+        };
+    let finish_reason = finish_reason_str(stop_reason);
 
     Json(CompletionResponse {
         id: format!("cmpl-{}", super::generate_id()),
@@ -1145,7 +1155,7 @@ async fn completions_stream(
     let stream = async_stream::stream! {
         while let Some(event) = response_rx.recv().await {
             match event {
-                InferenceEvent::Token { text } => {
+                InferenceEvent::Token { text, .. } => {
                     let chunk = serde_json::json!({
                         "id": &id,
                         "object": "text_completion",
@@ -1907,5 +1917,82 @@ mod tests {
     fn test_json_validation_accepts_nested() {
         let text = r#"{"users": [{"name": "Alice", "age": 30}], "total": 1}"#;
         assert!(serde_json::from_str::<serde_json::Value>(text.trim()).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Blocking handler regression tests — verify handlers return on Done,
+    // not on sender drop (the original hang bug).
+    // -----------------------------------------------------------------------
+
+    fn test_server_state() -> Arc<ServerState> {
+        use crate::api::{auth, metrics};
+        use crate::model::{config, tokenizer};
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<super::WorkerRequest>(1);
+        Arc::new(ServerState {
+            request_tx: tx,
+            model_name: "test".into(),
+            tokenizer: Arc::new(tokenizer::Tokenizer::for_test(vec![0])),
+            arch: config::ModelArch::Llama,
+            vision_config: None,
+            image_token_id: None,
+            auth: auth::AuthProviderKind::None,
+            metrics: Arc::new(metrics::Metrics::new()),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
+    /// Send Token + Done events on a channel, keeping the sender alive.
+    /// Returns the sender so the caller can verify the handler didn't wait
+    /// for it to drop.
+    async fn send_test_events(
+        tx: &tokio::sync::mpsc::Sender<InferenceEvent>,
+    ) {
+        tx.send(InferenceEvent::Token { text: "hello".into(), logprob_info: None }).await.unwrap();
+        tx.send(InferenceEvent::Done {
+            stop_reason: StopReason::EndOfSequence,
+            prompt_tokens: 3,
+            completion_tokens: 1,
+            cached_tokens: 0,
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn chat_completions_blocking_returns_on_done() {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let state = test_server_state();
+
+        send_test_events(&tx).await;
+
+        // Handler must complete within 1s — if it waits for sender drop, it hangs.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            chat_completions_blocking(state, rx, false, false, false, vec![], false),
+        ).await;
+        assert!(result.is_ok(), "chat_completions_blocking hung waiting for sender drop");
+
+        let response = result.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        // tx is still alive — proves we returned on Done, not sender drop.
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn completions_blocking_returns_on_done() {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let state = test_server_state();
+
+        send_test_events(&tx).await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            completions_blocking(state, rx),
+        ).await;
+        assert!(result.is_ok(), "completions_blocking hung waiting for sender drop");
+
+        let response = result.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        drop(tx);
     }
 }

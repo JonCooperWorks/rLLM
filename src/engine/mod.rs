@@ -56,6 +56,8 @@ pub(crate) mod multi_gpu;
 
 use std::collections::{HashMap, VecDeque};
 
+use crate::model::sampler::{SampleParams, SampleResult, TokenLogprob};
+
 use tracing::{info, debug};
 
 use self::dispatch::Dispatch;
@@ -88,11 +90,11 @@ pub(crate) trait InferenceEngine {
         &mut self,
         prompt_tokens: Vec<u32>,
         max_gen_tokens: usize,
-        temperature: f32,
-        top_p: f32,
+        params: SampleParams,
         images: Vec<crate::model::vision::ProcessedImage>,
         seed: Option<u64>,
         grammar: Option<std::sync::Arc<crate::model::grammar::CompiledGrammar>>,
+        logit_bias: HashMap<u32, f32>,
     ) -> SeqId;
 
     /// Run one engine step: admit → prefill → decode → sample → collect.
@@ -133,10 +135,22 @@ pub(crate) struct FinishedSequence {
     pub cached_tokens: usize,
 }
 
+/// Log-probability information for a single generated token.
+///
+/// Propagated from the sampler through StepOutput → InferenceEvent → API response.
+/// Only populated when the client requests `logprobs: true`.
+#[derive(Debug)]
+pub(crate) struct TokenLogprobInfo {
+    /// Log-probability of the selected token: ln(prob).
+    pub logprob: f32,
+    /// Top-N alternative tokens with their log-probabilities, sorted descending.
+    pub top_logprobs: Vec<TokenLogprob>,
+}
+
 /// Output from a single engine step.
 pub(crate) struct StepOutput {
-    /// Token generated this step for each active sequence (id, token_id).
-    pub tokens: Vec<(SeqId, u32)>,
+    /// Token generated this step for each active sequence (id, token_id, logprob_info).
+    pub tokens: Vec<(SeqId, u32, Option<TokenLogprobInfo>)>,
     /// Sequences that finished this step.
     pub finished: Vec<FinishedSequence>,
 }
@@ -158,14 +172,16 @@ pub(crate) type SeqId = u64;
 pub(crate) struct SequenceRequest {
     pub prompt_tokens: Vec<u32>,
     pub max_gen_tokens: usize,
-    pub temperature: f32,
-    pub top_p: f32,
+    /// Sampling parameters (temperature, top_p, top_k, penalties, logprobs, etc.).
+    pub params: SampleParams,
     /// Preprocessed images for vision models (consumed during first prefill).
     pub images: Vec<crate::model::vision::ProcessedImage>,
     /// Optional seed for deterministic sampling.
     pub seed: Option<u64>,
     /// Precompiled grammar for structured output (None for unconstrained generation).
     pub grammar: Option<std::sync::Arc<crate::model::grammar::CompiledGrammar>>,
+    /// Per-token logit bias (token_id → additive adjustment).
+    pub logit_bias: HashMap<u32, f32>,
 }
 
 /// State of a single active sequence.
@@ -182,10 +198,8 @@ pub(crate) struct Sequence<S> {
     pub generated_tokens: Vec<u32>,
     /// Maximum tokens to generate after prefill.
     pub max_gen_tokens: usize,
-    /// Sampling temperature for this sequence.
-    pub temperature: f32,
-    /// Top-p (nucleus) sampling threshold for this sequence.
-    pub top_p: f32,
+    /// Sampling parameters (temperature, top_p, top_k, penalties, logprobs, etc.).
+    pub params: SampleParams,
     /// Whether this sequence has finished (EOS or max_tokens reached).
     pub finished: bool,
     /// Number of prompt tokens served from the prefix cache.
@@ -209,6 +223,12 @@ pub(crate) struct Sequence<S> {
     /// Tracks the current DFA state for structured output.  Advanced after
     /// each sampled token; checked for completion alongside EOS/max_tokens.
     pub grammar_state: Option<crate::model::grammar::GrammarState>,
+    /// Per-token frequency counts for this sequence's generated tokens.
+    /// Used by frequency_penalty and presence_penalty to reduce repetition.
+    pub token_counts: HashMap<u32, u32>,
+    /// Per-token logit bias for this sequence.
+    /// Applied as additive adjustment to raw logits before temperature scaling.
+    pub logit_bias: HashMap<u32, f32>,
 }
 
 /// Manages the waiting queue and active set for continuous batching.
@@ -273,8 +293,7 @@ impl<S> Scheduler<S> {
                 kv_state: dispatch.new_seq_state(),
                 generated_tokens: Vec::new(),
                 max_gen_tokens: req.max_gen_tokens,
-                temperature: req.temperature,
-                top_p: req.top_p,
+                params: req.params,
                 finished: false,
                 cached_tokens: 0,
                 images: req.images,
@@ -282,6 +301,8 @@ impl<S> Scheduler<S> {
                 original_prompt_tokens,
                 had_images,
                 grammar_state,
+                token_counts: HashMap::new(),
+                logit_bias: req.logit_bias,
             };
             self.active.insert(id, seq);
             admitted.push(id);
@@ -391,11 +412,11 @@ impl<S> Scheduler<S> {
         let new_req = SequenceRequest {
             prompt_tokens: new_prompt,
             max_gen_tokens: remaining_gen,
-            temperature: seq.temperature,
-            top_p: seq.top_p,
+            params: seq.params,
             images: Vec::new(), // Images were consumed during original prefill
             seed: None,         // Determinism lost after partial generation
             grammar: None,      // Grammar state can't be cheaply replayed
+            logit_bias: seq.logit_bias,
         };
 
         // Push to front — this sequence already waited and did work.
@@ -434,7 +455,7 @@ pub(crate) fn run_step<D: Dispatch>(
     tokenizer: &Tokenizer,
 ) -> anyhow::Result<StepOutput> {
     let mut rng = rand::rng();
-    let mut step_tokens: Vec<(SeqId, u32)> = Vec::new();
+    let mut step_tokens: Vec<(SeqId, u32, Option<TokenLogprobInfo>)> = Vec::new();
 
     // 1. Admit waiting requests.
     let admitted = scheduler.schedule(dispatch);
@@ -556,13 +577,9 @@ pub(crate) fn run_step<D: Dispatch>(
 
         // Phase 1: prepare all sequences (mutable borrows for KV slot allocation).
         let mut tokens = Vec::with_capacity(decoding_ids.len());
-        let mut temperatures = Vec::with_capacity(decoding_ids.len());
-        let mut top_ps = Vec::with_capacity(decoding_ids.len());
         for &id in &decoding_ids {
             let seq = scheduler.active.get_mut(&id).unwrap();
             tokens.push(*seq.generated_tokens.last().unwrap());
-            temperatures.push(seq.temperature);
-            top_ps.push(seq.top_p);
             dispatch.prepare_decode(&mut seq.kv_state)?;
         }
 
@@ -587,7 +604,11 @@ pub(crate) fn run_step<D: Dispatch>(
         }
         model::profile::tick();
 
-        // Collect per-sequence grammar constraints for batched sampling.
+        // Collect per-sequence sampling params, grammar constraints, token counts, and bias.
+        let params_per_seq: Vec<&SampleParams> = decoding_ids
+            .iter()
+            .map(|id| &scheduler.active[id].params)
+            .collect();
         let allowed_tokens_per_seq: Vec<Option<Vec<u32>>> = decoding_ids
             .iter()
             .map(|id| {
@@ -597,33 +618,73 @@ pub(crate) fn run_step<D: Dispatch>(
                     .and_then(|gs| gs.allowed_tokens())
             })
             .collect();
+        let token_counts_per_seq: Vec<&HashMap<u32, u32>> = decoding_ids
+            .iter()
+            .map(|id| &scheduler.active[id].token_counts)
+            .collect();
+        let logit_bias_per_seq: Vec<&HashMap<u32, f32>> = decoding_ids
+            .iter()
+            .map(|id| &scheduler.active[id].logit_bias)
+            .collect();
         let any_grammar = allowed_tokens_per_seq.iter().any(|a| a.is_some());
 
-        // Greedy gate: if ALL sequences are greedy (temperature==0) and none
-        // have grammar constraints, try GPU-resident batched argmax.  Grammar
-        // masks live on CPU, so GPU argmax can't apply them — fall back to CPU.
-        // Inspired by rvLLM (m0at).
-        let all_greedy = temperatures.iter().all(|&t| t == 0.0);
-        let sampled = if all_greedy && !any_grammar {
-            match dispatch.sample_batch_greedy_gpu(temperatures.len()) {
-                Ok(tokens) => tokens,
-                Err(_) => dispatch.sample_batch(&temperatures, &top_ps, &mut rng, &allowed_tokens_per_seq)?,
+        // Greedy gate: if ALL sequences can use GPU-resident argmax (temperature==0,
+        // no logprobs, no penalties, no bias) and none have grammar constraints,
+        // try GPU-resident batched argmax.  Otherwise fall back to full CPU pipeline.
+        let all_gpu_greedy = params_per_seq.iter().all(|p| p.can_use_gpu_greedy())
+            && logit_bias_per_seq.iter().all(|b| b.is_empty());
+        let sampled: Vec<SampleResult> = if all_gpu_greedy && !any_grammar {
+            match dispatch.sample_batch_greedy_gpu(params_per_seq.len()) {
+                Ok(ids) => ids
+                    .into_iter()
+                    .map(|token_id| SampleResult {
+                        token_id,
+                        logprob: 0.0,
+                        top_logprobs: Vec::new(),
+                    })
+                    .collect(),
+                Err(_) => dispatch.sample_batch(
+                    &params_per_seq,
+                    &mut rng,
+                    &allowed_tokens_per_seq,
+                    &token_counts_per_seq,
+                    &logit_bias_per_seq,
+                )?,
             }
         } else {
-            dispatch.sample_batch(&temperatures, &top_ps, &mut rng, &allowed_tokens_per_seq)?
+            dispatch.sample_batch(
+                &params_per_seq,
+                &mut rng,
+                &allowed_tokens_per_seq,
+                &token_counts_per_seq,
+                &logit_bias_per_seq,
+            )?
         };
         for (i, &id) in decoding_ids.iter().enumerate() {
             let seq = scheduler.active.get_mut(&id).unwrap();
-            seq.generated_tokens.push(sampled[i]);
-            step_tokens.push((id, sampled[i]));
+            let result = &sampled[i];
+            seq.generated_tokens.push(result.token_id);
+            *seq.token_counts.entry(result.token_id).or_insert(0) += 1;
+
+            let logprob_info = if seq.params.logprobs {
+                Some(TokenLogprobInfo {
+                    logprob: result.logprob,
+                    top_logprobs: result.top_logprobs.iter().map(|t| TokenLogprob {
+                        token_id: t.token_id,
+                        logprob: t.logprob,
+                    }).collect(),
+                })
+            } else {
+                None
+            };
+            step_tokens.push((id, result.token_id, logprob_info));
 
             // Advance grammar state after sampling.
             if let Some(ref mut gs) = seq.grammar_state {
-                // Ignore advance errors in batched path — token was already committed.
-                let _ = gs.advance(sampled[i]);
+                let _ = gs.advance(result.token_id);
             }
 
-            if tokenizer.is_eos(sampled[i])
+            if tokenizer.is_eos(result.token_id)
                 || seq.generated_tokens.len() >= seq.max_gen_tokens
                 || seq.grammar_state.as_ref().is_some_and(|gs| gs.is_complete())
             {
@@ -686,18 +747,23 @@ fn sample_and_finish<D: Dispatch>(
     seq: &mut Sequence<D::SeqState>,
     id: SeqId,
     tokenizer: &Tokenizer,
-    step_tokens: &mut Vec<(SeqId, u32)>,
+    step_tokens: &mut Vec<(SeqId, u32, Option<TokenLogprobInfo>)>,
     global_rng: &mut impl rand::Rng,
 ) -> anyhow::Result<()> {
     // Get allowed tokens from grammar state (if grammar-constrained).
     let allowed = seq.grammar_state.as_ref().and_then(|gs| gs.allowed_tokens());
     let allowed_slice = allowed.as_deref();
 
-    let next_token = if let Some(ref mut seq_rng) = seq.seeded_rng {
-        dispatch.sample(seq.temperature, seq.top_p, seq_rng, allowed_slice)?
+    let result = if let Some(ref mut seq_rng) = seq.seeded_rng {
+        dispatch.sample(&seq.params, seq_rng, allowed_slice, &seq.token_counts, &seq.logit_bias)?
     } else {
-        dispatch.sample(seq.temperature, seq.top_p, global_rng, allowed_slice)?
+        dispatch.sample(&seq.params, global_rng, allowed_slice, &seq.token_counts, &seq.logit_bias)?
     };
+
+    let next_token = result.token_id;
+
+    // Update token frequency counts (for frequency/presence penalty).
+    *seq.token_counts.entry(next_token).or_insert(0) += 1;
 
     // Advance grammar state after sampling.
     if let Some(ref mut gs) = seq.grammar_state {
@@ -705,7 +771,16 @@ fn sample_and_finish<D: Dispatch>(
     }
 
     seq.generated_tokens.push(next_token);
-    step_tokens.push((id, next_token));
+
+    let logprob_info = if seq.params.logprobs {
+        Some(TokenLogprobInfo {
+            logprob: result.logprob,
+            top_logprobs: result.top_logprobs,
+        })
+    } else {
+        None
+    };
+    step_tokens.push((id, next_token, logprob_info));
 
     // Check finish: EOS, max_tokens, or grammar reached accepting state.
     if tokenizer.is_eos(next_token)
@@ -849,12 +924,16 @@ impl<'a, B: GpuBackend> Dispatch for SingleGpuDispatch<'a, B> {
 
     fn sample(
         &self,
-        temperature: f32,
-        top_p: f32,
+        params: &SampleParams,
         rng: &mut impl rand::Rng,
         allowed_tokens: Option<&[u32]>,
-    ) -> anyhow::Result<u32> {
-        crate::model::sampler::sample(self.backend, self.model.logits(), temperature, top_p, rng, self.tokenizer_vocab_size, allowed_tokens)
+        token_counts: &HashMap<u32, u32>,
+        logit_bias: &HashMap<u32, f32>,
+    ) -> anyhow::Result<SampleResult> {
+        crate::model::sampler::sample(
+            self.backend, self.model.logits(), params, rng,
+            self.tokenizer_vocab_size, allowed_tokens, token_counts, logit_bias,
+        )
     }
 
     fn sample_greedy_gpu(&self) -> anyhow::Result<u32> {
@@ -930,21 +1009,23 @@ impl<'a, B: GpuBackend> Dispatch for SingleGpuDispatch<'a, B> {
 
     fn sample_batch(
         &self,
-        temperatures: &[f32],
-        top_ps: &[f32],
+        params_per_seq: &[&SampleParams],
         rng: &mut impl rand::Rng,
         allowed_tokens_per_seq: &[Option<Vec<u32>>],
-    ) -> anyhow::Result<Vec<u32>> {
+        token_counts_per_seq: &[&HashMap<u32, u32>],
+        logit_bias_per_seq: &[&HashMap<u32, f32>],
+    ) -> anyhow::Result<Vec<SampleResult>> {
         crate::model::sampler::sample_batch(
             self.backend,
             &self.logits_batch,
-            temperatures.len(),
+            params_per_seq.len(),
             self.model.config().vocab_size,
-            temperatures,
-            top_ps,
+            params_per_seq,
             rng,
             self.tokenizer_vocab_size,
             allowed_tokens_per_seq,
+            token_counts_per_seq,
+            logit_bias_per_seq,
         )
     }
 }
@@ -988,20 +1069,20 @@ impl<'a, B: GpuBackend> InferenceEngine for Engine<'a, B> {
         &mut self,
         prompt_tokens: Vec<u32>,
         max_gen_tokens: usize,
-        temperature: f32,
-        top_p: f32,
+        params: SampleParams,
         images: Vec<crate::model::vision::ProcessedImage>,
         seed: Option<u64>,
         grammar: Option<std::sync::Arc<crate::model::grammar::CompiledGrammar>>,
+        logit_bias: HashMap<u32, f32>,
     ) -> SeqId {
         self.scheduler.add_request(SequenceRequest {
             prompt_tokens,
             max_gen_tokens,
-            temperature,
-            top_p,
+            params,
             images,
             seed,
             grammar,
+            logit_bias,
         })
     }
 
@@ -1116,12 +1197,13 @@ mod tests {
 
         fn sample(
             &self,
-            _temperature: f32,
-            _top_p: f32,
+            _params: &SampleParams,
             _rng: &mut impl rand::Rng,
             _allowed_tokens: Option<&[u32]>,
-        ) -> anyhow::Result<u32> {
-            Ok(0)
+            _token_counts: &HashMap<u32, u32>,
+            _logit_bias: &HashMap<u32, f32>,
+        ) -> anyhow::Result<SampleResult> {
+            Ok(SampleResult { token_id: 0, logprob: 0.0, top_logprobs: Vec::new() })
         }
     }
 
@@ -1208,14 +1290,15 @@ mod tests {
 
         fn sample(
             &self,
-            _temperature: f32,
-            _top_p: f32,
+            _params: &SampleParams,
             _rng: &mut impl rand::Rng,
             _allowed_tokens: Option<&[u32]>,
-        ) -> anyhow::Result<u32> {
+            _token_counts: &HashMap<u32, u32>,
+            _logit_bias: &HashMap<u32, f32>,
+        ) -> anyhow::Result<SampleResult> {
             let token = self.next_token.get();
             self.next_token.set(token + 1);
-            Ok(token)
+            Ok(SampleResult { token_id: token, logprob: 0.0, top_logprobs: Vec::new() })
         }
     }
 
@@ -1227,11 +1310,11 @@ mod tests {
         SequenceRequest {
             prompt_tokens: vec![1; prompt_len],
             max_gen_tokens: max_gen,
-            temperature: 1.0,
-            top_p: 0.9,
+            params: SampleParams::default(),
             images: Vec::new(),
             seed: None,
             grammar: None,
+            logit_bias: HashMap::new(),
         }
     }
 
@@ -1440,11 +1523,11 @@ mod tests {
         scheduler.add_request(SequenceRequest {
             prompt_tokens: vec![1, 2, 3, 4],
             max_gen_tokens: 3,
-            temperature: 0.0,
-            top_p: 1.0,
+            params: SampleParams { temperature: 0.0, ..SampleParams::default() },
             images: Vec::new(),
             seed: None,
             grammar: None,
+            logit_bias: HashMap::new(),
         });
 
         // Step 1: admit + prefill + decode (2 tokens in one step)
@@ -1476,11 +1559,11 @@ mod tests {
         scheduler.add_request(SequenceRequest {
             prompt_tokens: vec![1, 2],
             max_gen_tokens: 10,
-            temperature: 0.0,
-            top_p: 1.0,
+            params: SampleParams { temperature: 0.0, ..SampleParams::default() },
             images: Vec::new(),
             seed: None,
             grammar: None,
+            logit_bias: HashMap::new(),
         });
 
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1502,11 +1585,11 @@ mod tests {
         scheduler.add_request(SequenceRequest {
             prompt_tokens: vec![1, 2, 3],
             max_gen_tokens: 10,
-            temperature: 0.0,
-            top_p: 1.0,
+            params: SampleParams { temperature: 0.0, ..SampleParams::default() },
             images: Vec::new(),
             seed: None,
             grammar: None,
+            logit_bias: HashMap::new(),
         });
 
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1527,20 +1610,20 @@ mod tests {
         scheduler.add_request(SequenceRequest {
             prompt_tokens: vec![1, 2],
             max_gen_tokens: 2,
-            temperature: 0.0,
-            top_p: 1.0,
+            params: SampleParams { temperature: 0.0, ..SampleParams::default() },
             images: Vec::new(),
             seed: None,
             grammar: None,
+            logit_bias: HashMap::new(),
         });
         scheduler.add_request(SequenceRequest {
             prompt_tokens: vec![3, 4],
             max_gen_tokens: 2,
-            temperature: 0.0,
-            top_p: 1.0,
+            params: SampleParams { temperature: 0.0, ..SampleParams::default() },
             images: Vec::new(),
             seed: None,
             grammar: None,
+            logit_bias: HashMap::new(),
         });
 
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1558,11 +1641,11 @@ mod tests {
         scheduler.add_request(SequenceRequest {
             prompt_tokens: vec![1, 2],
             max_gen_tokens: 5,
-            temperature: 0.0,
-            top_p: 1.0,
+            params: SampleParams { temperature: 0.0, ..SampleParams::default() },
             images: Vec::new(),
             seed: None,
             grammar: None,
+            logit_bias: HashMap::new(),
         });
 
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1580,11 +1663,11 @@ mod tests {
         let id = scheduler.add_request(SequenceRequest {
             prompt_tokens: vec![1, 2],
             max_gen_tokens: 10,
-            temperature: 0.0,
-            top_p: 1.0,
+            params: SampleParams { temperature: 0.0, ..SampleParams::default() },
             images: Vec::new(),
             seed: None,
             grammar: None,
+            logit_bias: HashMap::new(),
         });
 
         run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1619,11 +1702,11 @@ mod tests {
         scheduler.add_request(SequenceRequest {
             prompt_tokens: vec![1],
             max_gen_tokens: 1,
-            temperature: 0.0,
-            top_p: 1.0,
+            params: SampleParams { temperature: 0.0, ..SampleParams::default() },
             images: Vec::new(),
             seed: None,
             grammar: None,
+            logit_bias: HashMap::new(),
         });
 
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1645,20 +1728,20 @@ mod tests {
         scheduler.add_request(SequenceRequest {
             prompt_tokens: vec![1],
             max_gen_tokens: 1,
-            temperature: 0.0,
-            top_p: 1.0,
+            params: SampleParams { temperature: 0.0, ..SampleParams::default() },
             images: Vec::new(),
             seed: None,
             grammar: None,
+            logit_bias: HashMap::new(),
         });
         scheduler.add_request(SequenceRequest {
             prompt_tokens: vec![2],
             max_gen_tokens: 1,
-            temperature: 0.0,
-            top_p: 1.0,
+            params: SampleParams { temperature: 0.0, ..SampleParams::default() },
             images: Vec::new(),
             seed: None,
             grammar: None,
+            logit_bias: HashMap::new(),
         });
 
         // Step 1: A admitted + prefilled + finished (max_tokens=1)
@@ -1765,12 +1848,13 @@ mod tests {
 
         fn sample(
             &self,
-            _temperature: f32,
-            _top_p: f32,
+            _params: &SampleParams,
             _rng: &mut impl rand::Rng,
             _allowed_tokens: Option<&[u32]>,
-        ) -> anyhow::Result<u32> {
-            Ok(0)
+            _token_counts: &HashMap<u32, u32>,
+            _logit_bias: &HashMap<u32, f32>,
+        ) -> anyhow::Result<SampleResult> {
+            Ok(SampleResult { token_id: 0, logprob: 0.0, top_logprobs: Vec::new() })
         }
 
         fn prefix_cache_lookup(&mut self, prompt_tokens: &[u32]) -> Option<(Vec<BlockHandle>, usize)> {
@@ -1818,11 +1902,11 @@ mod tests {
         scheduler.add_request(SequenceRequest {
             prompt_tokens: prompt1.clone(),
             max_gen_tokens: 1,
-            temperature: 0.0,
-            top_p: 1.0,
+            params: SampleParams { temperature: 0.0, ..SampleParams::default() },
             images: Vec::new(),
             seed: None,
             grammar: None,
+            logit_bias: HashMap::new(),
         });
 
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1844,11 +1928,11 @@ mod tests {
         scheduler.add_request(SequenceRequest {
             prompt_tokens: prompt2.clone(),
             max_gen_tokens: 1,
-            temperature: 0.0,
-            top_p: 1.0,
+            params: SampleParams { temperature: 0.0, ..SampleParams::default() },
             images: Vec::new(),
             seed: None,
             grammar: None,
+            logit_bias: HashMap::new(),
         });
 
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1879,11 +1963,11 @@ mod tests {
         scheduler.add_request(SequenceRequest {
             prompt_tokens: prompt.clone(),
             max_gen_tokens: 1,
-            temperature: 0.0,
-            top_p: 1.0,
+            params: SampleParams { temperature: 0.0, ..SampleParams::default() },
             images: Vec::new(),
             seed: None,
             grammar: None,
+            logit_bias: HashMap::new(),
         });
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
         assert_eq!(out.finished.len(), 1);
@@ -1905,11 +1989,11 @@ mod tests {
         scheduler.add_request(SequenceRequest {
             prompt_tokens: prompt2.clone(),
             max_gen_tokens: 1,
-            temperature: 0.0,
-            top_p: 1.0,
+            params: SampleParams { temperature: 0.0, ..SampleParams::default() },
             images: Vec::new(),
             seed: None,
             grammar: None,
+            logit_bias: HashMap::new(),
         });
         let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
         assert_eq!(out.finished.len(), 1);
@@ -1957,11 +2041,11 @@ mod tests {
         scheduler.add_request(SequenceRequest {
             prompt_tokens: vec![1, 2, 3],
             max_gen_tokens: 1,
-            temperature: 0.0,
-            top_p: 1.0,
+            params: SampleParams { temperature: 0.0, ..SampleParams::default() },
             images: Vec::new(),
             seed: None,
             grammar: None,
+            logit_bias: HashMap::new(),
         });
 
         run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
@@ -1981,11 +2065,11 @@ mod tests {
         scheduler.add_request(SequenceRequest {
             prompt_tokens: prompt1.clone(),
             max_gen_tokens: 1,
-            temperature: 0.0,
-            top_p: 1.0,
+            params: SampleParams { temperature: 0.0, ..SampleParams::default() },
             images: Vec::new(),
             seed: None,
             grammar: None,
+            logit_bias: HashMap::new(),
         });
         run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
 
@@ -1995,11 +2079,11 @@ mod tests {
         scheduler.add_request(SequenceRequest {
             prompt_tokens: prompt2.clone(),
             max_gen_tokens: 2,
-            temperature: 0.0,
-            top_p: 1.0,
+            params: SampleParams { temperature: 0.0, ..SampleParams::default() },
             images: Vec::new(),
             seed: None,
             grammar: None,
+            logit_bias: HashMap::new(),
         });
 
         // Step: admit + cache hit (32 tokens) + prefill suffix (24 tokens)

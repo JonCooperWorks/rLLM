@@ -94,7 +94,44 @@ def check_coherence(text: str) -> tuple[bool, str]:
             f"word salad: low space ratio ({space_ratio:.0%}, need ≥10%)"
         )
 
-    # --- 5. Language detection ------------------------------------------------
+    # --- 5. Unicode garbage detection -----------------------------------------
+    # Garbage output from corrupted inference often contains scattered Unicode
+    # codepoints (CJK, symbols, combining marks) mixed with ASCII.  Normal
+    # English text may contain a few non-ASCII chars (smart quotes, em-dashes)
+    # but not many.  Count chars outside the Basic Latin + Latin-1 Supplement
+    # range (U+0000–U+00FF).
+    if len(text) >= 30:
+        exotic_count = sum(1 for ch in text if ord(ch) > 0x00FF)
+        exotic_ratio = exotic_count / len(text)
+        if exotic_ratio > 0.05:
+            return False, (
+                f"unicode garbage: {exotic_ratio:.0%} exotic chars "
+                f"({exotic_count}/{len(text)}), need ≤5%"
+            )
+
+    # --- 6. Consecutive non-word fragments ------------------------------------
+    # Broken generation can produce sequences of short fragments that look
+    # like partial tokens (e.g. "xt erm ino gy").  Detect runs of 4+ "words"
+    # that are all ≤2 chars and contain no common English short words.
+    COMMON_SHORT = {"a", "i", "am", "an", "as", "at", "be", "by", "do", "go",
+                    "he", "if", "in", "is", "it", "me", "my", "no", "of", "on",
+                    "or", "so", "to", "up", "us", "we"}
+    if len(words) >= 8:
+        run = 0
+        max_run = 0
+        for w in words:
+            if len(w) <= 2 and w not in COMMON_SHORT:
+                run += 1
+                max_run = max(max_run, run)
+            else:
+                run = 0
+        if max_run >= 4:
+            return False, (
+                f"token fragment run: {max_run} consecutive non-word "
+                f"fragments (≤2 chars each)"
+            )
+
+    # --- 7. Language detection ------------------------------------------------
     try:
         lang = detect(text)
     except LangDetectException:

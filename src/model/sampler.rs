@@ -15,10 +15,22 @@
 //      distribution, trim the tail, and randomly sample.  Produces varied,
 //      creative output.  This is what ChatGPT/Claude use by default.
 //
-// The sampling pipeline (for temperature + top-p):
+// The full sampling pipeline (when all features are active):
 //
-//   logits  ──→  ÷ temperature  ──→  softmax  ──→  top-p filter  ──→  random sample
-//   [128256]     (sharpen/flatten)   (→ probs)     (trim tail)       (→ token ID)
+//   logits  ──→  penalties  ──→  logit bias  ──→  ÷ temperature  ──→  top-k
+//   [128256]    (freq+pres)     (per-token)      (sharpen/flatten)   (keep k best)
+//
+//       ──→  softmax  ──→  [snapshot for logprobs]  ──→  min-p  ──→  top-p
+//           (→ probs)                                   (floor)    (trim tail)
+//
+//       ──→  random sample  ──→  logprob extraction  ──→  SampleResult
+//           (→ token ID)        (ln(prob) of chosen)     {id, logprob, top_logprobs}
+//
+// The order matters.  Penalties and bias operate on raw logits (before softmax).
+// Top-k masks before softmax (avoids wasting exp() on garbage tokens).
+// Min-p and top-p operate on probabilities (after softmax).
+// Logprobs are captured from the post-softmax, pre-filter distribution so
+// top_logprobs reflects the model's actual beliefs, not the filtered set.
 //
 // Temperature intuition:
 //   Temperature controls how "confident" the model acts.  Mathematically, it
@@ -28,11 +40,6 @@
 //   T < 1.0 → sharpen: high-probability tokens get even higher, low ones vanish
 //   T → 0   → greedy: collapses to argmax (pick the single best token)
 //   T > 1.0 → flatten: spread probability more evenly (more random/creative)
-//
-//   Example with logits [2.0, 1.0, 0.5]:
-//     T=1.0 → softmax → [0.51, 0.19, 0.11, ...]  (natural)
-//     T=0.5 → logits/T=[4.0, 2.0, 1.0] → softmax → [0.84, 0.05, 0.02, ...]  (sharp)
-//     T=2.0 → logits/T=[1.0, 0.5, 0.25] → softmax → [0.38, 0.23, 0.18, ...]  (flat)
 //
 // Top-p (nucleus) intuition:
 //   Even with temperature, the model might sample very unlikely tokens (the
@@ -47,10 +54,25 @@
 //   This dynamically adjusts how many tokens are candidates — when the model
 //   is confident, only a few tokens pass; when uncertain, many do.
 //
-//   Top-p vs. top-k:
-//     Top-k always keeps exactly k tokens regardless of their probability.
-//     Top-p adapts: it might keep 5 tokens or 500, depending on the distribution.
-//     Top-p is generally preferred (used by most production systems).
+// Top-k intuition:
+//   Always keeps exactly the k highest-scoring tokens, regardless of their
+//   probability.  Applied before softmax using select_nth_unstable (O(n)
+//   partial sort).  Less adaptive than top-p but cheap to compute.
+//
+// Min-p intuition:
+//   Filters tokens with probability < min_p × max_probability.  Adaptive
+//   like top-p but simpler: when the model is confident (high max prob),
+//   few tokens pass; when uncertain (low max prob), more pass.
+//
+// Frequency/presence penalties:
+//   Reduce repetition by penalising tokens that have already appeared.
+//   frequency_penalty: logit -= freq_pen × count (scales with repetition)
+//   presence_penalty:  logit -= pres_pen × 1{count > 0} (flat penalty)
+//   Applied before temperature scaling (on raw logits).
+//
+// Logit bias:
+//   Per-token additive adjustment to raw logits.  Used by clients to steer
+//   generation (e.g., ban specific tokens with -100, boost others).
 //
 // Why sample on the CPU?
 //   The logits tensor has 128256 bfloat16 values (~250 KB).  Even with sorting,
@@ -58,193 +80,175 @@
 //   for single-sequence inference.
 // ===========================================================================
 
+use std::collections::HashMap;
+
 use half::bf16;
 use rand::Rng;
 
 use crate::gpu::{GpuBackend, TensorDtype};
 
-/// Sample the next token using temperature scaling and top-p (nucleus) filtering.
+// ---------------------------------------------------------------------------
+// Public types — returned from sampling, threaded through engine → API.
+// ---------------------------------------------------------------------------
+
+/// Result of sampling a single token, including optional log-probability info.
 ///
-/// Pipeline: copy logits → convert bf16→f32 → scale by temperature → softmax
-/// → top-p filter → weighted random sample.
+/// When logprobs are not requested, `logprob` is 0.0 and `top_logprobs` is empty.
+/// The engine propagates this through StepOutput → InferenceEvent → API response.
+pub(crate) struct SampleResult {
+    /// The sampled token ID.
+    pub token_id: u32,
+    /// Log-probability of the selected token: ln(prob) after the full pipeline.
+    /// Only meaningful when `SampleParams.logprobs` is true; 0.0 otherwise.
+    pub logprob: f32,
+    /// Top-N alternative tokens with their log-probabilities, sorted descending.
+    /// Captured from the post-softmax, pre-filter distribution (reflects the
+    /// model's actual beliefs, not the filtered candidate set).
+    /// Empty when logprobs are not requested.
+    pub top_logprobs: Vec<TokenLogprob>,
+}
+
+/// A single token's log-probability, used in top_logprobs arrays.
+#[derive(Debug)]
+pub(crate) struct TokenLogprob {
+    pub token_id: u32,
+    pub logprob: f32,
+}
+
+/// Extended sampling parameters — replaces the old (temperature, top_p) pair.
 ///
-/// Special case: temperature == 0.0 falls back to greedy (argmax).
+/// All fields have neutral defaults (no penalties, no filtering beyond top-p=1.0).
+/// The API layer constructs this from the union of OpenAI/Anthropic request fields.
+#[derive(Clone)]
+pub(crate) struct SampleParams {
+    /// Temperature scaling.  0.0 = greedy (argmax).  Default: 1.0.
+    pub temperature: f32,
+    /// Top-p (nucleus) sampling threshold.  Default: 1.0 (disabled).
+    pub top_p: f32,
+    /// Top-k: keep only the k highest-scoring tokens.  0 = disabled.  Default: 0.
+    pub top_k: u32,
+    /// Min-p: discard tokens with prob < min_p × max_prob.  0.0 = disabled.  Default: 0.0.
+    pub min_p: f32,
+    /// Frequency penalty: logit -= freq_pen × count.  Default: 0.0.
+    pub frequency_penalty: f32,
+    /// Presence penalty: logit -= pres_pen × 1{count > 0}.  Default: 0.0.
+    pub presence_penalty: f32,
+    /// Whether to compute and return log-probabilities.  Default: false.
+    pub logprobs: bool,
+    /// Number of top alternative tokens to include in logprob output.
+    /// Only used when `logprobs` is true.  Max 20 (OpenAI spec).  Default: 0.
+    pub top_logprobs: u8,
+}
+
+impl Default for SampleParams {
+    fn default() -> Self {
+        Self {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            logprobs: false,
+            top_logprobs: 0,
+        }
+    }
+}
+
+impl SampleParams {
+    /// Whether this configuration can use the fast GPU-resident greedy path.
+    ///
+    /// GPU argmax is only valid when: temperature=0, no logprobs needed,
+    /// no penalties or bias would alter the logits, and no grammar mask.
+    /// Any of these features require the full CPU sampling pipeline.
+    pub fn can_use_gpu_greedy(&self) -> bool {
+        self.temperature == 0.0
+            && !self.logprobs
+            && self.frequency_penalty == 0.0
+            && self.presence_penalty == 0.0
+    }
+}
+
+/// Convenience constant: empty maps, reusable to avoid allocation.
+static EMPTY_COUNTS: std::sync::LazyLock<HashMap<u32, u32>> =
+    std::sync::LazyLock::new(HashMap::new);
+static EMPTY_BIAS: std::sync::LazyLock<HashMap<u32, f32>> =
+    std::sync::LazyLock::new(HashMap::new);
+
+// ---------------------------------------------------------------------------
+// Public sampling functions.
+// ---------------------------------------------------------------------------
+
+/// Sample the next token using the full pipeline.
+///
+/// Pipeline: copy logits → penalties → logit bias → temperature → top-k
+/// → softmax → [logprob snapshot] → min-p → top-p → weighted random sample
+/// → logprob extraction → SampleResult.
+///
+/// Special case: temperature == 0.0 with no logprobs/penalties/bias falls back
+/// to greedy (argmax) via the GPU-resident path for maximum efficiency.
 pub(crate) fn sample<B: GpuBackend>(
     backend: &B,
     logits: &B::Tensor,
-    temperature: f32,
-    top_p: f32,
+    params: &SampleParams,
     rng: &mut impl Rng,
     vocab_size: usize,
     allowed_tokens: Option<&[u32]>,
-) -> anyhow::Result<u32> {
-    // Temperature = 0 is the convention for "be greedy / deterministic".
-    // Mathematically, lim(T→0) of softmax(logits/T) is a one-hot on the argmax.
-    // When grammar constraints are active, we can't use GPU argmax (the mask
-    // lives on CPU), so fall through to the CPU path.
-    if temperature == 0.0 && allowed_tokens.is_none() {
-        return sample_greedy(backend, logits, vocab_size);
+    token_counts: &HashMap<u32, u32>,
+    logit_bias: &HashMap<u32, f32>,
+) -> anyhow::Result<SampleResult> {
+    // Fast path: GPU-resident argmax when no CPU-side work is needed.
+    if params.can_use_gpu_greedy() && allowed_tokens.is_none() && logit_bias.is_empty() {
+        let token_id = sample_greedy(backend, logits, vocab_size)?;
+        return Ok(SampleResult {
+            token_id,
+            logprob: 0.0,
+            top_logprobs: Vec::new(),
+        });
     }
 
     // --- Step 1: Copy logits from GPU to host ---
-    // Same as greedy — on unified memory (Apple Silicon) this is just a pointer read.
     let byte_count = backend.tensor_byte_count(logits);
     let mut buf = vec![0u8; byte_count];
     backend.copy_to_host(logits, &mut buf);
 
     // --- Step 2: Convert bf16 → f32 ---
-    // We need f32 for the math that follows (exp, division, accumulation).
-    // bf16 has only ~3 decimal digits of precision — fine for storing logits,
-    // but not enough for stable softmax or cumulative sums.
     let bf16_values: &[bf16] = bytemuck::cast_slice(&buf);
-    // Truncate to tokenizer vocab size — the model embedding may be padded
-    // beyond the tokenizer's vocabulary (e.g. Qwen 3.5: 248320 embedding vs
-    // 248070 tokenizer tokens).  Sampling padding positions produces token IDs
-    // that decode to empty strings.
     let effective = vocab_size.min(bf16_values.len());
     let mut logits_f32: Vec<f32> = bf16_values[..effective].iter().map(|v| v.to_f32()).collect();
 
     // --- Step 2b: Grammar constraint masking ---
-    // Set disallowed tokens to -infinity before temperature scaling.
-    // After softmax, these become probability 0 — they can never be sampled.
     if let Some(allowed) = allowed_tokens {
         apply_token_mask(&mut logits_f32, allowed);
     }
 
-    // Greedy with grammar: after masking, just argmax on CPU.
-    if temperature == 0.0 {
-        return Ok(logits_f32
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0));
-    }
-
-    // --- Step 3: Temperature scaling ---
-    // Divide every logit by T.  This is equivalent to raising the softmax
-    // distribution to the power 1/T — high T flattens, low T sharpens.
-    let inv_temp = 1.0 / temperature;
-    for logit in logits_f32.iter_mut() {
-        *logit *= inv_temp;
-    }
-
-    // --- Step 4: Softmax → probabilities ---
-    // softmax(x_i) = exp(x_i - max) / Σ exp(x_j - max)
-    //
-    // Why subtract max?  Numerical stability.  exp(1000) overflows f32, but
-    // exp(1000 - 1000) = exp(0) = 1.  Subtracting the max shifts all values
-    // into a safe range without changing the resulting probabilities (the
-    // constant cancels in the numerator/denominator).
-    let max_logit = logits_f32.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-
-    let mut sum = 0.0f32;
-    for logit in logits_f32.iter_mut() {
-        *logit = (*logit - max_logit).exp();
-        sum += *logit;
-    }
-    // Now logits_f32[i] = exp(logit_i / T - max).  Divide by sum to get probs.
-    let inv_sum = 1.0 / sum;
-    for prob in logits_f32.iter_mut() {
-        *prob *= inv_sum;
-    }
-    // logits_f32 is now a valid probability distribution (sums to 1.0).
-
-    // --- Step 5: Top-p (nucleus) filtering ---
-    // Sort tokens by probability, keep only the top-p fraction of probability
-    // mass, zero out the rest.  This prevents sampling from the long tail of
-    // very unlikely tokens that can produce garbage.
-    //
-    // Implementation: we don't actually need to sort the full 128K array.  We
-    // build an index array, sort THAT by probability (descending), then walk
-    // it to find the cutoff.  This avoids shuffling the probability array itself
-    // (we need it indexed by token ID for the final sample).
-    if top_p < 1.0 {
-        // Build sorted indices.  For 128K elements, this sort takes ~1ms — fine.
-        let mut indices: Vec<u32> = (0..logits_f32.len() as u32).collect();
-        indices.sort_unstable_by(|&a, &b| {
-            logits_f32[b as usize]
-                .partial_cmp(&logits_f32[a as usize])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        // Walk down the sorted list, accumulating probability.  Once we've
-        // captured ≥ top_p of the total mass, zero out everything below.
-        let mut cumulative = 0.0f32;
-        let mut cutoff_idx = indices.len();
-        for (i, &token_idx) in indices.iter().enumerate() {
-            cumulative += logits_f32[token_idx as usize];
-            if cumulative >= top_p {
-                // Keep this token (it pushed us over the threshold), but
-                // everything after it gets zeroed.
-                cutoff_idx = i + 1;
-                break;
-            }
-        }
-
-        // Zero out tokens below the cutoff.
-        for &token_idx in &indices[cutoff_idx..] {
-            logits_f32[token_idx as usize] = 0.0;
-        }
-
-        // Renormalize so the remaining probabilities sum to 1.0.
-        // (We could reuse `cumulative` here, but it may have floating-point
-        // drift, so recompute for accuracy.)
-        let new_sum: f32 = logits_f32.iter().sum();
-        let inv_new_sum = 1.0 / new_sum;
-        for prob in logits_f32.iter_mut() {
-            *prob *= inv_new_sum;
-        }
-    }
-
-    // --- Step 6: Weighted random sampling ---
-    // Generate a random number in [0, 1) and walk through the probability
-    // distribution until the cumulative sum exceeds it.  This is O(n) but
-    // for a single sample from 128K elements it's ~microseconds.
-    //
-    // This is the simplest correct algorithm.  Fancier approaches (alias method,
-    // binary search on CDF) aren't worth the complexity for single-sequence
-    // inference.
-    let r: f32 = rng.random();
-    let mut cumulative = 0.0f32;
-    for (i, &prob) in logits_f32.iter().enumerate() {
-        cumulative += prob;
-        if cumulative > r {
-            return Ok(i as u32);
-        }
-    }
-
-    // Fallback: floating-point rounding could cause us to not exceed r.
-    // Return the last token with nonzero probability.
-    Ok((logits_f32.len() - 1) as u32)
+    let result = sample_from_logits(
+        &mut logits_f32,
+        params,
+        rng,
+        token_counts,
+        logit_bias,
+    );
+    Ok(result)
 }
 
 /// Sample N tokens from a batched logits tensor [batch_size, vocab_size].
 ///
-/// This is the batched-decode counterpart to `sample()`.  Instead of N
-/// separate GPU→CPU copies (one per sequence), we do ONE copy of the full
-/// [N, vocab_size] tensor, then iterate rows on the CPU.  Each sequence
-/// gets its own temperature and top_p — different concurrent requests can
-/// have different sampling parameters.
-///
-/// Why batch the copy but not the sampling math?
-///   The GPU→CPU transfer is the expensive part (~250 KB per sequence at
-///   vocab_size=128256).  The CPU sampling (softmax + sort + random walk)
-///   takes microseconds per sequence — parallelizing it on the GPU would
-///   add kernel complexity without meaningful speedup.
+/// One GPU→CPU copy for all N sequences' logits, then iterate rows on CPU.
+/// Each sequence gets its own SampleParams, token counts, and logit bias.
 pub(crate) fn sample_batch<B: GpuBackend>(
     backend: &B,
     logits_batch: &B::Tensor,
     batch_size: usize,
     vocab_size: usize,
-    temperatures: &[f32],
-    top_ps: &[f32],
+    params_per_seq: &[&SampleParams],
     rng: &mut impl Rng,
     tokenizer_vocab_size: usize,
     allowed_tokens_per_seq: &[Option<Vec<u32>>],
-) -> anyhow::Result<Vec<u32>> {
-    assert_eq!(temperatures.len(), batch_size);
-    assert_eq!(top_ps.len(), batch_size);
+    token_counts_per_seq: &[&HashMap<u32, u32>],
+    logit_bias_per_seq: &[&HashMap<u32, f32>],
+) -> anyhow::Result<Vec<SampleResult>> {
+    assert_eq!(params_per_seq.len(), batch_size);
 
     // One GPU→CPU copy for all N sequences' logits.
     let total_bytes = batch_size * vocab_size * 2; // bf16 = 2 bytes
@@ -252,8 +256,8 @@ pub(crate) fn sample_batch<B: GpuBackend>(
     backend.copy_to_host(logits_batch, &mut buf);
 
     let row_bytes = vocab_size * 2;
-    // Truncate each row to tokenizer vocab size (see sample() for rationale).
-    let effective_row_bytes = tokenizer_vocab_size.min(vocab_size) * 2;
+    let effective_vocab = tokenizer_vocab_size.min(vocab_size);
+    let effective_row_bytes = effective_vocab * 2;
     let mut results = Vec::with_capacity(batch_size);
 
     for i in 0..batch_size {
@@ -263,99 +267,288 @@ pub(crate) fn sample_batch<B: GpuBackend>(
         } else {
             None
         };
-        let token = if temperatures[i] == 0.0 && allowed.is_none() {
-            // Greedy: argmax on this row.
-            argmax_bf16(row_data)
+        let params = params_per_seq[i];
+        let counts = if i < token_counts_per_seq.len() {
+            token_counts_per_seq[i]
         } else {
-            // Temperature + top-p sampling on this row (with optional grammar mask).
-            sample_row(row_data, temperatures[i], top_ps[i], rng, allowed)
+            &EMPTY_COUNTS
         };
-        results.push(token);
+        let bias = if i < logit_bias_per_seq.len() {
+            logit_bias_per_seq[i]
+        } else {
+            &EMPTY_BIAS
+        };
+
+        // Fast greedy path for this row (no penalties, no logprobs, no grammar).
+        if params.can_use_gpu_greedy() && allowed.is_none() && bias.is_empty() {
+            let token_id = argmax_bf16(row_data);
+            results.push(SampleResult {
+                token_id,
+                logprob: 0.0,
+                top_logprobs: Vec::new(),
+            });
+            continue;
+        }
+
+        // Full pipeline for this row.
+        let bf16_values: &[bf16] = bytemuck::cast_slice(row_data);
+        let mut logits_f32: Vec<f32> = bf16_values.iter().map(|v| v.to_f32()).collect();
+
+        if let Some(allowed) = allowed {
+            apply_token_mask(&mut logits_f32, allowed);
+        }
+
+        let result = sample_from_logits(&mut logits_f32, params, rng, counts, bias);
+        results.push(result);
     }
 
     Ok(results)
 }
 
-/// Sample one token from a single row of bf16 logits (CPU-side).
+// ---------------------------------------------------------------------------
+// Core sampling pipeline — operates on f32 logits already on CPU.
+// ---------------------------------------------------------------------------
+
+/// The full sampling pipeline on a single row of f32 logits.
 ///
-/// Extracted from `sample()` so it can be reused by `sample_batch()` without
-/// needing a GPU tensor — it operates directly on a byte slice already on the CPU.
-fn sample_row(logits_bytes: &[u8], temperature: f32, top_p: f32, rng: &mut impl Rng, allowed_tokens: Option<&[u32]>) -> u32 {
-    let bf16_values: &[bf16] = bytemuck::cast_slice(logits_bytes);
-    let mut logits_f32: Vec<f32> = bf16_values.iter().map(|v| v.to_f32()).collect();
+/// This is the workhorse function shared by `sample()` and `sample_batch()`.
+/// Grammar masking must be applied BEFORE calling this function.
+///
+/// Pipeline order:
+///   1. Frequency/presence penalties
+///   2. Logit bias
+///   3. Temperature scaling
+///   4. Top-k masking
+///   5. Softmax → probabilities
+///   6. Snapshot for logprobs (pre-filter)
+///   7. Min-p filtering
+///   8. Top-p filtering + renormalization
+///   9. Weighted random sample
+///  10. Logprob extraction
+fn sample_from_logits(
+    logits: &mut [f32],
+    params: &SampleParams,
+    rng: &mut impl Rng,
+    token_counts: &HashMap<u32, u32>,
+    logit_bias: &HashMap<u32, f32>,
+) -> SampleResult {
+    let vocab_size = logits.len();
 
-    // Grammar constraint masking (before temperature scaling).
-    if let Some(allowed) = allowed_tokens {
-        apply_token_mask(&mut logits_f32, allowed);
+    // --- Step 1: Frequency and presence penalties ---
+    // These penalise tokens that have already appeared in the sequence.
+    // frequency_penalty scales with count (more repetition → stronger penalty).
+    // presence_penalty is a flat penalty for any token that appeared at all.
+    if params.frequency_penalty != 0.0 || params.presence_penalty != 0.0 {
+        for (&token_id, &count) in token_counts {
+            if (token_id as usize) < vocab_size && count > 0 {
+                logits[token_id as usize] -=
+                    params.frequency_penalty * count as f32
+                    + params.presence_penalty;
+            }
+        }
     }
 
-    // Greedy with grammar: after masking, argmax on CPU.
-    if temperature == 0.0 {
-        return logits_f32
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0);
+    // --- Step 2: Logit bias ---
+    // Per-token additive adjustment.  Clients use this to ban tokens (-100)
+    // or boost specific tokens.  Applied to raw logits before temperature.
+    for (&token_id, &bias) in logit_bias {
+        if (token_id as usize) < vocab_size {
+            logits[token_id as usize] += bias;
+        }
     }
 
-    // Temperature scaling.
-    let inv_temp = 1.0 / temperature;
-    for logit in logits_f32.iter_mut() {
-        *logit *= inv_temp;
+    // Greedy with no logprobs: just argmax after penalties/bias.
+    if params.temperature == 0.0 && !params.logprobs {
+        let token_id = argmax_f32(logits);
+        return SampleResult {
+            token_id,
+            logprob: 0.0,
+            top_logprobs: Vec::new(),
+        };
     }
 
-    // Softmax.
-    let max_logit = logits_f32.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    // --- Step 3: Temperature scaling ---
+    // Divide every logit by T.  T < 1 sharpens, T > 1 flattens.
+    // Special case: temperature=0 with logprobs — we need probabilities for the
+    // logprob output, but want deterministic (argmax) selection.  We skip
+    // temperature scaling entirely and just compute softmax on raw logits,
+    // then force-select the argmax.
+    let greedy_with_logprobs = params.temperature == 0.0 && params.logprobs;
+    if params.temperature != 0.0 {
+        let inv_temp = 1.0 / params.temperature;
+        for logit in logits.iter_mut() {
+            *logit *= inv_temp;
+        }
+    }
+
+    // --- Step 4: Top-k masking ---
+    // Keep only the k highest logits, set the rest to -inf.
+    // Uses select_nth_unstable for O(n) partial sort (no full sort needed).
+    if params.top_k > 0 && (params.top_k as usize) < vocab_size {
+        let k = params.top_k as usize;
+        // Find the kth-largest value via partial sort on a copy of indices.
+        let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+        // select_nth_unstable_by partitions so element at k-1 is the kth-largest.
+        indexed.select_nth_unstable_by(k - 1, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let threshold = indexed[k - 1].1;
+        // Mask everything below the threshold.  In case of ties at the boundary,
+        // we keep all tokens at exactly the threshold value.
+        for logit in logits.iter_mut() {
+            if *logit < threshold {
+                *logit = f32::NEG_INFINITY;
+            }
+        }
+    }
+
+    // --- Step 5: Softmax → probabilities ---
+    // softmax(x_i) = exp(x_i - max) / Σ exp(x_j - max)
+    // Subtract max for numerical stability (exp(1000) overflows, exp(0) = 1).
+    let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0f32;
-    for logit in logits_f32.iter_mut() {
+    for logit in logits.iter_mut() {
         *logit = (*logit - max_logit).exp();
         sum += *logit;
     }
     let inv_sum = 1.0 / sum;
-    for prob in logits_f32.iter_mut() {
+    for prob in logits.iter_mut() {
         *prob *= inv_sum;
     }
+    // `logits` is now a valid probability distribution (sums to 1.0).
+    // Rename conceptually: logits[i] is now probs[i].
 
-    // Top-p filtering.
-    if top_p < 1.0 {
-        let mut indices: Vec<u32> = (0..logits_f32.len() as u32).collect();
+    // --- Step 6: Snapshot for logprobs ---
+    // Capture the post-softmax, pre-filter distribution for top_logprobs.
+    // This reflects the model's actual beliefs before min-p/top-p filtering.
+    let logprob_snapshot = if params.logprobs {
+        Some(logits.to_vec())
+    } else {
+        None
+    };
+
+    // --- Step 7: Min-p filtering ---
+    // Zero out tokens with probability < min_p × max_probability.
+    // Adaptive like top-p but without sorting.
+    if params.min_p > 0.0 {
+        let max_prob = logits.iter().copied().fold(0.0f32, f32::max);
+        let threshold = params.min_p * max_prob;
+        let mut needs_renorm = false;
+        for prob in logits.iter_mut() {
+            if *prob < threshold {
+                *prob = 0.0;
+                needs_renorm = true;
+            }
+        }
+        if needs_renorm {
+            let new_sum: f32 = logits.iter().sum();
+            if new_sum > 0.0 {
+                let inv = 1.0 / new_sum;
+                for prob in logits.iter_mut() {
+                    *prob *= inv;
+                }
+            }
+        }
+    }
+
+    // --- Step 8: Top-p (nucleus) filtering ---
+    if params.top_p < 1.0 {
+        let mut indices: Vec<u32> = (0..logits.len() as u32).collect();
         indices.sort_unstable_by(|&a, &b| {
-            logits_f32[b as usize]
-                .partial_cmp(&logits_f32[a as usize])
+            logits[b as usize]
+                .partial_cmp(&logits[a as usize])
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         let mut cumulative = 0.0f32;
         let mut cutoff_idx = indices.len();
         for (i, &token_idx) in indices.iter().enumerate() {
-            cumulative += logits_f32[token_idx as usize];
-            if cumulative >= top_p {
+            cumulative += logits[token_idx as usize];
+            if cumulative >= params.top_p {
                 cutoff_idx = i + 1;
                 break;
             }
         }
         for &token_idx in &indices[cutoff_idx..] {
-            logits_f32[token_idx as usize] = 0.0;
+            logits[token_idx as usize] = 0.0;
         }
-        let new_sum: f32 = logits_f32.iter().sum();
-        let inv_new_sum = 1.0 / new_sum;
-        for prob in logits_f32.iter_mut() {
-            *prob *= inv_new_sum;
+        let new_sum: f32 = logits.iter().sum();
+        if new_sum > 0.0 {
+            let inv_new_sum = 1.0 / new_sum;
+            for prob in logits.iter_mut() {
+                *prob *= inv_new_sum;
+            }
         }
     }
 
-    // Weighted random sample.
-    let r: f32 = rng.random();
-    let mut cumulative = 0.0f32;
-    for (i, &prob) in logits_f32.iter().enumerate() {
-        cumulative += prob;
-        if cumulative > r {
-            return i as u32;
+    // --- Step 9: Weighted random sampling ---
+    // For greedy with logprobs, skip random sampling and force argmax.
+    let selected_id = if greedy_with_logprobs {
+        argmax_f32(logits)
+    } else {
+        let r: f32 = rng.random();
+        let mut cumulative = 0.0f32;
+        let mut id = (logits.len() - 1) as u32;
+        for (i, &prob) in logits.iter().enumerate() {
+            cumulative += prob;
+            if cumulative > r {
+                id = i as u32;
+                break;
+            }
         }
+        id
+    };
+
+    // --- Step 10: Logprob extraction ---
+    let (logprob, top_logprobs) = if let Some(ref snapshot) = logprob_snapshot {
+        let selected_prob = snapshot[selected_id as usize];
+        let logprob = if selected_prob > 0.0 { selected_prob.ln() } else { f32::NEG_INFINITY };
+
+        let n = params.top_logprobs as usize;
+        let top_logprobs = if n > 0 {
+            // Partial sort to find the top-N tokens by probability.
+            let mut indexed: Vec<(u32, f32)> = snapshot
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| **p > 0.0)
+                .map(|(i, &p)| (i as u32, p))
+                .collect();
+            // Sort descending by probability; take top N.
+            if indexed.len() > n {
+                indexed.select_nth_unstable_by(n - 1, |a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                indexed.truncate(n);
+            }
+            indexed.sort_unstable_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            indexed
+                .into_iter()
+                .map(|(id, p)| TokenLogprob {
+                    token_id: id,
+                    logprob: p.ln(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        (logprob, top_logprobs)
+    } else {
+        (0.0, Vec::new())
+    };
+
+    SampleResult {
+        token_id: selected_id,
+        logprob,
+        top_logprobs,
     }
-    (logits_f32.len() - 1) as u32
 }
+
+// ---------------------------------------------------------------------------
+// Greedy sampling functions (unchanged — GPU-resident fast paths).
+// ---------------------------------------------------------------------------
 
 /// Greedy sampling: copy logits to host, return the argmax token ID.
 ///
@@ -363,12 +556,9 @@ fn sample_row(logits_bytes: &[u8], temperature: f32, top_p: f32, rng: &mut impl 
 /// On Apple Silicon with unified memory, "copy" is just a pointer read —
 /// the data is already in the same physical memory.
 pub(crate) fn sample_greedy<B: GpuBackend>(backend: &B, logits: &B::Tensor, vocab_size: usize) -> anyhow::Result<u32> {
-    // Determine how many bytes the logits tensor occupies.
     let byte_count = backend.tensor_byte_count(logits);
     let mut buf = vec![0u8; byte_count];
-    // Copy raw bytes from the GPU tensor into our host buffer.
     backend.copy_to_host(logits, &mut buf);
-    // Truncate to tokenizer vocab size (see sample() for rationale).
     let effective_bytes = (vocab_size * 2).min(buf.len());
     Ok(argmax_bf16(&buf[..effective_bytes]))
 }
@@ -386,11 +576,8 @@ pub(crate) fn sample_greedy_gpu<B: GpuBackend>(
     logits: &B::Tensor,
     vocab_size: usize,
 ) -> anyhow::Result<u32> {
-    // Allocate a tiny output buffer for one u32 token ID.
-    let output = backend.alloc_tensor(&[1], TensorDtype::F32); // 4 bytes = 1 u32
+    let output = backend.alloc_tensor(&[1], TensorDtype::F32);
     backend.argmax_gpu(logits, &output, vocab_size as u32, 1);
-
-    // Copy just the single u32 result back to host.
     let mut buf = [0u8; 4];
     backend.copy_to_host(&output, &mut buf);
     Ok(u32::from_ne_bytes(buf))
@@ -408,19 +595,17 @@ pub(crate) fn sample_batch_greedy_gpu<B: GpuBackend>(
 ) -> anyhow::Result<Vec<u32>> {
     let output = backend.alloc_tensor(&[batch_size], TensorDtype::F32);
     backend.argmax_gpu(logits_batch, &output, vocab_size as u32, batch_size as u32);
-
-    // Copy N u32 token IDs back to host.
     let mut buf = vec![0u8; batch_size * 4];
     backend.copy_to_host(&output, &mut buf);
     let ids: &[u32] = bytemuck::cast_slice(&buf);
     Ok(ids.to_vec())
 }
 
+// ---------------------------------------------------------------------------
+// Internal helpers.
+// ---------------------------------------------------------------------------
+
 /// Find the index of the maximum value in a bf16 byte slice.
-///
-/// Uses `bytemuck::cast_slice` to reinterpret the raw bytes as bf16 values,
-/// then a simple linear scan.  For 128256 elements this takes ~microseconds
-/// on the CPU — not a bottleneck.
 fn argmax_bf16(data: &[u8]) -> u32 {
     let values: &[bf16] = bytemuck::cast_slice(data);
     values
@@ -431,16 +616,20 @@ fn argmax_bf16(data: &[u8]) -> u32 {
         .unwrap_or(0)
 }
 
+/// Find the index of the maximum value in an f32 slice.
+fn argmax_f32(data: &[f32]) -> u32 {
+    data.iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
+}
+
 /// Mask disallowed tokens to negative infinity.
 ///
 /// Sets all logits NOT in the `allowed_tokens` set to `f32::NEG_INFINITY`.
 /// After softmax, these become probability 0 — they can never be sampled.
-/// This is the standard approach used by vLLM, SGLang, and other inference
-/// servers for grammar-constrained generation.
 fn apply_token_mask(logits: &mut [f32], allowed_tokens: &[u32]) {
-    // Build a quick lookup of which token IDs are allowed.
-    // For typical JSON schemas the allowed set is small (10-1000 tokens),
-    // so building a bitset over vocab_size is efficient.
     let mut allowed = vec![false; logits.len()];
     for &id in allowed_tokens {
         if (id as usize) < allowed.len() {
@@ -465,6 +654,32 @@ mod tests {
         bytemuck::cast_slice(&bf16_values).to_vec()
     }
 
+    /// Helper: run the full pipeline on f32 logits with given params.
+    fn sample_with_params(
+        logits: &[f32],
+        params: &SampleParams,
+        rng: &mut impl Rng,
+        counts: &HashMap<u32, u32>,
+        bias: &HashMap<u32, f32>,
+    ) -> SampleResult {
+        let mut logits_f32 = logits.to_vec();
+        sample_from_logits(&mut logits_f32, params, rng, counts, bias)
+    }
+
+    fn default_params() -> SampleParams {
+        SampleParams::default()
+    }
+
+    fn no_counts() -> HashMap<u32, u32> {
+        HashMap::new()
+    }
+
+    fn no_bias() -> HashMap<u32, f32> {
+        HashMap::new()
+    }
+
+    // -- argmax tests (unchanged) --
+
     #[test]
     fn test_argmax_bf16_basic() {
         let data = bf16_bytes(&[1.0, 3.0, 2.0, 0.5]);
@@ -480,7 +695,7 @@ mod tests {
     #[test]
     fn test_argmax_bf16_all_negative() {
         let data = bf16_bytes(&[-5.0, -1.0, -3.0, -2.0]);
-        assert_eq!(argmax_bf16(&data), 1); // -1.0 is the largest
+        assert_eq!(argmax_bf16(&data), 1);
     }
 
     #[test]
@@ -501,94 +716,99 @@ mod tests {
         assert_eq!(argmax_bf16(&data), 2);
     }
 
-    // -- sample_row tests --
+    #[test]
+    fn test_argmax_bf16_two_elements_equal() {
+        let data = bf16_bytes(&[5.0, 5.0]);
+        let result = argmax_bf16(&data);
+        assert!(result == 0 || result == 1);
+    }
+
+    // -- basic sampling tests --
 
     #[test]
-    fn test_sample_row_very_low_temperature_acts_like_argmax() {
-        // Very low temperature should pick the highest-logit token.
-        let data = bf16_bytes(&[1.0, 5.0, 2.0, 0.5]);
+    fn test_very_low_temperature_acts_like_argmax() {
+        let logits = [1.0, 5.0, 2.0, 0.5];
+        let mut params = default_params();
+        params.temperature = 0.01;
         let mut rng = rand::rngs::SmallRng::seed_from_u64(42);
-        // Run multiple times — should always pick index 1.
         for _ in 0..20 {
-            let token = sample_row(&data, 0.01, 1.0, &mut rng, None);
-            assert_eq!(token, 1, "Very low temperature should pick argmax");
+            let result = sample_with_params(&logits, &params, &mut rng, &no_counts(), &no_bias());
+            assert_eq!(result.token_id, 1, "Very low temperature should pick argmax");
         }
     }
 
     #[test]
-    fn test_sample_row_deterministic_with_same_seed() {
-        let data = bf16_bytes(&[1.0, 2.0, 3.0, 2.0, 1.0]);
-        // Same seed should produce the same sequence of tokens.
+    fn test_deterministic_with_same_seed() {
+        let logits = [1.0, 2.0, 3.0, 2.0, 1.0];
+        let params = default_params();
         let mut rng1 = rand::rngs::SmallRng::seed_from_u64(123);
         let mut rng2 = rand::rngs::SmallRng::seed_from_u64(123);
         for _ in 0..50 {
-            let t1 = sample_row(&data, 1.0, 1.0, &mut rng1, None);
-            let t2 = sample_row(&data, 1.0, 1.0, &mut rng2, None);
-            assert_eq!(t1, t2, "Same seed should produce same token");
+            let r1 = sample_with_params(&logits, &params, &mut rng1, &no_counts(), &no_bias());
+            let r2 = sample_with_params(&logits, &params, &mut rng2, &no_counts(), &no_bias());
+            assert_eq!(r1.token_id, r2.token_id, "Same seed should produce same token");
         }
     }
 
     #[test]
-    fn test_sample_row_top_p_filters_tail() {
-        // Create a distribution where one token dominates.
-        // logits: [10.0, 0.0, 0.0, 0.0] — after softmax, token 0 has ~99.99%
-        let data = bf16_bytes(&[10.0, 0.0, 0.0, 0.0]);
+    fn test_top_p_filters_tail() {
+        let logits = [10.0, 0.0, 0.0, 0.0];
+        let mut params = default_params();
+        params.top_p = 0.5;
         let mut rng = rand::rngs::SmallRng::seed_from_u64(99);
-        // With top_p=0.5, only the dominant token should be sampled.
         for _ in 0..50 {
-            let token = sample_row(&data, 1.0, 0.5, &mut rng, None);
-            assert_eq!(token, 0, "Top-p should filter to dominant token");
+            let result = sample_with_params(&logits, &params, &mut rng, &no_counts(), &no_bias());
+            assert_eq!(result.token_id, 0, "Top-p should filter to dominant token");
         }
     }
 
     #[test]
-    fn test_sample_row_single_token_vocab() {
-        let data = bf16_bytes(&[42.0]);
+    fn test_single_token_vocab() {
+        let logits = [42.0];
+        let params = default_params();
         let mut rng = rand::rngs::SmallRng::seed_from_u64(0);
-        let token = sample_row(&data, 1.0, 1.0, &mut rng, None);
-        assert_eq!(token, 0);
+        let result = sample_with_params(&logits, &params, &mut rng, &no_counts(), &no_bias());
+        assert_eq!(result.token_id, 0);
     }
 
     #[test]
-    fn test_sample_row_equal_logits_samples_all_tokens() {
-        // With equal logits and temperature=1.0, all tokens should be sampled
-        // over enough trials.
-        let data = bf16_bytes(&[0.0, 0.0, 0.0, 0.0]);
+    fn test_equal_logits_samples_all_tokens() {
+        let logits = [0.0, 0.0, 0.0, 0.0];
+        let params = default_params();
         let mut rng = rand::rngs::SmallRng::seed_from_u64(7);
         let mut counts = [0u32; 4];
         for _ in 0..1000 {
-            let token = sample_row(&data, 1.0, 1.0, &mut rng, None);
-            counts[token as usize] += 1;
+            let result = sample_with_params(&logits, &params, &mut rng, &no_counts(), &no_bias());
+            counts[result.token_id as usize] += 1;
         }
-        // Each token should be sampled at least once (expected ~250 each).
         for (i, &count) in counts.iter().enumerate() {
             assert!(count > 50, "Token {i} sampled only {count} times out of 1000");
         }
     }
 
     #[test]
-    fn test_sample_row_high_temperature_more_uniform() {
-        // High temperature should spread probability more evenly.
-        // Use logits with a clear winner and see if high temp reduces its dominance.
-        let data = bf16_bytes(&[5.0, 0.0, 0.0, 0.0]);
+    fn test_high_temperature_more_uniform() {
+        let logits = [5.0, 0.0, 0.0, 0.0];
 
-        // Low temperature: token 0 should dominate.
+        let mut params_low = default_params();
+        params_low.temperature = 0.5;
         let mut rng_low = rand::rngs::SmallRng::seed_from_u64(42);
-        let mut count_low = 0u32;
-        for _ in 0..500 {
-            if sample_row(&data, 0.5, 1.0, &mut rng_low, None) == 0 {
-                count_low += 1;
-            }
-        }
+        let count_low = (0..500)
+            .filter(|_| {
+                sample_with_params(&logits, &params_low, &mut rng_low, &no_counts(), &no_bias())
+                    .token_id == 0
+            })
+            .count();
 
-        // High temperature: token 0 should still be most common but less dominant.
+        let mut params_high = default_params();
+        params_high.temperature = 3.0;
         let mut rng_high = rand::rngs::SmallRng::seed_from_u64(42);
-        let mut count_high = 0u32;
-        for _ in 0..500 {
-            if sample_row(&data, 3.0, 1.0, &mut rng_high, None) == 0 {
-                count_high += 1;
-            }
-        }
+        let count_high = (0..500)
+            .filter(|_| {
+                sample_with_params(&logits, &params_high, &mut rng_high, &no_counts(), &no_bias())
+                    .token_id == 0
+            })
+            .count();
 
         assert!(
             count_low > count_high,
@@ -597,23 +817,210 @@ mod tests {
     }
 
     #[test]
-    fn test_sample_row_top_p_one_no_filtering() {
-        // top_p=1.0 should not filter any tokens (all are candidates).
-        let data = bf16_bytes(&[1.0, 1.0, 1.0, 1.0, 1.0]);
+    fn test_top_p_one_no_filtering() {
+        let logits = [1.0, 1.0, 1.0, 1.0, 1.0];
+        let params = default_params();
         let mut rng = rand::rngs::SmallRng::seed_from_u64(55);
         let mut seen = std::collections::HashSet::new();
         for _ in 0..200 {
-            seen.insert(sample_row(&data, 1.0, 1.0, &mut rng, None));
+            let result = sample_with_params(&logits, &params, &mut rng, &no_counts(), &no_bias());
+            seen.insert(result.token_id);
         }
         assert_eq!(seen.len(), 5, "top_p=1.0 should allow all 5 tokens");
     }
 
+    // -- New feature tests --
+
     #[test]
-    fn test_argmax_bf16_two_elements_equal() {
-        // Two equal values — max_by returns the last equal element.
-        let data = bf16_bytes(&[5.0, 5.0]);
-        let result = argmax_bf16(&data);
-        // Either index is valid since they're equal.
-        assert!(result == 0 || result == 1);
+    fn test_frequency_penalty_suppresses_repeated_token() {
+        // Token 0 has the highest logit, but heavy frequency penalty should
+        // force the sampler to pick something else.
+        let logits = [5.0, 4.0, 3.0, 2.0];
+        let mut params = default_params();
+        params.temperature = 0.01; // near-greedy
+        let mut counts = HashMap::new();
+        counts.insert(0, 10); // token 0 appeared 10 times
+        params.frequency_penalty = 2.0; // penalty: 2.0 * 10 = 20 → logit becomes -15
+
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(42);
+        for _ in 0..20 {
+            let result = sample_with_params(&logits, &params, &mut rng, &counts, &no_bias());
+            assert_ne!(result.token_id, 0, "Frequency penalty should suppress token 0");
+        }
+    }
+
+    #[test]
+    fn test_presence_penalty_suppresses_seen_token() {
+        let logits = [5.0, 4.8, 3.0, 2.0];
+        let mut params = default_params();
+        params.temperature = 0.01;
+        let mut counts = HashMap::new();
+        counts.insert(0, 1); // token 0 appeared once
+        params.presence_penalty = 5.0; // flat penalty of 5.0
+
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(42);
+        for _ in 0..20 {
+            let result = sample_with_params(&logits, &params, &mut rng, &counts, &no_bias());
+            assert_ne!(result.token_id, 0, "Presence penalty should suppress token 0");
+        }
+    }
+
+    #[test]
+    fn test_top_k_limits_candidates() {
+        let logits = [1.0, 2.0, 3.0, 4.0]; // token 3 highest, then 2, 1, 0
+        let mut params = default_params();
+        params.top_k = 2; // only tokens 3 and 2 should be candidates
+
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(42);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let result = sample_with_params(&logits, &params, &mut rng, &no_counts(), &no_bias());
+            seen.insert(result.token_id);
+        }
+        assert!(
+            seen.len() <= 2,
+            "top_k=2 should limit to at most 2 tokens, got {seen:?}"
+        );
+        assert!(seen.contains(&3), "Should include the top token");
+        assert!(seen.contains(&2), "Should include the second token");
+    }
+
+    #[test]
+    fn test_min_p_filters_low_probability_tokens() {
+        // Token 0 dominates; others are very low probability.
+        let logits = [10.0, 0.0, 0.0, 0.0];
+        let mut params = default_params();
+        params.min_p = 0.1; // anything < 10% of max_prob gets filtered
+
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(42);
+        for _ in 0..100 {
+            let result = sample_with_params(&logits, &params, &mut rng, &no_counts(), &no_bias());
+            assert_eq!(result.token_id, 0, "min_p should filter weak tokens");
+        }
+    }
+
+    #[test]
+    fn test_logit_bias_boosts_token() {
+        // Token 3 has the lowest logit, but a large positive bias should
+        // make it the clear winner.
+        let logits = [5.0, 4.0, 3.0, 0.0];
+        let mut params = default_params();
+        params.temperature = 0.01;
+        let mut bias = HashMap::new();
+        bias.insert(3, 100.0); // massive boost
+
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(42);
+        for _ in 0..20 {
+            let result = sample_with_params(&logits, &params, &mut rng, &no_counts(), &bias);
+            assert_eq!(result.token_id, 3, "Logit bias should boost token 3 to winner");
+        }
+    }
+
+    #[test]
+    fn test_logprob_near_certain() {
+        // One token dominates → its logprob should be near 0.0 (ln(1.0) = 0).
+        let logits = [100.0, 0.0, 0.0, 0.0];
+        let mut params = default_params();
+        params.logprobs = true;
+        params.top_logprobs = 3;
+        params.temperature = 1.0;
+
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(42);
+        let result = sample_with_params(&logits, &params, &mut rng, &no_counts(), &no_bias());
+        assert_eq!(result.token_id, 0);
+        assert!(
+            result.logprob > -0.01,
+            "Near-certain token should have logprob ≈ 0.0, got {}",
+            result.logprob
+        );
+    }
+
+    #[test]
+    fn test_logprob_values() {
+        // Uniform distribution over 10 tokens: each has prob ≈ 0.1, logprob ≈ -2.3.
+        let logits = [0.0; 10];
+        let mut params = default_params();
+        params.logprobs = true;
+        params.top_logprobs = 5;
+
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(42);
+        let result = sample_with_params(&logits, &params, &mut rng, &no_counts(), &no_bias());
+
+        let expected_logprob = (0.1f32).ln(); // ≈ -2.302
+        assert!(
+            (result.logprob - expected_logprob).abs() < 0.05,
+            "Uniform 10-token logprob should be ≈ {expected_logprob}, got {}",
+            result.logprob
+        );
+        assert_eq!(result.top_logprobs.len(), 5);
+        for tlp in &result.top_logprobs {
+            assert!(
+                (tlp.logprob - expected_logprob).abs() < 0.05,
+                "Each top_logprob should be ≈ {expected_logprob}, got {}",
+                tlp.logprob
+            );
+        }
+    }
+
+    #[test]
+    fn test_top_logprobs_sorted_descending() {
+        let logits = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let mut params = default_params();
+        params.logprobs = true;
+        params.top_logprobs = 3;
+
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(42);
+        let result = sample_with_params(&logits, &params, &mut rng, &no_counts(), &no_bias());
+
+        assert_eq!(result.top_logprobs.len(), 3);
+        // Should be sorted descending by logprob.
+        for w in result.top_logprobs.windows(2) {
+            assert!(
+                w[0].logprob >= w[1].logprob,
+                "top_logprobs should be sorted descending: {} >= {}",
+                w[0].logprob,
+                w[1].logprob
+            );
+        }
+        // The top token should be token 4 (highest logit).
+        assert_eq!(result.top_logprobs[0].token_id, 4);
+    }
+
+    #[test]
+    fn test_greedy_with_logprobs() {
+        // Temperature=0 with logprobs should still compute probabilities.
+        let logits = [1.0, 5.0, 2.0, 0.5];
+        let mut params = default_params();
+        params.temperature = 0.0;
+        params.logprobs = true;
+        params.top_logprobs = 2;
+
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(42);
+        let result = sample_with_params(&logits, &params, &mut rng, &no_counts(), &no_bias());
+
+        // Should pick the argmax (token 1).
+        assert_eq!(result.token_id, 1);
+        // Logprob should be close to 0 (token 1 dominates with logit=5.0).
+        // With no temperature scaling, softmax(5.0) ≈ 0.93, logprob ≈ -0.08.
+        assert!(result.logprob > -0.1, "Greedy logprob should be near 0, got {}", result.logprob);
+        assert_eq!(result.top_logprobs.len(), 2);
+    }
+
+    #[test]
+    fn test_pipeline_order_penalties_before_temperature() {
+        // Verify penalties are applied to raw logits (before temperature).
+        // Token 0 logit=10, token 1 logit=9. With freq_penalty=1.5 and count[0]=2,
+        // token 0 becomes 10 - 1.5*2 = 7 < 9 (token 1 wins).
+        // If penalties were applied after temperature, the result would differ.
+        let logits = [10.0, 9.0];
+        let mut params = default_params();
+        params.temperature = 0.01;
+        params.frequency_penalty = 1.5;
+        let mut counts = HashMap::new();
+        counts.insert(0, 2);
+
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(42);
+        let result = sample_with_params(&logits, &params, &mut rng, &counts, &no_bias());
+        assert_eq!(result.token_id, 1, "Penalty should flip the winner from token 0 to token 1");
     }
 }

@@ -32,11 +32,14 @@ pub(crate) use imp::MultiGpuEngine;
 
 #[cfg(feature = "cuda")]
 mod imp {
+    use std::collections::HashMap;
+
     use crate::engine::dispatch::Dispatch;
     use crate::engine::{InferenceEngine, Scheduler, SeqId, SequenceRequest, StepOutput, run_step};
     use crate::gpu::cuda::CudaBackend;
     use crate::gpu::multi_gpu::tp::MultiGpuInference;
     use crate::model::kv_cache::SeqKvState;
+    use crate::model::sampler::{SampleParams, SampleResult};
     use crate::model::tokenizer::Tokenizer;
 
     // -----------------------------------------------------------------------
@@ -109,19 +112,21 @@ mod imp {
 
         fn sample(
             &self,
-            temperature: f32,
-            top_p: f32,
+            params: &SampleParams,
             rng: &mut impl rand::Rng,
             allowed_tokens: Option<&[u32]>,
-        ) -> anyhow::Result<u32> {
+            token_counts: &HashMap<u32, u32>,
+            logit_bias: &HashMap<u32, f32>,
+        ) -> anyhow::Result<SampleResult> {
             crate::model::sampler::sample(
                 self.multi.backend(),
                 self.multi.logits(),
-                temperature,
-                top_p,
+                params,
                 rng,
                 self.tokenizer_vocab_size,
                 allowed_tokens,
+                token_counts,
+                logit_bias,
             )
         }
     }
@@ -157,20 +162,20 @@ mod imp {
             &mut self,
             prompt_tokens: Vec<u32>,
             max_gen_tokens: usize,
-            temperature: f32,
-            top_p: f32,
+            params: SampleParams,
             images: Vec<crate::model::vision::ProcessedImage>,
             seed: Option<u64>,
             grammar: Option<std::sync::Arc<crate::model::grammar::CompiledGrammar>>,
+            logit_bias: HashMap<u32, f32>,
         ) -> SeqId {
             self.scheduler.add_request(SequenceRequest {
                 prompt_tokens,
                 max_gen_tokens,
-                temperature,
-                top_p,
+                params,
                 images,
                 seed,
                 grammar,
+                logit_bias,
             })
         }
 

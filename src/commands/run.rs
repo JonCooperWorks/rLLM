@@ -58,11 +58,15 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
         eng.add_request(
             tokens,
             max_tokens,
-            temperature,
-            top_p,
+            crate::model::sampler::SampleParams {
+                temperature,
+                top_p,
+                ..crate::model::sampler::SampleParams::default()
+            },
             processed_images.to_vec(),
             None,
             None,
+            std::collections::HashMap::new(),
         );
 
         // Stream tokens to stdout as they're generated.
@@ -87,7 +91,7 @@ pub(crate) fn exec(args: RunArgs) -> anyhow::Result<()> {
                 prefill_reported = true;
             }
 
-            for &(_seq_id, token_id) in &output.tokens {
+            for &(_seq_id, token_id, _) in &output.tokens {
                 all_token_ids.push(token_id);
                 gen_count += 1;
 

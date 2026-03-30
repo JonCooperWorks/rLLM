@@ -62,11 +62,9 @@ All models support bf16 and Q4. Multi-GPU via `--tp N` requires CUDA + NCCL.
 | Nemotron-H 30B ⚡ | 31.6B (3.6B active) | 7.7 tok/s | 33 tok/s | 39 tok/s | 834 ms | 180 ms |
 | Gemma 3 27B Instruct | 27.4B | 1.9 tok/s | 8.3 tok/s | 15 tok/s | 50,900 ms | 590 ms |
 | Mixtral 8x7B Instruct ⚡ | 46.7B (12.9B active) | 0.4 tok/s | — | 23 tok/s | 20,853 ms | 696 ms |
-| Qwen3.5 27B ⚡† | ~27B | 2.0 tok/s | 9.8 tok/s | 16 tok/s | 47,200 ms | 8,194 ms |
-| Qwen3.5 122B-A10B ⚡ | 122B (10B active) | — | — | — | 111,078 ms | 21,634 ms |
-| Qwen3.5 397B-A27B ⚡ | 397B (17B active) | — | — | — | — | 46,338 ms |
+| Qwen3.5 27B  | ~27B ⚡† | 2.0 tok/s | 9.8 tok/s | 16 tok/s | 47,200 ms | 8,194 ms |
 
-⚡ = SSD expert streaming (`--stream-experts`). † = thinking model (TTFT includes reasoning time). The 397B model (751 GB on disk, 213 GB Q4) runs on 64 GB using ~20 GB GPU memory. Q4 is strongly recommended for models over ~8B. Benchmarked via `tests/bench.py` (HTTP API, 2 runs averaged); bf16 numbers for ⚡ models from `scripts/benchmark.sh` (CLI).
+⚡ = SSD expert streaming (`--stream-experts`). † = thinking model (TTFT includes reasoning time). The 397B model (751 GB on disk, 213 GB Q4) runs on 64 GB using ~20 GB GPU memory. Q8 is strongly recommended for models over ~8B. Benchmarked via `tests/bench.py` (HTTP API, 2 runs averaged); bf16 numbers for ⚡ models from `scripts/benchmark.sh` (CLI).
 
 </details>
 

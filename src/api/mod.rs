@@ -82,10 +82,8 @@ pub(crate) struct WorkerRequest {
     pub prompt_tokens: Vec<u32>,
     /// Maximum tokens to generate.
     pub max_tokens: usize,
-    /// Sampling temperature.
-    pub temperature: f32,
-    /// Top-p (nucleus) sampling threshold.
-    pub top_p: f32,
+    /// Sampling parameters (temperature, top_p, top_k, penalties, logprobs, etc.).
+    pub params: crate::model::sampler::SampleParams,
     /// Per-request channel to send token events back to the handler.
     pub response_tx: tokio::sync::mpsc::Sender<InferenceEvent>,
     /// Whether thinking (extended reasoning) was requested.
@@ -108,13 +106,19 @@ pub(crate) struct WorkerRequest {
     /// Built on the async handler thread from a JSON schema, passed to the engine
     /// for per-token constraint enforcement.
     pub grammar: Option<std::sync::Arc<crate::model::grammar::CompiledGrammar>>,
+    /// Per-token logit bias (token_id → additive adjustment).
+    pub logit_bias: HashMap<u32, f32>,
 }
 
 /// Events sent from the inference worker back to an HTTP handler.
 #[derive(Debug)]
 pub(crate) enum InferenceEvent {
     /// A new token was generated.
-    Token { text: String },
+    Token {
+        text: String,
+        /// Log-probability information (only when logprobs was requested).
+        logprob_info: Option<engine::TokenLogprobInfo>,
+    },
     /// Generation finished.
     Done {
         stop_reason: StopReason,
@@ -125,6 +129,64 @@ pub(crate) enum InferenceEvent {
     },
     /// An error occurred during inference.
     Error(String),
+}
+
+/// Add standard headers to an API response.
+///
+/// Sets `x-request-id` for tracing, and `Connection: close` for non-streaming
+/// responses so clients like `curl -N` don't hang waiting for the keep-alive
+/// connection to close.  Streaming (SSE) responses leave the connection open
+/// naturally — the chunked stream terminates cleanly when the last event is sent.
+pub(crate) fn finalize_response(
+    response: &mut axum::response::Response,
+    request_id: &str,
+    close_connection: bool,
+) {
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-request-id"),
+        axum::http::HeaderValue::from_str(request_id).unwrap(),
+    );
+    if close_connection {
+        response.headers_mut().insert(
+            axum::http::header::CONNECTION,
+            axum::http::HeaderValue::from_static("close"),
+        );
+    }
+}
+
+/// Collect all tokens from an inference event channel into a single string.
+///
+/// Used by non-streaming (blocking) handlers across OpenAI and Anthropic
+/// endpoints.  Returns immediately after the `Done` event — does NOT wait
+/// for the sender to be dropped (which would cause the HTTP response to
+/// hang until the worker cleans up the request context).
+pub(crate) async fn collect_response(
+    mut rx: tokio::sync::mpsc::Receiver<InferenceEvent>,
+) -> Result<(String, usize, usize, StopReason), String> {
+    let mut text = String::new();
+    let mut prompt_tokens = 0usize;
+    let mut completion_tokens = 0usize;
+    let mut stop_reason = StopReason::MaxTokens;
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            InferenceEvent::Token { text: t, .. } => text.push_str(&t),
+            InferenceEvent::Done {
+                stop_reason: sr,
+                prompt_tokens: pt,
+                completion_tokens: ct,
+                cached_tokens: _,
+            } => {
+                prompt_tokens = pt;
+                completion_tokens = ct;
+                stop_reason = sr;
+                break;
+            }
+            InferenceEvent::Error(e) => return Err(e),
+        }
+    }
+
+    Ok((text, prompt_tokens, completion_tokens, stop_reason))
 }
 
 /// Why generation stopped.
@@ -697,6 +759,8 @@ struct RequestContext {
     /// Kept separately from the token-by-token SSE output so we can check
     /// the full string for stop sequence substrings each step.
     full_text: String,
+    /// Whether this request wants log-probability information.
+    logprobs_requested: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -765,14 +829,15 @@ fn run_worker_loop(
         let thinking = req.thinking.unwrap_or(false);
         let user = req.user;
         let stop = req.stop;
+        let logprobs_requested = req.params.logprobs;
         let seq_id = engine.add_request(
             req.prompt_tokens,
             req.max_tokens,
-            req.temperature,
-            req.top_p,
+            req.params,
             req.images,
             req.seed,
             req.grammar,
+            req.logit_bias,
         );
         registry.insert(
             seq_id,
@@ -792,6 +857,7 @@ fn run_worker_loop(
                 user,
                 stop,
                 full_text: String::new(),
+                logprobs_requested,
             },
         );
     }
@@ -846,7 +912,7 @@ fn run_worker_loop(
         let mut to_abort: Vec<SeqId> = Vec::new();
         let tokenizer = engine.tokenizer();
 
-        for &(seq_id, token_id) in &step_output.tokens {
+        for (seq_id, token_id, logprob_info) in step_output.tokens {
             if let Some(ctx) = registry.get_mut(&seq_id) {
                 // Detect thinking special tokens.  Models like Qwen 3.5 emit
                 // <think> (248068) and </think> (248069) as special tokens that
@@ -858,7 +924,7 @@ fn run_worker_loop(
                     if let Some(prev) = ctx.inject_marker.take() {
                         let _ = ctx
                             .response_tx
-                            .blocking_send(InferenceEvent::Token { text: prev.to_string() });
+                            .blocking_send(InferenceEvent::Token { text: prev.to_string(), logprob_info: None });
                     }
                     ctx.inject_marker = Some("<think>");
                     ctx.generated_count += 1;
@@ -871,7 +937,7 @@ fn run_worker_loop(
                     if let Some(prev) = ctx.inject_marker.take() {
                         let _ = ctx
                             .response_tx
-                            .blocking_send(InferenceEvent::Token { text: prev.to_string() });
+                            .blocking_send(InferenceEvent::Token { text: prev.to_string(), logprob_info: None });
                     }
                     ctx.inject_marker = Some("</think>");
                     ctx.generated_count += 1;
@@ -927,7 +993,7 @@ fn run_worker_loop(
                 if !text.is_empty() {
                     if ctx
                         .response_tx
-                        .blocking_send(InferenceEvent::Token { text })
+                        .blocking_send(InferenceEvent::Token { text, logprob_info })
                         .is_err()
                     {
                         to_abort.push(seq_id);
@@ -960,7 +1026,7 @@ fn run_worker_loop(
                 if let Some(marker) = ctx.inject_marker.take() {
                     let _ = ctx
                         .response_tx
-                        .blocking_send(InferenceEvent::Token { text: marker.to_string() });
+                        .blocking_send(InferenceEvent::Token { text: marker.to_string(), logprob_info: None });
                 }
 
                 let stop_reason = match finished.reason {
@@ -1089,6 +1155,7 @@ mod tests {
             user: None,
             stop: Vec::new(),
             full_text: String::new(),
+            logprobs_requested: false,
         }
     }
 
@@ -1138,6 +1205,7 @@ mod tests {
             user: None,
             stop: Vec::new(),
             full_text: String::new(),
+            logprobs_requested: false,
         };
 
         record_completion_metrics(&m, &ctx);
@@ -1196,6 +1264,7 @@ mod tests {
             user: None,
             stop: Vec::new(),
             full_text: String::new(),
+            logprobs_requested: false,
         };
         let now = Instant::now();
         assert!(ctx.deadline.is_some_and(|d| now >= d));
@@ -1220,6 +1289,7 @@ mod tests {
             user: None,
             stop: Vec::new(),
             full_text: String::new(),
+            logprobs_requested: false,
         };
         let now = Instant::now();
         assert!(!ctx.deadline.is_some_and(|d| now >= d));
@@ -1415,7 +1485,7 @@ mod tests {
         /// Queue a step that emits one token for each active sequence.
         fn push_token_step(&mut self, token_id: u32) {
             self.step_results.push_back(Box::new(move |eng: &mut MockEngine| {
-                let tokens: Vec<_> = eng.active.iter().map(|&id| (id, token_id)).collect();
+                let tokens: Vec<_> = eng.active.iter().map(|&id| (id, token_id, None)).collect();
                 Ok(StepOutput { tokens, finished: Vec::new() })
             }));
         }
@@ -1440,11 +1510,11 @@ mod tests {
             &mut self,
             _prompt_tokens: Vec<u32>,
             _max_gen_tokens: usize,
-            _temperature: f32,
-            _top_p: f32,
+            _params: crate::model::sampler::SampleParams,
             _images: Vec<crate::model::vision::ProcessedImage>,
             _seed: Option<u64>,
             _grammar: Option<std::sync::Arc<crate::model::grammar::CompiledGrammar>>,
+            _logit_bias: HashMap<u32, f32>,
         ) -> SeqId {
             let id = self.next_id;
             self.next_id += 1;
@@ -1485,8 +1555,10 @@ mod tests {
             request_id: "test-req".into(),
             prompt_tokens: vec![1],
             max_tokens: 10,
-            temperature: 0.0,
-            top_p: 1.0,
+            params: crate::model::sampler::SampleParams {
+                temperature: 0.0,
+                ..crate::model::sampler::SampleParams::default()
+            },
             response_tx: tx,
             thinking: None,
             images: Vec::new(),
@@ -1494,6 +1566,7 @@ mod tests {
             seed: None,
             stop: Vec::new(),
             grammar: None,
+            logit_bias: HashMap::new(),
         };
         (req, rx)
     }
@@ -1687,5 +1760,56 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         flag.store(true, Ordering::SeqCst);
         assert!(flag.load(Ordering::SeqCst));
+    }
+
+    // -----------------------------------------------------------------------
+    // collect_response() unit tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn collect_response_returns_on_done_not_sender_drop() {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+        let handle = tokio::spawn(collect_response(rx));
+
+        tx.send(InferenceEvent::Token { text: "hello ".into(), logprob_info: None }).await.unwrap();
+        tx.send(InferenceEvent::Token { text: "world".into(), logprob_info: None }).await.unwrap();
+        tx.send(InferenceEvent::Done {
+            stop_reason: StopReason::EndOfSequence,
+            prompt_tokens: 5,
+            completion_tokens: 2,
+            cached_tokens: 0,
+        }).await.unwrap();
+
+        // collect_response must complete while tx is still alive — if it waits
+        // for the sender to drop (the original bug), this timeout will fire.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handle,
+        ).await;
+        assert!(result.is_ok(), "collect_response hung waiting for sender drop");
+
+        let (text, prompt_tokens, completion_tokens, stop_reason) =
+            result.unwrap().unwrap().unwrap();
+        assert_eq!(text, "hello world");
+        assert_eq!(prompt_tokens, 5);
+        assert_eq!(completion_tokens, 2);
+        assert!(matches!(stop_reason, StopReason::EndOfSequence));
+
+        // tx is still alive — proves we returned on Done, not sender drop.
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn collect_response_returns_error() {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+        tx.send(InferenceEvent::Token { text: "partial".into(), logprob_info: None }).await.unwrap();
+        tx.send(InferenceEvent::Error("engine exploded".into())).await.unwrap();
+        drop(tx);
+
+        let result = collect_response(rx).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "engine exploded");
     }
 }

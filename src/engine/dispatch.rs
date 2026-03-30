@@ -30,6 +30,10 @@
 //   - engine/mod.rs       — Scheduler<S> is generic over the same SeqState
 // ===========================================================================
 
+use std::collections::HashMap;
+
+use crate::model::sampler::{SampleParams, SampleResult};
+
 /// Abstracts over single-GPU and multi-GPU inference dispatch.
 ///
 /// The engine step loop calls these methods without knowing the GPU topology.
@@ -93,17 +97,26 @@ pub(crate) trait Dispatch {
     /// Advance KV state by one position after decode.
     fn finish_decode(state: &mut Self::SeqState);
 
-    /// Sample a token from the current logits.
+    /// Sample a token from the current logits using the full pipeline.
     ///
     /// `allowed_tokens` constrains sampling to only the specified token IDs
     /// (grammar-based structured output).  When None, all tokens are allowed.
-    fn sample(&self, temperature: f32, top_p: f32, rng: &mut impl rand::Rng, allowed_tokens: Option<&[u32]>)
-    -> anyhow::Result<u32>;
+    /// `token_counts` maps token_id → occurrence count (for frequency/presence penalty).
+    /// `logit_bias` maps token_id → additive bias.
+    fn sample(
+        &self,
+        params: &SampleParams,
+        rng: &mut impl rand::Rng,
+        allowed_tokens: Option<&[u32]>,
+        token_counts: &HashMap<u32, u32>,
+        logit_bias: &HashMap<u32, f32>,
+    ) -> anyhow::Result<SampleResult>;
 
     /// GPU-resident greedy sampling: argmax entirely on device.
     ///
     /// Avoids copying the full logits tensor to CPU — only 4 bytes (one u32
-    /// token ID) are transferred.  Used when temperature == 0.0.
+    /// token ID) are transferred.  Used when temperature == 0.0 and no
+    /// penalties, bias, or logprobs are needed.
     ///
     /// Inspired by rvLLM (Andy Norris / m0at).
     #[allow(dead_code)] // engine uses batched version; kept as trait building block
@@ -194,16 +207,16 @@ pub(crate) trait Dispatch {
 
     /// Sample N tokens from the batched logits produced by `forward_decode_batch`.
     ///
-    /// Each sequence gets its own temperature and top_p — different concurrent
-    /// requests can have different sampling parameters.  `allowed_tokens_per_seq`
-    /// provides optional per-sequence grammar constraints.
+    /// Each sequence gets its own SampleParams, token counts, and logit bias.
+    /// `allowed_tokens_per_seq` provides optional per-sequence grammar constraints.
     fn sample_batch(
         &self,
-        _temperatures: &[f32],
-        _top_ps: &[f32],
+        _params_per_seq: &[&SampleParams],
         _rng: &mut impl rand::Rng,
         _allowed_tokens_per_seq: &[Option<Vec<u32>>],
-    ) -> anyhow::Result<Vec<u32>> {
+        _token_counts_per_seq: &[&HashMap<u32, u32>],
+        _logit_bias_per_seq: &[&HashMap<u32, f32>],
+    ) -> anyhow::Result<Vec<SampleResult>> {
         anyhow::bail!("batched sampling not supported by this Dispatch implementation")
     }
 }

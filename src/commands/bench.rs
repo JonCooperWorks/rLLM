@@ -69,7 +69,18 @@ pub(crate) fn exec(args: BenchArgs) -> anyhow::Result<()> {
                 super::encode_prompt(eng, arch, user_prompt, true, &system, None, None, &[])?;
             let prompt_len = prompt_tokens.len();
 
-            eng.add_request(prompt_tokens, max_tokens, 0.0, 1.0, Vec::new(), None, None);
+            eng.add_request(
+                prompt_tokens,
+                max_tokens,
+                crate::model::sampler::SampleParams {
+                    temperature: 0.0,
+                    ..crate::model::sampler::SampleParams::default()
+                },
+                Vec::new(),
+                None,
+                None,
+                std::collections::HashMap::new(),
+            );
 
             let start = Instant::now();
             let mut ttft = None;
@@ -83,7 +94,7 @@ pub(crate) fn exec(args: BenchArgs) -> anyhow::Result<()> {
                     ttft = Some(start.elapsed());
                 }
 
-                for &(_seq_id, _token_id) in &output.tokens {
+                for &(_seq_id, _token_id, _) in &output.tokens {
                     gen_count += 1;
                 }
 

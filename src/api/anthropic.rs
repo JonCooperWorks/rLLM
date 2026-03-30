@@ -51,6 +51,7 @@
 //   for any major LLM client.
 // ===========================================================================
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -61,6 +62,7 @@ use axum::Extension;
 use super::auth::AuthUser;
 use super::{InferenceEvent, ServerState, StopReason, WorkerRequest};
 use crate::model::chat::Message;
+use crate::model::sampler::SampleParams;
 use crate::model::thinking;
 use crate::model::tools::{self, ToolDefinition};
 
@@ -106,6 +108,10 @@ pub(crate) struct MessagesRequest {
     /// Anthropic calls this `stop_sequences` (array of strings).
     #[serde(default, alias = "stop_sequences")]
     pub stop: Option<Vec<String>>,
+    /// Top-k sampling: keep only the k highest-scoring tokens.  0 = disabled.
+    /// Anthropic supports this natively in their API.
+    #[serde(default)]
+    pub top_k: Option<u32>,
 }
 
 /// Anthropic thinking configuration.
@@ -276,8 +282,12 @@ pub(crate) async fn messages(
         request_id: request_id.clone(),
         prompt_tokens,
         max_tokens,
-        temperature: req.temperature.unwrap_or(1.0),
-        top_p: req.top_p.unwrap_or(0.9),
+        params: SampleParams {
+            temperature: req.temperature.unwrap_or(1.0),
+            top_p: req.top_p.unwrap_or(0.9),
+            top_k: req.top_k.unwrap_or(0),
+            ..SampleParams::default()
+        },
         response_tx,
         thinking: thinking_requested,
         images,
@@ -285,6 +295,7 @@ pub(crate) async fn messages(
         seed: None, // Anthropic API does not expose a seed parameter.
         stop: req.stop.unwrap_or_default(),
         grammar: None, // Anthropic API does not expose structured output.
+        logit_bias: HashMap::new(),
     };
 
     state.request_tx.try_send(worker_req).map_err(|e| match e {
@@ -317,10 +328,7 @@ pub(crate) async fn messages(
         .await
     };
 
-    response.headers_mut().insert(
-        axum::http::HeaderName::from_static("x-request-id"),
-        axum::http::HeaderValue::from_str(&request_id).unwrap(),
-    );
+    super::finalize_response(&mut response, &request_id, !req.stream);
     Ok(response)
 }
 
@@ -328,33 +336,15 @@ pub(crate) async fn messages(
 /// return complete JSON response.
 async fn messages_blocking(
     state: Arc<ServerState>,
-    mut response_rx: tokio::sync::mpsc::Receiver<InferenceEvent>,
+    response_rx: tokio::sync::mpsc::Receiver<InferenceEvent>,
     check_tools: bool,
     check_thinking: bool,
 ) -> Response {
-    let mut text = String::new();
-    let mut input_tokens = 0usize;
-    let mut output_tokens = 0usize;
-    let mut stop_reason = StopReason::MaxTokens;
-
-    while let Some(event) = response_rx.recv().await {
-        match event {
-            InferenceEvent::Token { text: t } => text.push_str(&t),
-            InferenceEvent::Done {
-                stop_reason: sr,
-                prompt_tokens,
-                completion_tokens,
-                cached_tokens: _cached,
-            } => {
-                input_tokens = prompt_tokens;
-                output_tokens = completion_tokens;
-                stop_reason = sr;
-            }
-            InferenceEvent::Error(e) => {
-                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e);
-            }
-        }
-    }
+    let (mut text, input_tokens, output_tokens, stop_reason) =
+        match super::collect_response(response_rx).await {
+            Ok(result) => result,
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
+        };
 
     // Parse thinking blocks first (they wrap the entire output including
     // any tool calls), then check for tool calls in the remaining content.
@@ -458,7 +448,7 @@ async fn messages_stream_with_tools(
 
         while let Some(event) = response_rx.recv().await {
             match event {
-                InferenceEvent::Token { text: t } => text.push_str(&t),
+                InferenceEvent::Token { text: t, .. } => text.push_str(&t),
                 InferenceEvent::Done {
                     stop_reason: sr,
                     prompt_tokens,
@@ -674,7 +664,7 @@ async fn messages_stream(
         // 3. content_block_delta — one event per generated token.
         while let Some(event) = response_rx.recv().await {
             match event {
-                InferenceEvent::Token { text } => {
+                InferenceEvent::Token { text, .. } => {
                     yield Ok(format!(
                         "event: content_block_delta\ndata: {}\n\n",
                         serde_json::json!({
@@ -1114,5 +1104,54 @@ mod tests {
         );
         assert_eq!(json["content"][1]["type"], "text");
         assert_eq!(json["content"][1]["text"], "The answer is 4.");
+    }
+
+    // -----------------------------------------------------------------------
+    // Blocking handler regression test — verify handler returns on Done,
+    // not on sender drop (the original hang bug).
+    // -----------------------------------------------------------------------
+
+    fn test_server_state() -> Arc<ServerState> {
+        use crate::api::{auth, metrics};
+        use crate::model::{config, tokenizer};
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<super::WorkerRequest>(1);
+        Arc::new(ServerState {
+            request_tx: tx,
+            model_name: "test".into(),
+            tokenizer: Arc::new(tokenizer::Tokenizer::for_test(vec![0])),
+            arch: config::ModelArch::Llama,
+            vision_config: None,
+            image_token_id: None,
+            auth: auth::AuthProviderKind::None,
+            metrics: Arc::new(metrics::Metrics::new()),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
+    #[tokio::test]
+    async fn messages_blocking_returns_on_done() {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let state = test_server_state();
+
+        tx.send(super::InferenceEvent::Token { text: "hello".into(), logprob_info: None }).await.unwrap();
+        tx.send(super::InferenceEvent::Done {
+            stop_reason: super::StopReason::EndOfSequence,
+            prompt_tokens: 3,
+            completion_tokens: 1,
+            cached_tokens: 0,
+        }).await.unwrap();
+
+        // Handler must complete within 1s — if it waits for sender drop, it hangs.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            messages_blocking(state, rx, false, false),
+        ).await;
+        assert!(result.is_ok(), "messages_blocking hung waiting for sender drop");
+
+        let response = result.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        // tx is still alive — proves we returned on Done, not sender drop.
+        drop(tx);
     }
 }
