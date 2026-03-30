@@ -92,10 +92,11 @@ pub(crate) mod tp {
                     loader::load_weights(&*backend, model_dir, &config, Some(&plan))?;
 
                 if rank == 0 {
-                    eprintln!(
-                        "weights loaded{} (rank 0/{})",
-                        if is_prequantized { " (Q4)" } else { "" },
-                        world_size,
+                    tracing::info!(
+                        quantized = is_prequantized,
+                        rank = 0,
+                        world_size = world_size,
+                        "weights loaded",
                     );
                 }
 
@@ -143,9 +144,11 @@ pub(crate) mod tp {
                             model.vision_weights = Some(vw);
                             model.vision_bufs = Some(bufs);
                             if rank == 0 {
-                                eprintln!(
-                                    "vision encoder ready ({} blocks, hidden={}, max {} patches)",
-                                    vc.depth, vc.hidden_size, max_patches,
+                                tracing::info!(
+                                    blocks = vc.depth,
+                                    hidden = vc.hidden_size,
+                                    max_patches = max_patches,
+                                    "vision encoder ready",
                                 );
                             }
                         }

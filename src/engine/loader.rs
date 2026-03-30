@@ -28,6 +28,8 @@
 use std::path::Path;
 use std::time::Instant;
 
+use tracing::{info, warn};
+
 use crate::gpu::{self, GpuBackend, GpuCore, GpuElementwise, TensorDtype};
 use crate::model;
 use crate::model::config::{ModelArch, ModelConfig};
@@ -235,7 +237,7 @@ fn load_and_run_single_gpu(
     let t_start = Instant::now();
 
     let backend = gpu::create_backend()?;
-    eprintln!("gpu: {}", backend.device_name());
+    info!(gpu = %backend.device_name(), "GPU initialized");
 
     let t_load = Instant::now();
     let loader::LoadedModel {
@@ -248,7 +250,7 @@ fn load_and_run_single_gpu(
         vision_weights,
     } = loader::load_model(&backend, model_dir, stream_experts)?;
     let load_secs = t_load.elapsed().as_secs_f64();
-    eprintln!("loaded in {:.2}s", load_secs);
+    info!(load_time_s = format_args!("{:.2}", load_secs), "model loaded");
 
     let mut model = model::Model::new(config.clone(), weights, &backend)?;
 
@@ -265,9 +267,9 @@ fn load_and_run_single_gpu(
     // TODO: fix TurboQuant to handle bias properly (e.g., subtract mean bias
     // before normalisation, or use bias-aware codebooks).
     let kv_quant = if kv_quant.is_quantized() && arch.has_qkv_bias() {
-        eprintln!(
-            "note: TurboQuant disabled for {arch:?} (QKV bias incompatibility); \
-             using BF16 KV cache"
+        warn!(
+            arch = ?arch,
+            "TurboQuant disabled (QKV bias incompatibility); using BF16 KV cache"
         );
         KvQuantMode::None
     } else {
@@ -293,9 +295,11 @@ fn load_and_run_single_gpu(
             let bufs = model::vision::alloc_vision_buffers(&backend, vc, max_patches);
             model.vision_weights = Some(vw);
             model.vision_bufs = Some(bufs);
-            eprintln!(
-                "vision encoder ready ({} blocks, hidden={}, max {} patches)",
-                vc.depth, vc.hidden_size, max_patches,
+            info!(
+                blocks = vc.depth,
+                hidden = vc.hidden_size,
+                max_patches = max_patches,
+                "vision encoder ready",
             );
         }
     }
@@ -313,21 +317,21 @@ fn load_and_run_single_gpu(
     let kv_mb = kv_pool.total_memory_bytes() as f64 / (1024.0 * 1024.0);
     let max_tokens = kv_pool.max_tokens();
     if kv_quant.is_quantized() {
-        eprintln!("kv cache: TurboQuant {}-bit ({:.1}x compression)",
-            kv_quant.bits(),
-            kv_dim as f64 * 2.0 / kv_pool.bytes_per_position() as f64,
+        info!(bits = kv_quant.bits(),
+            compression = format_args!("{:.1}x", kv_dim as f64 * 2.0 / kv_pool.bytes_per_position() as f64),
+            "kv cache: TurboQuant",
         );
     }
-    eprintln!(
-        "memory: {:.0} MB weights, {:.0} MB KV cache ({} blocks, {} max tokens), {:.0} MB GPU budget",
-        weight_mb,
-        kv_mb,
-        num_blocks,
-        max_tokens,
-        gpu_budget as f64 / (1024.0 * 1024.0),
+    info!(
+        weight_mb = format_args!("{:.0}", weight_mb),
+        kv_mb = format_args!("{:.0}", kv_mb),
+        blocks = num_blocks,
+        max_tokens = max_tokens,
+        gpu_budget_mb = format_args!("{:.0}", gpu_budget as f64 / (1024.0 * 1024.0)),
+        "memory allocation",
     );
-    eprintln!("max {} concurrent sequences", max_active);
-    eprintln!("ready in {:.2}s", t_start.elapsed().as_secs_f64());
+    info!(max_active = max_active, "max concurrent sequences");
+    info!(ready_s = format_args!("{:.2}", t_start.elapsed().as_secs_f64()), "ready");
 
     on_ready(&tokenizer, arch);
 
@@ -355,7 +359,7 @@ fn load_and_run_multi_gpu(
 
     let t_start = Instant::now();
 
-    eprintln!("tensor parallelism: {} GPUs", tp);
+    info!(gpus = tp, "tensor parallelism");
 
     let config = config::ModelConfig::from_file(&model_dir.join("config.json"))?;
 
@@ -367,12 +371,13 @@ fn load_and_run_multi_gpu(
     let is_prequantized = loader::is_prequantized_model(model_dir);
     let multi = MultiGpuInference::new(model_dir, config.clone(), is_prequantized, tp, num_blocks)?;
     let load_secs = t_load.elapsed().as_secs_f64();
-    eprintln!("loaded in {:.2}s", load_secs);
-    eprintln!(
-        "multi-GPU inference ready ({} ranks, max {} concurrent sequences)",
-        tp, max_active,
+    info!(load_time_s = format_args!("{:.2}", load_secs), "model loaded");
+    info!(
+        ranks = tp,
+        max_active = max_active,
+        "multi-GPU inference ready",
     );
-    eprintln!("ready in {:.2}s", t_start.elapsed().as_secs_f64());
+    info!(ready_s = format_args!("{:.2}", t_start.elapsed().as_secs_f64()), "ready");
 
     on_ready(&tok, arch);
 

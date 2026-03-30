@@ -22,6 +22,8 @@
 
 use std::path::PathBuf;
 
+use tracing::{info, warn, error};
+
 use crate::engine;
 use crate::gpu;
 use crate::model::config::ModelArch;
@@ -157,35 +159,26 @@ pub(crate) fn load_model_and_run(
     // Resolve --tp 0 → auto-detect available GPUs.
     if tp == 0 {
         tp = gpu::device_count();
-        eprintln!("auto-detected {} GPU(s)", tp);
+        info!(count = tp, "auto-detected GPU(s)");
     }
 
     // Multi-GPU tensor parallelism is CUDA-only (requires NCCL).
     #[cfg(not(feature = "cuda"))]
     if tp > 1 {
-        eprintln!(
-            "warning: --tp {} ignored (multi-GPU requires CUDA + NCCL), using single GPU",
-            tp
-        );
+        warn!(tp, "--tp ignored (multi-GPU requires CUDA + NCCL), using single GPU");
         tp = 1;
     }
 
     // Log sampling strategy so the user knows what to expect.
     if args.temperature == 0.0 {
-        eprintln!("sampling: greedy (temperature=0)");
+        info!("sampling: greedy (temperature=0)");
     } else {
-        eprintln!(
-            "sampling: temperature={}, top_p={}",
-            args.temperature, args.top_p
-        );
+        info!(temperature = args.temperature, top_p = args.top_p, "sampling parameters");
     }
 
     let kv_quant = crate::model::turboquant::KvQuantMode::from_str(&args.kv_quant)
         .unwrap_or_else(|| {
-            eprintln!(
-                "error: invalid --kv-quant value '{}', expected: turbo4, turbo3, turbo2, none",
-                args.kv_quant
-            );
+            error!(value = %args.kv_quant, "invalid --kv-quant value, expected: turbo4, turbo3, turbo2, none");
             std::process::exit(1);
         });
 
@@ -195,7 +188,7 @@ pub(crate) fn load_model_and_run(
         let data = std::fs::read(image_path).map_err(|e| {
             anyhow::anyhow!("failed to read image '{}': {e}", image_path.display())
         })?;
-        eprintln!("image: {} ({} bytes)", image_path.display(), data.len());
+        info!(path = %image_path.display(), bytes = data.len(), "image loaded");
         let model_config = crate::model::config::ModelConfig::from_file(
             &args.model.join("config.json"),
         )?;
@@ -204,9 +197,11 @@ pub(crate) fn load_model_and_run(
             anyhow::anyhow!("--image requires a vision model (no vision_config in config.json)")
         })?;
         let processed = crate::model::vision::preprocess_image(&data, &vc)?;
-        eprintln!(
-            "image preprocessed: {}x{} patches, {} vision tokens",
-            processed.grid_h, processed.grid_w, processed.num_vision_tokens
+        info!(
+            grid_h = processed.grid_h,
+            grid_w = processed.grid_w,
+            vision_tokens = processed.num_vision_tokens,
+            "image preprocessed"
         );
         vec![processed]
     } else {

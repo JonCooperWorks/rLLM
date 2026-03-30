@@ -178,11 +178,11 @@ impl AuthProvider for StaticApiKeyProvider {
                 Ok(new_hash) => {
                     let mut hash = self.key_hash.write().await;
                     *hash = new_hash;
-                    eprintln!("  auth: static_api_key hash reloaded");
+                    tracing::info!("static API key hash reloaded");
                 }
                 Err(e) => {
                     // Keep the old hash — don't break a running server.
-                    eprintln!("  auth: failed to reload static_api_key config: {e}");
+                    tracing::warn!(error = %e, "failed to reload static API key config");
                 }
             }
         }

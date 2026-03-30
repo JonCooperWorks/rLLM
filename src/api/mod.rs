@@ -58,6 +58,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use axum::response::IntoResponse;
 use auth::AuthProvider;
 use crate::ServeArgs;
 use crate::engine;
@@ -162,18 +163,27 @@ pub(crate) struct ServerState {
 
 /// GET /health — returns 200 when ready, 503 during shutdown.
 ///
+/// Returns a JSON body with queue depth for observability.  Load balancers
+/// can use the status code alone; dashboards can parse the body for details.
+///
 /// Since the server only binds after model loading completes (spawn_worker
 /// blocks until the engine is ready), a reachable /health endpoint implies
 /// the model is loaded and serving.  During shutdown, it returns 503 so
 /// load balancers stop routing traffic before connections are closed.
 async fn health_handler(
     axum::extract::State(state): axum::extract::State<Arc<ServerState>>,
-) -> impl axum::response::IntoResponse {
-    if state.shutting_down.load(Ordering::Relaxed) {
-        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "shutting down")
+) -> axum::response::Response {
+    let status = if state.shutting_down.load(Ordering::Relaxed) {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
     } else {
-        (axum::http::StatusCode::OK, "ok")
-    }
+        axum::http::StatusCode::OK
+    };
+    let body = serde_json::json!({
+        "status": if status == axum::http::StatusCode::OK { "ok" } else { "shutting_down" },
+        "active_sequences": state.metrics.active_sequences.get(),
+        "waiting_sequences": state.metrics.waiting_sequences.get(),
+    });
+    (status, axum::Json(body)).into_response()
 }
 
 /// Preprocess images from the last user message for vision models.
@@ -299,16 +309,10 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // ------------------------------------------------------------------
     // 2. Load model.
     // ------------------------------------------------------------------
-    eprintln!();
-    eprintln!("  rllm — loading {}", model_name);
-    eprintln!("  ----------------------------------------");
     // Detect pre-quantized models by checking safetensors metadata.
     let is_prequantized = crate::model::loader::is_prequantized_model(&args.model);
-    if is_prequantized {
-        eprintln!("  mode      : Q4 (pre-quantized)");
-    } else {
-        eprintln!("  mode      : bf16");
-    }
+    let mode = if is_prequantized { "Q4 (pre-quantized)" } else { "bf16" };
+    tracing::info!(model = %model_name, mode, "loading model");
 
     // Resolve --tp 0 → auto-detect available GPUs.
     let mut tp = args.tp;
@@ -320,31 +324,33 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // On macOS (Metal), fall back to single GPU with a warning.
     #[cfg(not(feature = "cuda"))]
     if tp > 1 {
-        eprintln!(
-            "  warning   : --tp {} ignored (multi-GPU requires CUDA + NCCL), using single GPU",
-            tp
-        );
+        tracing::warn!(requested_tp = tp, "multi-GPU requires CUDA + NCCL, falling back to single GPU");
         tp = 1;
     }
 
     if tp > 1 {
-        eprintln!("  tp        : {} GPUs", tp);
+        tracing::info!(gpus = tp, "tensor parallelism enabled");
     }
 
     let kv_quant = crate::model::turboquant::KvQuantMode::from_str(&args.kv_quant)
         .unwrap_or_else(|| {
-            eprintln!("error: invalid --kv-quant value '{}', expected: turbo4, turbo3, turbo2, none", args.kv_quant);
+            tracing::error!(value = %args.kv_quant, "invalid --kv-quant value, expected: turbo4, turbo3, turbo2, none");
             std::process::exit(1);
         });
 
     let server_metrics = Arc::new(metrics::Metrics::new());
+
+    let request_timeout = std::time::Duration::from_secs(args.request_timeout);
 
     let WorkerHandle {
         request_tx,
         tokenizer,
         arch,
         vision_config: _,
-    } = spawn_worker(args.model.clone(), args.stream_experts, tp, kv_quant, server_metrics.clone())?;
+    } = spawn_worker(
+        args.model.clone(), args.stream_experts, tp, kv_quant,
+        server_metrics.clone(), args.max_pending, args.max_active, request_timeout,
+    )?;
 
     // Parse vision config + image token ID from config.json for handler-side preprocessing.
     let parsed_config = config::ModelConfig::from_file(&args.model.join("config.json")).ok();
@@ -374,13 +380,13 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("auth config missing \"provider\" field"))?;
         match provider_name {
             "oidc" => {
-                eprintln!("  auth      : oidc");
+                tracing::info!(provider = "oidc", "auth enabled");
                 let provider =
                     rt.block_on(auth::oidc::OidcProvider::init(&config))?;
                 auth::AuthProviderKind::Oidc(Arc::new(provider))
             }
             "static_api_key" => {
-                eprintln!("  auth      : static_api_key");
+                tracing::info!(provider = "static_api_key", "auth enabled");
                 // Inject the config file path so the background task can
                 // re-read it for hot reload of the key hash.
                 let mut config = config;
@@ -405,7 +411,7 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 args.host
             );
         }
-        eprintln!("  auth      : none");
+        tracing::info!(provider = "none", "auth disabled");
         auth::AuthProviderKind::None
     };
 
@@ -415,23 +421,21 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
     if auth_provider.is_enabled()
         && matches!(tls_mode, tls::TlsMode::None)
     {
-        eprintln!();
-        eprintln!("  WARNING: auth is enabled but TLS is disabled.");
-        eprintln!("  Bearer tokens, prompts, and completions are sent in plaintext.");
-        eprintln!("  An attacker with network access can intercept tokens to");
-        eprintln!("  impersonate users, read prompts and completions, or modify");
-        eprintln!("  requests and responses in transit (man-in-the-middle).");
-        eprintln!("  This is safe over localhost or an SSH tunnel, but dangerous");
-        eprintln!("  on any network an attacker can observe.");
-        eprintln!("  To fix: add --cert/--private-key or --letsencrypt.");
-        eprintln!();
+        tracing::warn!(
+            "auth is enabled but TLS is disabled — tokens, prompts, and completions are sent \
+             in plaintext. Add --cert/--private-key or --letsencrypt to fix."
+        );
     }
 
-    eprintln!("  ----------------------------------------");
-    eprintln!("  endpoint  : {scheme}://{addr}/v1/chat/completions");
-    eprintln!("  health    : {scheme}://{addr}/health");
-    eprintln!("  metrics   : {scheme}://{addr}/metrics");
-    eprintln!();
+    tracing::info!(
+        endpoint = %format_args!("{scheme}://{addr}/v1/chat/completions"),
+        health = %format_args!("{scheme}://{addr}/health"),
+        metrics = %format_args!("{scheme}://{addr}/metrics"),
+        max_pending = args.max_pending,
+        max_active = args.max_active,
+        request_timeout_secs = args.request_timeout,
+        "server ready",
+    );
 
     let shutting_down = Arc::new(AtomicBool::new(false));
 
@@ -504,7 +508,7 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
             {
                 ctrl_c.await.ok();
             }
-            eprintln!("shutdown signal received, draining in-flight requests...");
+            tracing::info!("shutdown signal received, draining in-flight requests");
             shutdown_flag.store(true, Ordering::Relaxed);
             let _ = shutdown_tx.send(true);
         });
@@ -572,30 +576,52 @@ fn spawn_worker(
     tp: usize,
     kv_quant: crate::model::turboquant::KvQuantMode,
     metrics: Arc<metrics::Metrics>,
+    max_pending: usize,
+    max_active: usize,
+    request_timeout: std::time::Duration,
 ) -> anyhow::Result<WorkerHandle> {
-    let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
+    let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(max_pending);
     type ReadyPayload = (Arc<tokenizer::Tokenizer>, config::ModelArch, Option<crate::model::config::VisionConfig>);
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<
         Result<ReadyPayload, String>,
     >(1);
 
     std::thread::spawn(move || {
-        let max_active = 32;
+        let run = || -> anyhow::Result<()> {
+            engine::loader::load_and_run_ext(
+                &model_dir,
+                stream_experts,
+                tp,
+                kv_quant,
+                max_active,
+                |tok, arch| {
+                    let _ = ready_tx.send(Ok((Arc::new(tok.clone()), arch, None)));
+                },
+                |eng| run_worker_loop(eng, request_rx, metrics, request_timeout),
+            )
+        };
 
-        let result = engine::loader::load_and_run_ext(
-            &model_dir,
-            stream_experts,
-            tp,
-            kv_quant,
-            max_active,
-            |tok, arch| {
-                let _ = ready_tx.send(Ok((Arc::new(tok.clone()), arch, None)));
-            },
-            |eng| run_worker_loop(eng, request_rx, metrics),
-        );
-
-        if let Err(e) = result {
-            let _ = ready_tx.send(Err(format!("{e:#}")));
+        // catch_unwind prevents a panic in the GPU backend or model code from
+        // silently killing the worker thread.  Without this, a panic leaves
+        // all in-flight requests hanging forever and the server appears alive
+        // but cannot process any new work.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = ready_tx.send(Err(format!("{e:#}")));
+                tracing::error!(error = %e, "worker thread exited with error");
+            }
+            Err(panic_payload) => {
+                let msg = match panic_payload.downcast_ref::<&str>() {
+                    Some(s) => s.to_string(),
+                    None => match panic_payload.downcast_ref::<String>() {
+                        Some(s) => s.clone(),
+                        None => "unknown panic".to_string(),
+                    },
+                };
+                let _ = ready_tx.send(Err(format!("worker panicked: {msg}")));
+                tracing::error!(panic = %msg, "worker thread panicked");
+            }
         }
     });
 
@@ -619,6 +645,9 @@ struct RequestContext {
     response_tx: tokio::sync::mpsc::Sender<InferenceEvent>,
     prompt_token_count: usize,
     generated_count: usize,
+    /// Absolute deadline after which this request is aborted.
+    /// None means no timeout (request_timeout was 0).
+    deadline: Option<Instant>,
     /// Running buffer of all generated token IDs for this sequence.
     /// Used for incremental decoding: we decode the full buffer each step
     /// and emit only the new characters.  This avoids SentencePiece Strip
@@ -709,14 +738,17 @@ fn run_worker_loop(
     engine: &mut dyn engine::InferenceEngine,
     request_rx: std::sync::mpsc::Receiver<WorkerRequest>,
     metrics: Arc<metrics::Metrics>,
+    request_timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
     let mut registry: HashMap<SeqId, RequestContext> = HashMap::new();
+    let has_timeout = !request_timeout.is_zero();
 
     /// Helper: register a WorkerRequest with the engine and request registry.
     fn register_request(
         engine: &mut dyn engine::InferenceEngine,
         registry: &mut HashMap<SeqId, RequestContext>,
         req: WorkerRequest,
+        deadline: Option<Instant>,
     ) {
         let prompt_token_count = req.prompt_tokens.len();
         let thinking = req.thinking.unwrap_or(false);
@@ -737,6 +769,7 @@ fn run_worker_loop(
                 response_tx: req.response_tx,
                 prompt_token_count,
                 generated_count: 0,
+                deadline,
                 cached_tokens: 0,
                 token_ids: Vec::new(),
                 prev_text_len: 0,
@@ -752,16 +785,18 @@ fn run_worker_loop(
     }
 
     loop {
+        let deadline = if has_timeout { Some(Instant::now() + request_timeout) } else { None };
+
         // 1. Drain all pending requests (non-blocking).
         while let Ok(req) = request_rx.try_recv() {
-            register_request(engine, &mut registry, req);
+            register_request(engine, &mut registry, req, deadline);
         }
 
         // 2. If no work, block until a new request arrives.
         if !engine.has_work() {
             match request_rx.recv() {
                 Ok(req) => {
-                    register_request(engine, &mut registry, req);
+                    register_request(engine, &mut registry, req, deadline);
                 }
                 Err(_) => break, // Channel closed — server shutting down.
             }
@@ -938,22 +973,19 @@ fn run_worker_loop(
                 } else {
                     String::new()
                 };
-                // Include user identity in the log line when auth is enabled.
-                let user_label = ctx.user.as_ref().map(|u| {
-                    format!("  {}  |", u.sub)
-                }).unwrap_or_default();
-                eprintln!(
-                    "  req {}  |  seq {:>3}  |{} {} prompt{} + {} gen  |  TTFT {:.0} ms  |  {:.1} tok/s  |  {:.2}s  |  {}",
-                    ctx.request_id,
-                    finished.id,
-                    user_label,
-                    ctx.prompt_token_count,
-                    cache_label,
-                    ctx.generated_count,
-                    ttft_ms.unwrap_or(0.0),
-                    tok_per_sec,
-                    total_secs,
-                    stop_label,
+                let user_sub = ctx.user.as_ref().map(|u| u.sub.as_str()).unwrap_or("-");
+                tracing::info!(
+                    request_id = %ctx.request_id,
+                    seq = finished.id,
+                    user = user_sub,
+                    prompt_tokens = ctx.prompt_token_count,
+                    cached_tokens = ctx.cached_tokens,
+                    generated_tokens = ctx.generated_count,
+                    ttft_ms = format_args!("{:.0}", ttft_ms.unwrap_or(0.0)),
+                    tok_per_sec = format_args!("{:.1}", tok_per_sec),
+                    total_secs = format_args!("{:.2}", total_secs),
+                    stop = stop_label,
+                    "request complete",
                 );
 
                 record_completion_metrics(&metrics, &ctx);
@@ -982,6 +1014,31 @@ fn run_worker_loop(
             engine.abort_sequence(id);
             registry.remove(&id);
         }
+
+        // 7. Abort timed-out sequences.
+        if has_timeout {
+            let now = Instant::now();
+            let timed_out: Vec<SeqId> = registry
+                .iter()
+                .filter(|(_, ctx)| ctx.deadline.is_some_and(|d| now >= d))
+                .map(|(&id, _)| id)
+                .collect();
+            for id in timed_out {
+                if let Some(ctx) = registry.remove(&id) {
+                    tracing::warn!(
+                        request_id = %ctx.request_id,
+                        generated = ctx.generated_count,
+                        timeout_secs = request_timeout.as_secs(),
+                        "request timed out",
+                    );
+                    metrics.request_timeouts.inc();
+                    let _ = ctx.response_tx.blocking_send(InferenceEvent::Error(
+                        format!("request timed out after {}s", request_timeout.as_secs()),
+                    ));
+                    engine.abort_sequence(id);
+                }
+            }
+        }
     }
 
     Ok(())
@@ -1004,6 +1061,7 @@ mod tests {
             response_tx: tx,
             prompt_token_count: prompt_tokens,
             generated_count: generated,
+            deadline: None,
             token_ids: Vec::new(),
             prev_text_len: 0,
             cached_tokens: cached,
@@ -1052,6 +1110,7 @@ mod tests {
             response_tx: tx,
             prompt_token_count: 10,
             generated_count: 0,
+            deadline: None,
             token_ids: Vec::new(),
             prev_text_len: 0,
             cached_tokens: 0,
@@ -1072,5 +1131,88 @@ mod tests {
         // Duration and counters should still be recorded.
         assert_eq!(m.request_duration.get_sample_count(), 1);
         assert_eq!(m.prompt_tokens.get(), 10);
+    }
+
+    #[test]
+    fn request_timeout_counter_is_separate_from_errors() {
+        let m = metrics::Metrics::new();
+        // Simulate a timeout and an error — they go to different counters.
+        m.request_timeouts.inc();
+        m.errors.inc();
+        m.errors.inc();
+        assert_eq!(m.request_timeouts.get(), 1);
+        assert_eq!(m.errors.get(), 2);
+    }
+
+    #[test]
+    fn deadline_computed_from_timeout() {
+        // Zero timeout → no deadline.
+        let timeout = std::time::Duration::ZERO;
+        let has_timeout = !timeout.is_zero();
+        assert!(!has_timeout);
+
+        // Non-zero timeout → deadline is in the future.
+        let timeout = std::time::Duration::from_secs(30);
+        let has_timeout = !timeout.is_zero();
+        assert!(has_timeout);
+        let deadline = Instant::now() + timeout;
+        assert!(deadline > Instant::now());
+    }
+
+    #[test]
+    fn expired_deadline_detected() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let ctx = RequestContext {
+            request_id: "timeout-test".into(),
+            response_tx: tx,
+            prompt_token_count: 10,
+            generated_count: 5,
+            // Set deadline to 50ms ago — should be expired.
+            deadline: Some(Instant::now() - std::time::Duration::from_millis(50)),
+            token_ids: Vec::new(),
+            prev_text_len: 0,
+            cached_tokens: 0,
+            created_at: Instant::now() - std::time::Duration::from_secs(1),
+            first_token_at: None,
+            thinking: false,
+            inject_marker: None,
+            user: None,
+            stop: Vec::new(),
+            full_text: String::new(),
+        };
+        let now = Instant::now();
+        assert!(ctx.deadline.is_some_and(|d| now >= d));
+    }
+
+    #[test]
+    fn no_deadline_never_expires() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let ctx = RequestContext {
+            request_id: "no-timeout".into(),
+            response_tx: tx,
+            prompt_token_count: 10,
+            generated_count: 5,
+            deadline: None,
+            token_ids: Vec::new(),
+            prev_text_len: 0,
+            cached_tokens: 0,
+            created_at: Instant::now(),
+            first_token_at: None,
+            thinking: false,
+            inject_marker: None,
+            user: None,
+            stop: Vec::new(),
+            full_text: String::new(),
+        };
+        let now = Instant::now();
+        assert!(!ctx.deadline.is_some_and(|d| now >= d));
+    }
+
+    #[test]
+    fn timeout_metric_in_prometheus_output() {
+        let m = metrics::Metrics::new();
+        m.request_timeouts.inc_by(3);
+        let output = m.encode();
+        assert!(output.contains("rllm_request_timeouts_total 3"));
     }
 }

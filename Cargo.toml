@@ -33,6 +33,8 @@ jsonwebtoken = "9"
 argon2 = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 prometheus = "0.13"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.33.0"

@@ -33,6 +33,8 @@
 //   Forward:     model/forward.rs (ModelForward trait, MoeBuffers)
 // ===========================================================================
 
+use tracing::debug;
+
 use crate::gpu::{
     GpuAllReduce, GpuAttention, GpuBackend, GpuCore, GpuElementwise, GpuEmbed, GpuMatmul,
     GpuNorm, GpuRope, GpuTurboQuant, TensorDtype,
@@ -607,7 +609,7 @@ fn load_gpt_oss_moe<B: GpuCore>(
 
     let expert_vec = if skip_experts {
         if layer_idx == 0 {
-            eprintln!("  skipping {} experts per layer (streaming from SSD)", num_experts);
+            debug!(num_experts = num_experts, "skipping experts per layer (streaming from SSD)");
         }
         Vec::new()
     } else if is_mxfp4 {
@@ -641,8 +643,8 @@ fn load_gpt_oss_moe<B: GpuCore>(
         } else {
             String::new()
         };
-        eprintln!(
-            "  loading {} experts per layer (moe_inter={}){}",
+        debug!(
+            "loading {} experts per layer (moe_inter={}){}",
             loaded_count, moe_inter, ep_suffix,
         );
     }

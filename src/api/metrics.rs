@@ -44,6 +44,8 @@ pub(crate) struct Metrics {
     pub prefix_cache_hits: IntCounter,
     /// Total inference errors (engine.step() failures).
     pub errors: IntCounter,
+    /// Requests aborted due to per-request timeout.
+    pub request_timeouts: IntCounter,
     /// The registry these metrics are registered with.
     registry: Registry,
 }
@@ -146,6 +148,15 @@ impl Metrics {
         .unwrap();
         registry.register(Box::new(errors.clone())).unwrap();
 
+        let request_timeouts = IntCounter::with_opts(Opts::new(
+            "rllm_request_timeouts_total",
+            "Requests aborted due to per-request timeout",
+        ))
+        .unwrap();
+        registry
+            .register(Box::new(request_timeouts.clone()))
+            .unwrap();
+
         Self {
             request_duration,
             time_to_first_token,
@@ -157,6 +168,7 @@ impl Metrics {
             waiting_sequences,
             prefix_cache_hits,
             errors,
+            request_timeouts,
             registry,
         }
     }
@@ -254,6 +266,15 @@ mod tests {
         assert_eq!(m.request_duration.get_sample_count(), 1);
         assert_eq!(m.time_to_first_token.get_sample_count(), 1);
         assert_eq!(m.decode_tokens_per_second.get_sample_count(), 1);
+    }
+
+    #[test]
+    fn timeout_counter_increments() {
+        let m = Metrics::new();
+        assert_eq!(m.request_timeouts.get(), 0);
+        m.request_timeouts.inc();
+        m.request_timeouts.inc();
+        assert_eq!(m.request_timeouts.get(), 2);
     }
 
     #[test]

@@ -207,10 +207,10 @@ impl AuthProvider for OidcProvider {
             .await
             .map_err(|e| anyhow::anyhow!("invalid JWKS: {e}"))?;
 
-        eprintln!(
-            "  oidc      : {} ({} keys cached)",
-            oidc_config.issuer,
-            jwks.keys.len()
+        tracing::info!(
+            issuer = %oidc_config.issuer,
+            keys = jwks.keys.len(),
+            "OIDC provider initialized",
         );
 
         Ok(Self {
@@ -360,7 +360,7 @@ impl AuthProvider for OidcProvider {
         loop {
             tokio::time::sleep(interval).await;
             if let Err(e) = self.refresh_jwks().await {
-                eprintln!("  warning   : JWKS refresh failed: {e}");
+                tracing::warn!(error = %e, "JWKS refresh failed");
             }
         }
     }
@@ -474,7 +474,7 @@ impl OidcProvider {
             // Keys rotated — take the write lock and swap.
             let count = new_jwks.keys.len();
             *self.jwks.write().await = new_jwks;
-            eprintln!("  oidc      : JWKS rotated ({count} keys)");
+            tracing::info!(keys = count, "JWKS rotated");
         }
 
         Ok(())

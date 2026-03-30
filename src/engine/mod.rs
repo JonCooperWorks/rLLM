@@ -56,6 +56,8 @@ pub(crate) mod multi_gpu;
 
 use std::collections::{HashMap, VecDeque};
 
+use tracing::{info, debug};
+
 use self::dispatch::Dispatch;
 use crate::gpu::GpuBackend;
 use crate::model::forward::ModelForward;
@@ -359,10 +361,10 @@ impl<S> Scheduler<S> {
 
         let seq = self.active.remove(&victim_id).unwrap();
 
-        eprintln!(
-            "  preempt  |  evicting seq {} ({} generated tokens) to free KV blocks",
-            victim_id,
-            seq.generated_tokens.len(),
+        info!(
+            seq_id = victim_id,
+            generated_tokens = seq.generated_tokens.len(),
+            "preempt: evicting seq to free KV blocks",
         );
 
         // Free all KV blocks (releases prefix cache refs too).
@@ -478,9 +480,12 @@ pub(crate) fn run_step<D: Dispatch>(
             );
             seq.cached_tokens = prefix_len;
 
-            eprintln!(
-                "  seq {:>3}  |  prefix cache hit: {} tokens ({} blocks), prefilling {} suffix tokens",
-                id, prefix_len, prefix_block_count, tokens.len() - prefix_len,
+            debug!(
+                seq_id = id,
+                cached_tokens = prefix_len,
+                cached_blocks = prefix_block_count,
+                suffix_tokens = tokens.len() - prefix_len,
+                "prefix cache hit",
             );
 
             prefix_len

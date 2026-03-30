@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use safetensors::SafeTensors;
+use tracing::{info, debug};
 
 use crate::model::config::ModelConfig;
 use crate::model::expert_stream::{self, FusedLayerInfo, PerExpertInfo, safetensors_data_start};
@@ -121,16 +122,16 @@ pub(crate) fn build_expert_index_from_safetensors(
         // Check if fused expert tensors are pre-quantized (Q4 or Q8).
         let fused_gate_up = format!("{prefix_base}0.mlp.experts.gate_up_proj");
         let expert_quant = if q4_expert_names.contains(&fused_gate_up) {
-            eprintln!("  detected pre-quantized expert data (rllm-q4)");
+            debug!("detected pre-quantized expert data (rllm-q4)");
             Some(crate::gpu::ops::quant::QuantFormat::Q4)
         } else if q8_expert_names.contains(&fused_gate_up) {
-            eprintln!("  detected pre-quantized expert data (rllm-q8)");
+            debug!("detected pre-quantized expert data (rllm-q8)");
             Some(crate::gpu::ops::quant::QuantFormat::Q8)
         } else {
             None
         };
 
-        eprintln!("  built expert index: {} layers × {} experts (fused format)", num_layers, num_experts);
+        info!(layers = num_layers, experts = num_experts, format = "fused", "built expert index");
 
         Ok(expert_stream::build_fused_expert_index(
             layer_info, shard_files, hidden, moe_inter, num_experts, expert_quant,
@@ -200,16 +201,16 @@ pub(crate) fn build_expert_index_from_safetensors(
             format!("{test_prefix}.block_sparse_moe.experts.0.w1.weight")
         };
         let expert_quant = if q4_expert_names.contains(&first_expert_gate) {
-            eprintln!("  detected pre-quantized expert data (rllm-q4)");
+            debug!("detected pre-quantized expert data (rllm-q4)");
             Some(crate::gpu::ops::quant::QuantFormat::Q4)
         } else if q8_expert_names.contains(&first_expert_gate) {
-            eprintln!("  detected pre-quantized expert data (rllm-q8)");
+            debug!("detected pre-quantized expert data (rllm-q8)");
             Some(crate::gpu::ops::quant::QuantFormat::Q8)
         } else {
             None
         };
 
-        eprintln!("  built expert index: {} layers × {} experts (per-expert format)", num_layers, num_experts);
+        info!(layers = num_layers, experts = num_experts, format = "per-expert", "built expert index");
 
         Ok(expert_stream::build_per_expert_index(
             layer_info, shard_files, hidden, moe_inter, expert_quant,

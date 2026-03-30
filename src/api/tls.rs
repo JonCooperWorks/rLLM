@@ -123,8 +123,8 @@ pub(crate) async fn serve_letsencrypt(
         let mut state = std::pin::pin!(state);
         loop {
             match state.next().await {
-                Some(Ok(ok)) => eprintln!("acme: {ok:?}"),
-                Some(Err(err)) => eprintln!("acme error: {err:?}"),
+                Some(Ok(ok)) => tracing::info!(?ok, "acme event"),
+                Some(Err(err)) => tracing::error!(?err, "acme error"),
                 None => break,
             }
         }
@@ -181,7 +181,7 @@ async fn serve_tls_loop(
                             let tls_stream = match acceptor.accept(tcp_stream).await {
                                 Ok(stream) => stream,
                                 Err(err) => {
-                                    eprintln!("TLS handshake failed from {remote_addr}: {err}");
+                                    tracing::warn!(%remote_addr, %err, "TLS handshake failed");
                                     return;
                                 }
                             };
@@ -200,12 +200,12 @@ async fn serve_tls_loop(
                                     .serve_connection(stream, hyper_service)
                                     .await
                             {
-                                eprintln!("error serving {remote_addr}: {err}");
+                                tracing::error!(%remote_addr, %err, "error serving connection");
                             }
                         });
                     }
                     Err(err) => {
-                        eprintln!("TCP accept error: {err}");
+                        tracing::error!(%err, "TCP accept error");
                     }
                 }
             }
@@ -213,7 +213,7 @@ async fn serve_tls_loop(
 
         // Shutdown signal — stop accepting, drain in-flight connections.
         _ = shutdown => {
-            eprintln!("TLS server shutting down, draining {} in-flight connections...", connections.len());
+            tracing::info!(in_flight = connections.len(), "TLS server shutting down, draining connections");
         },
     }
 

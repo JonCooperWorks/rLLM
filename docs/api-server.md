@@ -44,8 +44,8 @@ runtime would block other requests.  The worker thread:
 2. **Batches naturally** — `try_recv()` drains all pending requests before each step
 3. **Avoids async/sync conflicts** — Metal/CUDA APIs are not async-safe
 
-**Note:** The `SyncSender` channel capacity should be tuned to avoid stalling
-HTTP handlers under burst load.
+**Note:** The `SyncSender` channel capacity is configurable via `--max-pending`
+(default 8).  Tune to avoid stalling HTTP handlers under burst load.
 
 ### Key Types
 
@@ -76,6 +76,7 @@ Supports:
 - `model`, `messages`, `max_tokens`, `temperature`, `top_p`
 - `stream: true` for Server-Sent Events (SSE) streaming
 - `tools` / `tool_choice` for function calling
+- `response_format: {"type": "json_object"}` for JSON mode
 
 ### Anthropic-Compatible (`src/api/anthropic.rs`)
 
@@ -138,6 +139,20 @@ loop {
 This naturally implements continuous batching — new requests are picked up
 every step, and finished requests are removed immediately.
 
+### Request Timeouts
+
+Each request has a deadline (`--request-timeout`, default 300s).  After every
+engine step, the worker checks for expired deadlines and aborts those sequences,
+sending an error to the client.  This prevents one hung request from blocking
+the entire server.
+
+### Panic Recovery
+
+The worker thread is wrapped in `catch_unwind`.  If a GPU backend or model
+panic occurs, the error is captured and sent to any waiting startup channel.
+Without this, a panic would silently kill the worker and leave all in-flight
+requests hanging forever.
+
 ---
 
 ## Observability
@@ -149,7 +164,7 @@ the channel to the worker thread.  The same ID appears in three places:
 
 1. **`X-Request-Id` response header** — returned to the client on every response
    (streaming and non-streaming).
-2. **Worker stderr log** — `req 3a8f...  |  seq   1  |  128 prompt + 64 gen  |  ...`
+2. **Worker log** — `request_id=3a8f... seq=1 prompt_tokens=128 generated_tokens=64 ...`
 3. **Response body** — the `id` field in OpenAI/Anthropic JSON responses.
 
 This lets you correlate a client-observed issue to the server-side log line.
@@ -171,6 +186,7 @@ Exempted from auth (like `/health`) so scrapers don't need credentials.
 | `rllm_waiting_sequences` | Gauge | Sequences in the admission queue |
 | `rllm_prefix_cache_hits_total` | Counter | Prefix cache hits |
 | `rllm_errors_total` | Counter | Engine step failures |
+| `rllm_request_timeouts_total` | Counter | Requests aborted due to timeout |
 
 **Where metrics are recorded:**
 - Histograms and token counters are recorded in the worker loop when a
@@ -196,18 +212,46 @@ TLS is optional — plain HTTP is the default for local development.
 
 ---
 
+## Structured Logging
+
+All logging uses the `tracing` crate with structured fields.  Default level is
+`info`; override with the `RUST_LOG` environment variable (e.g. `RUST_LOG=debug`).
+Output goes to stderr in human-readable format.
+
+---
+
+## Graceful Shutdown
+
+On SIGTERM or SIGINT:
+1. `/health` starts returning 503 (load balancers stop sending traffic)
+2. The server stops accepting new connections
+3. In-flight requests are drained to completion
+4. Server exits cleanly
+
+Works for both plain HTTP and TLS modes.
+
+---
+
 ## CLI Flags
 
 ```
 rllm serve [OPTIONS]
 
 Options:
-  --model <PATH>       Path to model directory
-  --host <HOST>        Bind address (default: 0.0.0.0)
-  --port <PORT>        Bind port (default: 8080)
-  --tp <N>             Tensor parallelism (number of GPUs)
-  --tls-cert <PATH>    TLS certificate file
-  --tls-key <PATH>     TLS private key file
+  --model <PATH>          Path to model directory
+  --host <HOST>           Bind address (default: 127.0.0.1)
+  --port <PORT>           Bind port (default: 8080)
+  --tp <N>                Tensor parallelism — number of GPUs (default: 0 = auto)
+  --max-pending <N>       Max queued requests between handlers and worker (default: 8)
+  --max-active <N>        Max concurrent sequences in the engine (default: 32)
+  --request-timeout <S>   Per-request timeout in seconds (default: 300, 0 = none)
+  --cert <PATH>           TLS certificate file (PEM)
+  --private-key <PATH>    TLS private key file (PEM)
+  --letsencrypt           Automatic TLS via Let's Encrypt
+  --domain <DOMAIN>       Domain for Let's Encrypt
+  --auth-config <PATH>    Path to auth config JSON
+  --kv-quant <MODE>       KV cache quantization (default: turbo4)
+  --stream-experts        Stream MoE experts from SSD
 ```
 
 ---
