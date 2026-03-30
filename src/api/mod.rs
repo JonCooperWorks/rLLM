@@ -602,6 +602,36 @@ struct RequestContext {
 // engine::loader::load_and_run() after constructing the appropriate engine.
 // ---------------------------------------------------------------------------
 
+/// Record Prometheus metrics for a completed request.
+///
+/// Called from both the normal completion path (section 5) and the
+/// stop-sequence path (section 4) to avoid missing metrics for
+/// sequences that finish via stop strings.
+fn record_completion_metrics(metrics: &metrics::Metrics, ctx: &RequestContext) {
+    let now = Instant::now();
+    let total_secs = now.duration_since(ctx.created_at).as_secs_f64();
+    metrics.request_duration.observe(total_secs);
+
+    if let Some(first) = ctx.first_token_at {
+        let ttft_secs = first.duration_since(ctx.created_at).as_secs_f64();
+        metrics.time_to_first_token.observe(ttft_secs);
+
+        let decode_secs = now.duration_since(first).as_secs_f64();
+        let decode_tokens = ctx.generated_count.saturating_sub(1);
+        if decode_secs > 0.0 {
+            metrics
+                .decode_tokens_per_second
+                .observe(decode_tokens as f64 / decode_secs);
+        }
+    }
+
+    metrics.prompt_tokens.inc_by(ctx.prompt_token_count as u64);
+    metrics.completion_tokens.inc_by(ctx.generated_count as u64);
+    if ctx.cached_tokens > 0 {
+        metrics.prefix_cache_hits.inc();
+    }
+}
+
 /// Run the continuous batching loop for any InferenceEngine.
 ///
 /// Blocks the calling thread until the request channel closes (server shutdown).
@@ -781,7 +811,9 @@ fn run_worker_loop(
                 }
 
                 if hit_stop {
-                    // Send Done with EndOfSequence and abort the engine sequence.
+                    // Record metrics for stop-sequence completions (these
+                    // bypass section 5 because the engine aborts them).
+                    record_completion_metrics(&metrics, ctx);
                     let _ = ctx.response_tx.blocking_send(InferenceEvent::Done {
                         stop_reason: StopReason::EndOfSequence,
                         prompt_tokens: ctx.prompt_token_count,
@@ -855,21 +887,7 @@ fn run_worker_loop(
                     stop_label,
                 );
 
-                // Record Prometheus metrics.
-                metrics.request_duration.observe(total_secs);
-                if let Some(ttft_secs) = ctx.first_token_at.map(|t| {
-                    t.duration_since(ctx.created_at).as_secs_f64()
-                }) {
-                    metrics.time_to_first_token.observe(ttft_secs);
-                }
-                if tok_per_sec > 0.0 {
-                    metrics.decode_tokens_per_second.observe(tok_per_sec);
-                }
-                metrics.prompt_tokens.inc_by(ctx.prompt_token_count as u64);
-                metrics.completion_tokens.inc_by(ctx.generated_count as u64);
-                if ctx.cached_tokens > 0 {
-                    metrics.prefix_cache_hits.inc();
-                }
+                record_completion_metrics(&metrics, &ctx);
 
                 let _ = ctx.response_tx.blocking_send(InferenceEvent::Done {
                     stop_reason,
@@ -898,4 +916,92 @@ fn run_worker_loop(
     }
 
     Ok(())
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal RequestContext for testing metrics recording.
+    fn test_ctx(prompt_tokens: usize, generated: usize, cached: usize) -> RequestContext {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let created = Instant::now() - std::time::Duration::from_millis(100);
+        RequestContext {
+            request_id: "test-id".into(),
+            response_tx: tx,
+            prompt_token_count: prompt_tokens,
+            generated_count: generated,
+            token_ids: Vec::new(),
+            prev_text_len: 0,
+            cached_tokens: cached,
+            created_at: created,
+            first_token_at: Some(created + std::time::Duration::from_millis(20)),
+            thinking: false,
+            inject_marker: None,
+            user: None,
+            stop: Vec::new(),
+            full_text: String::new(),
+        }
+    }
+
+    #[test]
+    fn record_completion_metrics_increments_counters() {
+        let m = metrics::Metrics::new();
+        let ctx = test_ctx(100, 50, 10);
+
+        record_completion_metrics(&m, &ctx);
+
+        assert_eq!(m.prompt_tokens.get(), 100);
+        assert_eq!(m.completion_tokens.get(), 50);
+        assert_eq!(m.prefix_cache_hits.get(), 1);
+        assert_eq!(m.request_duration.get_sample_count(), 1);
+        assert_eq!(m.time_to_first_token.get_sample_count(), 1);
+        assert_eq!(m.decode_tokens_per_second.get_sample_count(), 1);
+    }
+
+    #[test]
+    fn record_completion_metrics_no_cache_hit() {
+        let m = metrics::Metrics::new();
+        let ctx = test_ctx(50, 10, 0);
+
+        record_completion_metrics(&m, &ctx);
+
+        assert_eq!(m.prefix_cache_hits.get(), 0);
+        assert_eq!(m.prompt_tokens.get(), 50);
+    }
+
+    #[test]
+    fn record_completion_metrics_no_first_token() {
+        let m = metrics::Metrics::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let ctx = RequestContext {
+            request_id: "test".into(),
+            response_tx: tx,
+            prompt_token_count: 10,
+            generated_count: 0,
+            token_ids: Vec::new(),
+            prev_text_len: 0,
+            cached_tokens: 0,
+            created_at: Instant::now(),
+            first_token_at: None, // No tokens generated.
+            thinking: false,
+            inject_marker: None,
+            user: None,
+            stop: Vec::new(),
+            full_text: String::new(),
+        };
+
+        record_completion_metrics(&m, &ctx);
+
+        // TTFT and decode throughput should NOT be recorded.
+        assert_eq!(m.time_to_first_token.get_sample_count(), 0);
+        assert_eq!(m.decode_tokens_per_second.get_sample_count(), 0);
+        // Duration and counters should still be recorded.
+        assert_eq!(m.request_duration.get_sample_count(), 1);
+        assert_eq!(m.prompt_tokens.get(), 10);
+    }
 }

@@ -1,7 +1,7 @@
 // ===========================================================================
 // Prometheus metrics for the inference server.
 //
-// All metrics are registered with the global prometheus registry and exposed
+// All metrics are registered with a dedicated prometheus Registry and exposed
 // via the GET /metrics endpoint.  The worker thread (sync) records inference
 // metrics directly; HTTP handlers record request counts.
 //
@@ -16,9 +16,7 @@
 //   - api/anthropic.rs — handlers record request counts
 // ===========================================================================
 
-use prometheus::{
-    self, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, Opts, Registry,
-};
+use prometheus::{Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, Opts, Registry};
 
 /// All server metrics, constructed once at startup and shared via Arc.
 ///
@@ -36,7 +34,7 @@ pub(crate) struct Metrics {
     pub prompt_tokens: IntCounter,
     /// Total completion tokens generated.
     pub completion_tokens: IntCounter,
-    /// Total requests received, labelled by endpoint and status.
+    /// Total requests received, labelled by endpoint.
     pub requests_total: IntCounterVec,
     /// Number of sequences currently being processed by the engine.
     pub active_sequences: IntGauge,
@@ -174,12 +172,105 @@ impl Metrics {
     }
 }
 
+/// Prometheus text exposition content type.
+const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
 /// GET /metrics — Prometheus scrape endpoint.
 pub(crate) async fn metrics_handler(
     axum::extract::State(state): axum::extract::State<std::sync::Arc<super::ServerState>>,
 ) -> impl axum::response::IntoResponse {
     (
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        [(axum::http::header::CONTENT_TYPE, METRICS_CONTENT_TYPE)],
         state.metrics.encode(),
     )
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metrics_register_without_conflict() {
+        // Each Metrics instance uses its own Registry, so multiple instances
+        // must not conflict (important for test isolation).
+        let m1 = Metrics::new();
+        let m2 = Metrics::new();
+        m1.errors.inc();
+        assert_eq!(m1.errors.get(), 1);
+        assert_eq!(m2.errors.get(), 0);
+    }
+
+    #[test]
+    fn counters_increment() {
+        let m = Metrics::new();
+        m.prompt_tokens.inc_by(100);
+        m.completion_tokens.inc_by(50);
+        m.errors.inc();
+        m.prefix_cache_hits.inc();
+        m.requests_total.with_label_values(&["chat_completions"]).inc();
+        m.requests_total.with_label_values(&["messages"]).inc();
+        m.requests_total.with_label_values(&["messages"]).inc();
+
+        assert_eq!(m.prompt_tokens.get(), 100);
+        assert_eq!(m.completion_tokens.get(), 50);
+        assert_eq!(m.errors.get(), 1);
+        assert_eq!(m.prefix_cache_hits.get(), 1);
+        assert_eq!(
+            m.requests_total.with_label_values(&["chat_completions"]).get(),
+            1,
+        );
+        assert_eq!(
+            m.requests_total.with_label_values(&["messages"]).get(),
+            2,
+        );
+    }
+
+    #[test]
+    fn gauges_set_and_change() {
+        let m = Metrics::new();
+        assert_eq!(m.active_sequences.get(), 0);
+
+        m.active_sequences.set(5);
+        m.waiting_sequences.set(3);
+        assert_eq!(m.active_sequences.get(), 5);
+        assert_eq!(m.waiting_sequences.get(), 3);
+
+        m.active_sequences.set(2);
+        assert_eq!(m.active_sequences.get(), 2);
+    }
+
+    #[test]
+    fn histograms_observe() {
+        let m = Metrics::new();
+        m.request_duration.observe(1.5);
+        m.time_to_first_token.observe(0.05);
+        m.decode_tokens_per_second.observe(100.0);
+
+        // Histogram sample count increments on each observe.
+        assert_eq!(m.request_duration.get_sample_count(), 1);
+        assert_eq!(m.time_to_first_token.get_sample_count(), 1);
+        assert_eq!(m.decode_tokens_per_second.get_sample_count(), 1);
+    }
+
+    #[test]
+    fn encode_produces_prometheus_text() {
+        let m = Metrics::new();
+        m.prompt_tokens.inc_by(42);
+        m.errors.inc();
+        m.request_duration.observe(2.0);
+
+        let output = m.encode();
+
+        // Verify Prometheus text exposition format.
+        assert!(output.contains("rllm_prompt_tokens_total 42"));
+        assert!(output.contains("rllm_errors_total 1"));
+        assert!(output.contains("rllm_request_duration_seconds_bucket"));
+        assert!(output.contains("rllm_request_duration_seconds_count 1"));
+        // Metrics we didn't touch should still appear (with zero values).
+        assert!(output.contains("rllm_active_sequences 0"));
+    }
 }

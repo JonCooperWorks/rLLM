@@ -8,6 +8,7 @@ with synchronous GPU inference.
 - `src/api/mod.rs` — server setup, worker loop, shared types
 - `src/api/openai.rs` — OpenAI-compatible endpoints
 - `src/api/anthropic.rs` — Anthropic-compatible endpoint
+- `src/api/metrics.rs` — Prometheus metrics definitions and `/metrics` endpoint
 - `src/api/tls.rs` — TLS/HTTPS support
 - `src/commands/serve.rs` — CLI entry point for `rllm serve`
 
@@ -50,9 +51,11 @@ HTTP handlers under burst load.
 
 | Type | Purpose |
 |------|---------|
-| `ServerState` | Shared state: request channel, tokenizer, model name, arch |
-| `WorkerRequest` | Pre-tokenized prompt + generation params + response channel |
+| `ServerState` | Shared state: request channel, tokenizer, model name, arch, metrics |
+| `WorkerRequest` | Pre-tokenized prompt + generation params + response channel + request ID |
+| `RequestContext` | Per-sequence state in the worker: timing, token buffer, request ID |
 | `InferenceEvent` | `Token { text }`, `Done { stop_reason, tokens }`, or `Error(String)` |
+| `Metrics` | Prometheus counters, histograms, and gauges (see [Observability](#observability)) |
 
 Tokenization happens on the async handler thread (CPU-bound, fast).  Only
 the tokenized IDs cross the channel to the worker thread.
@@ -134,6 +137,51 @@ loop {
 
 This naturally implements continuous batching — new requests are picked up
 every step, and finished requests are removed immediately.
+
+---
+
+## Observability
+
+### Request IDs
+
+Every request is assigned a unique hex ID at the handler, before it crosses
+the channel to the worker thread.  The same ID appears in three places:
+
+1. **`X-Request-Id` response header** — returned to the client on every response
+   (streaming and non-streaming).
+2. **Worker stderr log** — `req 3a8f...  |  seq   1  |  128 prompt + 64 gen  |  ...`
+3. **Response body** — the `id` field in OpenAI/Anthropic JSON responses.
+
+This lets you correlate a client-observed issue to the server-side log line.
+
+### Prometheus Metrics
+
+`GET /metrics` returns all metrics in Prometheus text exposition format.
+Exempted from auth (like `/health`) so scrapers don't need credentials.
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `rllm_request_duration_seconds` | Histogram | End-to-end latency |
+| `rllm_time_to_first_token_seconds` | Histogram | Prompt submission → first token |
+| `rllm_decode_tokens_per_second` | Histogram | Decode throughput |
+| `rllm_prompt_tokens_total` | Counter | Total prompt tokens |
+| `rllm_completion_tokens_total` | Counter | Total generated tokens |
+| `rllm_requests_total{endpoint}` | Counter | Requests per endpoint |
+| `rllm_active_sequences` | Gauge | Sequences in flight |
+| `rllm_waiting_sequences` | Gauge | Sequences in the admission queue |
+| `rllm_prefix_cache_hits_total` | Counter | Prefix cache hits |
+| `rllm_errors_total` | Counter | Engine step failures |
+
+**Where metrics are recorded:**
+- Histograms and token counters are recorded in the worker loop when a
+  sequence completes (both normal completion and stop-sequence termination).
+- The `requests_total` counter is incremented in each HTTP handler.
+- Gauges are updated after every engine step.
+
+**Scraping:** Point Prometheus, Grafana Agent, Datadog, or any compatible
+scraper at `http://<host>:<port>/metrics`.  Default scrape interval of 15s
+is fine — the endpoint is cheap (no GPU work, just serialising in-memory
+atomics).
 
 ---
 

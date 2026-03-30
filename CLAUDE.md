@@ -86,6 +86,7 @@ api/
 ├── mod.rs         — server impl, continuous batching via tokio + worker threads
 ├── openai.rs      — /v1/chat/completions, /v1/completions, /v1/models
 ├── anthropic.rs   — /v1/messages
+├── metrics.rs     — Prometheus metrics definitions + GET /metrics handler
 └── tls.rs         — TLS support (manual certs, Let's Encrypt)
 ```
 
