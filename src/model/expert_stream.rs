@@ -145,6 +145,7 @@ impl ExpertLocation {
 
 pub(crate) struct ExpertIndex {
     /// Per-layer expert locations: layers[layer_idx][expert_idx].
+    /// Non-MoE layers (e.g. Nemotron-H mamba2/attention) have empty vecs.
     pub layers: Vec<Vec<ExpertLocation>>,
     /// Open file handles for each shard (kept alive for pread).
     pub shard_files: Arc<Vec<File>>,
@@ -154,6 +155,9 @@ pub(crate) struct ExpertIndex {
     /// Pre-quantization format of expert data on disk (Q4 or Q8).
     /// When Some, pread reads quantized bytes directly — less I/O than bf16.
     pub quant_format: Option<crate::gpu::ops::quant::QuantFormat>,
+    /// Whether experts have a gate projection (SwiGLU models).
+    /// False for Nemotron-H which uses relu² (only up_proj + down_proj).
+    pub has_gate_proj: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -300,8 +304,11 @@ impl<B: GpuCore> ExpertStreamer<B> {
         // needed — at most K experts are loaded from disk per call (misses).
         let hidden = index.hidden;
         let moe_inter = index.moe_inter;
+        // Nemotron (no gate): only up_proj on disk, so gate_up buffer = up_bytes.
+        // SwiGLU models: gate_up buffer = gate_bytes + up_bytes = 2 * moe_inter.
+        let gate_up_factor = if index.has_gate_proj { moe_inter * 2 } else { moe_inter };
         let (gate_up_bytes, down_bytes) = expert_byte_sizes(
-            index.quant_format, moe_inter * 2, hidden, moe_inter,
+            index.quant_format, gate_up_factor, hidden, moe_inter,
         );
         // Try pinned (page-locked) allocation for CUDA async DMA.
         // Falls back to heap allocation on Metal/CPU or if pinned alloc fails.
@@ -352,9 +359,16 @@ impl<B: GpuCore> ExpertStreamer<B> {
             None => TensorDtype::BF16,
         };
 
+        // Nemotron-H (relu²) has no gate_proj — allocate a dummy 1-element tensor.
+        let gate_shape = if index.has_gate_proj {
+            vec![moe_inter, hidden]
+        } else {
+            vec![1]
+        };
+
         (0..n)
             .map(|_| ExpertSlot {
-                gate_proj: backend.alloc_tensor(&[moe_inter, hidden], dtype),
+                gate_proj: backend.alloc_tensor(&gate_shape, dtype),
                 up_proj: backend.alloc_tensor(&[moe_inter, hidden], dtype),
                 down_proj: backend.alloc_tensor(&[hidden, moe_inter], dtype),
             })
@@ -479,7 +493,14 @@ impl<B: GpuCore> ExpertStreamer<B> {
 
                 handles.push(s.spawn(move || -> std::io::Result<()> {
                     let gate_up = slot_bufs.gate_up.as_mut_slice();
-                    if loc.gate_up_contiguous() {
+                    if loc.gate_bytes == 0 {
+                        // No gate projection (Nemotron relu²) — only read up_proj.
+                        pread_exact(
+                            &shard_files[loc.shard_up],
+                            &mut gate_up[..loc.up_bytes],
+                            loc.up_offset,
+                        )?;
+                    } else if loc.gate_up_contiguous() {
                         let total = loc.gate_bytes + loc.up_bytes;
                         pread_exact(
                             &shard_files[loc.shard_gate_up],
@@ -508,17 +529,30 @@ impl<B: GpuCore> ExpertStreamer<B> {
                     // Phase 2 (direct): memcpy for unified memory backends.
                     if let Some([g, u, d]) = ptrs {
                         let gate_up = slot_bufs.gate_up.as_slice();
+                        if loc.gate_bytes > 0 {
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    gate_up.as_ptr(),
+                                    g.0,
+                                    loc.gate_bytes,
+                                );
+                                std::ptr::copy_nonoverlapping(
+                                    gate_up.as_ptr().add(loc.gate_bytes),
+                                    u.0,
+                                    loc.up_bytes,
+                                );
+                            }
+                        } else {
+                            // No gate — up_proj is at offset 0 in the buffer.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    gate_up.as_ptr(),
+                                    u.0,
+                                    loc.up_bytes,
+                                );
+                            }
+                        }
                         unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                gate_up.as_ptr(),
-                                g.0,
-                                loc.gate_bytes,
-                            );
-                            std::ptr::copy_nonoverlapping(
-                                gate_up.as_ptr().add(loc.gate_bytes),
-                                u.0,
-                                loc.up_bytes,
-                            );
                             std::ptr::copy_nonoverlapping(
                                 slot_bufs.down.as_slice().as_ptr(),
                                 d.0,
@@ -547,11 +581,16 @@ impl<B: GpuCore> ExpertStreamer<B> {
                 let bufs = &read_bufs[miss_idx];
                 let gate_up = bufs.gate_up.as_slice();
 
-                backend.copy_to_tensor_async(&slot.gate_proj, &gate_up[..loc.gate_bytes]);
-                backend.copy_to_tensor_async(
-                    &slot.up_proj,
-                    &gate_up[loc.gate_bytes..loc.gate_bytes + loc.up_bytes],
-                );
+                if loc.gate_bytes > 0 {
+                    backend.copy_to_tensor_async(&slot.gate_proj, &gate_up[..loc.gate_bytes]);
+                    backend.copy_to_tensor_async(
+                        &slot.up_proj,
+                        &gate_up[loc.gate_bytes..loc.gate_bytes + loc.up_bytes],
+                    );
+                } else {
+                    // No gate — up_proj at offset 0.
+                    backend.copy_to_tensor_async(&slot.up_proj, &gate_up[..loc.up_bytes]);
+                }
                 backend.copy_to_tensor_async(&slot.down_proj, &bufs.down.as_slice()[..loc.down_bytes]);
             }
             backend.sync_transfers();
@@ -648,23 +687,25 @@ pub(crate) fn build_fused_expert_index(
         hidden,
         moe_inter,
         quant_format,
+        has_gate_proj: true, // Fused format always has gate+up
     }
 }
 
-/// Build an ExpertIndex for per-expert tensor format (Qwen3-MoE, Mixtral).
+/// Build an ExpertIndex for per-expert tensor format (Qwen3-MoE, Mixtral, Nemotron-H).
 ///
-/// Each expert has separate tensors:
-///   experts.{j}.gate_proj: [moe_inter, hidden]
-///   experts.{j}.up_proj:   [moe_inter, hidden]
-///   experts.{j}.down_proj: [hidden, moe_inter]
+/// Standard (has_gate=true): 3 tensors per expert (gate_proj, up_proj, down_proj).
+/// Nemotron (has_gate=false): 2 tensors per expert (up_proj, down_proj — relu² activation).
+/// Non-MoE layers have empty vecs in layer_info (Nemotron-H's mamba2/attention layers).
 pub(crate) fn build_per_expert_index(
     layer_info: Vec<Vec<PerExpertInfo>>,
     shard_files: Vec<File>,
     hidden: usize,
     moe_inter: usize,
     quant_format: Option<crate::gpu::ops::quant::QuantFormat>,
+    has_gate: bool,
 ) -> ExpertIndex {
-    let (gate_bytes, down_bytes) = expert_byte_sizes(quant_format, moe_inter, hidden, moe_inter);
+    let (proj_bytes, down_bytes) = expert_byte_sizes(quant_format, moe_inter, hidden, moe_inter);
+    let gate_bytes = if has_gate { proj_bytes } else { 0 };
 
     let layers = layer_info
         .iter()
@@ -679,7 +720,7 @@ pub(crate) fn build_per_expert_index(
                     up_offset: info.up_file_offset,
                     down_offset: info.down_file_offset,
                     gate_bytes,
-                    up_bytes: gate_bytes,
+                    up_bytes: proj_bytes,
                     down_bytes,
                 })
                 .collect()
@@ -692,6 +733,7 @@ pub(crate) fn build_per_expert_index(
         hidden,
         moe_inter,
         quant_format,
+        has_gate_proj: has_gate,
     }
 }
 

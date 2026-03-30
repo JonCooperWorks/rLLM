@@ -45,7 +45,7 @@ All models support bf16 and Q4. Multi-GPU via `--tp N` requires CUDA + NCCL.
 ## Benchmarks
 
 <details>
-<summary><b>Apple M4 Max</b> — 40-core GPU, 64 GB unified, 546 GB/s (March 29, 2026)</summary>
+<summary><b>Apple M4 Max</b> — 40-core GPU, 64 GB unified, 546 GB/s (March 30, 2026)</summary>
 
 | Model | Params | bf16 | Q8 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|---|
@@ -59,7 +59,7 @@ All models support bf16 and Q4. Multi-GPU via `--tp N` requires CUDA + NCCL.
 | Qwen3.5 9B † | ~9B | 20 tok/s | 31 tok/s | 43 tok/s | 6,484 ms | 3,022 ms |
 | Phi-4 | 14.7B | 10 tok/s | 22 tok/s | 32 tok/s | 4,971 ms | 285 ms |
 | GPT-OSS 20B | 20.0B (3.6B active) | 18 tok/s | 20 tok/s | 19 tok/s | 6,404 ms | 4,903 ms |
-| Nemotron-H 30B | 31.6B (3.6B active) | 5.6 tok/s | 21 tok/s | 47 tok/s | 40,173 ms | 426 ms |
+| Nemotron-H 30B ⚡ | 31.6B (3.6B active) | 7.7 tok/s | 33 tok/s | 39 tok/s | 834 ms | 180 ms |
 | Gemma 3 27B Instruct | 27.4B | 1.9 tok/s | 8.3 tok/s | 15 tok/s | 50,900 ms | 590 ms |
 | Mixtral 8x7B Instruct ⚡ | 46.7B (12.9B active) | 0.4 tok/s | — | 23 tok/s | 20,853 ms | 696 ms |
 | Qwen3.5 27B ⚡† | ~27B | 2.0 tok/s | 9.8 tok/s | 16 tok/s | 47,200 ms | 8,194 ms |

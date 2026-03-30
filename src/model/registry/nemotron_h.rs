@@ -379,7 +379,6 @@ fn moe_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe + GpuAll
 ) {
     let layer = &m.weights.layers[layer_idx];
     let router_gate = layer.router_gate.as_ref().expect("router_gate");
-    let experts = layer.experts.as_ref().expect("experts");
     let router_logits = &moe.router_logits;
     let routing_output = &moe.routing_output;
     let moe_up_buf = &moe.moe_up_buf;
@@ -424,30 +423,39 @@ fn moe_block<B: GpuCore + GpuNorm + GpuMatmul + GpuElementwise + GpuMoe + GpuAll
     m.backend.fill_zero(moe_output, d.hidden_size);
 
     // 5. For each selected expert: up_proj → relu² → down_proj → accumulate.
-    // EP: skip experts not owned by this rank, remap global → local index.
-    for pair_idx in 0..k {
-        let expert_idx = routing_data[pair_idx * 2] as usize;
-        let weight = routing_data[pair_idx * 2 + 1];
+    if let Some(ref streamer) = moe.expert_streamer {
+        // SSD streaming path: load selected experts from disk on demand.
+        let selected: Vec<(usize, f32)> = (0..k)
+            .map(|i| (routing_data[i * 2] as usize, routing_data[i * 2 + 1]))
+            .collect();
+        streamer.load_experts(m.backend, layer_idx, &selected);
 
-        if use_ep && (expert_idx < moe.local_expert_start || expert_idx >= local_expert_end) {
-            continue;
+        for (slot_idx, &(_expert_idx, weight)) in selected.iter().enumerate() {
+            let slot = streamer.active_slot(slot_idx);
+            m.backend.matmul(&slot.up_proj, &m.norm_buf, moe_up_buf, d.moe_inter, d.hidden_size);
+            m.backend.relu_squared(moe_up_buf, moe_up_buf, d.moe_inter);
+            m.backend.matmul(&slot.down_proj, moe_up_buf, &m.gate_buf, d.hidden_size, d.moe_inter);
+            m.backend.scale_add(moe_output, &m.gate_buf, weight, d.hidden_size);
         }
-        let local_idx = expert_idx - moe.local_expert_start;
-        let expert = &experts[local_idx];
+    } else {
+        // GPU-resident path: all experts loaded in memory.
+        let experts = layer.experts.as_ref().expect("experts");
+        // EP: skip experts not owned by this rank, remap global → local index.
+        for pair_idx in 0..k {
+            let expert_idx = routing_data[pair_idx * 2] as usize;
+            let weight = routing_data[pair_idx * 2 + 1];
 
-        // up_proj: [moe_inter, hidden] × norm_buf → moe_up_buf.
-        m.backend.matmul(&expert.up_proj, &m.norm_buf, moe_up_buf, d.moe_inter, d.hidden_size);
+            if use_ep && (expert_idx < moe.local_expert_start || expert_idx >= local_expert_end) {
+                continue;
+            }
+            let local_idx = expert_idx - moe.local_expert_start;
+            let expert = &experts[local_idx];
 
-        // relu²: in-place.
-        m.backend.relu_squared(moe_up_buf, moe_up_buf, d.moe_inter);
-
-        // down_proj: [hidden, moe_inter] × moe_up_buf → gate_buf.
-        // gate_buf is [effective_intermediate_size] ≥ [hidden_size], safe for
-        // the down_proj output.  moe_gate_buf is only [moe_inter] — too small!
-        m.backend.matmul(&expert.down_proj, moe_up_buf, &m.gate_buf, d.hidden_size, d.moe_inter);
-
-        // Weighted accumulate: moe_output += weight × gate_buf.
-        m.backend.scale_add(moe_output, &m.gate_buf, weight, d.hidden_size);
+            m.backend.matmul(&expert.up_proj, &m.norm_buf, moe_up_buf, d.moe_inter, d.hidden_size);
+            m.backend.relu_squared(moe_up_buf, moe_up_buf, d.moe_inter);
+            m.backend.matmul(&expert.down_proj, moe_up_buf, &m.gate_buf, d.hidden_size, d.moe_inter);
+            m.backend.scale_add(moe_output, &m.gate_buf, weight, d.hidden_size);
+        }
     }
 
     // EP: combine partial expert outputs across ranks before shared expert.

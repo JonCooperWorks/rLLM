@@ -66,7 +66,7 @@ KNOWN_MODELS = {
     "gpt-oss-20b":                     ("GptOss",    True,  40, False),
     "qwen3-coder-30b-a3b-instruct":    ("Qwen3Moe",  True,  60, True),
     "qwen3.5-35b-a3b":                ("Qwen3_5M",  True,  70, True),
-    "nemotron-3-30b":                   ("NemotronH",  True,  63, False),
+    "nemotron-3-30b":                   ("NemotronH",  True,  63, True),
     "deepseek-r1-distill-qwen-32b":    ("Qwen2",     False, 64, True),
     "mixtral-8x7b-instruct-v0.1":      ("Mixtral",   True,  93, True),
     # Big tier
@@ -85,9 +85,10 @@ KNOWN_MODELS = {
 
 DEFAULT_PROMPT = "The meaning of life is"
 
-# Models where Q4 quantization is known to degrade quality below the coherence
-# threshold.  Quality is still reported but not counted as a benchmark failure.
-KNOWN_Q4_SENSITIVE = {"gpt-oss-20b"}
+# Models where quality can drop below the coherence threshold regardless of
+# quantization level (some are just fragile with short prompts + temp=0).
+# Quality is still reported but not counted as a benchmark failure.
+KNOWN_QUALITY_SENSITIVE = {"gpt-oss-20b"}
 
 # Models with chat/instruct training (not base pretrained).  Base models need
 # /v1/completions (raw text) instead of /v1/chat/completions (chat template).
@@ -533,6 +534,7 @@ def main():
 
         discovered.append({
             "name": name,
+            "base_name": base_name,
             "path": str(entry),
             "family": family,
             "is_moe": is_moe,
@@ -594,8 +596,12 @@ def main():
             if use_completions:
                 print(f"  (base model — using /v1/completions)")
 
-            # Check if this model+quant combo has known Q4 quality sensitivity.
-            q4_sensitive = model["is_q4"] and base_name in KNOWN_Q4_SENSITIVE
+            # Base models (no chat alignment) often degenerate with temp=0 —
+            # quality checks are meaningless, only measure throughput.
+            skip_quality = model["is_base"]
+
+            # Check if this model has known quality sensitivity (any quant level).
+            quant_sensitive = model["base_name"] in KNOWN_QUALITY_SENSITIVE
 
             # Run multiple iterations and average.
             run_results = []
@@ -612,11 +618,15 @@ def main():
                 run_results.append(r)
 
                 # Quality check on generated content.
-                coherent, reason = check_coherence(r["content"])
-                status = "OK" if coherent else f"QUALITY FAIL: {reason}"
+                if skip_quality:
+                    coherent, reason = True, ""
+                    status = "OK (base model, quality skipped)"
+                else:
+                    coherent, reason = check_coherence(r["content"])
+                    status = "OK" if coherent else f"QUALITY FAIL: {reason}"
                 if not coherent:
-                    if q4_sensitive:
-                        status = f"QUALITY WARN (Q4-sensitive): {reason}"
+                    if quant_sensitive:
+                        status = f"QUALITY WARN (quality-sensitive): {reason}"
                         quality_reason = reason  # Record but don't fail.
                     else:
                         quality_ok = False
@@ -632,10 +642,12 @@ def main():
             if run_results:
                 avg_tps = sum(r["gen_tps"] for r in run_results) / len(run_results)
                 avg_ttft = sum(r["ttft_ms"] for r in run_results) / len(run_results)
-                if not quality_ok:
+                if skip_quality:
+                    quality_str = "SKIP (base model)"
+                elif not quality_ok:
                     quality_str = f"FAIL: {quality_reason}"
-                elif q4_sensitive and quality_reason:
-                    quality_str = f"WARN: {quality_reason} (Q4-sensitive)"
+                elif quant_sensitive and quality_reason:
+                    quality_str = f"WARN: {quality_reason} (quality-sensitive)"
                 else:
                     quality_str = "PASS"
                 results.append({

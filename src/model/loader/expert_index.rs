@@ -83,8 +83,17 @@ pub(crate) fn build_expert_index_from_safetensors(
         .map(|p| std::fs::File::open(p).expect("failed to open shard for streaming"))
         .collect();
 
+    // Find the first MoE layer for naming detection.  Nemotron-H interleaves
+    // mamba2/moe/attention layers — layer 0 may be mamba2 with no expert tensors.
+    // For models without layer_types (Mixtral, Qwen3-MoE), all layers are MoE.
+    let first_moe_layer = if config.layer_types.is_empty() {
+        0
+    } else {
+        config.layer_types.iter().position(|t| t == "moe").unwrap_or(0)
+    };
+
     // Detect fused vs per-expert format (same logic as load_ffn_weights).
-    let test_prefix = format!("{prefix_base}0");
+    let test_prefix = format!("{prefix_base}{first_moe_layer}");
     let fused_name = format!("{test_prefix}.mlp.experts.gate_up_proj");
     let is_fused = store.tensor(&fused_name).is_ok();
 
@@ -137,56 +146,97 @@ pub(crate) fn build_expert_index_from_safetensors(
             layer_info, shard_files, hidden, moe_inter, num_experts, expert_quant,
         ))
     } else {
-        // Per-expert format (Qwen3-MoE, Mixtral): experts.{j}.gate_proj etc.
+        // Per-expert format (Qwen3-MoE, Mixtral, Nemotron-H): experts.{j}.* etc.
         let mut layer_info = Vec::with_capacity(num_layers);
 
         // Detect per-expert naming pattern.
+        //   Qwen:     {prefix}.mlp.experts.0.gate_proj.weight  (3 tensors: gate, up, down)
+        //   Mixtral:  {prefix}.block_sparse_moe.experts.0.w1.weight (3 tensors: w1, w3, w2)
+        //   Nemotron: {prefix}.mixer.experts.0.up_proj.weight   (2 tensors: up, down — no gate)
         let test_qwen = format!("{test_prefix}.mlp.experts.0.gate_proj.weight");
-        let _test_mixtral = format!("{test_prefix}.block_sparse_moe.experts.0.w1.weight");
+        let test_nemotron = format!("{test_prefix}.mixer.experts.0.up_proj.weight");
         let is_qwen_naming = store.tensor(&test_qwen).is_ok();
+        let is_nemotron_naming = !is_qwen_naming && store.tensor(&test_nemotron).is_ok();
+        let has_gate = !is_nemotron_naming; // Nemotron uses relu² (no gate_proj)
 
         for layer_idx in 0..num_layers {
+            // Nemotron-H: only "moe" layers have expert tensors.  Non-MoE layers
+            // (mamba2, attention) get an empty vec so layer indices stay aligned.
+            if !config.layer_types.is_empty() && config.layer_types[layer_idx] != "moe" {
+                layer_info.push(Vec::new());
+                continue;
+            }
+
             let prefix = format!("{prefix_base}{layer_idx}");
             let mut experts = Vec::with_capacity(num_experts);
 
             for j in 0..num_experts {
-                let (gate_name, up_name, down_name) = if is_qwen_naming {
-                    (
-                        format!("{prefix}.mlp.experts.{j}.gate_proj.weight"),
-                        format!("{prefix}.mlp.experts.{j}.up_proj.weight"),
-                        format!("{prefix}.mlp.experts.{j}.down_proj.weight"),
-                    )
-                } else {
-                    // Mixtral naming: w1=gate, w3=up, w2=down
-                    (
-                        format!("{prefix}.block_sparse_moe.experts.{j}.w1.weight"),
-                        format!("{prefix}.block_sparse_moe.experts.{j}.w3.weight"),
-                        format!("{prefix}.block_sparse_moe.experts.{j}.w2.weight"),
-                    )
-                };
+                if is_nemotron_naming {
+                    // Nemotron: mixer.experts.{j}.up_proj + down_proj (no gate).
+                    let up_name = format!("{prefix}.mixer.experts.{j}.up_proj.weight");
+                    let down_name = format!("{prefix}.mixer.experts.{j}.down_proj.weight");
 
-                let gate_view = store.tensor(&gate_name)?;
-                let up_view = store.tensor(&up_name)?;
-                let down_view = store.tensor(&down_name)?;
+                    let up_view = store.tensor(&up_name)?;
+                    let down_view = store.tensor(&down_name)?;
 
-                let gate_shard = shard_index(&weight_map, &gate_name);
-                let up_shard = shard_index(&weight_map, &up_name);
-                let down_shard = shard_index(&weight_map, &down_name);
+                    let up_shard = shard_index(&weight_map, &up_name);
+                    let down_shard = shard_index(&weight_map, &down_name);
 
-                experts.push(PerExpertInfo {
-                    shard_gate: gate_shard,
-                    shard_up: up_shard,
-                    shard_down: down_shard,
-                    gate_file_offset: tensor_file_offset(
-                        gate_view.data(), mmaps[gate_shard].as_ref(), data_starts[gate_shard],
-                    ),
-                    up_file_offset: tensor_file_offset(
+                    let up_offset = tensor_file_offset(
                         up_view.data(), mmaps[up_shard].as_ref(), data_starts[up_shard],
-                    ),
-                    down_file_offset: tensor_file_offset(
-                        down_view.data(), mmaps[down_shard].as_ref(), data_starts[down_shard],
-                    ),
-                });
+                    );
+
+                    // No gate tensor — point gate at up (will be ignored by streamer
+                    // when has_gate_proj=false).
+                    experts.push(PerExpertInfo {
+                        shard_gate: up_shard,
+                        shard_up: up_shard,
+                        shard_down: down_shard,
+                        gate_file_offset: up_offset,
+                        up_file_offset: up_offset,
+                        down_file_offset: tensor_file_offset(
+                            down_view.data(), mmaps[down_shard].as_ref(), data_starts[down_shard],
+                        ),
+                    });
+                } else {
+                    let (gate_name, up_name, down_name) = if is_qwen_naming {
+                        (
+                            format!("{prefix}.mlp.experts.{j}.gate_proj.weight"),
+                            format!("{prefix}.mlp.experts.{j}.up_proj.weight"),
+                            format!("{prefix}.mlp.experts.{j}.down_proj.weight"),
+                        )
+                    } else {
+                        // Mixtral naming: w1=gate, w3=up, w2=down
+                        (
+                            format!("{prefix}.block_sparse_moe.experts.{j}.w1.weight"),
+                            format!("{prefix}.block_sparse_moe.experts.{j}.w3.weight"),
+                            format!("{prefix}.block_sparse_moe.experts.{j}.w2.weight"),
+                        )
+                    };
+
+                    let gate_view = store.tensor(&gate_name)?;
+                    let up_view = store.tensor(&up_name)?;
+                    let down_view = store.tensor(&down_name)?;
+
+                    let gate_shard = shard_index(&weight_map, &gate_name);
+                    let up_shard = shard_index(&weight_map, &up_name);
+                    let down_shard = shard_index(&weight_map, &down_name);
+
+                    experts.push(PerExpertInfo {
+                        shard_gate: gate_shard,
+                        shard_up: up_shard,
+                        shard_down: down_shard,
+                        gate_file_offset: tensor_file_offset(
+                            gate_view.data(), mmaps[gate_shard].as_ref(), data_starts[gate_shard],
+                        ),
+                        up_file_offset: tensor_file_offset(
+                            up_view.data(), mmaps[up_shard].as_ref(), data_starts[up_shard],
+                        ),
+                        down_file_offset: tensor_file_offset(
+                            down_view.data(), mmaps[down_shard].as_ref(), data_starts[down_shard],
+                        ),
+                    });
+                }
             }
 
             layer_info.push(experts);
@@ -195,25 +245,29 @@ pub(crate) fn build_expert_index_from_safetensors(
         // Check if per-expert tensors are pre-quantized (Q4 or Q8).
         // Mixtral's expert weights (w1/w2/w3) may remain BF16 even in a Q4 model
         // because the quantizer only quantizes weight names it recognises.
-        let first_expert_gate = if is_qwen_naming {
+        let first_expert_up = if is_nemotron_naming {
+            format!("{test_prefix}.mixer.experts.0.up_proj.weight")
+        } else if is_qwen_naming {
             format!("{test_prefix}.mlp.experts.0.gate_proj.weight")
         } else {
             format!("{test_prefix}.block_sparse_moe.experts.0.w1.weight")
         };
-        let expert_quant = if q4_expert_names.contains(&first_expert_gate) {
+        let expert_quant = if q4_expert_names.contains(&first_expert_up) {
             debug!("detected pre-quantized expert data (rllm-q4)");
             Some(crate::gpu::ops::quant::QuantFormat::Q4)
-        } else if q8_expert_names.contains(&first_expert_gate) {
+        } else if q8_expert_names.contains(&first_expert_up) {
             debug!("detected pre-quantized expert data (rllm-q8)");
             Some(crate::gpu::ops::quant::QuantFormat::Q8)
         } else {
             None
         };
 
-        info!(layers = num_layers, experts = num_experts, format = "per-expert", "built expert index");
+        let moe_layers = layer_info.iter().filter(|l| !l.is_empty()).count();
+        info!(layers = moe_layers, experts = num_experts, format = "per-expert",
+              has_gate = has_gate, "built expert index");
 
         Ok(expert_stream::build_per_expert_index(
-            layer_info, shard_files, hidden, moe_inter, expert_quant,
+            layer_info, shard_files, hidden, moe_inter, expert_quant, has_gate,
         ))
     }
 }
