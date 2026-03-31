@@ -59,20 +59,20 @@ def _resolve_model_dir(models_dir: Path, config, q4: bool = False,
     return d if d.is_dir() else None
 
 
-def _build_extra_args(config, is_q4: bool) -> list[str]:
+def _build_extra_args(config, is_q4: bool, model_dir: str = "") -> list[str]:
     """Build CLI extra args, including --stream-experts decision for MoE."""
     args = list(config.extra_args)
     if config.is_moe and config.supports_stream_experts:
-        if _should_stream_experts(config.bf16_size_gb, is_q4):
+        if _should_stream_experts(config.bf16_size_gb, is_q4, model_dir):
             args.extend(["--stream-experts"])
     return args
 
 
-def _estimate_memory_gb(config, is_q4: bool) -> float:
+def _estimate_memory_gb(config, is_q4: bool, model_dir: str = "") -> float:
     """Estimate GPU memory required for a model (weights + KV cache overhead)."""
     weight_gb = config.bf16_size_gb * 0.5 if is_q4 else config.bf16_size_gb
     if config.is_moe and config.supports_stream_experts:
-        if _should_stream_experts(config.bf16_size_gb, is_q4):
+        if _should_stream_experts(config.bf16_size_gb, is_q4, model_dir):
             weight_gb *= 0.25
     return weight_gb * 1.2
 
@@ -246,9 +246,14 @@ def test_model_q4(config_index, server_manager, models_dir, bench_context):
     mem = _estimate_memory_gb(config, is_q4=True)
     base_url = server_manager.get_or_start(str(model_dir), extra_args, memory_gb=mem)
 
+    # Q4 quantization noise + non-greedy sampling can cause repetition in
+    # quality-sensitive models (e.g. gpt-oss-20b).  Use greedy decoding to
+    # avoid amplifying quantization error through the sampling distribution.
+    temp = 0 if config.quality_sensitive else config.temperature
+
     prompt = prompt_for_index(config_index + 5)
     t_start = time.monotonic()
-    resp = _chat_completion(base_url, prompt, temperature=config.temperature)
+    resp = _chat_completion(base_url, prompt, temperature=temp)
     assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text[:500]}"
 
     body = resp.json()
@@ -276,8 +281,8 @@ def test_model_q8(config_index, server_manager, models_dir, bench_context):
     if model_dir is None:
         pytest.skip(f"Q8 model not found: {config.model_name}-q8")
 
-    extra_args = _build_extra_args(config, is_q4=False)
-    mem = _estimate_memory_gb(config, is_q4=False) * 0.53
+    extra_args = _build_extra_args(config, is_q4=False, model_dir=str(model_dir))
+    mem = _estimate_memory_gb(config, is_q4=False, model_dir=str(model_dir)) * 0.53
     base_url = server_manager.get_or_start(str(model_dir), extra_args, memory_gb=mem)
 
     prompt = prompt_for_index(config_index + 3)
