@@ -819,6 +819,27 @@ fn run_worker_loop(
     let mut registry: HashMap<SeqId, RequestContext> = HashMap::new();
     let has_timeout = !request_timeout.is_zero();
 
+    /// Helper: try_send that logs a warning when the channel is full (slow
+    /// client back-pressure) vs silently handling closed (client disconnect).
+    /// Returns true on success, false if the send failed for any reason.
+    fn try_send_event(
+        request_id: &str,
+        tx: &tokio::sync::mpsc::Sender<InferenceEvent>,
+        event: InferenceEvent,
+    ) -> bool {
+        match tx.try_send(event) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    request_id = %request_id,
+                    "response channel full — aborting sequence (slow client)",
+                );
+                false
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
     /// Helper: register a WorkerRequest with the engine and request registry.
     fn register_request(
         engine: &mut dyn engine::InferenceEngine,
@@ -892,11 +913,11 @@ fn run_worker_loop(
                 tracing::error!(error = %format_args!("{e:#}"), "engine step failed");
                 let seq_ids: Vec<SeqId> = registry.keys().copied().collect();
                 for (_, ctx) in registry.drain() {
-                    let _ = ctx
-                        .response_tx
-                        .try_send(InferenceEvent::Error(
-                            "internal inference error".to_string(),
-                        ));
+                    try_send_event(
+                        &ctx.request_id,
+                        &ctx.response_tx,
+                        InferenceEvent::Error("internal inference error".to_string()),
+                    );
                 }
                 for id in seq_ids {
                     engine.abort_sequence(id);
@@ -923,7 +944,7 @@ fn run_worker_loop(
                 if tokenizer.is_think_start(token_id) {
                     // Flush any pending marker first, then store the new one.
                     if let Some(prev) = ctx.inject_marker.take() {
-                        if ctx.response_tx.try_send(InferenceEvent::Token { text: prev.to_string(), logprob_info: None }).is_err() {
+                        if !try_send_event(&ctx.request_id, &ctx.response_tx, InferenceEvent::Token { text: prev.to_string(), logprob_info: None }) {
                             to_abort.push(seq_id);
                             continue;
                         }
@@ -937,7 +958,7 @@ fn run_worker_loop(
                 }
                 if tokenizer.is_think_end(token_id) {
                     if let Some(prev) = ctx.inject_marker.take() {
-                        if ctx.response_tx.try_send(InferenceEvent::Token { text: prev.to_string(), logprob_info: None }).is_err() {
+                        if !try_send_event(&ctx.request_id, &ctx.response_tx, InferenceEvent::Token { text: prev.to_string(), logprob_info: None }) {
                             to_abort.push(seq_id);
                             continue;
                         }
@@ -994,11 +1015,7 @@ fn run_worker_loop(
                 }
 
                 if !text.is_empty() {
-                    if ctx
-                        .response_tx
-                        .try_send(InferenceEvent::Token { text, logprob_info })
-                        .is_err()
-                    {
+                    if !try_send_event(&ctx.request_id, &ctx.response_tx, InferenceEvent::Token { text, logprob_info }) {
                         to_abort.push(seq_id);
                         continue;
                     }
@@ -1008,7 +1025,7 @@ fn run_worker_loop(
                     // Record metrics for stop-sequence completions (these
                     // bypass section 5 because the engine aborts them).
                     record_completion_metrics(&metrics, ctx);
-                    let _ = ctx.response_tx.try_send(InferenceEvent::Done {
+                    try_send_event(&ctx.request_id, &ctx.response_tx, InferenceEvent::Done {
                         stop_reason: StopReason::EndOfSequence,
                         prompt_tokens: ctx.prompt_token_count,
                         completion_tokens: ctx.generated_count,
@@ -1027,9 +1044,11 @@ fn run_worker_loop(
                 // Flush any pending thinking marker (e.g. </think> was the
                 // last token before EOS).
                 if let Some(marker) = ctx.inject_marker.take() {
-                    let _ = ctx
-                        .response_tx
-                        .try_send(InferenceEvent::Token { text: marker.to_string(), logprob_info: None });
+                    try_send_event(
+                        &ctx.request_id,
+                        &ctx.response_tx,
+                        InferenceEvent::Token { text: marker.to_string(), logprob_info: None },
+                    );
                 }
 
                 let stop_reason = match finished.reason {
@@ -1075,7 +1094,7 @@ fn run_worker_loop(
 
                 record_completion_metrics(&metrics, &ctx);
 
-                let _ = ctx.response_tx.try_send(InferenceEvent::Done {
+                try_send_event(&ctx.request_id, &ctx.response_tx, InferenceEvent::Done {
                     stop_reason,
                     prompt_tokens: ctx.prompt_token_count,
                     completion_tokens: ctx.generated_count,
@@ -1117,9 +1136,13 @@ fn run_worker_loop(
                         "request timed out",
                     );
                     metrics.request_timeouts.inc();
-                    let _ = ctx.response_tx.try_send(InferenceEvent::Error(
-                        format!("request timed out after {}s", request_timeout.as_secs()),
-                    ));
+                    try_send_event(
+                        &ctx.request_id,
+                        &ctx.response_tx,
+                        InferenceEvent::Error(
+                            format!("request timed out after {}s", request_timeout.as_secs()),
+                        ),
+                    );
                     engine.abort_sequence(id);
                 }
             }
@@ -1865,6 +1888,58 @@ mod tests {
         // The sequence should have been aborted due to the full channel.
         // Don't read from response_rx — it may still hold the first token.
         drop(response_rx);
+    }
+
+    #[test]
+    fn slow_client_does_not_starve_fast_client() {
+        // Integration test: two concurrent sequences — one with a tiny channel
+        // (simulating a slow client that can't keep up) and one with a normal
+        // channel.  The slow client's backpressure must NOT block the worker
+        // from delivering tokens to the fast client.
+        let mut engine = MockEngine::new();
+        // Emit several tokens so the slow client's channel fills up.
+        for _ in 0..5 {
+            engine.push_token_step(42);
+        }
+        engine.push_finish_step();
+
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
+        let m = Arc::new(metrics::Metrics::new());
+
+        // Slow client: capacity 1 — fills after one token.
+        let (slow_req, slow_rx) = mock_worker_request_with_capacity(1);
+        // Fast client: capacity 64 — plenty of room.
+        let (fast_req, mut fast_rx) = mock_worker_request();
+
+        request_tx.send(slow_req).unwrap();
+        request_tx.send(fast_req).unwrap();
+        drop(request_tx);
+
+        let m2 = m.clone();
+        let handle = std::thread::spawn(move || {
+            run_worker_loop(
+                &mut engine,
+                request_rx,
+                m2,
+                std::time::Duration::from_secs(300),
+            )
+        });
+
+        let result = handle.join();
+        assert!(result.is_ok(), "worker loop panicked");
+
+        // The fast client must have received a Done event (the slow one may
+        // have been aborted partway through).
+        let mut got_done = false;
+        while let Ok(event) = fast_rx.try_recv() {
+            if matches!(event, InferenceEvent::Done { .. }) {
+                got_done = true;
+            }
+        }
+        assert!(got_done, "fast client never received Done — slow client starved it");
+
+        // The slow client's channel should have at most 1 event (its capacity).
+        drop(slow_rx);
     }
 
     #[tokio::test]
