@@ -471,13 +471,17 @@ pub(crate) fn run_step<D: Dispatch>(
         }
     }
 
-    // 2. Batched prefill: drain all pending tokens for each prefilling sequence.
-    //    Each sequence's prompt is processed via GEMM (mat-mat).  Long prompts
-    //    are chunked to fit within the prefill buffer allocation (max_chunk).
+    // 2. Chunked prefill: process ONE chunk per prefilling sequence per step.
     //
-    //    Prefix caching: before running prefill, check if the prompt's prefix
-    //    is already cached.  If so, link the cached blocks and only prefill
-    //    the suffix.  After prefill, register the prefix for future reuse.
+    //    Long prompts are split into max_prefill_chunk-sized pieces.  Only one
+    //    chunk is processed per step, then control returns to the decode phase
+    //    so decoding sequences aren't starved.  This is the key to avoiding
+    //    head-of-line blocking on long prompts and thinking models.
+    //
+    //    Prefix caching runs on the FIRST chunk only (when the sequence hasn't
+    //    started prefilling yet, i.e. seq_len == 0 and cached_tokens == 0).
+    //    After all chunks are done (pending_prefill empty), we register the
+    //    prefix and sample the first token.
     let prefilling_ids: Vec<SeqId> = scheduler
         .active
         .iter()
@@ -489,72 +493,75 @@ pub(crate) fn run_step<D: Dispatch>(
 
     for id in prefilling_ids {
         let seq = scheduler.active.get_mut(&id).unwrap();
-        let tokens: Vec<u32> = seq.pending_prefill.drain(..).collect();
 
-        // --- Prefix cache lookup ---
-        // Check if a prefix of this prompt is already cached.  If so,
-        // link the cached blocks (skip prefill for those tokens) and
-        // only run the model on the remaining suffix.
-        let cached_prefix_len = if let Some((prefix_blocks, prefix_token_count)) =
-            dispatch.prefix_cache_lookup(&tokens)
-        {
-            let prefix_len = prefix_token_count;
-            let prefix_block_count = prefix_blocks.len();
+        // --- Prefix cache lookup (first chunk only) ---
+        // On the first prefill step for this sequence (seq_len == 0 and no
+        // cached prefix), check if a prefix is already in the cache.  If so,
+        // link the cached blocks and skip those tokens.
+        let first_chunk = D::seq_len(&seq.kv_state) == 0 && seq.cached_tokens == 0;
+        if first_chunk {
+            // Peek at full pending tokens for cache lookup (without draining).
+            let all_tokens: Vec<u32> = seq.pending_prefill.iter().copied().collect();
+            if let Some((prefix_blocks, prefix_token_count)) =
+                dispatch.prefix_cache_lookup(&all_tokens)
+            {
+                let prefix_len = prefix_token_count;
+                let prefix_block_count = prefix_blocks.len();
 
-            // Block-aligned prefix tokens for cache release on free.
-            let prefix_tokens = tokens[..prefix_len].to_vec();
+                // Block-aligned prefix tokens for cache release on free.
+                let prefix_tokens = all_tokens[..prefix_len].to_vec();
 
-            dispatch.link_prefix(
-                &mut seq.kv_state,
-                &prefix_blocks,
-                prefix_token_count,
-                prefix_tokens,
-            );
-            seq.cached_tokens = prefix_len;
+                dispatch.link_prefix(
+                    &mut seq.kv_state,
+                    &prefix_blocks,
+                    prefix_token_count,
+                    prefix_tokens,
+                );
+                seq.cached_tokens = prefix_len;
 
-            debug!(
-                seq_id = id,
-                cached_tokens = prefix_len,
-                cached_blocks = prefix_block_count,
-                suffix_tokens = tokens.len() - prefix_len,
-                "prefix cache hit",
-            );
+                // Skip the cached prefix tokens in pending_prefill.
+                seq.pending_prefill.drain(..prefix_len);
 
-            prefix_len
-        } else {
-            0
-        };
-
-        let suffix_tokens = &tokens[cached_prefix_len..];
-
-        // Chunk the suffix (or full prompt) and run prefill.
-        // Images are passed only for the FIRST chunk (vision encoding happens
-        // once; subsequent chunks are pure text continuation).
-        if !suffix_tokens.is_empty() {
-            let mut first_chunk = true;
-            for chunk in suffix_tokens.chunks(max_chunk) {
-                let chunk_size = chunk.len();
-                dispatch.prepare_prefill(&mut seq.kv_state, chunk_size)?;
-                let images = if first_chunk {
-                    first_chunk = false;
-                    std::mem::take(&mut seq.images)
-                } else {
-                    Vec::new()
-                };
-                dispatch.forward_prefill(chunk, &seq.kv_state, &images)?;
-                D::finish_prefill(&mut seq.kv_state, chunk_size);
+                debug!(
+                    seq_id = id,
+                    cached_tokens = prefix_len,
+                    cached_blocks = prefix_block_count,
+                    suffix_tokens = seq.pending_prefill.len(),
+                    "prefix cache hit",
+                );
             }
         }
 
-        // --- Prefix cache registration ---
-        // After prefill, register the block-aligned prefix for future reuse.
-        // Only register if we didn't already use a cached prefix (avoid
-        // re-registering a subset of an existing entry).
-        if cached_prefix_len == 0 {
-            dispatch.prefix_cache_register(&tokens, &mut seq.kv_state);
+        // Drain ONE chunk from pending_prefill.
+        let chunk_size = max_chunk.min(seq.pending_prefill.len());
+        if chunk_size > 0 {
+            let chunk: Vec<u32> = seq.pending_prefill.drain(..chunk_size).collect();
+            dispatch.prepare_prefill(&mut seq.kv_state, chunk_size)?;
+            // Images are passed only on the FIRST chunk (vision encoding happens
+            // once; subsequent chunks are pure text continuation).
+            let images = if first_chunk {
+                std::mem::take(&mut seq.images)
+            } else {
+                Vec::new()
+            };
+            dispatch.forward_prefill(&chunk, &seq.kv_state, &images)?;
+            D::finish_prefill(&mut seq.kv_state, chunk_size);
         }
 
-        sample_and_finish(dispatch, seq, id, tokenizer, &mut step_tokens, &mut rng)?;
+        // If all tokens are now prefilled, register the prefix cache and
+        // sample the first token.  Otherwise, this sequence continues
+        // prefilling in the next step.
+        if seq.pending_prefill.is_empty() {
+            // --- Prefix cache registration ---
+            // Register the block-aligned prefix for future reuse.
+            // Only register if we didn't already use a cached prefix.
+            if seq.cached_tokens == 0 {
+                let tokens = &seq.original_prompt_tokens;
+                dispatch.prefix_cache_register(tokens, &mut seq.kv_state);
+            }
+
+            sample_and_finish(dispatch, seq, id, tokenizer, &mut step_tokens, &mut rng)?;
+        }
     }
 
     // 3. Decode: run one token per decoding sequence.
