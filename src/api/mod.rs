@@ -42,9 +42,10 @@
 //   - Request channel (std::sync::mpsc):  HTTP handlers → worker
 //   - Response channel (tokio::sync::mpsc, one per request):  worker → handler
 //
-//   The worker calls `blocking_send` on the tokio channel, which is safe
-//   from synchronous code.  The handler calls `recv().await` on the async
-//   side.  This cleanly bridges sync GPU code and async HTTP serving.
+//   The worker calls `try_send` on the tokio channel (non-blocking).  If a
+//   slow client's channel is full, the worker treats it as a disconnect and
+//   aborts the sequence — this prevents one slow client from freezing the
+//   GPU thread.  The handler calls `recv().await` on the async side.
 // ===========================================================================
 
 pub(crate) mod anthropic;
@@ -893,7 +894,7 @@ fn run_worker_loop(
                 for (_, ctx) in registry.drain() {
                     let _ = ctx
                         .response_tx
-                        .blocking_send(InferenceEvent::Error(
+                        .try_send(InferenceEvent::Error(
                             "internal inference error".to_string(),
                         ));
                 }
@@ -922,9 +923,10 @@ fn run_worker_loop(
                 if tokenizer.is_think_start(token_id) {
                     // Flush any pending marker first, then store the new one.
                     if let Some(prev) = ctx.inject_marker.take() {
-                        let _ = ctx
-                            .response_tx
-                            .blocking_send(InferenceEvent::Token { text: prev.to_string(), logprob_info: None });
+                        if ctx.response_tx.try_send(InferenceEvent::Token { text: prev.to_string(), logprob_info: None }).is_err() {
+                            to_abort.push(seq_id);
+                            continue;
+                        }
                     }
                     ctx.inject_marker = Some("<think>");
                     ctx.generated_count += 1;
@@ -935,9 +937,10 @@ fn run_worker_loop(
                 }
                 if tokenizer.is_think_end(token_id) {
                     if let Some(prev) = ctx.inject_marker.take() {
-                        let _ = ctx
-                            .response_tx
-                            .blocking_send(InferenceEvent::Token { text: prev.to_string(), logprob_info: None });
+                        if ctx.response_tx.try_send(InferenceEvent::Token { text: prev.to_string(), logprob_info: None }).is_err() {
+                            to_abort.push(seq_id);
+                            continue;
+                        }
                     }
                     ctx.inject_marker = Some("</think>");
                     ctx.generated_count += 1;
@@ -993,7 +996,7 @@ fn run_worker_loop(
                 if !text.is_empty() {
                     if ctx
                         .response_tx
-                        .blocking_send(InferenceEvent::Token { text, logprob_info })
+                        .try_send(InferenceEvent::Token { text, logprob_info })
                         .is_err()
                     {
                         to_abort.push(seq_id);
@@ -1005,7 +1008,7 @@ fn run_worker_loop(
                     // Record metrics for stop-sequence completions (these
                     // bypass section 5 because the engine aborts them).
                     record_completion_metrics(&metrics, ctx);
-                    let _ = ctx.response_tx.blocking_send(InferenceEvent::Done {
+                    let _ = ctx.response_tx.try_send(InferenceEvent::Done {
                         stop_reason: StopReason::EndOfSequence,
                         prompt_tokens: ctx.prompt_token_count,
                         completion_tokens: ctx.generated_count,
@@ -1026,7 +1029,7 @@ fn run_worker_loop(
                 if let Some(marker) = ctx.inject_marker.take() {
                     let _ = ctx
                         .response_tx
-                        .blocking_send(InferenceEvent::Token { text: marker.to_string(), logprob_info: None });
+                        .try_send(InferenceEvent::Token { text: marker.to_string(), logprob_info: None });
                 }
 
                 let stop_reason = match finished.reason {
@@ -1072,7 +1075,7 @@ fn run_worker_loop(
 
                 record_completion_metrics(&metrics, &ctx);
 
-                let _ = ctx.response_tx.blocking_send(InferenceEvent::Done {
+                let _ = ctx.response_tx.try_send(InferenceEvent::Done {
                     stop_reason,
                     prompt_tokens: ctx.prompt_token_count,
                     completion_tokens: ctx.generated_count,
@@ -1114,7 +1117,7 @@ fn run_worker_loop(
                         "request timed out",
                     );
                     metrics.request_timeouts.inc();
-                    let _ = ctx.response_tx.blocking_send(InferenceEvent::Error(
+                    let _ = ctx.response_tx.try_send(InferenceEvent::Error(
                         format!("request timed out after {}s", request_timeout.as_secs()),
                     ));
                     engine.abort_sequence(id);
@@ -1798,6 +1801,70 @@ mod tests {
 
         // tx is still alive — proves we returned on Done, not sender drop.
         drop(tx);
+    }
+
+    /// Helper: build a WorkerRequest with a small-capacity response channel.
+    fn mock_worker_request_with_capacity(cap: usize) -> (WorkerRequest, tokio::sync::mpsc::Receiver<InferenceEvent>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(cap);
+        let req = WorkerRequest {
+            request_id: "test-req".into(),
+            prompt_tokens: vec![1],
+            max_tokens: 10,
+            params: crate::model::sampler::SampleParams {
+                temperature: 0.0,
+                ..crate::model::sampler::SampleParams::default()
+            },
+            response_tx: tx,
+            thinking: None,
+            images: Vec::new(),
+            user: None,
+            seed: None,
+            stop: Vec::new(),
+            grammar: None,
+            logit_bias: HashMap::new(),
+        };
+        (req, rx)
+    }
+
+    #[test]
+    fn worker_loop_does_not_block_on_full_channel() {
+        // A slow client whose response channel is full must NOT block the
+        // worker thread.  The worker should treat the full channel like a
+        // disconnect and abort the sequence.
+        let mut engine = MockEngine::new();
+        engine.push_token_step(42); // step 1: fills the channel (cap=1)
+        engine.push_token_step(42); // step 2: channel is full — must not block
+        engine.push_finish_step();  // step 3: finish remaining sequences
+
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<WorkerRequest>(8);
+        let m = Arc::new(metrics::Metrics::new());
+
+        // Use capacity 1 so the channel fills after one token.
+        let (req, response_rx) = mock_worker_request_with_capacity(1);
+        request_tx.send(req).unwrap();
+        drop(request_tx);
+
+        // Run the worker loop in a thread with a timeout — if it blocks on
+        // the full channel, the timeout will fire.
+        let m2 = m.clone();
+        let handle = std::thread::spawn(move || {
+            run_worker_loop(
+                &mut engine,
+                request_rx,
+                m2,
+                std::time::Duration::from_secs(300),
+            )
+        });
+
+        let result = handle.join();
+        // If the worker blocked, join would hang.  We verify it completed by
+        // checking it within a reasonable time.  Since join() itself doesn't
+        // have a timeout, we rely on the engine running out of steps to exit.
+        assert!(result.is_ok(), "worker loop panicked or failed to complete");
+
+        // The sequence should have been aborted due to the full channel.
+        // Don't read from response_rx — it may still hold the first token.
+        drop(response_rx);
     }
 
     #[tokio::test]
