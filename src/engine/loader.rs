@@ -272,6 +272,21 @@ fn load_and_run_single_gpu(
             "TurboQuant disabled (QKV bias incompatibility); using BF16 KV cache"
         );
         KvQuantMode::None
+    } else if kv_quant.is_quantized() && config.has_sparse_attention() {
+        // Hybrid architectures (Qwen 3.5, Nemotron-H) have very few attention
+        // layers relative to total layers.  TurboQuant quantization errors in
+        // these sparse attention layers propagate through many non-attention
+        // layers (DeltaNet/Mamba-2/MoE) before the next attention correction,
+        // causing progressive output degradation (word salad / repetition).
+        // The KV cache is already tiny for these models (e.g. 6 of 52 layers),
+        // so compression saves negligible memory.
+        warn!(
+            arch = ?arch,
+            kv_layers = config.num_kv_layers(),
+            total_layers = config.num_hidden_layers,
+            "TurboQuant disabled (sparse attention — hybrid architecture); using BF16 KV cache"
+        );
+        KvQuantMode::None
     } else {
         kv_quant
     };

@@ -1332,9 +1332,20 @@ impl ModelConfig {
 
     /// Whether this model uses the hybrid Nemotron-H (Mamba-2 + MoE + attention)
     /// architecture.
-    #[allow(dead_code)] // Nemotron-H architecture support (future)
     pub fn is_hybrid_mamba2(&self) -> bool {
         !self.layer_types.is_empty() && self.layer_types.iter().any(|t| t == "mamba2")
+    }
+
+    /// Whether this model has sparse attention layers (only some layers use KV cache).
+    ///
+    /// Hybrid architectures like Qwen 3.5 (DeltaNet + GQA) and Nemotron-H
+    /// (Mamba-2 + MoE + attention) have far fewer attention layers than total
+    /// layers.  TurboQuant KV cache quantization degrades quality for these
+    /// models because the sparse attention layers carry disproportionate weight
+    /// in the residual stream — quantization errors in 6 out of 52 layers
+    /// propagate through ~46 non-attention layers before the next correction.
+    pub fn has_sparse_attention(&self) -> bool {
+        self.is_hybrid_deltanet() || self.is_hybrid_mamba2()
     }
 
     /// Whether a given layer is a Mamba-2 SSM layer.
