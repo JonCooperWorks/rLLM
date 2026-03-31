@@ -226,21 +226,18 @@ rllm serve  — HTTP API server (accepts images via OpenAI/Anthropic multimodal 
 ## Testing & Benchmarks
 
 Python tests and benchmarks use **`uv`** (not raw `python3`).  Dependencies are in
-`tests/requirements.txt`.  Testing and benchmarking are unified — `--bench` flag
-enables performance measurement alongside correctness validation.
+`tests/requirements.txt`.  Testing and benchmarking are unified — every test run
+measures performance (tok/s, TTFT, quality).
 
 ```bash
-# Run the full test suite
+# Run the full test suite (test + benchmark)
 uv run pytest tests/ -v
 
-# Test + benchmark all models (TTFT + tok/s + quality)
-uv run pytest tests/ -v --bench
-
-# Benchmark a specific model
-uv run pytest tests/ -v --bench --bench-filter qwen3.5-27b-q8
+# Test + benchmark a specific model
+uv run pytest tests/ -v --filter qwen3.5-27b-q8
 
 # Benchmark all Q4 models
-uv run pytest tests/ -v --bench --bench-q4-only
+uv run pytest tests/ -v --bench-q4-only
 
 # CLI benchmark (raw GPU throughput, no serving overhead)
 scripts/benchmark.sh

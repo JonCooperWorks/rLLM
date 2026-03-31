@@ -36,7 +36,7 @@ use crate::model::config::{ModelArch, ModelConfig};
 use crate::model::forward::{MoeBuffers, DeltaNetBuffers, Mamba2Buffers, ModelForward};
 use crate::model::registry;
 use crate::model::tokenizer::Tokenizer;
-use crate::model::turboquant::KvQuantMode;
+use crate::model::turboquant::{KvQuantMode, KvQuantPair};
 use crate::model::{kv_cache, loader};
 
 use super::InferenceEngine;
@@ -213,7 +213,7 @@ pub(crate) fn load_and_run_ext(
     model_dir: &Path,
     stream_experts: bool,
     tp: usize,
-    kv_quant: KvQuantMode,
+    kv_quant: KvQuantPair,
     max_active: usize,
     on_ready: impl FnOnce(&Tokenizer, ModelArch),
     run: impl FnOnce(&mut dyn InferenceEngine) -> anyhow::Result<()>,
@@ -229,7 +229,7 @@ pub(crate) fn load_and_run_ext(
 fn load_and_run_single_gpu(
     model_dir: &Path,
     stream_experts: bool,
-    kv_quant: KvQuantMode,
+    kv_quant: KvQuantPair,
     max_active: usize,
     on_ready: impl FnOnce(&Tokenizer, ModelArch),
     run: impl FnOnce(&mut dyn InferenceEngine) -> anyhow::Result<()>,
@@ -254,45 +254,58 @@ fn load_and_run_single_gpu(
 
     let mut model = model::Model::new(config.clone(), weights, &backend)?;
 
-    // Auto-disable TurboQuant for architectures with QKV bias (Qwen2, GPT-OSS).
+    // Auto-adjust TurboQuant for K-intolerant architectures.
     //
-    // TurboQuant normalises each K/V vector to unit length before rotation and
-    // quantisation.  With QKV bias, the learned bias vector adds a constant
-    // component shared across all positions.  This reduces the effective angular
-    // diversity of the normalised K/V distribution, making the quantisation
-    // error correlated across positions.  The result is progressive output
-    // degradation during decode (confirmed empirically: Gemma3 with 4 KV heads
-    // and no bias works perfectly; Qwen2 with 4 KV heads and bias degenerates).
+    // Some models have properties that make K quantization produce correlated
+    // errors that softmax amplifies:
+    //   - QKV bias (Qwen2, GPT-OSS): learned bias reduces angular diversity
+    //     of normalised K vectors.
+    //   - Sparse attention hybrids (Qwen 3.5, Nemotron-H): few attention layers
+    //     mean K errors propagate through many non-attention layers uncorrected.
     //
-    // TODO: fix TurboQuant to handle bias properly (e.g., subtract mean bias
-    // before normalisation, or use bias-aware codebooks).
-    let kv_quant = if kv_quant.is_quantized() && arch.has_qkv_bias() {
-        warn!(
-            arch = ?arch,
-            "TurboQuant disabled (QKV bias incompatibility); using BF16 KV cache"
-        );
-        KvQuantMode::None
-    } else if kv_quant.is_quantized() && config.has_sparse_attention() {
-        // Hybrid architectures (Qwen 3.5, Nemotron-H) have very few attention
-        // layers relative to total layers.  TurboQuant quantization errors in
-        // these sparse attention layers propagate through many non-attention
-        // layers (DeltaNet/Mamba-2/MoE) before the next attention correction,
-        // causing progressive output degradation (word salad / repetition).
-        // The KV cache is already tiny for these models (e.g. 6 of 52 layers),
-        // so compression saves negligible memory.
-        warn!(
-            arch = ?arch,
-            kv_layers = config.num_kv_layers(),
-            total_layers = config.num_hidden_layers,
-            "TurboQuant disabled (sparse attention — hybrid architecture); using BF16 KV cache"
-        );
-        KvQuantMode::None
+    // V is tolerant of quantisation error in both cases because it's a weighted
+    // sum — errors average out across positions.  On Metal (where the V-only
+    // kernel exists), we keep K at BF16 and turbo-quantise V only ("asymmetric
+    // mode").  On CUDA the V-only kernel doesn't exist yet, so we fully disable.
+    let needs_asymmetric = arch.has_qkv_bias() || config.has_sparse_attention();
+    let kv_quant = if kv_quant.is_any_quantized() && needs_asymmetric {
+        #[cfg(target_os = "macos")]
+        {
+            let pair = KvQuantPair::asymmetric(KvQuantMode::None, kv_quant.v);
+            if arch.has_qkv_bias() {
+                warn!(
+                    arch = ?arch,
+                    k = "BF16",
+                    v = ?kv_quant.v,
+                    "TurboQuant asymmetric mode (K=BF16, V=turbo) — QKV bias",
+                );
+            } else {
+                warn!(
+                    arch = ?arch,
+                    kv_layers = config.num_kv_layers(),
+                    total_layers = config.num_hidden_layers,
+                    k = "BF16",
+                    v = ?kv_quant.v,
+                    "TurboQuant asymmetric mode (K=BF16, V=turbo) — sparse attention",
+                );
+            }
+            pair
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            warn!(
+                arch = ?arch,
+                "TurboQuant disabled (V-only kernel unavailable on CUDA); using BF16 KV cache"
+            );
+            KvQuantPair::symmetric(KvQuantMode::None)
+        }
     } else {
         kv_quant
     };
 
-    // Set up TurboQuant KV cache quantization if enabled.
-    if kv_quant.is_quantized() {
+    // Set up TurboQuant KV cache quantization if any pool is quantized.
+    // In asymmetric mode (K=BF16, V=Turbo), V still needs rotation + centroids.
+    if kv_quant.is_any_quantized() {
         model.turbo_ctx = Some(model::turboquant::TurboContext::new(
             &backend,
             kv_quant,
@@ -331,9 +344,19 @@ fn load_and_run_single_gpu(
     let weight_mb = config.estimate_weight_bytes(is_quantized, &qpb) as f64 / (1024.0 * 1024.0);
     let kv_mb = kv_pool.total_memory_bytes() as f64 / (1024.0 * 1024.0);
     let max_tokens = kv_pool.max_tokens();
-    if kv_quant.is_quantized() {
-        info!(bits = kv_quant.bits(),
-            compression = format_args!("{:.1}x", kv_dim as f64 * 2.0 / kv_pool.bytes_per_position() as f64),
+    let bf16_bytes_per_pos = (kv_dim * 2) as f64;
+    if kv_quant.is_asymmetric() {
+        let v_compression = bf16_bytes_per_pos / kv_pool.v_bytes_per_position() as f64;
+        info!(
+            k = "BF16",
+            v_bits = kv_quant.v.bits(),
+            v_compression = format_args!("{:.1}x", v_compression),
+            "kv cache: TurboQuant asymmetric (K=BF16, V=turbo)",
+        );
+    } else if kv_quant.is_any_quantized() {
+        let compression = bf16_bytes_per_pos / kv_pool.v_bytes_per_position() as f64;
+        info!(bits = kv_quant.v.bits(),
+            compression = format_args!("{:.1}x", compression),
             "kv cache: TurboQuant",
         );
     }

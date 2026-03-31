@@ -406,9 +406,9 @@ pub(crate) fn serve(args: ServeArgs) -> anyhow::Result<()> {
         tracing::info!(gpus = tp, "tensor parallelism enabled");
     }
 
-    let kv_quant = crate::model::turboquant::KvQuantMode::from_str(&args.kv_quant)
+    let kv_quant = crate::model::turboquant::KvQuantPair::from_str(&args.kv_quant)
         .unwrap_or_else(|| {
-            tracing::error!(value = %args.kv_quant, "invalid --kv-quant value, expected: turbo4, turbo3, turbo2, none");
+            tracing::error!(value = %args.kv_quant, "invalid --kv-quant value, expected: turbo4, turbo3, turbo2, none, none:turbo4");
             std::process::exit(1);
         });
 
@@ -648,7 +648,7 @@ fn spawn_worker(
     model_dir: std::path::PathBuf,
     stream_experts: bool,
     tp: usize,
-    kv_quant: crate::model::turboquant::KvQuantMode,
+    kv_quant: crate::model::turboquant::KvQuantPair,
     metrics: Arc<metrics::Metrics>,
     max_pending: usize,
     max_active: usize,

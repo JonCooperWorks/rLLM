@@ -103,7 +103,7 @@ pub(crate) mod tp {
                 // TP-aware KV cache: each rank has kv_dim / world_size heads.
                 let kv_dim = (config.num_key_value_heads / world_size) * config.head_dim;
                 let num_kv_layers = config.num_kv_layers();
-                let kv_pool = KvPool::new(&*backend, num_blocks, kv_dim, num_kv_layers, crate::model::turboquant::KvQuantMode::None, config.head_dim);
+                let kv_pool = KvPool::new(&*backend, num_blocks, kv_dim, num_kv_layers, crate::model::turboquant::KvQuantPair::symmetric(crate::model::turboquant::KvQuantMode::None), config.head_dim);
                 let seq_state = kv_pool.new_sequence(&*backend);
 
                 // TP-aware scratch buffers.

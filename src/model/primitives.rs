@@ -301,28 +301,75 @@ pub(crate) fn paged_kv_and_attention_maybe_quantized<B: GpuAttention + GpuTurboQ
     turbo: Option<&crate::model::turboquant::TurboContext<B>>,
 ) {
     if let Some(tc) = turbo {
-        backend.turbo_paged_attention_fused(
-            q_buf,
-            k_buf,
-            v_buf,
-            &pool.k_pool[layer_idx],
-            &pool.v_pool[layer_idx],
-            &seq_state.block_table_gpu,
-            &tc.pi,
-            &tc.pi_t,
-            &tc.centroids,
-            &tc.q_rot_buf,
-            attn_out,
-            pos,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            tc.config.bits,
-            tc.config.bytes_per_head_pos as u32,
-            window_size,
-            attn_scale,
-            sinks,
-        );
+        if tc.kv_pair.is_asymmetric() {
+            // Asymmetric mode: K=BF16, V=TurboQuant.
+            // Write K as BF16 to paged cache.
+            backend.copy_to_paged_kv_cache(
+                k_buf,
+                &pool.k_pool[layer_idx],
+                &seq_state.block_table_gpu,
+                pos,
+                num_kv_heads,
+                head_dim,
+            );
+            // Turbo-quantize V into paged cache.
+            backend.turbo_quantize_to_paged(
+                v_buf,
+                &pool.v_pool[layer_idx],
+                &seq_state.block_table_gpu,
+                &tc.pi,
+                &tc.centroids,
+                pos,
+                num_kv_heads,
+                head_dim,
+                tc.config.bits,
+                tc.config.bytes_per_head_pos as u32,
+            );
+            // V-only attention: BF16 K scoring + turbo V accumulation.
+            backend.turbo_paged_attention_v_only(
+                q_buf,
+                &pool.k_pool[layer_idx],
+                &pool.v_pool[layer_idx],
+                &seq_state.block_table_gpu,
+                &tc.pi_t,
+                &tc.centroids,
+                attn_out,
+                pos + 1,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                tc.config.bits,
+                (num_kv_heads * head_dim) as u32, // kv_dim for BF16 K addressing
+                tc.config.bytes_per_head_pos as u32,
+                window_size,
+                attn_scale,
+                sinks,
+            );
+        } else {
+            // Symmetric mode: both K and V are turbo-quantized.
+            backend.turbo_paged_attention_fused(
+                q_buf,
+                k_buf,
+                v_buf,
+                &pool.k_pool[layer_idx],
+                &pool.v_pool[layer_idx],
+                &seq_state.block_table_gpu,
+                &tc.pi,
+                &tc.pi_t,
+                &tc.centroids,
+                &tc.q_rot_buf,
+                attn_out,
+                pos,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                tc.config.bits,
+                tc.config.bytes_per_head_pos as u32,
+                window_size,
+                attn_scale,
+                sinks,
+            );
+        }
     } else {
         paged_kv_and_attention(
             backend, k_buf, v_buf, q_buf, attn_out, pool, seq_state,
@@ -1173,33 +1220,59 @@ pub(crate) fn paged_kv_and_prefill_attention_maybe_quantized<
     turbo: Option<&crate::model::turboquant::TurboContext<B>>,
 ) {
     if let Some(tc) = turbo {
-        // TurboQuant: rotate + quantize K/V into paged pool.
-        backend.turbo_quantize_to_paged_batch(
-            &bufs.k_buf,
-            &pool.k_pool[layer_idx],
-            &seq_state.block_table_gpu,
-            &bufs.positions,
-            &tc.pi,
-            &tc.centroids,
-            bs,
-            num_kv_heads,
-            head_dim,
-            tc.config.bits,
-            tc.config.bytes_per_head_pos as u32,
-        );
-        backend.turbo_quantize_to_paged_batch(
-            &bufs.v_buf,
-            &pool.v_pool[layer_idx],
-            &seq_state.block_table_gpu,
-            &bufs.positions,
-            &tc.pi,
-            &tc.centroids,
-            bs,
-            num_kv_heads,
-            head_dim,
-            tc.config.bits,
-            tc.config.bytes_per_head_pos as u32,
-        );
+        if tc.kv_pair.is_asymmetric() {
+            // Asymmetric: K=BF16 copy, V=TurboQuant.
+            backend.copy_to_paged_kv_cache_batch(
+                &bufs.k_buf,
+                &pool.k_pool[layer_idx],
+                &seq_state.block_table_gpu,
+                &bufs.positions,
+                bs,
+                num_kv_heads,
+                head_dim,
+            );
+            backend.turbo_quantize_to_paged_batch(
+                &bufs.v_buf,
+                &pool.v_pool[layer_idx],
+                &seq_state.block_table_gpu,
+                &bufs.positions,
+                &tc.pi,
+                &tc.centroids,
+                bs,
+                num_kv_heads,
+                head_dim,
+                tc.config.bits,
+                tc.config.bytes_per_head_pos as u32,
+            );
+        } else {
+            // Symmetric TurboQuant: rotate + quantize both K and V.
+            backend.turbo_quantize_to_paged_batch(
+                &bufs.k_buf,
+                &pool.k_pool[layer_idx],
+                &seq_state.block_table_gpu,
+                &bufs.positions,
+                &tc.pi,
+                &tc.centroids,
+                bs,
+                num_kv_heads,
+                head_dim,
+                tc.config.bits,
+                tc.config.bytes_per_head_pos as u32,
+            );
+            backend.turbo_quantize_to_paged_batch(
+                &bufs.v_buf,
+                &pool.v_pool[layer_idx],
+                &seq_state.block_table_gpu,
+                &bufs.positions,
+                &tc.pi,
+                &tc.centroids,
+                bs,
+                num_kv_heads,
+                head_dim,
+                tc.config.bits,
+                tc.config.bytes_per_head_pos as u32,
+            );
+        }
     } else {
         // BF16: direct copy to paged pool.
         backend.copy_to_paged_kv_cache_batch(

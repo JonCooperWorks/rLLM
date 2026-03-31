@@ -11,9 +11,8 @@
 #   - --bench mode: performance measurement integrated into pytest runs
 #
 # Usage:
-#   pytest tests/ -v                         # just test
-#   pytest tests/ -v --bench                 # test + benchmark
-#   pytest tests/ -v --bench --bench-filter llama  # bench specific models
+#   pytest tests/ -v                         # test + benchmark all models
+#   pytest tests/ -v --filter llama          # test + benchmark specific models
 #
 # Related: models.py (model registry), quality.py (validation),
 #          benchmark.py (measurement engine), test_model_families.py (tests)
@@ -148,6 +147,7 @@ class ServerProcess:
     proc: subprocess.Popen
     base_url: str
     config_key: str
+    log_thread: "threading.Thread | None" = None
 
 
 class ServerManager:
@@ -299,8 +299,8 @@ class BenchContext:
 
 def pytest_addoption(parser):
     group = parser.getgroup("bench", "rLLM benchmark options")
-    group.addoption("--bench", action="store_true", default=False,
-                    help="Enable benchmark mode (measure tok/s + TTFT)")
+    group.addoption("--bench", action="store_true", default=True,
+                    help="Benchmark mode (always on — measures tok/s + TTFT)")
     group.addoption("--bench-runs", type=int, default=1,
                     help="Number of runs per model (default: 1)")
     group.addoption("--bench-max-tokens", type=int, default=128,
@@ -309,8 +309,10 @@ def pytest_addoption(parser):
                     help="Override benchmark prompt")
     group.addoption("--bench-output", default=None,
                     help="Write markdown results to this file path")
+    group.addoption("--filter", default="",
+                    help="Only run/bench models matching this substring (filters both tests and benchmarks)")
     group.addoption("--bench-filter", default="",
-                    help="Only bench models matching this substring")
+                    help="Alias for --filter (deprecated)")
     group.addoption("--bench-q4-only", action="store_true", default=False,
                     help="Skip bf16 variants, only bench Q4")
     group.addoption("--bench-bf16-only", action="store_true", default=False,
@@ -455,7 +457,19 @@ collect_ignore_glob = ["test_nemotron_debug.py"]
 
 
 def pytest_collection_modifyitems(config, items):
-    """Skip bench_only tests when --bench is not active."""
+    """Skip bench_only tests when --bench is not active, and apply --filter."""
+    # --filter / --bench-filter: skip model tests whose ID doesn't match.
+    model_filter = (config.getoption("--filter", default="")
+                    or config.getoption("--bench-filter", default=""))
+    if model_filter:
+        skip_filter = pytest.mark.skip(reason=f"--filter '{model_filter}' not matched")
+        for item in items:
+            # Only filter parametrized model tests (test_model_bf16[xxx], etc.)
+            if "[" in item.nodeid:
+                param_id = item.nodeid.split("[")[-1].rstrip("]")
+                if model_filter not in param_id:
+                    item.add_marker(skip_filter)
+
     if config.getoption("--bench", default=False):
         return
     skip_bench = pytest.mark.skip(reason="--bench not active")

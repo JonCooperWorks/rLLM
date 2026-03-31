@@ -16,7 +16,8 @@
 #   --bench-runs N   number of benchmark runs per model (default: 1)
 #   --bench-tokens N max tokens for benchmark (default: 128)
 #   --bench-output F write benchmark markdown to file
-#   --bench-filter P only benchmark models matching pattern
+#   --filter P    only run/bench models matching pattern
+#   --bench-filter P alias for --filter (deprecated)
 #   -k EXPR       pass pytest -k filter (e.g., -k llama)
 #   -v            verbose pytest output
 #   --            remaining args passed directly to pytest
@@ -55,7 +56,8 @@ while [[ $# -gt 0 ]]; do
     --bench-runs)     BENCH_ARGS+=("--runs" "$2"); shift 2 ;;
     --bench-tokens)   BENCH_ARGS+=("--max-tokens" "$2"); shift 2 ;;
     --bench-output)   BENCH_ARGS+=("--output" "$2"); shift 2 ;;
-    --bench-filter)   BENCH_ARGS+=("--filter" "$2"); shift 2 ;;
+    --filter)         PYTEST_ARGS+=("--filter" "$2"); shift 2 ;;
+    --bench-filter)   PYTEST_ARGS+=("--filter" "$2"); shift 2 ;;
     --q4-only)        BENCH_ARGS+=("--q4-only"); shift ;;
     --bf16-only)      BENCH_ARGS+=("--bf16-only"); shift ;;
     -k)               PYTEST_ARGS+=("-k" "$2"); shift 2 ;;

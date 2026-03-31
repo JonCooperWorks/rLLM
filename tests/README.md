@@ -227,7 +227,7 @@ tests/run.sh --bench --bench-tokens 512
 tests/run.sh --bench --q4-only
 
 # Only models matching "llama":
-tests/run.sh --bench --bench-filter llama
+tests/run.sh --bench --filter llama
 
 # Save to a specific file:
 tests/run.sh --bench --bench-output my-results.md

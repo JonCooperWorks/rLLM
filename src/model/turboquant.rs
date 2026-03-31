@@ -136,6 +136,70 @@ impl KvQuantMode {
 }
 
 // ---------------------------------------------------------------------------
+// KV cache quantization pair — allows asymmetric K/V quantization modes.
+//
+// Models with QKV bias (Qwen2, GPT-OSS) exhibit correlated K quantization
+// error that softmax amplifies.  V is tolerant because errors average out
+// in weighted sums.  KvQuantPair allows K=BF16, V=TurboX ("asymmetric mode")
+// while preserving the existing K=V=TurboX ("symmetric mode") path.
+// ---------------------------------------------------------------------------
+
+/// Paired K/V quantization modes, supporting asymmetric configurations.
+///
+/// Symmetric: both K and V use the same mode (the common case).
+/// Asymmetric: K=BF16, V=TurboX (for models with QKV bias on Metal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KvQuantPair {
+    pub k: KvQuantMode,
+    pub v: KvQuantMode,
+}
+
+impl KvQuantPair {
+    /// Both K and V use the same quantization mode.
+    pub fn symmetric(mode: KvQuantMode) -> Self {
+        Self { k: mode, v: mode }
+    }
+
+    /// Different quantization modes for K and V.
+    pub fn asymmetric(k: KvQuantMode, v: KvQuantMode) -> Self {
+        Self { k, v }
+    }
+
+    /// Whether either K or V is quantized.
+    pub fn is_any_quantized(self) -> bool {
+        self.k.is_quantized() || self.v.is_quantized()
+    }
+
+    /// Whether K and V use different modes.
+    pub fn is_asymmetric(self) -> bool {
+        self.k != self.v
+    }
+
+    /// Whether K and V use the same mode.
+    #[allow(dead_code)]
+    pub fn is_symmetric(self) -> bool {
+        self.k == self.v
+    }
+
+    /// Parse from CLI string.
+    ///
+    /// Accepted formats:
+    ///   "turbo4"       → symmetric (K=Turbo4, V=Turbo4)
+    ///   "none"         → symmetric (K=None, V=None)
+    ///   "none:turbo4"  → asymmetric (K=None, V=Turbo4) — K:V format
+    pub fn from_str(s: &str) -> Option<Self> {
+        if let Some((k_str, v_str)) = s.split_once(':') {
+            let k = KvQuantMode::from_str(k_str)?;
+            let v = KvQuantMode::from_str(v_str)?;
+            Some(Self { k, v })
+        } else {
+            let mode = KvQuantMode::from_str(s)?;
+            Some(Self::symmetric(mode))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Max-Lloyd codebook centroids for the standard Gaussian distribution.
 //
 // These are the optimal scalar quantizer centroids for N(0, 1), computed via
@@ -359,6 +423,9 @@ pub(crate) struct TurboContext<B: GpuCore> {
     pub q_rot_buf: B::Tensor,
     /// Configuration (bits, bytes_per_head_pos, etc.).
     pub config: TurboQuantConfig,
+    /// K/V quantization pair — needed by primitives to choose the right
+    /// attention path (symmetric turbo, asymmetric V-only, or BF16).
+    pub kv_pair: KvQuantPair,
 }
 
 impl<B: GpuCore> TurboContext<B> {
@@ -366,7 +433,15 @@ impl<B: GpuCore> TurboContext<B> {
     ///
     /// The rotation matrix is generated from a fixed seed (42) for
     /// reproducibility and prefix cache compatibility.
-    pub fn new(backend: &B, mode: KvQuantMode, head_dim: usize, num_heads: usize) -> Self {
+    ///
+    /// `kv_pair` stores the full K/V quantization pair so primitives can
+    /// choose the right attention path.  The V mode determines the config
+    /// (bits, codebook, bytes_per_head_pos) since only V is guaranteed to
+    /// be quantized when this context exists.
+    pub fn new(backend: &B, kv_pair: KvQuantPair, head_dim: usize, num_heads: usize) -> Self {
+        // V mode drives the TurboQuant config — it's always quantized when
+        // a TurboContext is created.
+        let mode = kv_pair.v;
         let config = TurboQuantConfig::new(mode, head_dim);
 
         // Generate and upload rotation matrix.
@@ -399,6 +474,7 @@ impl<B: GpuCore> TurboContext<B> {
             centroids,
             q_rot_buf,
             config,
+            kv_pair,
         }
     }
 }
@@ -435,6 +511,31 @@ mod tests {
         assert_eq!(KvQuantMode::from_str("turbo2"), Some(KvQuantMode::Turbo2));
         assert_eq!(KvQuantMode::from_str("none"), Some(KvQuantMode::None));
         assert_eq!(KvQuantMode::from_str("invalid"), Option::None);
+    }
+
+    #[test]
+    fn test_kv_quant_pair_parsing() {
+        // Symmetric: single mode string.
+        let pair = KvQuantPair::from_str("turbo4").unwrap();
+        assert_eq!(pair.k, KvQuantMode::Turbo4);
+        assert_eq!(pair.v, KvQuantMode::Turbo4);
+        assert!(!pair.is_asymmetric());
+        assert!(pair.is_any_quantized());
+
+        // Asymmetric: "K:V" format.
+        let pair = KvQuantPair::from_str("none:turbo4").unwrap();
+        assert_eq!(pair.k, KvQuantMode::None);
+        assert_eq!(pair.v, KvQuantMode::Turbo4);
+        assert!(pair.is_asymmetric());
+        assert!(pair.is_any_quantized());
+
+        // Both none.
+        let pair = KvQuantPair::from_str("none").unwrap();
+        assert!(!pair.is_any_quantized());
+
+        // Invalid.
+        assert!(KvQuantPair::from_str("invalid").is_none());
+        assert!(KvQuantPair::from_str("none:invalid").is_none());
     }
 
     #[test]

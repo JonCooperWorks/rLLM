@@ -68,6 +68,23 @@ struct TurboPagedAttentionParams {
     has_sinks: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TurboPagedAttentionVOnlyParams {
+    seq_len: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    bits: u32,
+    kv_dim: u32,
+    v_bytes_per_head_pos: u32,
+    block_size: u32,
+    num_centroids: u32,
+    window_size: u32,
+    attn_scale: f32,
+    has_sinks: u32,
+}
+
 impl GpuTurboQuant for MetalBackend {
     fn turbo_quantize_to_paged(
         &self,
@@ -225,6 +242,63 @@ impl GpuTurboQuant for MetalBackend {
             &params,
             &[
                 (&q_rot.buffer, 1),
+                (&k_pool.buffer, 2),
+                (&v_pool.buffer, 3),
+                (&block_table.buffer, 4),
+                (&pi_t.buffer, 5),
+                (&centroids.buffer, 6),
+                (&out.buffer, 7),
+                (sinks_buf, 8),
+            ],
+            MTLSize::new(num_threadgroups * threads_per_group, 1, 1),
+            MTLSize::new(threads_per_group, 1, 1),
+        );
+    }
+
+    fn turbo_paged_attention_v_only(
+        &self,
+        q: &MetalTensor,
+        k_pool: &MetalTensor,
+        v_pool: &MetalTensor,
+        block_table: &MetalTensor,
+        pi_t: &MetalTensor,
+        centroids: &MetalTensor,
+        out: &MetalTensor,
+        seq_len: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        bits: u32,
+        kv_dim: u32,
+        v_bytes_per_head_pos: u32,
+        window_size: u32,
+        attn_scale: f32,
+        sinks: Option<&MetalTensor>,
+    ) {
+        let params = TurboPagedAttentionVOnlyParams {
+            seq_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            bits,
+            kv_dim,
+            v_bytes_per_head_pos,
+            block_size: kv_cache::BLOCK_SIZE as u32,
+            num_centroids: 1 << bits,
+            window_size,
+            attn_scale,
+            has_sinks: if sinks.is_some() { 1 } else { 0 },
+        };
+
+        let sinks_buf = sinks.map(|s| &s.buffer).unwrap_or(&out.buffer);
+        let threads_per_group: u64 = 256;
+        let num_threadgroups = num_heads as u64;
+
+        self.dispatch_async(
+            &self.pipeline_turbo_paged_attention_v_only,
+            &params,
+            &[
+                (&q.buffer, 1),
                 (&k_pool.buffer, 2),
                 (&v_pool.buffer, 3),
                 (&block_table.buffer, 4),

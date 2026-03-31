@@ -191,6 +191,7 @@ pub(crate) struct MetalBackend {
     pub(crate) pipeline_turbo_quantize_paged_batch: metal::ComputePipelineState,
     pub(crate) pipeline_turbo_rotate_q: metal::ComputePipelineState,
     pub(crate) pipeline_turbo_paged_attention: metal::ComputePipelineState,
+    pub(crate) pipeline_turbo_paged_attention_v_only: metal::ComputePipelineState,
 
     // Batched command encoding state.
     //
@@ -575,6 +576,12 @@ impl MetalBackend {
             "turbo_paged_attention",
             &compile_opts,
         )?;
+        let pipeline_turbo_paged_attention_v_only = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_TURBOQUANT,
+            "turbo_paged_attention_v_only",
+            &compile_opts,
+        )?;
 
         Ok(Self {
             device,
@@ -648,6 +655,7 @@ impl MetalBackend {
             pipeline_turbo_quantize_paged_batch,
             pipeline_turbo_rotate_q,
             pipeline_turbo_paged_attention,
+            pipeline_turbo_paged_attention_v_only,
             current_cmd: std::sync::Mutex::new(None),
         })
     }

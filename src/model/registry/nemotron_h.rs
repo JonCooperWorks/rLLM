@@ -704,20 +704,37 @@ pub(crate) fn forward_prefill_paged<
                 // Paged KV cache write (batched).
                 let kv_idx = m.kv_layer_map[layer_idx].unwrap();
                 if let Some(tc) = &m.turbo_ctx {
-                    m.backend.turbo_quantize_to_paged_batch(
-                        &bufs.k_buf, &pool.k_pool[kv_idx],
-                        &seq_state.block_table_gpu, &bufs.positions,
-                        &tc.pi, &tc.centroids,
-                        bs, d.num_kv_heads, d.head_dim,
-                        tc.config.bits, tc.config.bytes_per_head_pos as u32,
-                    );
-                    m.backend.turbo_quantize_to_paged_batch(
-                        &bufs.v_buf, &pool.v_pool[kv_idx],
-                        &seq_state.block_table_gpu, &bufs.positions,
-                        &tc.pi, &tc.centroids,
-                        bs, d.num_kv_heads, d.head_dim,
-                        tc.config.bits, tc.config.bytes_per_head_pos as u32,
-                    );
+                    if tc.kv_pair.is_asymmetric() {
+                        // Asymmetric: K=BF16 copy, V=TurboQuant.
+                        m.backend.copy_to_paged_kv_cache_batch(
+                            &bufs.k_buf, &pool.k_pool[kv_idx],
+                            &seq_state.block_table_gpu, &bufs.positions,
+                            bs, d.num_kv_heads, d.head_dim,
+                        );
+                        m.backend.turbo_quantize_to_paged_batch(
+                            &bufs.v_buf, &pool.v_pool[kv_idx],
+                            &seq_state.block_table_gpu, &bufs.positions,
+                            &tc.pi, &tc.centroids,
+                            bs, d.num_kv_heads, d.head_dim,
+                            tc.config.bits, tc.config.bytes_per_head_pos as u32,
+                        );
+                    } else {
+                        // Symmetric TurboQuant.
+                        m.backend.turbo_quantize_to_paged_batch(
+                            &bufs.k_buf, &pool.k_pool[kv_idx],
+                            &seq_state.block_table_gpu, &bufs.positions,
+                            &tc.pi, &tc.centroids,
+                            bs, d.num_kv_heads, d.head_dim,
+                            tc.config.bits, tc.config.bytes_per_head_pos as u32,
+                        );
+                        m.backend.turbo_quantize_to_paged_batch(
+                            &bufs.v_buf, &pool.v_pool[kv_idx],
+                            &seq_state.block_table_gpu, &bufs.positions,
+                            &tc.pi, &tc.centroids,
+                            bs, d.num_kv_heads, d.head_dim,
+                            tc.config.bits, tc.config.bytes_per_head_pos as u32,
+                        );
+                    }
                 } else {
                     m.backend.copy_to_paged_kv_cache_batch(
                         &bufs.k_buf, &pool.k_pool[kv_idx],

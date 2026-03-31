@@ -98,6 +98,22 @@ struct TurboPagedAttentionParams {
     uint has_sinks;
 };
 
+// V-only variant: K is BF16, V is TurboQuant.
+struct TurboPagedAttentionVOnlyParams {
+    uint seq_len;
+    uint num_heads;
+    uint num_kv_heads;
+    uint head_dim;
+    uint bits;              // V quantization bits
+    uint kv_dim;            // num_kv_heads * head_dim (for BF16 K addressing)
+    uint v_bytes_per_head_pos;  // bytes per V head per position (quantized)
+    uint block_size;
+    uint num_centroids;
+    uint window_size;
+    float attn_scale;
+    uint has_sinks;
+};
+
 // ---------------------------------------------------------------------------
 // Helper: extract a b-bit code from a packed byte array.
 //
@@ -658,6 +674,214 @@ kernel void turbo_paged_attention(
     if (tid < hd) {
         // First, reduce the rotated V from shared memory into a local copy.
         // Then apply Pi^T[tid, :] · v_rot[:].
+        float v_out = 0.0f;
+        for (uint j = 0; j < hd; j++) {
+            float v_rot_j = 0.0f;
+            for (uint g = 0; g < num_groups; g++) {
+                v_rot_j += shared_reduce[g * hd + j];
+            }
+            v_out += pi_t[tid * hd + j] * v_rot_j;
+        }
+        output[head_id * hd + tid] = bfloat(v_out);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// turbo_paged_attention_v_only — asymmetric attention: BF16 K + TurboQuant V.
+//
+// For models with QKV bias (Qwen2, GPT-OSS), K quantization produces
+// correlated errors that softmax amplifies.  V is tolerant because errors
+// average out in weighted sums.  This kernel scores Q against BF16 K
+// (standard dot product, no rotation) and accumulates turbo-quantized V
+// (centroid dequant in rotated space, Pi^T inverse rotation at the end).
+//
+// K scoring follows the BF16 paged_attention pattern (attention.metal).
+// V accumulation follows the turbo_paged_attention pattern above.
+//
+// Dispatch: num_heads threadgroups, 256 threads each.
+// ---------------------------------------------------------------------------
+
+kernel void turbo_paged_attention_v_only(
+    constant TurboPagedAttentionVOnlyParams& params [[buffer(0)]],
+    device const bfloat* q               [[buffer(1)]],   // [num_heads, head_dim] bf16 (NOT rotated)
+    device const bfloat* k_pool          [[buffer(2)]],   // BF16 paged K pool
+    device const uchar* v_pool           [[buffer(3)]],   // quantized paged V pool
+    device const uint* block_table       [[buffer(4)]],
+    constant float* pi_t                 [[buffer(5)]],   // [head_dim, head_dim] f32
+    constant float* centroids            [[buffer(6)]],   // [num_centroids] f32
+    device bfloat* output                [[buffer(7)]],   // [num_heads, head_dim] bf16
+    device const bfloat* sinks           [[buffer(8)]],   // [num_heads] or dummy
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_id [[threadgroup_position_in_grid]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    uint head_id = tg_id;
+    if (head_id >= params.num_heads) return;
+
+    uint hd = params.head_dim;
+    uint seq_len = params.seq_len;
+    uint num_kv_heads = params.num_kv_heads;
+    uint bits = params.bits;
+    uint kv_dim = params.kv_dim;
+    uint v_bytes_per_head_pos = params.v_bytes_per_head_pos;
+    uint block_size = params.block_size;
+    uint num_centroids = params.num_centroids;
+
+    // GQA: map query head to KV head.
+    uint heads_per_kv = params.num_heads / num_kv_heads;
+    uint kv_head = head_id / heads_per_kv;
+
+    // Load centroids into shared memory (for V dequant).
+    threadgroup float shared_centroids[16];
+    if (tid < num_centroids) {
+        shared_centroids[tid] = centroids[tid];
+    }
+
+    // Load Q into shared memory (bf16, NOT rotated — K is BF16).
+    threadgroup float q_shared[256];
+    if (tid < hd) {
+        q_shared[tid] = float(q[head_id * hd + tid]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Per-thread V accumulator in rotated space + online softmax state.
+    float local_max = -INFINITY;
+    float local_sum_exp = 0.0f;
+    float v_acc[256] = {};  // max head_dim; zero-initialised
+
+    // V pool addressing: bytes per position across all V KV heads.
+    uint v_bytes_per_pos = num_kv_heads * v_bytes_per_head_pos;
+
+    // Attention scale.
+    float scale = (params.attn_scale != 0.0f) ? params.attn_scale : rsqrt(float(hd));
+
+    // Block table caching.
+    uint prev_logical_block = ~0u;
+    uint physical_base = 0;
+
+    // Determine attention window.
+    uint start = 0;
+    if (params.window_size > 0 && seq_len > params.window_size) {
+        start = seq_len - params.window_size;
+    }
+
+    // --- Main position loop (strided across 256 threads). ---
+    for (uint pos = start + tid; pos < seq_len; pos += tg_size) {
+        // Block table lookup with caching.
+        uint logical_block = pos / block_size;
+        if (logical_block != prev_logical_block) {
+            prev_logical_block = logical_block;
+            physical_base = block_table[logical_block] * block_size;
+        }
+        uint offset_in_block = pos % block_size;
+        uint pool_pos = physical_base + offset_in_block;
+
+        // --- K scoring: standard BF16 dot product (same as paged_attention). ---
+        device const bfloat* k_vec = k_pool + pool_pos * kv_dim + kv_head * hd;
+        float score = 0.0f;
+        for (uint j = 0; j < hd; j++) {
+            score += q_shared[j] * float(k_vec[j]);
+        }
+        score *= scale;
+
+        // Online softmax update — rescale ALL V dimensions on new max.
+        if (score > local_max) {
+            float rescale = exp(local_max - score);
+            for (uint d = 0; d < hd; d++) v_acc[d] *= rescale;
+            local_sum_exp = local_sum_exp * rescale + 1.0f;
+            local_max = score;
+        } else {
+            local_sum_exp += exp(score - local_max);
+        }
+
+        float weight = exp(score - local_max);
+
+        // --- V accumulation: turbo-quantized dequant in rotated space. ---
+        device const uchar* v_pos_base = v_pool + pool_pos * v_bytes_per_pos + kv_head * v_bytes_per_head_pos;
+        float v_norm = float(*(device const bfloat*)v_pos_base);
+        device const uchar* v_codes = v_pos_base + 2;
+
+        for (uint d = 0; d < hd; d++) {
+            uint v_code = extract_code(v_codes, d, bits);
+            v_acc[d] += weight * shared_centroids[v_code] * v_norm;
+        }
+    }
+
+    // Handle attention sinks.
+    if (params.has_sinks && tid == 0) {
+        float sink_score = float(sinks[head_id]);
+        if (sink_score > local_max) {
+            float rescale = exp(local_max - sink_score);
+            for (uint d = 0; d < hd; d++) v_acc[d] *= rescale;
+            local_sum_exp = local_sum_exp * rescale + 1.0f;
+            local_max = sink_score;
+        } else {
+            local_sum_exp += exp(sink_score - local_max);
+        }
+    }
+
+    // --- Cross-thread softmax + V reduction (same as turbo_paged_attention). ---
+    threadgroup float shared_max[8];
+    threadgroup float shared_sum[8];
+
+    uint simd_group = tid / 32;
+    uint simd_lane = tid % 32;
+
+    float group_max = simd_max(local_max);
+    if (simd_lane == 0) shared_max[simd_group] = group_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float global_max;
+    if (tid == 0) {
+        global_max = shared_max[0];
+        uint num_groups = (tg_size + 31) / 32;
+        for (uint i = 1; i < num_groups; i++) {
+            global_max = max(global_max, shared_max[i]);
+        }
+        shared_max[0] = global_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    global_max = shared_max[0];
+
+    float rescale = exp(local_max - global_max);
+    local_sum_exp *= rescale;
+    for (uint d = 0; d < hd; d++) v_acc[d] *= rescale;
+
+    float group_sum = simd_sum(local_sum_exp);
+    if (simd_lane == 0) shared_sum[simd_group] = group_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float total_sum;
+    if (tid == 0) {
+        total_sum = 0.0f;
+        uint num_groups = (tg_size + 31) / 32;
+        for (uint i = 0; i < num_groups; i++) total_sum += shared_sum[i];
+        shared_sum[0] = total_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    total_sum = shared_sum[0];
+
+    float inv_sum = (total_sum > 0.0f) ? (1.0f / total_sum) : 0.0f;
+    for (uint d = 0; d < hd; d++) v_acc[d] *= inv_sum;
+
+    // --- Cross-thread V reduction + Pi^T inverse rotation. ---
+    // V was accumulated in rotated space (turbo centroids), so we need Pi^T
+    // to get back to original space.
+    threadgroup float shared_reduce[8 * 256];
+    uint num_groups = (tg_size + 31) / 32;
+
+    for (uint d = 0; d < hd; d++) {
+        v_acc[d] = simd_sum(v_acc[d]);
+    }
+
+    if (simd_lane == 0) {
+        for (uint d = 0; d < hd; d++) {
+            shared_reduce[simd_group * hd + d] = v_acc[d];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < hd) {
         float v_out = 0.0f;
         for (uint j = 0; j < hd; j++) {
             float v_rot_j = 0.0f;

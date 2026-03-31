@@ -176,9 +176,9 @@ pub(crate) fn load_model_and_run(
         info!(temperature = args.temperature, top_p = args.top_p, "sampling parameters");
     }
 
-    let kv_quant = crate::model::turboquant::KvQuantMode::from_str(&args.kv_quant)
+    let kv_quant = crate::model::turboquant::KvQuantPair::from_str(&args.kv_quant)
         .unwrap_or_else(|| {
-            error!(value = %args.kv_quant, "invalid --kv-quant value, expected: turbo4, turbo3, turbo2, none");
+            error!(value = %args.kv_quant, "invalid --kv-quant value, expected: turbo4, turbo3, turbo2, none, none:turbo4");
             std::process::exit(1);
         });
 

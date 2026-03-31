@@ -117,6 +117,43 @@ pub(crate) trait GpuTurboQuant: GpuCore {
         sinks: Option<&Self::Tensor>,
     );
 
+    /// V-only quantized paged attention: BF16 K scoring + turbo V accumulation.
+    ///
+    /// For asymmetric mode (K=BF16, V=TurboQuant): the K pool stores BF16
+    /// vectors, so Q·K scoring uses standard dot products (no rotation needed).
+    /// The V pool stores turbo-quantized vectors, so V accumulation uses
+    /// centroid dequantization in rotated space with Pi^T inverse rotation.
+    ///
+    /// `q`: [num_heads, head_dim] bf16 — raw query (NOT rotated).
+    /// `k_pool`: BF16 paged pool.
+    /// `v_pool`: quantized paged pool.
+    /// `pi_t`: [head_dim, head_dim] f32 — rotation matrix transpose (for V).
+    /// `centroids`: [num_centroids] f32 — codebook (for V).
+    /// `kv_dim`: num_kv_heads * head_dim (for BF16 K pool addressing).
+    /// `v_bytes_per_head_pos`: bytes per V head per position (quantized).
+    fn turbo_paged_attention_v_only(
+        &self,
+        _q: &Self::Tensor,
+        _k_pool: &Self::Tensor,
+        _v_pool: &Self::Tensor,
+        _block_table: &Self::Tensor,
+        _pi_t: &Self::Tensor,
+        _centroids: &Self::Tensor,
+        _out: &Self::Tensor,
+        _seq_len: u32,
+        _num_heads: u32,
+        _num_kv_heads: u32,
+        _head_dim: u32,
+        _bits: u32,
+        _kv_dim: u32,
+        _v_bytes_per_head_pos: u32,
+        _window_size: u32,
+        _attn_scale: f32,
+        _sinks: Option<&Self::Tensor>,
+    ) {
+        unimplemented!("V-only turbo paged attention not implemented on this backend");
+    }
+
     /// Fused: quantize K/V + pre-rotate Q + quantized attention.
     ///
     /// Default implementation calls the four separate methods.  Backends can
