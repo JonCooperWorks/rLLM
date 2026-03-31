@@ -471,13 +471,17 @@ pub(crate) fn run_step<D: Dispatch>(
         }
     }
 
-    // 2. Batched prefill: drain all pending tokens for each prefilling sequence.
-    //    Each sequence's prompt is processed via GEMM (mat-mat).  Long prompts
-    //    are chunked to fit within the prefill buffer allocation (max_chunk).
+    // 2. Chunked prefill: process ONE chunk per prefilling sequence per step.
     //
-    //    Prefix caching: before running prefill, check if the prompt's prefix
-    //    is already cached.  If so, link the cached blocks and only prefill
-    //    the suffix.  After prefill, register the prefix for future reuse.
+    //    Long prompts are split into max_prefill_chunk-sized pieces.  Only one
+    //    chunk is processed per step, then control returns to the decode phase
+    //    so decoding sequences aren't starved.  This is the key to avoiding
+    //    head-of-line blocking on long prompts and thinking models.
+    //
+    //    Prefix caching runs on the FIRST chunk only (when the sequence hasn't
+    //    started prefilling yet, i.e. seq_len == 0 and cached_tokens == 0).
+    //    After all chunks are done (pending_prefill empty), we register the
+    //    prefix and sample the first token.
     let prefilling_ids: Vec<SeqId> = scheduler
         .active
         .iter()
@@ -489,72 +493,75 @@ pub(crate) fn run_step<D: Dispatch>(
 
     for id in prefilling_ids {
         let seq = scheduler.active.get_mut(&id).unwrap();
-        let tokens: Vec<u32> = seq.pending_prefill.drain(..).collect();
 
-        // --- Prefix cache lookup ---
-        // Check if a prefix of this prompt is already cached.  If so,
-        // link the cached blocks (skip prefill for those tokens) and
-        // only run the model on the remaining suffix.
-        let cached_prefix_len = if let Some((prefix_blocks, prefix_token_count)) =
-            dispatch.prefix_cache_lookup(&tokens)
-        {
-            let prefix_len = prefix_token_count;
-            let prefix_block_count = prefix_blocks.len();
+        // --- Prefix cache lookup (first chunk only) ---
+        // On the first prefill step for this sequence (seq_len == 0 and no
+        // cached prefix), check if a prefix is already in the cache.  If so,
+        // link the cached blocks and skip those tokens.
+        let first_chunk = D::seq_len(&seq.kv_state) == 0 && seq.cached_tokens == 0;
+        if first_chunk {
+            // Peek at full pending tokens for cache lookup (without draining).
+            let all_tokens: Vec<u32> = seq.pending_prefill.iter().copied().collect();
+            if let Some((prefix_blocks, prefix_token_count)) =
+                dispatch.prefix_cache_lookup(&all_tokens)
+            {
+                let prefix_len = prefix_token_count;
+                let prefix_block_count = prefix_blocks.len();
 
-            // Block-aligned prefix tokens for cache release on free.
-            let prefix_tokens = tokens[..prefix_len].to_vec();
+                // Block-aligned prefix tokens for cache release on free.
+                let prefix_tokens = all_tokens[..prefix_len].to_vec();
 
-            dispatch.link_prefix(
-                &mut seq.kv_state,
-                &prefix_blocks,
-                prefix_token_count,
-                prefix_tokens,
-            );
-            seq.cached_tokens = prefix_len;
+                dispatch.link_prefix(
+                    &mut seq.kv_state,
+                    &prefix_blocks,
+                    prefix_token_count,
+                    prefix_tokens,
+                );
+                seq.cached_tokens = prefix_len;
 
-            debug!(
-                seq_id = id,
-                cached_tokens = prefix_len,
-                cached_blocks = prefix_block_count,
-                suffix_tokens = tokens.len() - prefix_len,
-                "prefix cache hit",
-            );
+                // Skip the cached prefix tokens in pending_prefill.
+                seq.pending_prefill.drain(..prefix_len);
 
-            prefix_len
-        } else {
-            0
-        };
-
-        let suffix_tokens = &tokens[cached_prefix_len..];
-
-        // Chunk the suffix (or full prompt) and run prefill.
-        // Images are passed only for the FIRST chunk (vision encoding happens
-        // once; subsequent chunks are pure text continuation).
-        if !suffix_tokens.is_empty() {
-            let mut first_chunk = true;
-            for chunk in suffix_tokens.chunks(max_chunk) {
-                let chunk_size = chunk.len();
-                dispatch.prepare_prefill(&mut seq.kv_state, chunk_size)?;
-                let images = if first_chunk {
-                    first_chunk = false;
-                    std::mem::take(&mut seq.images)
-                } else {
-                    Vec::new()
-                };
-                dispatch.forward_prefill(chunk, &seq.kv_state, &images)?;
-                D::finish_prefill(&mut seq.kv_state, chunk_size);
+                debug!(
+                    seq_id = id,
+                    cached_tokens = prefix_len,
+                    cached_blocks = prefix_block_count,
+                    suffix_tokens = seq.pending_prefill.len(),
+                    "prefix cache hit",
+                );
             }
         }
 
-        // --- Prefix cache registration ---
-        // After prefill, register the block-aligned prefix for future reuse.
-        // Only register if we didn't already use a cached prefix (avoid
-        // re-registering a subset of an existing entry).
-        if cached_prefix_len == 0 {
-            dispatch.prefix_cache_register(&tokens, &mut seq.kv_state);
+        // Drain ONE chunk from pending_prefill.
+        let chunk_size = max_chunk.min(seq.pending_prefill.len());
+        if chunk_size > 0 {
+            let chunk: Vec<u32> = seq.pending_prefill.drain(..chunk_size).collect();
+            dispatch.prepare_prefill(&mut seq.kv_state, chunk_size)?;
+            // Images are passed only on the FIRST chunk (vision encoding happens
+            // once; subsequent chunks are pure text continuation).
+            let images = if first_chunk {
+                std::mem::take(&mut seq.images)
+            } else {
+                Vec::new()
+            };
+            dispatch.forward_prefill(&chunk, &seq.kv_state, &images)?;
+            D::finish_prefill(&mut seq.kv_state, chunk_size);
         }
 
-        sample_and_finish(dispatch, seq, id, tokenizer, &mut step_tokens, &mut rng)?;
+        // If all tokens are now prefilled, register the prefix cache and
+        // sample the first token.  Otherwise, this sequence continues
+        // prefilling in the next step.
+        if seq.pending_prefill.is_empty() {
+            // --- Prefix cache registration ---
+            // Register the block-aligned prefix for future reuse.
+            // Only register if we didn't already use a cached prefix.
+            if seq.cached_tokens == 0 {
+                let tokens = &seq.original_prompt_tokens;
+                dispatch.prefix_cache_register(tokens, &mut seq.kv_state);
+            }
+
+            sample_and_finish(dispatch, seq, id, tokenizer, &mut step_tokens, &mut rng)?;
+        }
     }
 
     // 3. Decode: run one token per decoding sequence.
@@ -2247,5 +2254,282 @@ mod tests {
             blocks_after_preempt > blocks_total - blocks_used,
             "preemption should have freed blocks"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Chunked prefill interleaving tests — verify that long prefills don't
+    // starve decoding sequences.
+    // -----------------------------------------------------------------------
+
+    /// Mock dispatch with a configurable max_prefill_chunk.
+    ///
+    /// Used to test chunked prefill interleaving: when a sequence has a prompt
+    /// longer than `chunk_size`, each step should prefill at most one chunk,
+    /// then yield to let decoding sequences make progress.
+    struct ChunkedMockDispatch {
+        free_blocks: usize,
+        next_token: Cell<u32>,
+        prefill_count: Cell<usize>,
+        decode_count: Cell<usize>,
+        chunk_size: usize,
+    }
+
+    impl ChunkedMockDispatch {
+        fn new(free_blocks: usize, start_token: u32, chunk_size: usize) -> Self {
+            Self {
+                free_blocks,
+                next_token: Cell::new(start_token),
+                prefill_count: Cell::new(0),
+                decode_count: Cell::new(0),
+                chunk_size,
+            }
+        }
+    }
+
+    impl Dispatch for ChunkedMockDispatch {
+        type SeqState = MockSeqState;
+
+        fn new_seq_state(&self) -> MockSeqState {
+            MockSeqState { seq_len: 0 }
+        }
+
+        fn free_seq_state(&mut self, _state: &MockSeqState) {
+            self.free_blocks += 1;
+        }
+
+        fn free_block_count(&self) -> usize {
+            self.free_blocks
+        }
+
+        fn max_prefill_chunk(&self) -> usize {
+            self.chunk_size
+        }
+
+        fn seq_len(state: &MockSeqState) -> usize {
+            state.seq_len
+        }
+
+        fn prepare_prefill(
+            &mut self,
+            _state: &mut MockSeqState,
+            _token_count: usize,
+        ) -> anyhow::Result<()> {
+            self.prefill_count.set(self.prefill_count.get() + 1);
+            Ok(())
+        }
+
+        fn forward_prefill(&self, _tokens: &[u32], _state: &MockSeqState, _images: &[crate::model::vision::ProcessedImage]) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn finish_prefill(state: &mut MockSeqState, token_count: usize) {
+            state.seq_len += token_count;
+        }
+
+        fn prepare_decode(&mut self, _state: &mut MockSeqState) -> anyhow::Result<()> {
+            self.decode_count.set(self.decode_count.get() + 1);
+            Ok(())
+        }
+
+        fn forward_decode(&self, _token: u32, _state: &MockSeqState) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn finish_decode(state: &mut MockSeqState) {
+            state.seq_len += 1;
+        }
+
+        fn sample(
+            &self,
+            _params: &SampleParams,
+            _rng: &mut impl rand::Rng,
+            _allowed_tokens: Option<&[u32]>,
+            _token_counts: &HashMap<u32, u32>,
+            _logit_bias: &HashMap<u32, f32>,
+        ) -> anyhow::Result<SampleResult> {
+            let token = self.next_token.get();
+            self.next_token.set(token + 1);
+            Ok(SampleResult { token_id: token, logprob: 0.0, top_logprobs: Vec::new() })
+        }
+    }
+
+    #[test]
+    fn test_chunked_prefill_does_not_starve_decoding_sequences() {
+        // Scenario: Sequence A has a short prompt (4 tokens) and is already
+        // decoding.  Sequence B arrives with a long prompt (20 tokens) and
+        // max_prefill_chunk=8.  Without interleaving, B's prefill would run
+        // 3 chunks (8+8+4) in one step, blocking A from decoding.
+        //
+        // With interleaving, each step should:
+        //   - Prefill at most ONE chunk for B
+        //   - Decode A (producing a token)
+        //
+        // So A should get a decode token every step, even while B is still
+        // prefilling.
+        let chunk_size = 8;
+        let mut dispatch = ChunkedMockDispatch::new(100, 100, chunk_size);
+        let mut scheduler: Scheduler<MockSeqState> = Scheduler::new(4);
+        let tokenizer = make_tokenizer(vec![999]);
+
+        // Sequence A: short prompt, will enter decode quickly.
+        scheduler.add_request(SequenceRequest {
+            prompt_tokens: vec![1, 2, 3, 4],
+            max_gen_tokens: 10,
+            params: SampleParams { temperature: 0.0, ..SampleParams::default() },
+            images: Vec::new(),
+            seed: None,
+            grammar: None,
+            logit_bias: HashMap::new(),
+        });
+
+        // Step 1: Admit A, prefill A (4 tokens, fits in one chunk), decode A.
+        let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
+        assert!(out.tokens.iter().any(|(_, _, _)| true), "A should produce tokens");
+
+        // Now add B with a long prompt that requires multiple chunks.
+        scheduler.add_request(SequenceRequest {
+            prompt_tokens: vec![10; 20], // 20 tokens → needs ceil(20/8) = 3 chunks
+            max_gen_tokens: 5,
+            params: SampleParams { temperature: 0.0, ..SampleParams::default() },
+            images: Vec::new(),
+            seed: None,
+            grammar: None,
+            logit_bias: HashMap::new(),
+        });
+
+        let prefill_before = dispatch.prefill_count.get();
+        let decode_before = dispatch.decode_count.get();
+
+        // Step 2: Should admit B, prefill ONE chunk of B (8 tokens), AND
+        // decode A.  B should NOT fully prefill in this step.
+        let out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
+
+        let prefill_calls = dispatch.prefill_count.get() - prefill_before;
+        let decode_calls = dispatch.decode_count.get() - decode_before;
+
+        // Key assertion: only ONE prefill chunk should have been processed,
+        // not all 3 chunks.  This ensures the long prefill is interleaved
+        // with decode steps.
+        assert_eq!(
+            prefill_calls, 1,
+            "should prefill exactly one chunk per step, got {prefill_calls}"
+        );
+
+        // A should have decoded (got a token) — not starved by B's prefill.
+        assert!(
+            decode_calls >= 1,
+            "decoding sequence A should get a decode step, got {decode_calls} decode calls"
+        );
+
+        // B should still have pending prefill tokens (12 remaining).
+        let b_still_prefilling = scheduler.active.values().any(|seq| !seq.pending_prefill.is_empty());
+        assert!(
+            b_still_prefilling,
+            "sequence B should still have pending prefill tokens after one chunk"
+        );
+
+        // Step 3: Another chunk of B (8 tokens) + decode A.
+        let prefill_before = dispatch.prefill_count.get();
+        let decode_before = dispatch.decode_count.get();
+        let _out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
+        let prefill_calls = dispatch.prefill_count.get() - prefill_before;
+        let decode_calls = dispatch.decode_count.get() - decode_before;
+
+        assert_eq!(
+            prefill_calls, 1,
+            "step 3: should prefill exactly one chunk, got {prefill_calls}"
+        );
+        assert!(
+            decode_calls >= 1,
+            "step 3: decoding sequence A should still get a decode step"
+        );
+
+        // Step 4: Final chunk of B (4 remaining tokens) + sample B's first
+        // token + decode A.
+        let prefill_before = dispatch.prefill_count.get();
+        let _out = run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
+        let prefill_calls = dispatch.prefill_count.get() - prefill_before;
+
+        assert_eq!(
+            prefill_calls, 1,
+            "step 4: should prefill the final chunk, got {prefill_calls}"
+        );
+
+        // B should now be fully prefilled — no more pending tokens.
+        let any_prefilling = scheduler.active.values().any(|seq| !seq.pending_prefill.is_empty());
+        assert!(
+            !any_prefilling,
+            "all sequences should be done prefilling after 3 chunks"
+        );
+    }
+
+    #[test]
+    fn test_chunked_prefill_yields_partial_pending() {
+        // Verify that pending_prefill is only partially drained per step
+        // when the prompt is longer than max_prefill_chunk.
+        let chunk_size = 8;
+        let mut dispatch = ChunkedMockDispatch::new(100, 100, chunk_size);
+        let mut scheduler: Scheduler<MockSeqState> = Scheduler::new(4);
+        let tokenizer = make_tokenizer(vec![999]);
+
+        // 24-token prompt → 3 chunks of 8.
+        scheduler.add_request(SequenceRequest {
+            prompt_tokens: vec![1; 24],
+            max_gen_tokens: 5,
+            params: SampleParams { temperature: 0.0, ..SampleParams::default() },
+            images: Vec::new(),
+            seed: None,
+            grammar: None,
+            logit_bias: HashMap::new(),
+        });
+
+        // Step 1: admit + prefill chunk 1 (8 tokens).
+        run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
+        // Should have 16 tokens remaining.
+        let remaining: usize = scheduler
+            .active
+            .values()
+            .map(|s| s.pending_prefill.len())
+            .sum();
+        assert_eq!(
+            remaining, 16,
+            "should have 16 tokens remaining after first chunk, got {remaining}"
+        );
+
+        // No token should have been sampled yet (prefill not complete).
+        let generated: usize = scheduler
+            .active
+            .values()
+            .map(|s| s.generated_tokens.len())
+            .sum();
+        assert_eq!(
+            generated, 0,
+            "should not sample until prefill is complete, got {generated} generated tokens"
+        );
+
+        // Step 2: prefill chunk 2 (8 tokens), 8 remaining.
+        run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
+        let remaining: usize = scheduler
+            .active
+            .values()
+            .map(|s| s.pending_prefill.len())
+            .sum();
+        assert_eq!(remaining, 8, "should have 8 tokens remaining after second chunk");
+
+        // Step 3: prefill chunk 3 (final 8 tokens) + sample first token.
+        run_step(&mut dispatch, &mut scheduler, &tokenizer).unwrap();
+        let remaining: usize = scheduler
+            .active
+            .values()
+            .map(|s| s.pending_prefill.len())
+            .sum();
+        assert_eq!(remaining, 0, "all tokens should be prefilled after third chunk");
+
+        let generated: usize = scheduler
+            .active
+            .values()
+            .map(|s| s.generated_tokens.len())
+            .sum();
+        assert!(generated >= 1, "should have sampled at least one token after prefill completes");
     }
 }
