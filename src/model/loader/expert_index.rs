@@ -71,6 +71,7 @@ pub(crate) fn build_expert_index_from_safetensors(
         q4_map: HashMap::new(),
         q8_map: HashMap::new(),
         fp8_map: HashMap::new(),
+        tq3_map: HashMap::new(),
     };
 
     // Determine the layer prefix pattern.

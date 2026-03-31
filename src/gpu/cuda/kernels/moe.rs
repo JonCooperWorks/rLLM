@@ -56,6 +56,7 @@ impl GpuMoe for CudaBackend {
             TensorDtype::Q4 => &self.fn_fused_gate_up_swiglu_q4,
             TensorDtype::Q8 => &self.fn_fused_gate_up_swiglu_q8,
             TensorDtype::FP8 => &self.fn_fused_gate_up_swiglu_fp8,
+            TensorDtype::TQ3 => todo!("TQ3 CUDA fused MoE kernel not yet implemented"),
             _ => &self.fn_fused_gate_up_swiglu_bf16,
         };
         // M rows × 32 threads per row = M*32 total threads.

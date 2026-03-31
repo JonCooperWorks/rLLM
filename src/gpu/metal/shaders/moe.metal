@@ -317,6 +317,183 @@ kernel void fused_gate_up_swiglu_q8(
 }
 
 // ---------------------------------------------------------------------------
+// Fused gate+up+SwiGLU with TQ3 weights.
+//
+// Same structure as the Q4 variant but with:
+//   1. WHT rotation of x in shared memory (same as matvec_tq3)
+//   2. Centroid lookup dequant (3-bit → 8 centroids)
+//   3. Dual scales (scale_lo for [0:15], scale_hi for [16:31])
+//
+// Block layout (16 bytes per block of 32 weights):
+//   [0:2]   bf16 scale_lo
+//   [2:4]   bf16 scale_hi
+//   [4:16]  12 bytes packed 3-bit codes
+//
+// Dispatch: grid = M * 32, threadgroup = 256.
+// ---------------------------------------------------------------------------
+
+// TQ3 centroids and helpers are defined in matmul.metal (same compilation unit
+// via include_str! in backend.rs).  We re-declare them here since moe.metal is
+// a separate shader source.
+constant constexpr float MOE_TQ3_CENTROIDS[8] = {
+    -2.1520f, -1.3440f, -0.7560f, -0.2451f,
+     0.2451f,  0.7560f,  1.3440f,  2.1520f
+};
+
+constant constexpr float MOE_WHT_NORM = 0.176776695f;  // 1/sqrt(32)
+
+inline uint moe_extract_3bit(device const uchar* packed, uint idx) {
+    uint bit_offset = idx * 3;
+    uint byte_idx = bit_offset / 8;
+    uint bit_within = bit_offset % 8;
+    uint val = packed[byte_idx];
+    if (bit_within + 3 > 8) {
+        val |= (uint(packed[byte_idx + 1]) << 8);
+    }
+    return (val >> bit_within) & 0x7;
+}
+
+// Bulk-decode 32 × 3-bit codes into dequantized weights (same as matmul.metal).
+inline void moe_decode_tq3_block(
+    device const uchar* codes, float scale_lo, float scale_hi, thread float* w
+) {
+    uint w0 = uint(codes[0]) | (uint(codes[1]) << 8) | (uint(codes[2]) << 16) | (uint(codes[3]) << 24);
+    uint w1 = uint(codes[4]) | (uint(codes[5]) << 8) | (uint(codes[6]) << 16) | (uint(codes[7]) << 24);
+    uint w2 = uint(codes[8]) | (uint(codes[9]) << 8) | (uint(codes[10]) << 16) | (uint(codes[11]) << 24);
+    w[0]  = MOE_TQ3_CENTROIDS[(w0)       & 0x7] * scale_lo;
+    w[1]  = MOE_TQ3_CENTROIDS[(w0 >> 3)  & 0x7] * scale_lo;
+    w[2]  = MOE_TQ3_CENTROIDS[(w0 >> 6)  & 0x7] * scale_lo;
+    w[3]  = MOE_TQ3_CENTROIDS[(w0 >> 9)  & 0x7] * scale_lo;
+    w[4]  = MOE_TQ3_CENTROIDS[(w0 >> 12) & 0x7] * scale_lo;
+    w[5]  = MOE_TQ3_CENTROIDS[(w0 >> 15) & 0x7] * scale_lo;
+    w[6]  = MOE_TQ3_CENTROIDS[(w0 >> 18) & 0x7] * scale_lo;
+    w[7]  = MOE_TQ3_CENTROIDS[(w0 >> 21) & 0x7] * scale_lo;
+    w[8]  = MOE_TQ3_CENTROIDS[(w0 >> 24) & 0x7] * scale_lo;
+    w[9]  = MOE_TQ3_CENTROIDS[(w0 >> 27) & 0x7] * scale_lo;
+    w[10] = MOE_TQ3_CENTROIDS[((w0 >> 30) | (w1 << 2)) & 0x7] * scale_lo;
+    w[11] = MOE_TQ3_CENTROIDS[(w1 >> 1)  & 0x7] * scale_lo;
+    w[12] = MOE_TQ3_CENTROIDS[(w1 >> 4)  & 0x7] * scale_lo;
+    w[13] = MOE_TQ3_CENTROIDS[(w1 >> 7)  & 0x7] * scale_lo;
+    w[14] = MOE_TQ3_CENTROIDS[(w1 >> 10) & 0x7] * scale_lo;
+    w[15] = MOE_TQ3_CENTROIDS[(w1 >> 13) & 0x7] * scale_lo;
+    w[16] = MOE_TQ3_CENTROIDS[(w1 >> 16) & 0x7] * scale_hi;
+    w[17] = MOE_TQ3_CENTROIDS[(w1 >> 19) & 0x7] * scale_hi;
+    w[18] = MOE_TQ3_CENTROIDS[(w1 >> 22) & 0x7] * scale_hi;
+    w[19] = MOE_TQ3_CENTROIDS[(w1 >> 25) & 0x7] * scale_hi;
+    w[20] = MOE_TQ3_CENTROIDS[(w1 >> 28) & 0x7] * scale_hi;
+    w[21] = MOE_TQ3_CENTROIDS[((w1 >> 31) | (w2 << 1)) & 0x7] * scale_hi;
+    w[22] = MOE_TQ3_CENTROIDS[(w2 >> 2)  & 0x7] * scale_hi;
+    w[23] = MOE_TQ3_CENTROIDS[(w2 >> 5)  & 0x7] * scale_hi;
+    w[24] = MOE_TQ3_CENTROIDS[(w2 >> 8)  & 0x7] * scale_hi;
+    w[25] = MOE_TQ3_CENTROIDS[(w2 >> 11) & 0x7] * scale_hi;
+    w[26] = MOE_TQ3_CENTROIDS[(w2 >> 14) & 0x7] * scale_hi;
+    w[27] = MOE_TQ3_CENTROIDS[(w2 >> 17) & 0x7] * scale_hi;
+    w[28] = MOE_TQ3_CENTROIDS[(w2 >> 20) & 0x7] * scale_hi;
+    w[29] = MOE_TQ3_CENTROIDS[(w2 >> 23) & 0x7] * scale_hi;
+    w[30] = MOE_TQ3_CENTROIDS[(w2 >> 26) & 0x7] * scale_hi;
+    w[31] = MOE_TQ3_CENTROIDS[(w2 >> 29) & 0x7] * scale_hi;
+}
+
+kernel void fused_gate_up_swiglu_tq3(
+    constant FusedGateUpParams& params [[buffer(0)]],
+    device const uchar* W_gate_tq3     [[buffer(1)]],  // [M * (K/32) * 16]
+    device const uchar* W_up_tq3       [[buffer(2)]],  // [M * (K/32) * 16]
+    device const bfloat* x             [[buffer(3)]],   // [K]
+    device bfloat* output              [[buffer(4)]],   // [M]
+    uint gid                           [[thread_position_in_grid]],
+    uint lid                           [[thread_position_in_threadgroup]]
+) {
+    const uint M = params.M;
+    const uint K = params.K;
+
+    uint row = gid / 32;
+    uint lane = gid % 32;
+
+    const uint blocks_per_row = K / 32;
+    const uint bytes_per_block = 16;
+
+    // Shared memory: load x, then WHT-rotate all blocks in parallel.
+    threadgroup float x_shared[4096];
+
+    float acc_gate = 0.0f;
+    float acc_up   = 0.0f;
+
+    for (uint tile = 0; tile < K; tile += 4096) {
+        uint tile_len = min((uint)4096, K - tile);
+
+        // Cooperative load.
+        for (uint i = lid; i < tile_len; i += 256) {
+            x_shared[i] = float(x[tile + i]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // WHT all blocks in parallel: 256 threads / 32 per block = 8 blocks per pass.
+        uint num_blocks = tile_len / 32;
+        for (uint batch = 0; batch < num_blocks; batch += 8) {
+            uint my_block = batch + (lid / 32);
+            uint my_elem  = lid % 32;
+
+            if (my_block < num_blocks) {
+                uint base = my_block * 32;
+                for (uint step = 1; step < 32; step <<= 1) {
+                    uint pair = my_elem ^ step;
+                    float my_val   = x_shared[base + my_elem];
+                    float pair_val = x_shared[base + pair];
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (my_elem < pair) {
+                        x_shared[base + my_elem] = my_val + pair_val;
+                        x_shared[base + pair]    = my_val - pair_val;
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                x_shared[base + my_elem] *= MOE_WHT_NORM;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (row < M) {
+            device const uchar* gate_row = W_gate_tq3 + row * blocks_per_row * bytes_per_block;
+            device const uchar* up_row   = W_up_tq3   + row * blocks_per_row * bytes_per_block;
+
+            uint block_start = tile / 32;
+            uint block_end   = (tile + tile_len) / 32;
+
+            for (uint block_idx = block_start + lane; block_idx < block_end; block_idx += 32) {
+                device const uchar* g_ptr = gate_row + block_idx * bytes_per_block;
+                float g_scale_lo = float(*((device const bfloat*)g_ptr));
+                float g_scale_hi = float(*((device const bfloat*)(g_ptr + 2)));
+
+                device const uchar* u_ptr = up_row + block_idx * bytes_per_block;
+                float u_scale_lo = float(*((device const bfloat*)u_ptr));
+                float u_scale_hi = float(*((device const bfloat*)(u_ptr + 2)));
+
+                float gw[32], uw[32];
+                moe_decode_tq3_block(g_ptr + 4, g_scale_lo, g_scale_hi, gw);
+                moe_decode_tq3_block(u_ptr + 4, u_scale_lo, u_scale_hi, uw);
+
+                uint xb = (block_idx * 32) - tile;
+
+                for (uint i = 0; i < 32; i++) {
+                    float x_val = x_shared[xb + i];
+                    acc_gate = fma(gw[i], x_val, acc_gate);
+                    acc_up   = fma(uw[i], x_val, acc_up);
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    acc_gate = simd_sum(acc_gate);
+    acc_up   = simd_sum(acc_up);
+
+    if (lane == 0) {
+        float silu = acc_gate / (1.0f + exp(-acc_gate));
+        output[row] = bfloat(silu * acc_up);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Fused MoE combine + residual add.
 //
 // Combines k expert outputs with routing weights and adds the residual in

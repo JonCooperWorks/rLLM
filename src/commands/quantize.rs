@@ -48,7 +48,8 @@ pub(crate) struct QuantizeArgs {
     #[arg(long)]
     output: PathBuf,
 
-    /// Quantization format: "q4" (4-bit, default), "q8" (8-bit), or "fp8" (FP8 E4M3).
+    /// Quantization format: "q4" (4-bit, default), "q8" (8-bit), "fp8" (FP8 E4M3),
+    /// or "tq3" (TurboQuant 3-bit, 4.0 bpw with Walsh-Hadamard rotation).
     /// When "q8" is used on NVIDIA SM 89+ (Ada/Hopper), FP8 E4M3 is selected
     /// automatically for better hardware utilisation.
     #[arg(long, default_value = "q4")]
@@ -86,7 +87,7 @@ pub(crate) fn exec(args: QuantizeArgs) -> anyhow::Result<()> {
 
     let format = QuantFormat::from_name(&args.format).ok_or_else(|| {
         anyhow::anyhow!(
-            "unknown quantization format '{}' (supported: q4, q8, fp8)",
+            "unknown quantization format '{}' (supported: q4, q8, fp8, tq3)",
             args.format
         )
     })?;

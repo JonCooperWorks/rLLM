@@ -76,6 +76,10 @@ pub(crate) enum QuantFormat {
     /// Used on NVIDIA SM 89+ (Ada/Hopper).  Transparent to user: `--quant q8`
     /// automatically selects FP8 on supported hardware.
     FP8,
+    /// TQ3 — TurboQuant 3-bit with Walsh-Hadamard rotation.
+    /// 32 weights per block, 16 bytes per block (2× bf16 dual scales + 12 packed
+    /// 3-bit centroid codes).  4.0 bits per weight.
+    TQ3,
 }
 
 impl QuantFormat {
@@ -85,6 +89,7 @@ impl QuantFormat {
             "q4" | "Q4" => Some(Self::Q4),
             "q8" | "Q8" => Some(Self::Q8),
             "fp8" | "FP8" => Some(Self::FP8),
+            "tq3" | "TQ3" => Some(Self::TQ3),
             _ => None,
         }
     }
@@ -95,6 +100,7 @@ impl QuantFormat {
             Self::Q4 => "q4",
             Self::Q8 => "q8",
             Self::FP8 => "fp8",
+            Self::TQ3 => "tq3",
         }
     }
 
@@ -105,6 +111,7 @@ impl QuantFormat {
             Self::Q4 => TensorDtype::Q4,
             Self::Q8 => TensorDtype::Q8,
             Self::FP8 => TensorDtype::FP8,
+            Self::TQ3 => TensorDtype::TQ3,
         }
     }
 
@@ -114,6 +121,7 @@ impl QuantFormat {
             Self::Q4 => "rllm-q4",
             Self::Q8 => "rllm-q8",
             Self::FP8 => "rllm-fp8",
+            Self::TQ3 => "rllm-tq3",
         }
     }
 
@@ -123,6 +131,7 @@ impl QuantFormat {
             Self::Q4 => "rllm_q4:",
             Self::Q8 => "rllm_q8:",
             Self::FP8 => "rllm_fp8:",
+            Self::TQ3 => "rllm_tq3:",
         }
     }
 
@@ -132,6 +141,7 @@ impl QuantFormat {
             "rllm-q4" => Some(Self::Q4),
             "rllm-q8" => Some(Self::Q8),
             "rllm-fp8" => Some(Self::FP8),
+            "rllm-tq3" => Some(Self::TQ3),
             _ => None,
         }
     }
@@ -280,6 +290,34 @@ impl WeightQuantiser for FP8Quantiser {
 }
 
 // ---------------------------------------------------------------------------
+// TQ3 quantiser — TurboQuant 3-bit with Walsh-Hadamard rotation.
+//
+// Delegates to quantize_bf16_to_tq3() which applies WHT, finds nearest
+// Max-Lloyd centroids (8 levels, 3-bit codes), and packs into blocks.
+// Block format: 2× bf16 dual scales + 12 bytes packed 3-bit codes = 16 bytes.
+// ---------------------------------------------------------------------------
+
+pub(crate) struct TQ3Quantiser;
+
+impl WeightQuantiser for TQ3Quantiser {
+    fn format(&self) -> QuantFormat {
+        QuantFormat::TQ3
+    }
+
+    fn block_size(&self) -> usize {
+        32
+    }
+
+    fn bytes_per_block(&self) -> usize {
+        16
+    }
+
+    fn quantise(&self, bf16_data: &[u8], m: usize, k: usize) -> Vec<u8> {
+        super::super::quantize_bf16_to_tq3(bf16_data, m, k)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Factory — get the quantiser for a given format.
 // ---------------------------------------------------------------------------
 
@@ -289,6 +327,7 @@ pub(crate) fn quantiser(format: QuantFormat) -> &'static dyn WeightQuantiser {
         QuantFormat::Q4 => &Q4Quantiser,
         QuantFormat::Q8 => &Q8Quantiser,
         QuantFormat::FP8 => &FP8Quantiser,
+        QuantFormat::TQ3 => &TQ3Quantiser,
     }
 }
 

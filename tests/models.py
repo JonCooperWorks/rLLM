@@ -128,7 +128,7 @@ MODEL_REGISTRY: dict[str, ModelConfig] = {
     ),
     "qwen3.5-27b": ModelConfig(
         "qwen3.5-27b", "qwen3.5-27b", "Qwen3_5",
-        bf16_size_gb=54, is_chat=True,
+        bf16_size_gb=54, is_chat=True, in_test_suite=True,
     ),
     "deepseek-r1-distill-qwen-32b": ModelConfig(
         "deepseek-r1-32b", "deepseek-r1-distill-qwen-32b", "Qwen2",

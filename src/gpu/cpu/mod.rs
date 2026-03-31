@@ -113,6 +113,10 @@ impl GpuCore for CpuBackend {
                 let total_elements: usize = shape.iter().product();
                 (total_elements / 32) * 34
             }
+            TensorDtype::TQ3 => {
+                let total_elements: usize = shape.iter().product();
+                (total_elements / 32) * 16
+            }
             other => {
                 let total_elements: usize = shape.iter().product();
                 total_elements * other.byte_size()
@@ -717,6 +721,49 @@ impl GpuMatmul for CpuBackend {
                 }
                 write_bf16(out, &result);
             }
+            TensorDtype::TQ3 => {
+                let inp = read_bf16(input, kk);
+                let blocks_per_row = kk / 32;
+                let mut result = vec![0.0f32; mm];
+                let centroids: [f32; 8] = [
+                    -2.1520, -1.3440, -0.7560, -0.2451,
+                     0.2451,  0.7560,  1.3440,  2.1520,
+                ];
+
+                for row in 0..mm {
+                    let row_offset = row * blocks_per_row * 16;
+                    let mut acc = 0.0f32;
+                    for block in 0..blocks_per_row {
+                        let block_offset = row_offset + block * 16;
+                        let scale_lo: f32 = read_q4_scale(&weight.data, block_offset);
+                        let scale_hi: f32 = read_q4_scale(&weight.data, block_offset + 2);
+                        let codes = &weight.data[block_offset + 4..block_offset + 16];
+
+                        // WHT-rotate the 32-element input block.
+                        let mut xw = [0.0f32; 32];
+                        for j in 0..32 {
+                            xw[j] = inp[block * 32 + j];
+                        }
+                        crate::gpu::wht_32(&mut xw);
+
+                        // Dot product with centroid dequant.
+                        for j in 0..32 {
+                            let bit_offset = j * 3;
+                            let byte_idx = bit_offset / 8;
+                            let bit_within = bit_offset % 8;
+                            let mut val = codes[byte_idx] as u32;
+                            if bit_within + 3 > 8 {
+                                val |= (codes[byte_idx + 1] as u32) << 8;
+                            }
+                            let code = ((val >> bit_within) & 0x7) as usize;
+                            let scale = if j < 16 { scale_lo } else { scale_hi };
+                            acc += centroids[code] * scale * xw[j];
+                        }
+                    }
+                    result[row] = acc;
+                }
+                write_bf16(out, &result);
+            }
             _ => unimplemented!("CpuBackend::matmul for {:?}", weight.dtype),
         }
     }
@@ -802,6 +849,50 @@ impl GpuMatmul for CpuBackend {
                                 let q = weight.data[block_offset + 2 + j] as i8;
                                 let w = q as f32 * scale;
                                 acc += w * inp[block * 32 + j];
+                            }
+                        }
+                        row_result[row] = acc;
+                    }
+                    write_bf16_at(out, b * mm * 2, &row_result);
+                }
+            }
+            TensorDtype::TQ3 => {
+                let blocks_per_row = kk / 32;
+                let centroids: [f32; 8] = [
+                    -2.1520, -1.3440, -0.7560, -0.2451,
+                     0.2451,  0.7560,  1.3440,  2.1520,
+                ];
+                for b in 0..bs {
+                    let inp_offset = b * kk * 2;
+                    let inp = read_bf16_bytes(&input.data[inp_offset..], kk);
+
+                    let mut row_result = vec![0.0f32; mm];
+                    for row in 0..mm {
+                        let row_offset = row * blocks_per_row * 16;
+                        let mut acc = 0.0f32;
+                        for block in 0..blocks_per_row {
+                            let block_offset = row_offset + block * 16;
+                            let scale_lo: f32 = read_q4_scale(&weight.data, block_offset);
+                            let scale_hi: f32 = read_q4_scale(&weight.data, block_offset + 2);
+                            let codes = &weight.data[block_offset + 4..block_offset + 16];
+
+                            let mut xw = [0.0f32; 32];
+                            for j in 0..32 {
+                                xw[j] = inp[block * 32 + j];
+                            }
+                            crate::gpu::wht_32(&mut xw);
+
+                            for j in 0..32 {
+                                let bit_offset = j * 3;
+                                let byte_idx = bit_offset / 8;
+                                let bit_within = bit_offset % 8;
+                                let mut val = codes[byte_idx] as u32;
+                                if bit_within + 3 > 8 {
+                                    val |= (codes[byte_idx + 1] as u32) << 8;
+                                }
+                                let code = ((val >> bit_within) & 0x7) as usize;
+                                let scale = if j < 16 { scale_lo } else { scale_hi };
+                                acc += centroids[code] * scale * xw[j];
                             }
                         }
                         row_result[row] = acc;

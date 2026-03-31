@@ -26,6 +26,10 @@ impl MetalTensor {
                 assert!(self.shape.len() == 2, "Q8 tensors must be 2D [m, k]");
                 crate::gpu::q8_byte_count(self.shape[0], self.shape[1])
             }
+            TensorDtype::TQ3 => {
+                assert!(self.shape.len() == 2, "TQ3 tensors must be 2D [m, k]");
+                crate::gpu::tq3_byte_count(self.shape[0], self.shape[1])
+            }
             _ => self.shape.iter().product::<usize>() * self.dtype.byte_size(),
         }
     }

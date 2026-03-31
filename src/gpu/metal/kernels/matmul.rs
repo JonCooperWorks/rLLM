@@ -37,12 +37,46 @@ struct GemmParams {
     k: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WhtParams {
+    k: u32,
+}
+
 /// Number of output rows per SIMD group in bf16 matvec kernel.
 /// Must match ROWS_PER_SIMD in matmul.metal.
 const ROWS_PER_SIMD_BF16: u64 = 2;
 
 impl GpuMatmul for MetalBackend {
     fn matmul(&self, weight: &MetalTensor, input: &MetalTensor, out: &MetalTensor, m: u32, k: u32) {
+        // TQ3: two-step dispatch — WHT-rotate x first (O(K)), then matvec (O(M×K)).
+        // Scratch buffer is cached and reused across calls.
+        if weight.dtype == TensorDtype::TQ3 {
+            let k_padded = ((k + 255) / 256) * 256;
+            let scratch = self.tq3_scratch(k_padded as u64);
+            let wht_buf = scratch.as_ref().unwrap();
+
+            let wht_params = WhtParams { k };
+            self.dispatch_async(
+                &self.pipeline_wht_rotate_x,
+                &wht_params,
+                &[(wht_buf, 1), (&input.buffer, 2)],
+                MTLSize::new(k_padded as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+
+            let params = MatvecParams { m, k };
+            let num_simd_groups = (m as u64 + 1) / 2;
+            self.dispatch_async(
+                &self.pipeline_matvec_tq3,
+                &params,
+                &[(&weight.buffer, 1), (wht_buf, 2), (&out.buffer, 3)],
+                MTLSize::new(num_simd_groups * 32, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+            return;
+        }
+
         let params = MatvecParams { m, k };
         let (pipeline, rows_per_simd) = match weight.dtype {
             // Q4: multi-row SIMD (2 rows per SIMD group) — fused dequant
@@ -75,6 +109,33 @@ impl GpuMatmul for MetalBackend {
         m: u32,
         k: u32,
     ) {
+        // TQ3: two-step dispatch — batch WHT-rotate X first, then GEMM.
+        if weight.dtype == TensorDtype::TQ3 {
+            let total_elements = batch_size as u64 * k as u64;
+            let total_padded = ((total_elements + 255) / 256) * 256;
+            let scratch = self.tq3_scratch(total_padded);
+            let wht_buf = scratch.as_ref().unwrap();
+
+            let wht_params = GemmParams { batch_size, m, k };
+            self.dispatch_async(
+                &self.pipeline_wht_rotate_x_batch,
+                &wht_params,
+                &[(wht_buf, 1), (&input.buffer, 2)],
+                MTLSize::new(total_padded, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+
+            let params = GemmParams { batch_size, m, k };
+            self.dispatch_async(
+                &self.pipeline_gemm_tq3,
+                &params,
+                &[(&weight.buffer, 1), (wht_buf, 2), (&out.buffer, 3)],
+                MTLSize::new(batch_size as u64 * m as u64 * 32, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+            return;
+        }
+
         let params = GemmParams { batch_size, m, k };
         let pipeline = match weight.dtype {
             TensorDtype::Q4 => &self.pipeline_gemm_q4,

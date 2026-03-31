@@ -394,10 +394,7 @@ def bench_context(request):
 # ---------------------------------------------------------------------------
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
-    """Print and save benchmark results when --bench is active."""
-    if not config.getoption("--bench", default=False):
-        return
-
+    """Print and save benchmark results."""
     # Access the bench_context fixture from the session.
     session = terminalreporter.config._tmp_session
     if not hasattr(session, "_bench_context"):
@@ -435,15 +432,15 @@ def pytest_sessionstart(session):
     session._bench_context — one instance shared across the entire run.
     """
     # Always stash the session so the fixture can find it.
+    # Bench is always on — every test run measures performance and writes results.
     session.config._tmp_session = session
-    if session.config.getoption("--bench", default=False):
-        session._bench_context = BenchContext(
-            enabled=True,
-            runs=session.config.getoption("--bench-runs", default=1),
-            max_tokens=session.config.getoption("--bench-max-tokens", default=128),
-            prompt=session.config.getoption("--bench-prompt",
-                                            default="The meaning of life is"),
-        )
+    session._bench_context = BenchContext(
+        enabled=True,
+        runs=session.config.getoption("--bench-runs", default=1),
+        max_tokens=session.config.getoption("--bench-max-tokens", default=128),
+        prompt=session.config.getoption("--bench-prompt",
+                                        default="The meaning of life is"),
+    )
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -457,8 +454,7 @@ collect_ignore_glob = ["test_nemotron_debug.py"]
 
 
 def pytest_collection_modifyitems(config, items):
-    """Skip bench_only tests when --bench is not active, and apply --filter."""
-    # --filter / --bench-filter: skip model tests whose ID doesn't match.
+    """Apply --filter to skip non-matching model tests."""
     model_filter = (config.getoption("--filter", default="")
                     or config.getoption("--bench-filter", default=""))
     if model_filter:
@@ -469,10 +465,3 @@ def pytest_collection_modifyitems(config, items):
                 param_id = item.nodeid.split("[")[-1].rstrip("]")
                 if model_filter not in param_id:
                     item.add_marker(skip_filter)
-
-    if config.getoption("--bench", default=False):
-        return
-    skip_bench = pytest.mark.skip(reason="--bench not active")
-    for item in items:
-        if "bench_only" in item.keywords:
-            item.add_marker(skip_bench)

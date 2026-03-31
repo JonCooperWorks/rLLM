@@ -605,6 +605,7 @@ fn load_weights_inner<B: GpuCore>(
     let mut q4_map: HashMap<String, (usize, usize)> = HashMap::new();
     let mut q8_map: HashMap<String, (usize, usize)> = HashMap::new();
     let mut fp8_map: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut tq3_map: HashMap<String, (usize, usize)> = HashMap::new();
     let mut is_prequantized = false;
     for mmap in &mmaps {
         if let Ok((_, metadata)) = SafeTensors::read_metadata(mmap.as_ref()) {
@@ -620,6 +621,8 @@ fn load_weights_inner<B: GpuCore>(
                                 Some((&mut q8_map, name))
                             } else if let Some(name) = key.strip_prefix("rllm_fp8:") {
                                 Some((&mut fp8_map, name))
+                            } else if let Some(name) = key.strip_prefix("rllm_tq3:") {
+                                Some((&mut tq3_map, name))
                             } else {
                                 None
                             };
@@ -640,9 +643,10 @@ fn load_weights_inner<B: GpuCore>(
         let q4_count = q4_map.len();
         let q8_count = q8_map.len();
         let fp8_count = fp8_map.len();
-        let fmt = if fp8_count > 0 { "FP8" } else if q8_count > 0 { "Q8" } else { "Q4" };
+        let tq3_count = tq3_map.len();
+        let fmt = if tq3_count > 0 { "TQ3" } else if fp8_count > 0 { "FP8" } else if q8_count > 0 { "Q8" } else { "Q4" };
         info!(
-            count = q4_count + q8_count + fp8_count,
+            count = q4_count + q8_count + fp8_count + tq3_count,
             format = fmt,
             "detected pre-quantized model, skipping on-load quantization"
         );
@@ -654,6 +658,7 @@ fn load_weights_inner<B: GpuCore>(
         q4_map,
         q8_map,
         fp8_map,
+        tq3_map,
     };
 
     let hidden = config.hidden_size;
@@ -2139,6 +2144,7 @@ pub(crate) fn load_model<B: GpuCore>(
             q4_map: HashMap::new(),
             q8_map: HashMap::new(),
             fp8_map: HashMap::new(),
+            tq3_map: HashMap::new(),
         };
         load_vision_weights(backend, &store, &config)
     } else {

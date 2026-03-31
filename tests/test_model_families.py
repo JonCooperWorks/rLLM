@@ -51,9 +51,9 @@ VISION_MODELS = get_vision_models()
 # ---------------------------------------------------------------------------
 
 def _resolve_model_dir(models_dir: Path, config, q4: bool = False,
-                       q8: bool = False) -> Path | None:
+                       q8: bool = False, tq3: bool = False) -> Path | None:
     """Return the model directory path, or None if it doesn't exist."""
-    suffix = "-q4" if q4 else ("-q8" if q8 else "")
+    suffix = "-q4" if q4 else ("-q8" if q8 else ("-tq3" if tq3 else ""))
     name = config.model_name + suffix
     d = models_dir / name
     return d if d.is_dir() else None
@@ -299,6 +299,47 @@ def test_model_q8(config_index, server_manager, models_dir, bench_context):
 
     _assert_quality(content, f"{config.test_id}-q8", prompt)
     _record_bench(bench_context, config, content, t_start, t_end,
+                  usage.get("completion_tokens", 0))
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "config_index", range(len(BASE_MODELS)),
+    ids=[f"{c.test_id}-tq3" for c in BASE_MODELS],
+)
+def test_model_tq3(config_index, server_manager, models_dir, bench_context):
+    """TQ3-quantized variant of each model family (TurboQuant 3-bit weights)."""
+    config = BASE_MODELS[config_index]
+
+    model_dir = _resolve_model_dir(models_dir, config, tq3=True)
+    if model_dir is None:
+        pytest.skip(f"TQ3 model not found: {config.model_name}-tq3")
+
+    extra_args = _build_extra_args(config, is_q4=True, model_dir=str(model_dir))
+    # TQ3 is 4.0 bpw (slightly smaller than Q4's 4.5 bpw).
+    mem = _estimate_memory_gb(config, is_q4=True, model_dir=str(model_dir))
+    base_url = server_manager.get_or_start(str(model_dir), extra_args, memory_gb=mem)
+
+    temp = 0 if config.quality_sensitive else config.temperature
+
+    prompt = prompt_for_index(config_index + 7)
+    t_start = time.monotonic()
+    resp = _chat_completion(base_url, prompt, temperature=temp)
+    assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text[:500]}"
+
+    body = resp.json()
+    content = body["choices"][0]["message"]["content"]
+    usage = body.get("usage", {})
+    t_end = time.monotonic()
+
+    assert usage.get("completion_tokens", 0) > 0, "no tokens generated"
+
+    _assert_quality(content, f"{config.test_id}-tq3", prompt)
+
+    # Override model_name so the bench table shows "xxx-tq3" not just "xxx".
+    from dataclasses import replace
+    tq3_config = replace(config, test_id=f"{config.test_id}-tq3")
+    _record_bench(bench_context, tq3_config, content, t_start, t_end,
                   usage.get("completion_tokens", 0))
 
 

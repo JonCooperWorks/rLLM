@@ -134,6 +134,14 @@ pub(crate) enum TensorDtype {
     /// Used on NVIDIA SM 89+ (Ada/Hopper) where hardware supports native FP8.
     /// Range ±448, precision ~0.125.  On Metal, Q8 blocks are used instead.
     FP8,
+    /// TQ3 — TurboQuant 3-bit weight quantization with Walsh-Hadamard rotation.
+    /// 32 weights per block, 16 bytes per block (2× bf16 dual scales + 12 packed
+    /// 3-bit centroid codes).  4.0 bits per weight.
+    ///
+    /// Algorithm: WHT rotates each 32-weight block to make coordinates ~Gaussian,
+    /// then Max-Lloyd scalar quantization maps each to one of 8 optimal centroids.
+    /// Inference requires WHT-rotating activations before the dot product.
+    TQ3,
 }
 
 impl TensorDtype {
@@ -145,6 +153,7 @@ impl TensorDtype {
             TensorDtype::FP8 => 1,
             TensorDtype::Q4 => panic!("Q4 has variable byte size; use q4_byte_count()"),
             TensorDtype::Q8 => panic!("Q8 has variable byte size; use q8_byte_count()"),
+            TensorDtype::TQ3 => panic!("TQ3 has variable byte size; use tq3_byte_count()"),
         }
     }
 }
@@ -178,6 +187,17 @@ pub(crate) fn q8_byte_count(m: usize, k: usize) -> usize {
 pub(crate) fn fp8_byte_count(m: usize, k: usize) -> usize {
     m.checked_mul(k)
         .expect("fp8_byte_count overflow: tensor dimensions too large")
+}
+
+/// Compute total byte count for a TQ3 weight tensor [m, k].
+///
+/// TQ3 block: 32 weights, 16 bytes per block (2× bf16 scale + 12 packed 3-bit codes).
+/// 4.0 bits per weight (vs 4.5 for Q4).
+pub(crate) fn tq3_byte_count(m: usize, k: usize) -> usize {
+    let blocks_per_row = k / 32;
+    m.checked_mul(blocks_per_row)
+        .and_then(|v| v.checked_mul(16))
+        .expect("tq3_byte_count overflow: tensor dimensions too large")
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +507,208 @@ pub(crate) fn quantize_bf16_to_fp8(bf16_data: &[u8], m: usize, k: usize) -> Vec<
 
     for i in 0..m * k {
         out[i] = f32_to_fp8_e4m3(values[i].to_f32());
+    }
+
+    out
+}
+
+// ---------------------------------------------------------------------------
+// TQ3 quantisation — TurboQuant 3-bit with Walsh-Hadamard rotation.
+//
+// Based on the TurboQuant algorithm (Zandieh et al., arXiv:2504.19874) applied
+// to weight quantization rather than KV cache.  Uses Walsh-Hadamard Transform
+// (WHT) instead of random orthogonal rotation — WHT is deterministic, O(n log n),
+// and computable via butterfly ops on GPU (SIMD shuffles).
+//
+// Block layout (16 bytes per block of 32 weights):
+//   [0..2]:  bf16 scale_lo (for weights 0-15)
+//   [2..4]:  bf16 scale_hi (for weights 16-31)
+//   [4..16]: 12 bytes of packed 3-bit centroid codes (32 × 3 = 96 bits)
+//
+// Centroids: 8 Max-Lloyd optimal centroids for N(0,1):
+//   [-2.1520, -1.3440, -0.7560, -0.2451, 0.2451, 0.7560, 1.3440, 2.1520]
+//
+// Quantization:
+//   1. Load 32 bf16 weights → f32
+//   2. Apply 32-point WHT (in-place butterfly, 5 stages)
+//   3. Compute scale_lo = max(|wht[0:16]|) / 2.1520
+//      and    scale_hi = max(|wht[16:32]|) / 2.1520
+//   4. Map each wht[i] / scale to nearest centroid (3-bit index)
+//   5. Pack 32 × 3-bit codes into 12 bytes
+//
+// GPU dequant (inference):
+//   1. Load activation tile, apply WHT in shared memory
+//   2. For each weight block: extract 3-bit code → centroid lookup → scale × x_wht
+//   Dot product is preserved because WHT is orthogonal: <w, x> = <WHT(w), WHT(x)>
+//
+// Related files:
+//   gpu/ops/quant.rs          — TQ3Quantiser (WeightQuantiser impl)
+//   gpu/metal/shaders/matmul.metal — matvec_tq3, gemm_tq3 kernels
+//   gpu/metal/kernels/matmul.rs    — pipeline dispatch for TQ3
+//   model/turboquant.rs       — CENTROIDS_3BIT (same centroids, used for KV cache)
+// ---------------------------------------------------------------------------
+
+/// Max-Lloyd optimal centroids for N(0,1) at 3-bit (8 levels).
+///
+/// These are the same centroids used in TurboQuant KV cache quantization
+/// (see `model/turboquant.rs` CENTROIDS_3BIT).  Precomputed via the Lloyd-Max
+/// iterative algorithm — universal constants for Gaussian-distributed scalars.
+const TQ3_CENTROIDS: [f32; 8] = [
+    -2.1520, -1.3440, -0.7560, -0.2451, 0.2451, 0.7560, 1.3440, 2.1520,
+];
+
+/// Maximum centroid magnitude — used to compute per-block scale factors.
+/// scale = max(|wht_block|) / TQ3_MAX_CENTROID maps the block's range
+/// onto the centroid range [-2.1520, 2.1520].
+const TQ3_MAX_CENTROID: f32 = 2.1520;
+
+/// Apply 32-point Walsh-Hadamard Transform in-place.
+///
+/// WHT is a deterministic orthogonal transform computable in O(n log n) via
+/// butterfly operations.  For block_size=32 there are 5 stages (log2(32) = 5),
+/// each performing 16 butterfly additions/subtractions.
+///
+/// The normalised WHT preserves inner products: <WHT(a), WHT(b)> = <a, b>.
+/// This means we can quantize WHT(weights) and compute dot products against
+/// WHT(activations) without any inverse transform.
+pub(crate) fn wht_32(block: &mut [f32; 32]) {
+    let mut step = 1;
+    while step < 32 {
+        let mut i = 0;
+        while i < 32 {
+            for j in 0..step {
+                let a = block[i + j];
+                let b = block[i + j + step];
+                block[i + j] = a + b;
+                block[i + j + step] = a - b;
+            }
+            i += step * 2;
+        }
+        step <<= 1;
+    }
+    // Normalise: divide by sqrt(32) to make the transform orthonormal.
+    let norm = 1.0 / (32.0_f32).sqrt();
+    for v in block.iter_mut() {
+        *v *= norm;
+    }
+}
+
+/// Find the nearest centroid index (0-7) for a given value.
+///
+/// Linear scan over 8 centroids — trivially fast.  The centroids are sorted,
+/// so a binary search could be used, but 8 comparisons is already branch-free
+/// in practice and avoids the complexity.
+fn nearest_centroid(val: f32) -> u8 {
+    let mut best = 0u8;
+    let mut best_dist = f32::INFINITY;
+    for (i, &c) in TQ3_CENTROIDS.iter().enumerate() {
+        let d = (val - c).abs();
+        if d < best_dist {
+            best_dist = d;
+            best = i as u8;
+        }
+    }
+    best
+}
+
+/// Pack 32 × 3-bit codes into 12 bytes (96 bits).
+///
+/// Bit layout: code[0] occupies bits 0-2, code[1] bits 3-5, etc.
+/// Codes can span byte boundaries (e.g., code[2] starts at bit 6, spans bytes 0-1).
+fn pack_3bit_codes(codes: &[u8; 32], out: &mut [u8; 12]) {
+    out.fill(0);
+    for (idx, &code) in codes.iter().enumerate() {
+        let bit_offset = idx * 3;
+        let byte_idx = bit_offset / 8;
+        let bit_within = bit_offset % 8;
+        out[byte_idx] |= (code & 0x7) << bit_within;
+        // Handle spanning byte boundary.
+        if bit_within + 3 > 8 {
+            out[byte_idx + 1] |= (code & 0x7) >> (8 - bit_within);
+        }
+    }
+}
+
+/// Quantise a bf16 weight matrix [m, k] to TQ3 block format.
+///
+/// Block layout (16 bytes per block of 32 weights):
+///   [0..2]:  bf16 scale_lo (scale for transformed weights 0-15)
+///   [2..4]:  bf16 scale_hi (scale for transformed weights 16-31)
+///   [4..16]: 12 bytes packed 3-bit centroid codes
+///
+/// Dual scale (split at 16) improves quality: each half of the WHT block
+/// can have a different dynamic range, reducing quantization error.  This
+/// matches the TQ3_1S variant from the turbo-tan/llama.cpp-tq3 fork.
+pub(crate) fn quantize_bf16_to_tq3(bf16_data: &[u8], m: usize, k: usize) -> Vec<u8> {
+    use half::bf16;
+
+    assert_eq!(bf16_data.len(), m * k * 2);
+
+    let owned_buf: Vec<bf16>;
+    let values: &[bf16] = match bytemuck::try_cast_slice(bf16_data) {
+        Ok(v) => v,
+        Err(_) => {
+            owned_buf = bf16_data
+                .chunks_exact(2)
+                .map(|c| bf16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            &owned_buf
+        }
+    };
+    assert_eq!(values.len(), m * k);
+
+    let blocks_per_row = k / 32;
+    let mut out = vec![0u8; tq3_byte_count(m, k)];
+
+    for row in 0..m {
+        for block in 0..blocks_per_row {
+            let src_offset = row * k + block * 32;
+            let dst_offset = (row * blocks_per_row + block) * 16;
+
+            // Step 1: Load 32 bf16 weights into f32 and apply WHT.
+            let mut wht_block = [0.0f32; 32];
+            for i in 0..32 {
+                wht_block[i] = values[src_offset + i].to_f32();
+            }
+            wht_32(&mut wht_block);
+
+            // Step 2: Compute dual scales (lo for [0:16], hi for [16:32]).
+            let mut max_lo: f32 = 0.0;
+            for i in 0..16 {
+                let v = wht_block[i].abs();
+                if v > max_lo { max_lo = v; }
+            }
+            let mut max_hi: f32 = 0.0;
+            for i in 16..32 {
+                let v = wht_block[i].abs();
+                if v > max_hi { max_hi = v; }
+            }
+
+            let scale_lo = if max_lo == 0.0 { 1.0 } else { max_lo / TQ3_MAX_CENTROID };
+            let scale_hi = if max_hi == 0.0 { 1.0 } else { max_hi / TQ3_MAX_CENTROID };
+            let inv_lo = 1.0 / scale_lo;
+            let inv_hi = 1.0 / scale_hi;
+
+            // Write dual scales as bf16.
+            let scale_lo_bf16 = (scale_lo.to_bits() >> 16) as u16;
+            let scale_hi_bf16 = (scale_hi.to_bits() >> 16) as u16;
+            out[dst_offset..dst_offset + 2].copy_from_slice(&scale_lo_bf16.to_le_bytes());
+            out[dst_offset + 2..dst_offset + 4].copy_from_slice(&scale_hi_bf16.to_le_bytes());
+
+            // Step 3: Map each WHT coefficient to nearest centroid.
+            let mut codes = [0u8; 32];
+            for i in 0..16 {
+                codes[i] = nearest_centroid(wht_block[i] * inv_lo);
+            }
+            for i in 16..32 {
+                codes[i] = nearest_centroid(wht_block[i] * inv_hi);
+            }
+
+            // Step 4: Pack 32 × 3-bit codes into 12 bytes.
+            let mut packed = [0u8; 12];
+            pack_3bit_codes(&codes, &mut packed);
+            out[dst_offset + 4..dst_offset + 16].copy_from_slice(&packed);
+        }
     }
 
     out

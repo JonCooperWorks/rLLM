@@ -94,11 +94,18 @@ pub(crate) struct MetalBackend {
     pub(crate) queue: metal::CommandQueue,
     pub(crate) name: String,
 
+    // Reusable scratch buffer for TQ3 WHT pre-rotation.  Lazily grown to fit
+    // the largest K (matvec) or batch_size×K (GEMM) seen.  Avoids per-call
+    // Metal buffer allocation which is expensive (involves kernel calls).
+    pub(crate) tq3_wht_scratch: std::sync::Mutex<Option<metal::Buffer>>,
+
     // Compiled kernel pipelines — one per kernel entry point.
     pub(crate) pipeline_rms_norm: metal::ComputePipelineState,
     pub(crate) pipeline_matvec: metal::ComputePipelineState,
     pub(crate) pipeline_matvec_q4: metal::ComputePipelineState,
     pub(crate) pipeline_matvec_q8: metal::ComputePipelineState,
+    pub(crate) pipeline_matvec_tq3: metal::ComputePipelineState,
+    pub(crate) pipeline_wht_rotate_x: metal::ComputePipelineState,
     pub(crate) pipeline_rope: metal::ComputePipelineState,
     #[allow(dead_code)]
     pub(crate) pipeline_attention: metal::ComputePipelineState,
@@ -125,6 +132,8 @@ pub(crate) struct MetalBackend {
     pub(crate) pipeline_gemm_bf16: metal::ComputePipelineState,
     pub(crate) pipeline_gemm_q4: metal::ComputePipelineState,
     pub(crate) pipeline_gemm_q8: metal::ComputePipelineState,
+    pub(crate) pipeline_gemm_tq3: metal::ComputePipelineState,
+    pub(crate) pipeline_wht_rotate_x_batch: metal::ComputePipelineState,
     pub(crate) pipeline_rms_norm_batch: metal::ComputePipelineState,
     pub(crate) pipeline_layer_norm_batch: metal::ComputePipelineState,
     pub(crate) pipeline_embed_lookup_batch: metal::ComputePipelineState,
@@ -153,6 +162,7 @@ pub(crate) struct MetalBackend {
     pub(crate) pipeline_fused_gate_up_swiglu: metal::ComputePipelineState,
     pub(crate) pipeline_fused_gate_up_swiglu_q4: metal::ComputePipelineState,
     pub(crate) pipeline_fused_gate_up_swiglu_q8: metal::ComputePipelineState,
+    pub(crate) pipeline_fused_gate_up_swiglu_tq3: metal::ComputePipelineState,
     #[allow(dead_code)] // compiled pipeline; callers use explicit loops for now
     pub(crate) pipeline_moe_combine_residual: metal::ComputePipelineState,
 
@@ -223,6 +233,10 @@ impl MetalBackend {
             Self::make_pipeline(&device, METAL_SOURCE_MATMUL, "matvec_q4", &compile_opts)?;
         let pipeline_matvec_q8 =
             Self::make_pipeline(&device, METAL_SOURCE_MATMUL, "matvec_q8", &compile_opts)?;
+        let pipeline_matvec_tq3 =
+            Self::make_pipeline(&device, METAL_SOURCE_MATMUL, "matvec_tq3", &compile_opts)?;
+        let pipeline_wht_rotate_x =
+            Self::make_pipeline(&device, METAL_SOURCE_MATMUL, "wht_rotate_x", &compile_opts)?;
         let pipeline_rope = Self::make_pipeline(
             &device,
             METAL_SOURCE_ROPE,
@@ -308,6 +322,10 @@ impl MetalBackend {
             Self::make_pipeline(&device, METAL_SOURCE_MATMUL, "gemm_q4", &compile_opts)?;
         let pipeline_gemm_q8 =
             Self::make_pipeline(&device, METAL_SOURCE_MATMUL, "gemm_q8", &compile_opts)?;
+        let pipeline_gemm_tq3 =
+            Self::make_pipeline(&device, METAL_SOURCE_MATMUL, "gemm_tq3", &compile_opts)?;
+        let pipeline_wht_rotate_x_batch =
+            Self::make_pipeline(&device, METAL_SOURCE_MATMUL, "wht_rotate_x_batch", &compile_opts)?;
         let pipeline_rms_norm_batch = Self::make_pipeline(
             &device,
             METAL_SOURCE_RMS_NORM,
@@ -434,6 +452,12 @@ impl MetalBackend {
             &device,
             METAL_SOURCE_MOE,
             "fused_gate_up_swiglu_q8",
+            &compile_opts,
+        )?;
+        let pipeline_fused_gate_up_swiglu_tq3 = Self::make_pipeline(
+            &device,
+            METAL_SOURCE_MOE,
+            "fused_gate_up_swiglu_tq3",
             &compile_opts,
         )?;
         let pipeline_moe_combine_residual = Self::make_pipeline(
@@ -587,10 +611,13 @@ impl MetalBackend {
             device,
             queue,
             name,
+            tq3_wht_scratch: std::sync::Mutex::new(None),
             pipeline_rms_norm,
             pipeline_matvec,
             pipeline_matvec_q4,
             pipeline_matvec_q8,
+            pipeline_matvec_tq3,
+            pipeline_wht_rotate_x,
             pipeline_rope,
             pipeline_attention,
             pipeline_attention_hd256,
@@ -612,6 +639,8 @@ impl MetalBackend {
             pipeline_gemm_bf16,
             pipeline_gemm_q4,
             pipeline_gemm_q8,
+            pipeline_gemm_tq3,
+            pipeline_wht_rotate_x_batch,
             pipeline_rms_norm_batch,
             pipeline_layer_norm_batch,
             pipeline_embed_lookup_batch,
@@ -634,6 +663,7 @@ impl MetalBackend {
             pipeline_fused_gate_up_swiglu,
             pipeline_fused_gate_up_swiglu_q4,
             pipeline_fused_gate_up_swiglu_q8,
+            pipeline_fused_gate_up_swiglu_tq3,
             pipeline_moe_combine_residual,
             pipeline_silu_mul_clamp,
             pipeline_gpt_oss_gated_act,
@@ -709,6 +739,23 @@ impl MetalBackend {
     /// `new_command_buffer()` returns a borrowed `&CommandBufferRef` with
     /// autorelease semantics.  We retain it via `to_owned()` so it lives
     /// in the Mutex until flush() commits it.
+    /// Get or grow the TQ3 WHT scratch buffer.  Reuses the existing buffer
+    /// if it's large enough; allocates a new one (rounded up) otherwise.
+    /// Returns the MutexGuard so the buffer stays locked for the dispatch.
+    pub(crate) fn tq3_scratch(&self, num_floats: u64) -> std::sync::MutexGuard<'_, Option<metal::Buffer>> {
+        let needed_bytes = num_floats * 4;
+        let mut guard = self.tq3_wht_scratch.lock().unwrap();
+        let needs_alloc = match guard.as_ref() {
+            Some(buf) => buf.length() < needed_bytes,
+            None => true,
+        };
+        if needs_alloc {
+            let alloc_bytes = needed_bytes * 2;
+            *guard = Some(self.device.new_buffer(alloc_bytes, MTLResourceOptions::StorageModeShared));
+        }
+        guard
+    }
+
     pub(crate) fn get_or_create_cmd(&self) -> std::sync::MutexGuard<'_, Option<metal::CommandBuffer>> {
         let mut guard = self.current_cmd.lock().unwrap();
         if guard.is_none() {

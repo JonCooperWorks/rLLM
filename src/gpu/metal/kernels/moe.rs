@@ -49,6 +49,7 @@ impl GpuMoe for MetalBackend {
         let pipeline = match w_gate.dtype {
             TensorDtype::Q4 => &self.pipeline_fused_gate_up_swiglu_q4,
             TensorDtype::Q8 => &self.pipeline_fused_gate_up_swiglu_q8,
+            TensorDtype::TQ3 => &self.pipeline_fused_gate_up_swiglu_tq3,
             TensorDtype::FP8 => panic!("FP8 tensors not supported on Metal — use Q8 block format"),
             _ => &self.pipeline_fused_gate_up_swiglu,
         };
