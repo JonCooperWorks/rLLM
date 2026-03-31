@@ -1,5 +1,6 @@
 # ---------------------------------------------------------------------------
-# conftest.py — pytest fixtures for GPU integration tests.
+# conftest.py — pytest fixtures and hooks for GPU integration tests and
+# optional benchmarking.
 #
 # Provides:
 #   - GPU availability detection (Metal on macOS, CUDA on Linux)
@@ -7,11 +8,17 @@
 #   - Model directory resolution
 #   - Server lifecycle management (start/stop rllm serve, health checks)
 #   - Available memory detection for MoE streaming decisions
+#   - --bench mode: performance measurement integrated into pytest runs
 #
-# Related: test_model_families.py (tests), coherence.py (validation)
+# Usage:
+#   pytest tests/ -v                         # just test
+#   pytest tests/ -v --bench                 # test + benchmark
+#   pytest tests/ -v --bench --bench-filter llama  # bench specific models
+#
+# Related: models.py (model registry), quality.py (validation),
+#          benchmark.py (measurement engine), test_model_families.py (tests)
 # ---------------------------------------------------------------------------
 
-import json
 import os
 import platform
 import signal
@@ -26,6 +33,9 @@ import psutil
 import pytest
 import requests
 
+from benchmark import BenchResult, detect_gpu_name, format_markdown_table, write_results
+from models import MODEL_REGISTRY, ModelConfig, is_base_model, check_model_shards
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -33,12 +43,10 @@ import requests
 
 def _find_rllm_binary() -> Path | None:
     """Locate the rllm release binary relative to the repo root."""
-    # Allow override via env var.
     if env := os.environ.get("RLLM_BIN"):
         p = Path(env)
         return p if p.is_file() else None
 
-    # Walk up from this file to find the repo root (contains Cargo.toml).
     here = Path(__file__).resolve().parent
     for ancestor in [here] + list(here.parents):
         candidate = ancestor / "target" / "release" / "rllm"
@@ -50,9 +58,7 @@ def _find_rllm_binary() -> Path | None:
 def _has_gpu() -> bool:
     """Return True if a Metal or CUDA GPU is available."""
     if platform.system() == "Darwin":
-        # macOS — Metal is always available on Apple Silicon / recent Intel.
         return True
-    # Linux — check for nvidia-smi (CUDA).
     try:
         subprocess.run(
             ["nvidia-smi"], capture_output=True, check=True, timeout=10
@@ -92,22 +98,16 @@ def _get_available_memory_gb() -> float:
 
     macOS (unified memory): total system RAM.
     Linux + CUDA: sum of all GPU memory via nvidia-smi.
-
-    For multi-GPU setups with tensor parallelism, the full aggregate memory
-    is available since rllm shards the model across all GPUs.
     """
     if platform.system() == "Darwin":
         return psutil.virtual_memory().total / (1024 ** 3)
 
-    # Linux: try nvidia-smi for GPU memory.
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.total",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, check=True, timeout=10,
         )
-        # Sum all GPUs, nvidia-smi reports in MiB.  With tensor parallelism
-        # the model is sharded across all GPUs, so aggregate memory applies.
         total_mib = sum(
             int(line.strip())
             for line in result.stdout.strip().splitlines()
@@ -115,7 +115,6 @@ def _get_available_memory_gb() -> float:
         )
         return total_mib / 1024
     except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        # Fallback to system RAM.
         return psutil.virtual_memory().total / (1024 ** 3)
 
 
@@ -129,16 +128,13 @@ def _should_stream_experts(model_size_gb: float, is_q4: bool, model_dir: str = "
     """Decide whether to use --stream-experts based on available memory.
 
     Uses actual model size on disk when available (accurate for Q4/Q8 variants),
-    falling back to a bf16 size estimate otherwise.  Adds headroom for MoE
-    routing buffers and activations — models with many experts (256+) need
-    significant scratch memory beyond the weight footprint.
+    falling back to a bf16 size estimate otherwise.
     """
     if model_dir:
         effective_size = _get_model_disk_size_gb(model_dir)
     else:
         effective_size = model_size_gb / 1.5 if is_q4 else model_size_gb
     available = _get_available_memory_gb()
-    # Stream if model exceeds 80% of available memory.
     return effective_size > available * 0.80
 
 
@@ -175,7 +171,7 @@ class ServerManager:
         model_dir: str,
         extra_args: list[str] | None = None,
         startup_timeout: float = 300,
-        memory_gb: float = 0,  # unused, kept for call-site compat
+        memory_gb: float = 0,
     ) -> str:
         """Return the base_url of a running server for this config.
 
@@ -187,17 +183,14 @@ class ServerManager:
 
         if key in self._servers:
             srv = self._servers[key]
-            # Quick health check — server may have died.
             try:
                 r = requests.get(f"{srv.base_url}/health", timeout=5)
                 if r.status_code == 200:
                     return srv.base_url
             except requests.ConnectionError:
                 pass
-            # Dead — remove and restart.
             self._stop_one(key)
 
-        # Stop all other servers before starting a new one (prevent OOM).
         self.stop_all()
 
         port = _get_free_port()
@@ -218,10 +211,8 @@ class ServerManager:
             stderr=subprocess.PIPE,
         )
 
-        # Wait for /health to respond.
         deadline = time.monotonic() + startup_timeout
         while time.monotonic() < deadline:
-            # Check if process died.
             if proc.poll() is not None:
                 stderr = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
                 raise RuntimeError(
@@ -235,7 +226,6 @@ class ServerManager:
             except requests.ConnectionError:
                 time.sleep(1)
         else:
-            # Timed out.
             stderr = ""
             proc.terminate()
             try:
@@ -257,7 +247,6 @@ class ServerManager:
         if srv is None:
             return
         print(f"\n  Stopping server {srv.base_url}", file=sys.stderr)
-        # Graceful shutdown.
         try:
             srv.proc.terminate()
             srv.proc.wait(timeout=15)
@@ -268,6 +257,66 @@ class ServerManager:
     def stop_all(self) -> None:
         for key in list(self._servers):
             self._stop_one(key)
+
+
+# ---------------------------------------------------------------------------
+# Benchmark context — collects results when --bench is active.
+# ---------------------------------------------------------------------------
+
+class BenchContext:
+    """Collects benchmark measurements during a pytest session.
+
+    When --bench is not active, all methods are no-ops.
+    """
+
+    def __init__(self, enabled: bool = False, runs: int = 1,
+                 max_tokens: int = 128, prompt: str = ""):
+        self.enabled = enabled
+        self.runs = runs
+        self.max_tokens = max_tokens
+        self.prompt = prompt
+        self.results: list[BenchResult] = []
+
+    def record(self, model_name: str, family: str,
+               gen_tps: float | None = None, ttft_ms: float | None = None,
+               quality: str = "", scores: dict[str, float] | None = None) -> None:
+        """Record a benchmark result.  No-op if --bench is not active."""
+        if not self.enabled:
+            return
+        self.results.append(BenchResult(
+            model_name=model_name,
+            family=family,
+            gen_tps=gen_tps,
+            ttft_ms=ttft_ms,
+            quality=quality,
+            scores=scores or {},
+        ))
+
+
+# ---------------------------------------------------------------------------
+# pytest CLI options for --bench mode
+# ---------------------------------------------------------------------------
+
+def pytest_addoption(parser):
+    group = parser.getgroup("bench", "rLLM benchmark options")
+    group.addoption("--bench", action="store_true", default=False,
+                    help="Enable benchmark mode (measure tok/s + TTFT)")
+    group.addoption("--bench-runs", type=int, default=1,
+                    help="Number of runs per model (default: 1)")
+    group.addoption("--bench-max-tokens", type=int, default=128,
+                    help="Max tokens to generate per run (default: 128)")
+    group.addoption("--bench-prompt", default="The meaning of life is",
+                    help="Override benchmark prompt")
+    group.addoption("--bench-output", default=None,
+                    help="Write markdown results to this file path")
+    group.addoption("--bench-filter", default="",
+                    help="Only bench models matching this substring")
+    group.addoption("--bench-q4-only", action="store_true", default=False,
+                    help="Skip bf16 variants, only bench Q4")
+    group.addoption("--bench-bf16-only", action="store_true", default=False,
+                    help="Skip Q4 variants")
+    group.addoption("--bench-max-size", type=float, default=0,
+                    help="Skip models exceeding this disk size in GB (0 = no limit)")
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +344,6 @@ def models_dir():
     """Resolve the models directory."""
     d = Path(os.environ.get("RLLM_MODELS_DIR", "models"))
     if not d.is_dir():
-        # Try relative to repo root.
         here = Path(__file__).resolve().parent
         for ancestor in [here] + list(here.parents):
             candidate = ancestor / "models"
@@ -319,10 +367,98 @@ def gpu_count():
 
 @pytest.fixture(scope="session")
 def server_manager(rllm_binary, gpu_available, gpu_count):
-    """Session-scoped server manager; stops all servers at teardown.
-
-    Automatically passes --tp <gpu_count> to use all available GPUs.
-    """
+    """Session-scoped server manager; stops all servers at teardown."""
     mgr = ServerManager(rllm_binary, gpu_count=gpu_count)
     yield mgr
     mgr.stop_all()
+
+
+@pytest.fixture(scope="session")
+def bench_context(request):
+    """Session-scoped benchmark context.  No-op when --bench is not active.
+
+    Returns the same BenchContext instance created by pytest_sessionstart,
+    so results recorded here are visible to pytest_terminal_summary.
+    """
+    session = request.config._tmp_session
+    if hasattr(session, "_bench_context"):
+        return session._bench_context
+    # --bench not active — return a disabled context.
+    return BenchContext(enabled=False)
+
+
+# ---------------------------------------------------------------------------
+# pytest hooks — terminal summary for --bench results
+# ---------------------------------------------------------------------------
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """Print and save benchmark results when --bench is active."""
+    if not config.getoption("--bench", default=False):
+        return
+
+    # Access the bench_context fixture from the session.
+    session = terminalreporter.config._tmp_session
+    if not hasattr(session, "_bench_context"):
+        return
+
+    ctx = session._bench_context
+    if not ctx.results:
+        terminalreporter.write_line("\nNo benchmark results collected.", yellow=True)
+        return
+
+    gpu_name = detect_gpu_name()
+    gpu_count = _get_gpu_count()
+
+    table = format_markdown_table(
+        ctx.results, gpu_name, gpu_count, ctx.max_tokens, ctx.runs,
+    )
+    terminalreporter.write_line("")
+    terminalreporter.write_line(table)
+
+    # Write results to file.
+    output = config.getoption("--bench-output", default=None)
+    output_path = Path(output) if output else None
+    path = write_results(
+        ctx.results, gpu_name, gpu_count, ctx.max_tokens, ctx.runs,
+        output_path=output_path,
+    )
+    terminalreporter.write_line(f"Results saved to {path}")
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_sessionstart(session):
+    """Create the shared BenchContext and stash it on the session.
+
+    The bench_context fixture and pytest_terminal_summary both read from
+    session._bench_context — one instance shared across the entire run.
+    """
+    # Always stash the session so the fixture can find it.
+    session.config._tmp_session = session
+    if session.config.getoption("--bench", default=False):
+        session._bench_context = BenchContext(
+            enabled=True,
+            runs=session.config.getoption("--bench-runs", default=1),
+            max_tokens=session.config.getoption("--bench-max-tokens", default=128),
+            prompt=session.config.getoption("--bench-prompt",
+                                            default="The meaning of life is"),
+        )
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_configure(config):
+    """Register custom markers."""
+    config.addinivalue_line("markers", "bench_only: only run in --bench mode")
+    config.addinivalue_line("markers", "gpu: requires GPU (Metal on macOS, CUDA on Linux)")
+
+
+collect_ignore_glob = ["test_nemotron_debug.py"]
+
+
+def pytest_collection_modifyitems(config, items):
+    """Skip bench_only tests when --bench is not active."""
+    if config.getoption("--bench", default=False):
+        return
+    skip_bench = pytest.mark.skip(reason="--bench not active")
+    for item in items:
+        if "bench_only" in item.keywords:
+            item.add_marker(skip_bench)

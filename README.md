@@ -64,7 +64,7 @@ All models support bf16 and Q4. Multi-GPU via `--tp N` requires CUDA + NCCL.
 | Mixtral 8x7B Instruct ⚡ | 46.7B (12.9B active) | 0.4 tok/s | — | 23 tok/s | 20,853 ms | 696 ms |
 | Qwen3.5 27B  | ~27B ⚡† | 2.0 tok/s | 9.8 tok/s | 16 tok/s | 47,200 ms | 8,194 ms |
 
-⚡ = SSD expert streaming (`--stream-experts`). † = thinking model (TTFT includes reasoning time). The 397B model (751 GB on disk, 213 GB Q4) runs on 64 GB using ~20 GB GPU memory. Q8 is strongly recommended for models over ~8B. Benchmarked via `tests/bench.py` (HTTP API, 2 runs averaged); bf16 numbers for ⚡ models from `scripts/benchmark.sh` (CLI).
+⚡ = SSD expert streaming (`--stream-experts`). † = thinking model (TTFT includes reasoning time). The 397B model (751 GB on disk, 213 GB Q4) runs on 64 GB using ~20 GB GPU memory. Q8 is strongly recommended for models over ~8B. Benchmarked via `pytest --bench` (HTTP API, 2 runs averaged); bf16 numbers for ⚡ models from `scripts/benchmark.sh` (CLI).
 
 </details>
 
@@ -90,7 +90,7 @@ Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Q8 uses FP8 E4M3
 | Qwen3.5 35B-A3B † | 35.1B (3.3B active) | 3.5 ⚡ | — | 58 tok/s | 38,442 ms | 2,219 ms |
 | Mixtral 8x7B Instruct | 46.7B (12.9B active) | 0.4 ⚡ | — | 59 tok/s | 21,756 ms | 251 ms |
 
-⚡ = SSD expert streaming (`--stream-experts`). † = thinking model (TTFT includes reasoning time). Q8 column uses FP8 E4M3 format (auto-selected on NVIDIA SM 89+). Q4 MoE models fit entirely in VRAM: Qwen3.5 35B-A3B Q4 at 22 GB, Mixtral Q4 at 25 GB, Nemotron-H Q4 at 19 GB. Benchmarked via `tests/bench.py` (HTTP API, 2 runs averaged).
+⚡ = SSD expert streaming (`--stream-experts`). † = thinking model (TTFT includes reasoning time). Q8 column uses FP8 E4M3 format (auto-selected on NVIDIA SM 89+). Q4 MoE models fit entirely in VRAM: Qwen3.5 35B-A3B Q4 at 22 GB, Mixtral Q4 at 25 GB, Nemotron-H Q4 at 19 GB. Benchmarked via `pytest --bench` (HTTP API, 2 runs averaged).
 
 </details>
 
@@ -175,7 +175,7 @@ Benchmarked on [RunPod](https://runpod.io?ref=249k2lel). Tensor parallelism acro
 | Qwen 2.5 72B Instruct | 72.7B | — | — | 18.5 tok/s | — | 1,010 ms |
 | Llama 3.1 70B Instruct | 70.6B | — | — | 19.6 tok/s | — | 926 ms |
 
-† = thinking model (TTFT includes reasoning time). MoE models (GPT-OSS, Mixtral, Qwen3.5 35B-A3B) use expert parallelism (experts split across GPUs). Llama 70B and Qwen 72B fit as Q4 (~40 GB). Benchmarked via `tests/bench.py` (HTTP API).
+† = thinking model (TTFT includes reasoning time). MoE models (GPT-OSS, Mixtral, Qwen3.5 35B-A3B) use expert parallelism (experts split across GPUs). Llama 70B and Qwen 72B fit as Q4 (~40 GB). Benchmarked via `pytest --bench` (HTTP API).
 
 </details>
 
@@ -334,8 +334,8 @@ tests/run.sh                              # build + download small tier + test
 tests/run.sh --skip-download -k llama     # filter by family
 uv run pytest tests/ -v                   # run directly (models must be present)
 
-# Benchmarks — throughput + TTFT + quality validation
-uv run python tests/bench.py --models-dir models
-uv run python tests/bench.py --filter qwen3.5 --runs 3
-tests/run.sh --bench                      # all-in-one (build + bench)
+# Benchmarks — throughput + TTFT + quality validation (integrated into pytest)
+uv run pytest tests/ -v --bench                          # test + bench all models
+uv run pytest tests/ -v --bench --bench-filter qwen3.5   # bench specific model
+uv run pytest tests/ -v --bench --bench-q4-only          # Q4 variants only
 ```

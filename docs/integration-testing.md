@@ -11,12 +11,15 @@ starts `rllm serve`, sends real HTTP requests, and validates real model output.
 **Files:**
 ```
 tests/
+  models.py               -- unified model registry (ModelConfig, prompts, helpers)
+  quality.py              -- output quality validation (11 checks: coherence + grammar + readability)
+  coherence.py            -- backward-compat re-export from quality.py
+  benchmark.py            -- measurement engine (TTFT, tok/s, markdown formatting)
+  conftest.py             -- fixtures: server lifecycle, GPU detection, --bench hooks
   test_model_families.py  -- GPU integration tests (pytest)
-  coherence.py            -- output quality validation (language, repetition, encoding)
-  conftest.py             -- fixtures: server lifecycle, GPU detection, memory estimation
-  bench.py                -- HTTP API benchmark (TTFT + tok/s + quality)
+  test_bench_regressions.py -- regression tests for quality checks and registry helpers
   run.sh                  -- all-in-one: build, download, quantize, test or bench
-  requirements.txt        -- Python deps (requests, langdetect, psutil, pytest)
+  requirements.txt        -- Python deps (requests, langdetect, psutil, pytest, textstat)
 
 scripts/
   benchmark.sh            -- CLI benchmark (raw throughput, no HTTP overhead)
@@ -32,14 +35,14 @@ Every model family that rLLM supports gets tested end-to-end.  The test matrix c
 
 - **All architectures** -- Llama, Qwen 2.5, Gemma 3, Mistral, Mixtral, Phi, Qwen 3 MoE,
   Qwen 3.5 (hybrid DeltaNet+GQA), GPT-OSS, NemotronH.  One representative model per
-  family, smallest available, defined in the `BASE_MODELS` list.
+  family, smallest available, defined in `models.py`'s `MODEL_REGISTRY`.
 
 - **Three quantization levels** -- bf16, Q4 (4-bit symmetric), and Q8 (8-bit).  Each
   variant gets a different prompt so we exercise distinct generation patterns per
   quantization level.
 
 - **TurboQuant KV cache modes** -- turbo4 (default 4-bit), turbo2 (aggressive 2-bit),
-  and none (bf16 baseline).  Tested on Llama 1B for fast iteration.  512 tokens
+  and none (bf16 baseline).  Tested on Llama 3B for fast iteration.  512 tokens
   exercises the quantized KV cache across many decode steps.
 
 - **API formats** -- OpenAI `/v1/chat/completions` (streaming and non-streaming) and
@@ -120,10 +123,13 @@ The manager handles:
 - Automatic `--tp <gpu_count>` for multi-GPU tensor parallelism
 - stderr capture on failure for debugging
 
-### Coherence validation
+### Quality validation
 
-Every test validates output quality using `coherence.py`, a lightweight local checker
-that requires no external LLM.  Five checks run in sequence:
+Every test validates output quality using `quality.py`, a comprehensive local checker
+that requires no external LLM.  Eleven checks run in sequence, divided into hard failures
+(indicate broken inference) and soft warnings (track quality trends).
+
+**Hard checks (1-9, 11):**
 
 1. **Minimum length** -- at least 20 characters of content (catches silent failures
    where the model generates zero or near-zero tokens).
@@ -144,8 +150,47 @@ that requires no external LLM.  Five checks run in sequence:
    20 characters (>15% is word salad) and overall space ratio (<10% for text longer than
    100 characters).
 
-5. **Language detection** -- uses `langdetect` to confirm the output is English.  Catches
+5. **Unicode garbage** -- rejects text with >5% exotic characters outside U+0000-U+00FF
+   (catches broken dequantization producing scattered CJK/symbols).
+
+6. **Token fragment runs** -- detects 4+ consecutive 1-2 character non-words that are
+   not common English short words (catches broken tokenizer/detokenizer output).
+
+7. **Language detection** -- uses `langdetect` to confirm the output is English.  Catches
    models that degenerate into another language or produce statistically random tokens.
+
+8. **Sentence structure** -- three sub-checks on prose (code blocks stripped):
+   - *Capitalization* -- >40% of sentence starts lacking uppercase indicates broken
+     tokenizer/detokenizer.
+   - *Sentence length* -- median <3 words (fragmented junk) or >80 words (run-on blob).
+   - *Dangling endings* -- text ending with a function word (conjunction, preposition,
+     article) after 5+ words indicates truncated generation.
+
+9. **Punctuation patterns** -- two sub-checks:
+   - *Runs* -- 4+ consecutive punctuation characters (not markdown/ellipsis) indicate
+     degenerate generation (e.g. "!!!!!" or ".,.,.,").
+   - *Unmatched brackets* -- >3 open/close mismatch for `()`, `[]`, `{}` indicates
+     broken structured output.
+
+10. **(Soft) Readability** -- uses `textstat` (pure Python) for Flesch Reading Ease
+    and sentence length metrics.  Anomalies produce warnings but never fail the test.
+    Scores are recorded in `QualityResult.scores` for bench table reporting.
+
+11. **Vocabulary diversity** -- type-token ratio (unique words / total words) below 0.15
+    for outputs with 100+ words indicates repetitive content that may evade the trigram
+    check by varying word order.
+
+**Why these specific checks:** Each targets a real failure mode observed in LLM inference:
+
+| Check | Failure mode |
+|-------|-------------|
+| Capitalization | Broken tokenizer/detokenizer |
+| Sentence length | Missing punctuation generation |
+| Dangling endings | Truncated generation |
+| Punctuation runs | Degenerate repetition variant |
+| Unmatched brackets | Broken structured output |
+| Readability | Subtle quality degradation |
+| Vocabulary diversity | Paraphrased repetition |
 
 ### Design decisions
 
@@ -171,11 +216,63 @@ tokens (~400 words) exercises the KV cache across hundreds of decode steps and s
 issues that only appear in sustained generation (cache overflow, attention drift,
 repetition collapse).
 
+**No Java/LanguageTool.**  `textstat` is pure Python (~50KB, zero deps).  Full grammar
+checking via LanguageTool requires a Java runtime and a ~200MB JAR.  The heuristic checks
+catch broken inference (what these tests target), not imperfect grammar in otherwise
+coherent output (which would indicate the model is working fine).
+
 ---
 
 ## Benchmarks
 
-Two complementary tools measure performance at different levels of the stack.
+Testing and benchmarking are unified into a single `pytest` invocation.  The `--bench`
+flag enables performance measurement alongside correctness validation.
+
+### pytest --bench -- HTTP API benchmark
+
+Integrated into the test suite.  When `--bench` is active, each test records TTFT and
+generation throughput alongside its quality checks.  Results are printed as a markdown
+table and saved to a file.
+
+**What it measures:**
+- TTFT (time to first token) -- measured via SSE streaming, from request to first
+  `content` delta
+- Generation throughput (tok/s) -- `completion_tokens / generation_duration`
+- Quality -- full quality check on every generated response (11 checks)
+- Readability scores -- Flesch Reading Ease and type-token ratio in the results table
+
+**Usage:**
+
+```bash
+# Test + benchmark all models
+uv run pytest tests/ -v --bench
+
+# Benchmark specific models
+uv run pytest tests/ -v --bench --bench-filter qwen3.5
+
+# Q4 only, 3 runs averaged, 256 tokens
+uv run pytest tests/ -v --bench --bench-q4-only --bench-runs 3 --bench-max-tokens 256
+
+# Custom prompt
+uv run pytest tests/ -v --bench --bench-prompt "Write a poem about Rust"
+
+# Save results to specific file
+uv run pytest tests/ -v --bench --bench-output results/my-bench.md
+```
+
+**Benchmark CLI options:**
+- `--bench` -- enable benchmark mode
+- `--bench-runs N` -- runs per model, results averaged (default: 1)
+- `--bench-max-tokens N` -- tokens per run (default: 128)
+- `--bench-prompt TEXT` -- override prompt
+- `--bench-output PATH` -- write markdown results to file
+- `--bench-filter PATTERN` -- only bench models matching substring
+- `--bench-q4-only` / `--bench-bf16-only` -- filter quantization variants
+- `--bench-max-size GB` -- skip models exceeding disk size threshold
+
+**Output:** Markdown table with Model, Family, tok/s, TTFT, Quality columns (plus
+Flesch and TTR when quality scores are available).  Results are always saved to a file
+(auto-named under `results/` by default).
 
 ### scripts/benchmark.sh -- CLI throughput
 
@@ -216,76 +313,27 @@ for pasting into the README.
 - `--massive` -- 300B+ (Qwen 3.5 397B)
 - `--all` -- everything
 
-### tests/bench.py -- HTTP API benchmark
-
-Measures end-to-end performance through the HTTP API, including server startup, SSE
-streaming, and response parsing.  This reflects what real users experience when calling
-the OpenAI-compatible endpoint.
-
-**What it measures:**
-- TTFT (time to first token) -- measured via SSE streaming, from request to first
-  `content` delta
-- Generation throughput (tok/s) -- `completion_tokens / generation_duration`
-- Quality -- coherence check on every generated response (same checks as the test suite)
-
-**Usage:**
-
-```bash
-# Benchmark all discovered models
-python tests/bench.py
-
-# Filter to specific models
-python tests/bench.py --filter qwen3.5
-
-# Q4 only, 3 runs averaged, 256 tokens
-python tests/bench.py --q4-only --runs 3 --max-tokens 256
-
-# Custom prompt
-python tests/bench.py --prompt "Write a poem about Rust"
-
-# Save results to file (auto-generates results/bench-TIMESTAMP.md)
-python tests/bench.py --output
-```
-
-**Output:** Markdown table with Model, Family, tok/s, TTFT, and Quality columns.
-Results are always saved to a file (auto-named under `results/` by default).
-
-**Key options:**
-- `--models-dir PATH` -- where to find models (default: `models/`)
-- `--binary PATH` -- rllm binary (default: `target/release/rllm`)
-- `--max-tokens N` -- tokens to generate per run (default: 128)
-- `--runs N` -- runs per model, results averaged (default: 1)
-- `--q4-only` / `--bf16-only` -- filter quantization variants
-- `--filter PATTERN` -- substring match on model directory names
-- `--output [PATH]` -- write markdown to file (auto-generates if no path given)
-
-**Model discovery:** bench.py scans the models directory and matches against a built-in
-`KNOWN_MODELS` registry that maps directory names to (family, is_moe, bf16_size_gb,
-supports_stream_experts).  Unknown models are still benchmarked -- the registry just
-provides metadata for the results table and streaming decisions.
-
 ### Thinking models and pseudo-streaming
 
 Models with extended thinking (e.g. Qwen 3.5) emit `reasoning_content` deltas before
 `content` deltas.  The thinking-aware streaming path collects all tokens, then emits
-content as a burst.  bench.py handles this by:
+content as a burst.  The benchmark handles this by:
 
 - Recording TTFT as the time to the first `reasoning_content` delta (not the first
   `content` delta, which would be misleadingly late)
 - Computing generation throughput from total wall time minus TTFT, rather than from
   inter-token timing (which would give absurd numbers due to the burst delivery)
 
-### Using run.sh for benchmarks
+### Unified model registry
 
-The all-in-one runner supports benchmarking mode:
+Both tests and benchmarks share a single `MODEL_REGISTRY` in `models.py`.  Adding a
+new model family requires one edit: add a `ModelConfig` entry with `in_test_suite=True`
+for the curated test model.  All other models in the registry are bench-only (discovered
+when scanning the `models/` directory).
 
-```bash
-# Build + benchmark all models
-tests/run.sh --bench
-
-# Benchmark with options
-tests/run.sh --bench --bench-filter mixtral --bench-runs 3 --bench-tokens 256
-```
+The `ModelConfig` dataclass carries all metadata needed for both testing and benchmarking:
+architecture family, MoE status, memory estimates, expert streaming support, chat/base
+detection, vision capabilities, and quality sensitivity flags.
 
 ---
 

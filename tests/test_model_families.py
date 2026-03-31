@@ -2,7 +2,11 @@
 # test_model_families.py — GPU integration tests for every rLLM model family.
 #
 # Starts `rllm serve` for each model configuration, sends requests via the
-# OpenAI / Anthropic HTTP API, and validates that outputs are coherent English.
+# OpenAI / Anthropic HTTP API, and validates that outputs pass quality checks
+# (coherence, grammar structure, vocabulary diversity, readability).
+#
+# When run with `--bench`, also records performance measurements (TTFT, tok/s)
+# alongside correctness validation.
 #
 # Tests are skipped when:
 #   - No GPU is available (Metal on macOS, CUDA on Linux)
@@ -11,115 +15,42 @@
 #
 # Run:  pytest tests/ -v
 # Run one family:  pytest tests/ -v -k llama
+# Run + bench:  pytest tests/ -v --bench
 #
-# Related: conftest.py (fixtures), coherence.py (validation)
+# Related: models.py (model registry), quality.py (validation),
+#          benchmark.py (measurement), conftest.py (fixtures)
 # ---------------------------------------------------------------------------
 
 import base64
-import io
 import json
 import os
-from dataclasses import dataclass, field
+import time
 from pathlib import Path
 
 import pytest
 import requests
 
-from coherence import check_coherence
+from models import (
+    MODEL_REGISTRY, TURBOQUANT_CONFIGS, PROMPTS, MAX_TOKENS,
+    get_test_models, get_vision_models, prompt_for_index,
+)
+from quality import check_quality
 from conftest import _should_stream_experts
 
 
 # ---------------------------------------------------------------------------
-# Model configuration registry
+# Derived model lists
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True)
-class ModelConfig:
-    """Describes one model configuration to test."""
-
-    test_id: str
-    model_name: str        # directory name under models/
-    family: str            # architecture family
-    is_moe: bool = False   # requires --stream-experts decision
-    bf16_size_gb: float = 0  # estimated bf16 weight size for streaming decision
-    extra_args: tuple[str, ...] = ()  # additional CLI args (e.g., --kv-quant)
-    supports_stream_experts: bool = True  # some MoE models don't support it yet
-    temperature: float = 0  # sampling temperature (0 = greedy)
-    has_vision: bool = False  # model supports image input
-
-
-# One model per architecture family — smallest available.
-BASE_MODELS = [
-    ModelConfig("llama-3b",    "llama-3.2-3b-instruct",           "Llama",     bf16_size_gb=6),
-    ModelConfig("qwen2-3b",    "qwen2.5-3b-instruct",             "Qwen2",     bf16_size_gb=6),
-    ModelConfig("gemma3-4b",   "gemma-3-4b-it",                   "Gemma3",    bf16_size_gb=8, has_vision=True),
-    ModelConfig("mistral-7b",  "mistral-7b-instruct-v0.3",        "Mistral",   bf16_size_gb=14),
-    # Qwen3.5 Q4 text generates 0 tokens (thinking mode interaction). bf16 works.
-    ModelConfig("qwen3.5-9b",  "qwen3.5-9b",                      "Qwen3_5",   bf16_size_gb=18, has_vision=True),
-    ModelConfig("phi-4",       "phi-4",                            "Phi",       bf16_size_gb=28),
-    ModelConfig("mixtral-8x7b","mixtral-8x7b-instruct-v0.1",      "Mixtral",   is_moe=True, bf16_size_gb=93),
-    ModelConfig("qwen3moe-30b","qwen3-coder-30b-a3b-instruct",    "Qwen3Moe",  is_moe=True, bf16_size_gb=60),
-    ModelConfig("qwen3.5-35b", "qwen3.5-35b-a3b",                 "Qwen3_5M",  is_moe=True, bf16_size_gb=70, has_vision=True),
-    # GPT-OSS Q4 degenerates into self-evaluation loops at low temperature due to
-    # reduced logit precision.  temperature=0.6 adds enough noise to break the loop.
-    ModelConfig("gpt-oss-20b", "gpt-oss-20b",                     "GptOss",    is_moe=True, bf16_size_gb=40, supports_stream_experts=False, temperature=0.6),
-    ModelConfig("nemotron-h-30b", "nemotron-3-30b",               "NemotronH", is_moe=True, bf16_size_gb=63, supports_stream_experts=False),
-    ModelConfig("nemotron-h-120b","nemotron-3-120b",              "NemotronH", is_moe=True, bf16_size_gb=240),
-]
-
-# TurboQuant variations (tested on Llama 3B — smallest instruct model).
-TURBOQUANT_CONFIGS = [
-    ModelConfig("turbo4-llama", "llama-3.2-3b-instruct", "Llama", extra_args=("--kv-quant", "turbo4"), bf16_size_gb=6),
-    ModelConfig("turbo2-llama", "llama-3.2-3b-instruct", "Llama", extra_args=("--kv-quant", "turbo2"), bf16_size_gb=6),
-    ModelConfig("no-kv-quant-llama", "llama-3.2-3b-instruct", "Llama", extra_args=("--kv-quant", "none"), bf16_size_gb=6),
-]
-
-# Varied prompts that exercise different generation patterns.  Each model
-# family test uses a different prompt so we're not just testing one pattern.
-# All are factual / instructional — any instruction-tuned model should handle
-# them, and the output is easy to validate for English coherence.
-PROMPTS = [
-    # Short factual — tests basic instruction following.
-    "Explain what a hash table is in two sentences.",
-    # Longer expository — tests sustained multi-paragraph generation.
-    "Write a short paragraph explaining how the internet works, from typing "
-    "a URL in a browser to seeing the webpage.  Include DNS, TCP, and HTTP.",
-    # Enumeration / structured — tests list generation and formatting.
-    "List five common sorting algorithms and give a one-sentence description "
-    "of how each one works.",
-    # Reasoning / comparison — tests coherent argumentation.
-    "Compare and contrast Python and Rust.  What are the strengths and "
-    "weaknesses of each language?  Give concrete examples.",
-    # Creative but bounded — tests fluency without drifting into gibberish.
-    "Write a short story in exactly three sentences about a robot that "
-    "discovers it can dream.",
-    # Technical explanation — tests domain vocabulary coherence.
-    "Explain how public-key cryptography works.  Include the roles of the "
-    "public key, private key, and why it is difficult to reverse.",
-    # Step-by-step — tests sequential reasoning.
-    "Walk me through the steps to deploy a web application to a cloud "
-    "provider.  Cover DNS setup, containerisation, and monitoring.",
-    # Concise summary — tests compression and accuracy.
-    "Summarise the key ideas behind MapReduce in a few sentences.",
-    # Multi-part question — tests handling compound prompts.
-    "What is gradient descent?  Why is the learning rate important?  "
-    "What happens if it is set too high or too low?",
-    # Opinion / analysis — tests balanced generation.
-    "What are the trade-offs between microservices and monolithic "
-    "architectures?  When would you choose one over the other?",
-]
-
-# Realistic max_tokens — long enough to exercise sustained generation and
-# KV cache behavior (prefill + many decode steps), but not so long that
-# tests take forever.  512 tokens is ~400 words, a solid paragraph or two.
-MAX_TOKENS = 512
+BASE_MODELS = get_test_models()
+VISION_MODELS = get_vision_models()
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _resolve_model_dir(models_dir: Path, config: ModelConfig, q4: bool = False,
+def _resolve_model_dir(models_dir: Path, config, q4: bool = False,
                        q8: bool = False) -> Path | None:
     """Return the model directory path, or None if it doesn't exist."""
     suffix = "-q4" if q4 else ("-q8" if q8 else "")
@@ -128,7 +59,7 @@ def _resolve_model_dir(models_dir: Path, config: ModelConfig, q4: bool = False,
     return d if d.is_dir() else None
 
 
-def _build_extra_args(config: ModelConfig, is_q4: bool) -> list[str]:
+def _build_extra_args(config, is_q4: bool) -> list[str]:
     """Build CLI extra args, including --stream-experts decision for MoE."""
     args = list(config.extra_args)
     if config.is_moe and config.supports_stream_experts:
@@ -137,32 +68,19 @@ def _build_extra_args(config: ModelConfig, is_q4: bool) -> list[str]:
     return args
 
 
-def _estimate_memory_gb(config: ModelConfig, is_q4: bool) -> float:
-    """Estimate GPU memory required for a model (weights + KV cache overhead).
-
-    Used by ServerManager to evict servers before OOM.  Streamed-expert MoE
-    models only load active experts, so we estimate ~25% of total weight size.
-    """
+def _estimate_memory_gb(config, is_q4: bool) -> float:
+    """Estimate GPU memory required for a model (weights + KV cache overhead)."""
     weight_gb = config.bf16_size_gb * 0.5 if is_q4 else config.bf16_size_gb
     if config.is_moe and config.supports_stream_experts:
         if _should_stream_experts(config.bf16_size_gb, is_q4):
-            weight_gb *= 0.25  # only active experts in memory
-    return weight_gb * 1.2  # +20% overhead for KV cache, activations, scratch
-
-
-def _prompt_for_index(index: int) -> str:
-    """Return a prompt from the PROMPTS list, cycling if index exceeds length."""
-    return PROMPTS[index % len(PROMPTS)]
+            weight_gb *= 0.25
+    return weight_gb * 1.2
 
 
 def _chat_completion(base_url: str, prompt: str, max_tokens: int = MAX_TOKENS,
                      temperature: float = 0, stream: bool = False,
                      thinking: bool = False) -> requests.Response:
-    """Send an OpenAI-format chat completion request.
-
-    thinking=False (default) disables extended thinking so models like Qwen3.5
-    don't spend their entire token budget on chain-of-thought reasoning.
-    """
+    """Send an OpenAI-format chat completion request."""
     body = {
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
@@ -172,9 +90,7 @@ def _chat_completion(base_url: str, prompt: str, max_tokens: int = MAX_TOKENS,
     }
     return requests.post(
         f"{base_url}/v1/chat/completions",
-        json=body,
-        timeout=300,
-        stream=stream,
+        json=body, timeout=300, stream=stream,
     )
 
 
@@ -189,8 +105,7 @@ def _anthropic_message(base_url: str, prompt: str, max_tokens: int = MAX_TOKENS,
             "temperature": temperature,
             "stream": stream,
         },
-        timeout=300,
-        stream=stream,
+        timeout=300, stream=stream,
     )
 
 
@@ -237,8 +152,43 @@ def _collect_anthropic_sse_content(response: requests.Response) -> tuple[str, in
     return "".join(content_parts), chunk_count
 
 
+def _assert_quality(content: str, test_id: str, prompt: str) -> None:
+    """Run quality checks and assert the output passes."""
+    result = check_quality(content)
+    assert result.passed, (
+        f"quality check failed for {test_id}: {result.reason}\n"
+        f"Prompt: {prompt}\nOutput: {content[:500]}"
+    )
+    if result.warnings:
+        print(f"  Quality warnings for {test_id}: {'; '.join(result.warnings)}")
+
+
+def _record_bench(bench_context, config, content: str, t_start: float,
+                  t_end: float, completion_tokens: int) -> None:
+    """Record benchmark measurements if --bench is active."""
+    if not bench_context.enabled:
+        return
+
+    total_ms = (t_end - t_start) * 1000
+    gen_duration = total_ms / 1000
+    gen_tps = (completion_tokens / gen_duration
+               if gen_duration > 0 and completion_tokens > 0 else 0)
+
+    result = check_quality(content)
+    quality = "PASS" if result.passed else f"FAIL: {result.reason}"
+
+    bench_context.record(
+        model_name=config.test_id,
+        family=config.family,
+        gen_tps=gen_tps,
+        ttft_ms=total_ms,  # Approximation for non-streaming.
+        quality=quality,
+        scores=result.scores,
+    )
+
+
 # ---------------------------------------------------------------------------
-# Tests — Basic model inference (one per family, bf16 + optional Q4)
+# Tests — Basic model inference (one per family, bf16 + optional Q4/Q8)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.gpu
@@ -246,16 +196,10 @@ def _collect_anthropic_sse_content(response: requests.Response) -> tuple[str, in
     "config_index", range(len(BASE_MODELS)),
     ids=[c.test_id for c in BASE_MODELS],
 )
-def test_model_bf16(config_index, server_manager, models_dir):
-    """Each model family produces coherent English via the OpenAI API.
-
-    Each model gets a different prompt from the PROMPTS list so we exercise
-    varied generation patterns across the suite.
-    """
+def test_model_bf16(config_index, server_manager, models_dir, bench_context):
+    """Each model family produces coherent English via the OpenAI API."""
     config = BASE_MODELS[config_index]
 
-    # BF16 MoE models that require expert streaming are too slow (0.4 tok/s for
-    # 336 MB bf16 experts per token) — skip in favour of the Q4 variant.
     if config.is_moe and _should_stream_experts(config.bf16_size_gb, is_q4=False):
         pytest.skip(f"bf16 MoE too large for memory ({config.bf16_size_gb}GB), use Q4")
 
@@ -267,22 +211,22 @@ def test_model_bf16(config_index, server_manager, models_dir):
     mem = _estimate_memory_gb(config, is_q4=False)
     base_url = server_manager.get_or_start(str(model_dir), extra_args, memory_gb=mem)
 
-    prompt = _prompt_for_index(config_index)
+    prompt = prompt_for_index(config_index)
+    t_start = time.monotonic()
     resp = _chat_completion(base_url, prompt, temperature=config.temperature)
     assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text[:500]}"
 
     body = resp.json()
     content = body["choices"][0]["message"]["content"]
     usage = body.get("usage", {})
+    t_end = time.monotonic()
 
     assert usage.get("completion_tokens", 0) > 0, "no tokens generated"
     assert len(content.strip()) > 0, "empty response"
 
-    ok, reason = check_coherence(content)
-    assert ok, (
-        f"coherence check failed for {config.test_id}: {reason}\n"
-        f"Prompt: {prompt}\nOutput: {content[:500]}"
-    )
+    _assert_quality(content, config.test_id, prompt)
+    _record_bench(bench_context, config, content, t_start, t_end,
+                  usage.get("completion_tokens", 0))
 
 
 @pytest.mark.gpu
@@ -290,12 +234,8 @@ def test_model_bf16(config_index, server_manager, models_dir):
     "config_index", range(len(BASE_MODELS)),
     ids=[f"{c.test_id}-q4" for c in BASE_MODELS],
 )
-def test_model_q4(config_index, server_manager, models_dir):
-    """Q4-quantized variant of each model family (skipped if not quantized).
-
-    Uses a different prompt than the bf16 test (offset by 5) so each model
-    is tested with two distinct prompts across bf16 and Q4.
-    """
+def test_model_q4(config_index, server_manager, models_dir, bench_context):
+    """Q4-quantized variant of each model family."""
     config = BASE_MODELS[config_index]
 
     model_dir = _resolve_model_dir(models_dir, config, q4=True)
@@ -306,38 +246,30 @@ def test_model_q4(config_index, server_manager, models_dir):
     mem = _estimate_memory_gb(config, is_q4=True)
     base_url = server_manager.get_or_start(str(model_dir), extra_args, memory_gb=mem)
 
-    prompt = _prompt_for_index(config_index + 5)
+    prompt = prompt_for_index(config_index + 5)
+    t_start = time.monotonic()
     resp = _chat_completion(base_url, prompt, temperature=config.temperature)
     assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text[:500]}"
 
     body = resp.json()
     content = body["choices"][0]["message"]["content"]
     usage = body.get("usage", {})
+    t_end = time.monotonic()
 
     assert usage.get("completion_tokens", 0) > 0, "no tokens generated"
 
-    ok, reason = check_coherence(content)
-    assert ok, (
-        f"coherence check failed for {config.test_id}-q4: {reason}\n"
-        f"Prompt: {prompt}\nOutput: {content[:500]}"
-    )
+    _assert_quality(content, f"{config.test_id}-q4", prompt)
+    _record_bench(bench_context, config, content, t_start, t_end,
+                  usage.get("completion_tokens", 0))
 
-
-# ---------------------------------------------------------------------------
-# Tests — Q8-quantized model inference
-# ---------------------------------------------------------------------------
 
 @pytest.mark.gpu
 @pytest.mark.parametrize(
     "config_index", range(len(BASE_MODELS)),
     ids=[f"{c.test_id}-q8" for c in BASE_MODELS],
 )
-def test_model_q8(config_index, server_manager, models_dir):
-    """Q8-quantized variant of each model family (skipped if not quantized).
-
-    Uses a different prompt than bf16 and Q4 tests (offset by 3) so each model
-    is tested with three distinct prompts across bf16, Q4, and Q8.
-    """
+def test_model_q8(config_index, server_manager, models_dir, bench_context):
+    """Q8-quantized variant of each model family."""
     config = BASE_MODELS[config_index]
 
     model_dir = _resolve_model_dir(models_dir, config, q8=True)
@@ -345,25 +277,24 @@ def test_model_q8(config_index, server_manager, models_dir):
         pytest.skip(f"Q8 model not found: {config.model_name}-q8")
 
     extra_args = _build_extra_args(config, is_q4=False)
-    # Q8 is ~53% of bf16 size (34/64 bytes per weight)
     mem = _estimate_memory_gb(config, is_q4=False) * 0.53
     base_url = server_manager.get_or_start(str(model_dir), extra_args, memory_gb=mem)
 
-    prompt = _prompt_for_index(config_index + 3)
+    prompt = prompt_for_index(config_index + 3)
+    t_start = time.monotonic()
     resp = _chat_completion(base_url, prompt, temperature=config.temperature)
     assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text[:500]}"
 
     body = resp.json()
     content = body["choices"][0]["message"]["content"]
     usage = body.get("usage", {})
+    t_end = time.monotonic()
 
     assert usage.get("completion_tokens", 0) > 0, "no tokens generated"
 
-    ok, reason = check_coherence(content)
-    assert ok, (
-        f"coherence check failed for {config.test_id}-q8: {reason}\n"
-        f"Prompt: {prompt}\nOutput: {content[:500]}"
-    )
+    _assert_quality(content, f"{config.test_id}-q8", prompt)
+    _record_bench(bench_context, config, content, t_start, t_end,
+                  usage.get("completion_tokens", 0))
 
 
 # ---------------------------------------------------------------------------
@@ -375,13 +306,8 @@ def test_model_q8(config_index, server_manager, models_dir):
     "config_index", range(len(TURBOQUANT_CONFIGS)),
     ids=[c.test_id for c in TURBOQUANT_CONFIGS],
 )
-def test_turboquant(config_index, server_manager, models_dir):
-    """Different KV cache quantization modes produce coherent output.
-
-    Tests turbo4 (default 4-bit), turbo2 (aggressive 2-bit), and none
-    (BF16 baseline) on the same model with different prompts.  512 tokens
-    exercises the KV cache across many decode steps.
-    """
+def test_turboquant(config_index, server_manager, models_dir, bench_context):
+    """Different KV cache quantization modes produce coherent output."""
     config = TURBOQUANT_CONFIGS[config_index]
     model_dir = _resolve_model_dir(models_dir, config)
     if model_dir is None:
@@ -390,18 +316,14 @@ def test_turboquant(config_index, server_manager, models_dir):
     mem = _estimate_memory_gb(config, is_q4=False)
     base_url = server_manager.get_or_start(str(model_dir), list(config.extra_args), memory_gb=mem)
 
-    prompt = _prompt_for_index(config_index + 3)
+    prompt = prompt_for_index(config_index + 3)
     resp = _chat_completion(base_url, prompt)
     assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text[:500]}"
 
     body = resp.json()
     content = body["choices"][0]["message"]["content"]
 
-    ok, reason = check_coherence(content)
-    assert ok, (
-        f"coherence check failed for {config.test_id}: {reason}\n"
-        f"Prompt: {prompt}\nOutput: {content[:500]}"
-    )
+    _assert_quality(content, config.test_id, prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -409,19 +331,15 @@ def test_turboquant(config_index, server_manager, models_dir):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.gpu
-def test_openai_streaming(server_manager, models_dir):
-    """OpenAI-format SSE streaming returns incremental chunks of coherent text.
-
-    Uses the expository internet prompt at 512 tokens to exercise sustained
-    streaming over many decode steps.
-    """
-    model_dir = _resolve_model_dir(models_dir, BASE_MODELS[0])  # Llama 3B
+def test_openai_streaming(server_manager, models_dir, bench_context):
+    """OpenAI-format SSE streaming returns incremental chunks of coherent text."""
+    model_dir = _resolve_model_dir(models_dir, BASE_MODELS[0])
     if model_dir is None:
         pytest.skip("llama-3.2-3b-instruct not found")
 
     base_url = server_manager.get_or_start(str(model_dir), [], memory_gb=7.2)
 
-    prompt = PROMPTS[1]  # Internet / DNS / TCP / HTTP — longer response expected.
+    prompt = PROMPTS[1]
     resp = _chat_completion(base_url, prompt, stream=True)
     assert resp.status_code == 200
 
@@ -430,23 +348,19 @@ def test_openai_streaming(server_manager, models_dir):
     assert chunk_count > 1, f"expected multiple SSE chunks, got {chunk_count}"
     assert len(content.strip()) > 0, "empty streamed response"
 
-    ok, reason = check_coherence(content)
-    assert ok, f"streaming coherence failed: {reason}\nOutput: {content[:500]}"
+    _assert_quality(content, "openai-streaming", prompt)
 
 
 @pytest.mark.gpu
-def test_anthropic_streaming(server_manager, models_dir):
-    """Anthropic-format SSE streaming returns incremental chunks.
-
-    Uses the sorting algorithms prompt to exercise list-style generation.
-    """
-    model_dir = _resolve_model_dir(models_dir, BASE_MODELS[0])  # Llama 3B
+def test_anthropic_streaming(server_manager, models_dir, bench_context):
+    """Anthropic-format SSE streaming returns incremental chunks."""
+    model_dir = _resolve_model_dir(models_dir, BASE_MODELS[0])
     if model_dir is None:
         pytest.skip("llama-3.2-3b-instruct not found")
 
     base_url = server_manager.get_or_start(str(model_dir), [], memory_gb=7.2)
 
-    prompt = PROMPTS[2]  # Sorting algorithms enumeration.
+    prompt = PROMPTS[2]
     resp = _anthropic_message(base_url, prompt, stream=True)
     assert resp.status_code == 200
 
@@ -455,8 +369,7 @@ def test_anthropic_streaming(server_manager, models_dir):
     assert chunk_count > 1, f"expected multiple SSE chunks, got {chunk_count}"
     assert len(content.strip()) > 0, "empty streamed response"
 
-    ok, reason = check_coherence(content)
-    assert ok, f"anthropic streaming coherence failed: {reason}\nOutput: {content[:500]}"
+    _assert_quality(content, "anthropic-streaming", prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -464,19 +377,15 @@ def test_anthropic_streaming(server_manager, models_dir):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.gpu
-def test_anthropic_api(server_manager, models_dir):
-    """Anthropic /v1/messages endpoint returns coherent response.
-
-    Uses the public-key cryptography prompt — a technical explanation that
-    any model should handle coherently at 512 tokens.
-    """
-    model_dir = _resolve_model_dir(models_dir, BASE_MODELS[0])  # Llama 3B
+def test_anthropic_api(server_manager, models_dir, bench_context):
+    """Anthropic /v1/messages endpoint returns coherent response."""
+    model_dir = _resolve_model_dir(models_dir, BASE_MODELS[0])
     if model_dir is None:
         pytest.skip("llama-3.2-3b-instruct not found")
 
     base_url = server_manager.get_or_start(str(model_dir), [], memory_gb=7.2)
 
-    prompt = PROMPTS[5]  # Public-key cryptography.
+    prompt = PROMPTS[5]
     resp = _anthropic_message(base_url, prompt)
     assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text[:500]}"
 
@@ -484,7 +393,6 @@ def test_anthropic_api(server_manager, models_dir):
     assert body.get("type") == "message"
     assert body.get("role") == "assistant"
 
-    # Content is an array of blocks.
     content_blocks = body.get("content", [])
     assert len(content_blocks) > 0, "no content blocks"
 
@@ -495,10 +403,8 @@ def test_anthropic_api(server_manager, models_dir):
 
     assert len(text.strip()) > 0, "empty response"
 
-    ok, reason = check_coherence(text)
-    assert ok, f"anthropic coherence failed: {reason}\nOutput: {text[:500]}"
+    _assert_quality(text, "anthropic-api", prompt)
 
-    # Validate usage.
     usage = body.get("usage", {})
     assert usage.get("output_tokens", 0) > 0, "no output tokens"
 
@@ -507,40 +413,32 @@ def test_anthropic_api(server_manager, models_dir):
 # Tests — Vision (VLM) models
 # ---------------------------------------------------------------------------
 
-# Filter BASE_MODELS to those with vision support.
-VISION_MODELS = [c for c in BASE_MODELS if c.has_vision]
-
-
 def _make_test_image() -> str:
-    """Generate a simple 128×128 test image as a base64-encoded PNG.
+    """Generate a simple 128x128 test image as a base64-encoded PNG.
 
-    Creates a 2×2 grid: red (top-left), green (top-right),
-    blue (bottom-left), white (bottom-right).  This is trivially
-    recognisable by any VLM, and tiny enough to not slow down tests.
-    Returns a base64 string (no data URL prefix).
+    Creates a 2x2 grid: red (top-left), green (top-right),
+    blue (bottom-left), white (bottom-right).
     """
-    # Minimal PNG via raw pixel data — no PIL dependency needed.
     import struct
     import zlib
 
     width, height = 128, 128
     half = 64
 
-    # Build raw RGBA pixel rows (filter byte 0 = None at start of each row).
     rows = []
     for y in range(height):
-        row = bytearray([0])  # PNG filter: None
+        row = bytearray([0])
         for x in range(width):
             if y < half:
                 if x < half:
-                    row.extend([255, 0, 0, 255])      # red
+                    row.extend([255, 0, 0, 255])
                 else:
-                    row.extend([0, 255, 0, 255])      # green
+                    row.extend([0, 255, 0, 255])
             else:
                 if x < half:
-                    row.extend([0, 0, 255, 255])      # blue
+                    row.extend([0, 0, 255, 255])
                 else:
-                    row.extend([255, 255, 255, 255])  # white
+                    row.extend([255, 255, 255, 255])
         rows.append(bytes(row))
 
     raw_data = b"".join(rows)
@@ -552,7 +450,6 @@ def _make_test_image() -> str:
         return struct.pack(">I", len(data)) + c + crc
 
     png = b"\x89PNG\r\n\x1a\n"
-    # IHDR: width, height, bit_depth=8, color_type=6 (RGBA)
     ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
     png += _png_chunk(b"IHDR", ihdr)
     png += _png_chunk(b"IDAT", compressed)
@@ -594,14 +491,8 @@ def _vision_chat_completion(base_url: str, image_b64: str, prompt: str,
     "config_index", range(len(VISION_MODELS)),
     ids=[f"{c.test_id}-vision" for c in VISION_MODELS],
 )
-def test_vision(config_index, server_manager, models_dir):
-    """Vision models describe a simple coloured-quadrant image coherently.
-
-    Sends a 128×128 PNG with red/green/blue/white quadrants and asks the
-    model to describe the colours.  Validates that the response mentions at
-    least one colour, confirming the vision encoder + projector + LLM pipeline
-    works end-to-end.
-    """
+def test_vision(config_index, server_manager, models_dir, bench_context):
+    """Vision models describe a simple coloured-quadrant image coherently."""
     config = VISION_MODELS[config_index]
 
     model_dir = _resolve_model_dir(models_dir, config)
@@ -625,7 +516,6 @@ def test_vision(config_index, server_manager, models_dir):
     assert usage.get("completion_tokens", 0) > 0, "no tokens generated"
     assert len(content.strip()) > 0, "empty response"
 
-    # The model should mention at least one colour from the test image.
     content_lower = content.lower()
     colours_found = [c for c in ["red", "green", "blue", "white"]
                      if c in content_lower]
@@ -634,12 +524,7 @@ def test_vision(config_index, server_manager, models_dir):
         f"Output: {content[:500]}"
     )
 
-    # Also check general coherence (no word salad).
-    ok, reason = check_coherence(content)
-    assert ok, (
-        f"vision coherence failed for {config.test_id}: {reason}\n"
-        f"Output: {content[:500]}"
-    )
+    _assert_quality(content, f"{config.test_id}-vision", prompt)
 
 
 @pytest.mark.gpu
@@ -647,15 +532,12 @@ def test_vision(config_index, server_manager, models_dir):
     "config_index", range(len(VISION_MODELS)),
     ids=[f"{c.test_id}-vision-q4" for c in VISION_MODELS],
 )
-def test_vision_q4(config_index, server_manager, models_dir):
+def test_vision_q4(config_index, server_manager, models_dir, bench_context):
     """Q4-quantized vision model variant describes images correctly."""
     config = VISION_MODELS[config_index]
 
-    # Gemma3 Q4 distributions quantize vision weights to U8 (unsupported).
-    # The loader skips the vision encoder entirely, so the model can't see images.
-    # This is a dataset/distribution issue, not an inference bug.
     if config.family == "Gemma3":
-        pytest.xfail("Gemma3 Q4 vision weights are U8 (unsupported) — vision encoder skipped")
+        pytest.xfail("Gemma3 Q4 vision weights are U8 (unsupported) -- vision encoder skipped")
 
     model_dir = _resolve_model_dir(models_dir, config, q4=True)
     if model_dir is None:
