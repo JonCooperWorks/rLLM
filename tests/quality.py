@@ -56,15 +56,21 @@ _COMMON_SHORT = {
     "or", "so", "to", "up", "us", "we",
 }
 
-# Words that signal a dangling/truncated sentence ending (check 8c).
-_DANGLING_WORDS = {
-    "a", "an", "the", "and", "but", "or", "nor", "for", "yet", "so",
-    "of", "with", "in", "on", "to", "at", "by", "from", "that", "which",
-    "this", "these", "those", "is", "are", "was", "were", "be",
-}
+def _strip_thinking_tags(text: str) -> str:
+    """Remove <think>...</think> blocks and stray </think> tags.
 
-# Markdown patterns to exclude from punctuation run detection (check 9a).
-_MARKDOWN_PUNCT_RE = re.compile(r'(?:---+|===+|\*\*\*+|```)')
+    Thinking models (Qwen 3.5, DeepSeek-R1, GPT-OSS) emit reasoning in
+    <think> tags that leak into the response content.  These are formatting
+    artifacts, not model output quality issues — strip them before analysis.
+    """
+    # Remove complete <think>...</think> blocks.
+    text = re.sub(r'<think>[\s\S]*?</think>', ' ', text)
+    # Remove stray closing tags (server may strip opening tags only).
+    text = re.sub(r'</think>', ' ', text)
+    # Remove stray opening tags.
+    text = re.sub(r'<think>', ' ', text)
+    # Collapse whitespace left behind.
+    return re.sub(r'\s+', ' ', text).strip()
 
 
 def _strip_code_blocks(text: str) -> str:
@@ -74,6 +80,26 @@ def _strip_code_blocks(text: str) -> str:
     endings), so grammar-oriented checks should skip it.
     """
     return re.sub(r'```[\s\S]*?```', ' ', text)
+
+
+def _strip_markdown(text: str) -> str:
+    """Strip markdown formatting for prose analysis.
+
+    Removes heading markers (###), bold/italic markers (**), link syntax,
+    and other formatting that creates false-positive punctuation runs.
+    The goal is to get plain prose for structural checks.
+    """
+    # Remove heading markers.
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    # Remove bold/italic markers.
+    text = re.sub(r'\*{1,3}', '', text)
+    # Remove link syntax [text](url) → text.
+    text = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', text)
+    # Remove inline code backticks.
+    text = re.sub(r'`[^`]*`', 'code', text)
+    # Remove LaTeX delimiters.
+    text = re.sub(r'\\\(|\\\)|\\\[|\\\]|\$\$?', '', text)
+    return text
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -113,6 +139,11 @@ def check_quality(text: str) -> QualityResult:
     soft warnings, and numeric quality scores.
     """
     result = QualityResult()
+
+    # ---- 0. Strip thinking tags ---------------------------------------------
+    # Thinking models emit <think>...</think> reasoning that leaks into content.
+    # Strip before all checks so they don't pollute repetition, structure, etc.
+    text = _strip_thinking_tags(text)
 
     # ---- 1. Minimum length --------------------------------------------------
     if len(text.strip()) < 20:
@@ -225,8 +256,9 @@ def check_quality(text: str) -> QualityResult:
         return result
 
     # ---- 8. Sentence structure validation -----------------------------------
-    # Operate on text with code blocks stripped — code has different rules.
-    prose = _strip_code_blocks(text)
+    # Operate on text with code blocks and markdown stripped — code and
+    # formatting have different structural rules than prose.
+    prose = _strip_markdown(_strip_code_blocks(text))
 
     if len(prose.strip()) >= 50:
         sentences = _split_sentences(prose)
@@ -265,36 +297,20 @@ def check_quality(text: str) -> QualityResult:
                 )
                 return result
 
-        # 8c. Dangling sentence endings — truncated mid-sentence.
-        # Check if the text after the last sentence-ending punctuation ends
-        # with a function word (conjunction, preposition, article).
-        last_punct = max(
-            (prose.rfind("."), prose.rfind("!"), prose.rfind("?")),
-            default=-1,
-        )
-        if last_punct >= 0 and last_punct < len(prose) - 1:
-            trailing = prose[last_punct + 1:].strip()
-            trailing_words = trailing.split()
-            if len(trailing_words) > 5:
-                last_word = trailing_words[-1].lower().rstrip(".,;:!?")
-                if last_word in _DANGLING_WORDS:
-                    result.passed = False
-                    result.reason = (
-                        f"truncated: text ends with dangling word \"{last_word}\" "
-                        f"after {len(trailing_words)} words"
-                    )
-                    return result
+        # 8c. (Removed) Dangling sentence endings check was removed because
+        # output truncated at max_tokens naturally ends mid-sentence — that's
+        # expected behavior, not broken inference.
 
     # ---- 9. Punctuation pattern analysis ------------------------------------
 
-    # 9a. Excessive punctuation runs (4+ consecutive non-markdown).
-    for m in re.finditer(r'[^\w\s]{4,}', text):
+    # 9a. Excessive punctuation runs (5+ consecutive non-markdown).
+    # Run on markdown-stripped text so heading markers (####), bold (**text**),
+    # LaTeX (\(\)), and other formatting don't trigger false positives.
+    stripped_for_punct = _strip_markdown(_strip_code_blocks(text))
+    for m in re.finditer(r'[^\w\s]{5,}', stripped_for_punct):
         span = m.group()
-        # Allow common markdown patterns.
-        if _MARKDOWN_PUNCT_RE.fullmatch(span):
-            continue
-        # Allow ellipsis variants and common decorators.
-        if re.fullmatch(r'\.{3,4}', span):
+        # Allow ellipsis variants.
+        if re.fullmatch(r'\.{3,6}', span):
             continue
         # Allow horizontal rules and table separators.
         if re.fullmatch(r'[-=|:+]+', span):

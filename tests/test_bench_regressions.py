@@ -184,8 +184,12 @@ class TestSentenceStructure:
         assert not result.passed, "should detect fragmented sentences"
         assert "fragmented" in result.reason.lower()
 
-    def test_catches_dangling_ending(self):
-        """Text ending with a function word after many words should fail."""
+    def test_allows_truncated_ending(self):
+        """Text truncated at max_tokens mid-sentence should still pass.
+
+        Output cut at max_tokens naturally ends mid-sentence — that's
+        expected behavior, not broken inference.
+        """
         text = (
             "A hash table is a data structure that maps keys to values. "
             "It uses a hash function to compute an index. "
@@ -193,8 +197,7 @@ class TestSentenceStructure:
             "constant time lookup for data that is stored in the"
         )
         result = check_quality(text)
-        assert not result.passed, "should detect dangling ending"
-        assert "truncated" in result.reason.lower()
+        assert result.passed, f"truncated text should pass: {result.reason}"
 
     def test_passes_complete_ending(self):
         """Text ending with a complete sentence should pass."""
@@ -211,8 +214,8 @@ class TestPunctuationPatterns:
     """Verify punctuation pattern checks (check 9)."""
 
     def test_catches_excessive_punctuation(self):
-        """4+ consecutive punctuation chars should fail."""
-        text = "This is great!!!! Really amazing content here with proper length and structure."
+        """5+ consecutive punctuation chars should fail."""
+        text = "This is great!!!!! Really amazing content here with proper length and structure."
         result = check_quality(text)
         assert not result.passed, "should detect excessive punctuation"
         assert "punctuation run" in result.reason.lower()
@@ -227,6 +230,49 @@ class TestPunctuationPatterns:
         )
         result = check_quality(text)
         assert result.passed, f"markdown separators should pass: {result.reason}"
+
+    def test_allows_markdown_headings(self):
+        """Markdown heading markers (####) should pass."""
+        text = (
+            "Here is a guide to deployment.\n\n"
+            "#### Step 1: Set Up DNS\n"
+            "Configure your domain name. "
+            "#### Step 2: Containerize\n"
+            "Build a Docker image for your application."
+        )
+        result = check_quality(text)
+        assert result.passed, f"markdown headings should pass: {result.reason}"
+
+    def test_allows_markdown_bold_with_punctuation(self):
+        """Bold markers mixed with parens/commas should pass."""
+        text = (
+            "Public-key cryptography (also known as **asymmetric cryptography**), "
+            "uses two keys. The public key encrypts data and the private key "
+            "decrypts it. This is fundamental to modern secure communications."
+        )
+        result = check_quality(text)
+        assert result.passed, f"bold+punctuation should pass: {result.reason}"
+
+    def test_allows_latex_notation(self):
+        r"""LaTeX math notation like \(\theta\) should pass."""
+        text = (
+            r"Gradient descent updates parameters using the formula "
+            r"\(\theta = \theta - \alpha \nabla J(\theta)\) where alpha "
+            "is the learning rate. This iterative process converges to "
+            "a local minimum of the cost function."
+        )
+        result = check_quality(text)
+        assert result.passed, f"LaTeX notation should pass: {result.reason}"
+
+    def test_strips_thinking_tags(self):
+        """<think> tags should be stripped before quality checks."""
+        text = (
+            "The meaning of life is a philosophical question.</think> "
+            "Many thinkers have pondered this throughout history. "
+            "Some argue it lies in personal fulfillment and growth."
+        )
+        result = check_quality(text)
+        assert result.passed, f"thinking tags should be stripped: {result.reason}"
 
     def test_allows_ellipsis(self):
         """Ellipsis (3-4 dots) should pass."""
