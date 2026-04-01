@@ -86,7 +86,7 @@
 // ===========================================================================
 
 mod expert_index;
-mod mxfp4;
+pub(crate) mod mxfp4;
 mod store;
 pub(crate) mod upload;
 pub(crate) mod vision;
@@ -606,6 +606,7 @@ fn load_weights_inner<B: GpuCore>(
     let mut q8_map: HashMap<String, (usize, usize)> = HashMap::new();
     let mut fp8_map: HashMap<String, (usize, usize)> = HashMap::new();
     let mut tq3_map: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut nvfp4_map: HashMap<String, (usize, usize)> = HashMap::new();
     let mut is_prequantized = false;
     for mmap in &mmaps {
         if let Ok((_, metadata)) = SafeTensors::read_metadata(mmap.as_ref()) {
@@ -623,6 +624,8 @@ fn load_weights_inner<B: GpuCore>(
                                 Some((&mut fp8_map, name))
                             } else if let Some(name) = key.strip_prefix("rllm_tq3:") {
                                 Some((&mut tq3_map, name))
+                            } else if let Some(name) = key.strip_prefix("rllm_nvfp4:") {
+                                Some((&mut nvfp4_map, name))
                             } else {
                                 None
                             };
@@ -644,9 +647,10 @@ fn load_weights_inner<B: GpuCore>(
         let q8_count = q8_map.len();
         let fp8_count = fp8_map.len();
         let tq3_count = tq3_map.len();
-        let fmt = if tq3_count > 0 { "TQ3" } else if fp8_count > 0 { "FP8" } else if q8_count > 0 { "Q8" } else { "Q4" };
+        let nvfp4_count = nvfp4_map.len();
+        let fmt = if nvfp4_count > 0 { "NVFP4" } else if tq3_count > 0 { "TQ3" } else if fp8_count > 0 { "FP8" } else if q8_count > 0 { "Q8" } else { "Q4" };
         info!(
-            count = q4_count + q8_count + fp8_count + tq3_count,
+            count = q4_count + q8_count + fp8_count + tq3_count + nvfp4_count,
             format = fmt,
             "detected pre-quantized model, skipping on-load quantization"
         );
@@ -659,6 +663,7 @@ fn load_weights_inner<B: GpuCore>(
         q8_map,
         fp8_map,
         tq3_map,
+        nvfp4_map,
     };
 
     let hidden = config.hidden_size;
@@ -1731,6 +1736,17 @@ pub(crate) fn load_moe_ffn_weights<B: GpuCore>(
                     format!("{ep}.down_proj.weight"),
                 )
             };
+            // Load per-expert biases if present (e.g. re-quantized GPT-OSS models
+            // where MXFP4 experts were dequantized to per-expert layout).
+            let ep = if hints.is_mixtral {
+                format!("{prefix}.block_sparse_moe.experts.{j}")
+            } else {
+                format!("{prefix}.mlp.experts.{j}")
+            };
+            let gate_bias = upload_optional_bf16(store, backend, &format!("{ep}.gate_proj.bias"), &[moe_inter]);
+            let up_bias = upload_optional_bf16(store, backend, &format!("{ep}.up_proj.bias"), &[moe_inter]);
+            let down_bias = upload_optional_bf16(store, backend, &format!("{ep}.down_proj.bias"), &[hidden]);
+
             experts.push(ExpertWeights {
                 gate_proj: upload_sharded(
                     store,
@@ -1753,9 +1769,9 @@ pub(crate) fn load_moe_ffn_weights<B: GpuCore>(
                     &[hidden, moe_inter],
                     sharding,
                 )?,
-                gate_bias: None,
-                up_bias: None,
-                down_bias: None,
+                gate_bias,
+                up_bias,
+                down_bias,
             });
         }
         experts
@@ -1824,6 +1840,19 @@ pub(crate) fn load_moe_ffn_weights<B: GpuCore>(
         shared_expert_up_proj: se_up_proj,
         shared_expert_down_proj: se_down_proj,
         shared_expert_gate: se_gate,
+    })
+}
+
+/// Upload an optional bf16 tensor.  Returns None if the tensor doesn't exist
+/// in the store (used for per-expert biases that may or may not be present).
+fn upload_optional_bf16<B: GpuCore>(
+    store: &TensorStore,
+    backend: &B,
+    name: &str,
+    shape: &[usize],
+) -> Option<B::Tensor> {
+    store.tensor(name).ok().map(|view| {
+        upload_raw_bf16(backend, view.data(), shape)
     })
 }
 
@@ -2145,6 +2174,7 @@ pub(crate) fn load_model<B: GpuCore>(
             q8_map: HashMap::new(),
             fp8_map: HashMap::new(),
             tq3_map: HashMap::new(),
+            nvfp4_map: HashMap::new(),
         };
         load_vision_weights(backend, &store, &config)
     } else {

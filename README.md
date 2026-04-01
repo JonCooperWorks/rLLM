@@ -9,7 +9,7 @@ Runs models up to 397B parameters on a MacBook via NVMe expert streaming. 13 arc
 - **Expert streaming** — stream hundreds of GB of expert weights from NVMe on demand with GPU-side LRU caching, on both Metal and CUDA ([docs](docs/expert-streaming.md))
 - **13 architectures** — Llama 3.x, Qwen 2.5/3/3.5, Mistral, Mixtral, Gemma 3, Phi-4, DeepSeek-R1-Distill, GPT-OSS, Nemotron-H
 - **Vision-language models** — SigLIP ViT encoder for Qwen 3.5 VL and Gemma 3 VLMs ([docs](docs/vision.md))
-- **Three quantization formats** — Q4 block, Q8 block, and FP8 E4M3 (auto-selected on NVIDIA Ada/Hopper) ([docs](docs/quantization.md), [FP8 docs](docs/fp8.md))
+- **Four quantization formats** — Q4 block, Q8 block, FP8 E4M3 (auto on Ada/Hopper), NVFP4 E2M1 (auto on Blackwell) ([docs](docs/quantization.md), [FP8 docs](docs/fp8.md), [NVFP4 docs](docs/nvfp4.md))
 - **Multi-GPU tensor parallelism** — NCCL-based weight sharding + expert parallelism for MoE models ([docs](docs/multi-gpu-moe.md))
 - **Hand-written Metal and CUDA shaders** — SIMD-cooperative matmul, WMMA tensor-core GEMM, fused attention, DeltaNet linear attention
 
@@ -69,35 +69,28 @@ All models support bf16 and Q4. Multi-GPU via `--tp N` requires CUDA + NCCL.
 </details>
 
 <details>
-<summary><b>NVIDIA RTX 5090 32 GB</b> — 1.79 TB/s GDDR7X (March 29, 2026)</summary>
+<summary><b>NVIDIA RTX 5090 32 GB</b> — 1.79 TB/s GDDR7X (April 1, 2026)</summary>
 
-Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Q8 uses FP8 E4M3 (native on SM 12.0).
+Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Q4 uses NVFP4 E2M1 (native on SM 12.0 Blackwell). Q8 uses FP8 E4M3 (native on SM 12.0). TTFT measured via streaming (time to first SSE token).
 
-| Model | Params | bf16 | Q8 (FP8) | Q4 | TTFT (bf16) | TTFT (Q4) |
-|---|---|---|---|---|---|---|
-| Llama 3.2 3B Instruct | 3.2B | 108 tok/s | 97 tok/s | 129 tok/s | 100 ms | 102 ms |
-| Qwen 2.5 3B Instruct | 3.1B | 122 tok/s | 100 tok/s | 137 tok/s | 109 ms | 127 ms |
-| Gemma 3 4B Instruct | 4.3B | 60 tok/s | 58 tok/s | 68 tok/s | 119 ms | 121 ms |
-| Qwen 2.5 7B Instruct | 7.6B | 77 tok/s | 77 tok/s | 110 tok/s | 152 ms | 149 ms |
-| Mistral 7B Instruct | 7.2B | 67 tok/s | 67 tok/s | 89 tok/s | 158 ms | 162 ms |
-| Llama 3.1 8B Instruct | 8.0B | 65 tok/s | 65 tok/s | 86 tok/s | 164 ms | 165 ms |
-| Qwen3.5 9B † | ~9B | 55 tok/s | 62 tok/s | 76 tok/s | 2,323 ms | 1,679 ms |
-| Phi-4 | 14.7B | 39 tok/s | 40 tok/s | 57 tok/s | 254 ms | 253 ms |
-| Nemotron-H 30B | 31.6B (3.6B active) | — | — | 104 tok/s | — | 148 ms |
-| DeepSeek-R1-Distill-Qwen-32B | 32.8B | — | — | 31 tok/s | — | 597 ms |
-| Gemma 3 27B Instruct | 27.4B | — | — | 30 tok/s | — | 465 ms |
-| Qwen3.5 27B † | ~27B | — | 22 tok/s | 29 tok/s | — | 4,353 ms |
-| Qwen3.5 35B-A3B † | 35.1B (3.3B active) | 3.5 ⚡ | — | 58 tok/s | 38,442 ms | 2,219 ms |
-| Mixtral 8x7B Instruct | 46.7B (12.9B active) | 0.4 ⚡ | — | 59 tok/s | 21,756 ms | 251 ms |
+| Model | Params | bf16 | TTFT (bf16) |
+|---|---|---|---|
+| Llama 3.2 3B Instruct | 3.2B | 135 tok/s | 124 ms |
+| Qwen 2.5 3B Instruct | 3.1B | 144 tok/s | 136 ms |
+| Gemma 3 4B Instruct | 4.3B | 68 tok/s | 130 ms |
+| Mistral 7B Instruct | 7.2B | 73 tok/s | 187 ms |
+| Qwen3.5 9B † | ~9B | — | 7,760 ms |
+| Phi-4 | 14.7B | 41 tok/s | 329 ms |
+| Qwen3.5 27B Q8 (FP8) † | ~27B | — | 21,430 ms |
 
-⚡ = SSD expert streaming (`--stream-experts`). † = thinking model (TTFT includes reasoning time). Q8 column uses FP8 E4M3 format (auto-selected on NVIDIA SM 89+). Q4 MoE models fit entirely in VRAM: Qwen3.5 35B-A3B Q4 at 22 GB, Mixtral Q4 at 25 GB, Nemotron-H Q4 at 19 GB. Benchmarked via `pytest --bench` (HTTP API, 2 runs averaged).
+† = thinking model (TTFT includes reasoning time). Partial run — Q4/Q8 variants pending. Benchmarked via `pytest --bench` (HTTP API, streaming TTFT).
 
 </details>
 
 <details>
-<summary><b>NVIDIA RTX 4080 SUPER 32 GB</b> — 736 GB/s GDDR6X (March 28, 2026)</summary>
+<summary><b>NVIDIA RTX 4080 SUPER 32 GB</b> — 736 GB/s GDDR6X (March 28, 2026 — older build)</summary>
 
-Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548).
+Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Numbers from an earlier build — expect improvement on current code.
 
 | Model | Params | bf16 | Q8 | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|---|
@@ -152,9 +145,9 @@ Q4 is slower than bf16 on H100 — the 3.35 TB/s HBM3 bandwidth means bf16 matve
 </details>
 
 <details>
-<summary><b>2× NVIDIA RTX 4090 (TP=2)</b> — 2× 1.01 TB/s GDDR6X, 48 GB total (March 29, 2026)</summary>
+<summary><b>2× NVIDIA RTX 4090 (TP=2)</b> — 2× 1.01 TB/s GDDR6X, 48 GB total (March 29, 2026 — older build)</summary>
 
-Benchmarked on [RunPod](https://runpod.io?ref=249k2lel). Tensor parallelism across 2 GPUs. MoE models use hybrid strategy (TP for attention, expert parallelism for MoE FFN). Q8 uses FP8 E4M3 (auto-selected on SM 89+).
+Benchmarked on [RunPod](https://runpod.io?ref=249k2lel). Numbers from an earlier build — expect improvement on current code. Tensor parallelism across 2 GPUs. MoE models use hybrid strategy (TP for attention, expert parallelism for MoE FFN). Q8 uses FP8 E4M3 (auto-selected on SM 89+).
 
 | Model | Params | bf16 | Q8 (FP8) | Q4 | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|---|
@@ -280,7 +273,7 @@ cargo run --release -- serve --model models/llama-3.2-1b-instruct \
 | Layer | Technique | Docs |
 |---|---|---|
 | Matmul | SIMD-cooperative (32 threads/row, `simd_sum`), WMMA tensor-core GEMM | — |
-| Weights | Q4/Q8 block quantization, FP8 E4M3 on NVIDIA SM 89+ | [quantization](docs/quantization.md), [fp8](docs/fp8.md) |
+| Weights | Q4/Q8 block quantization, FP8 E4M3 on SM 89+, NVFP4 E2M1 on SM 100+ | [quantization](docs/quantization.md), [fp8](docs/fp8.md), [nvfp4](docs/nvfp4.md) |
 | KV cache | Paged allocation (vLLM-style), TurboQuant 4-bit compression (~4×) | [kv-cache](docs/kv-cache.md), [turboquant](docs/turboquant.md) |
 | Prefill | Tiled prefill (Flash Attention v2 style), batched GEMM | [tiled_prefill](docs/tiled_prefill.md) |
 | Prefix caching | Shared KV blocks across sequences with common prefixes | [prompt-caching](docs/prompt-caching.md) |

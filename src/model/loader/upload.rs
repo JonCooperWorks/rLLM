@@ -27,6 +27,7 @@ pub(crate) fn quant_byte_count(dtype: TensorDtype, m: usize, k: usize) -> usize 
         TensorDtype::Q8 => crate::gpu::q8_byte_count(m, k),
         TensorDtype::FP8 => crate::gpu::fp8_byte_count(m, k),
         TensorDtype::TQ3 => crate::gpu::tq3_byte_count(m, k),
+        TensorDtype::NVFP4 => crate::gpu::nvfp4_byte_count(m, k),
         _ => panic!("quant_byte_count called for non-quantized dtype {dtype:?}"),
     }
 }
@@ -39,6 +40,7 @@ pub(crate) fn quant_row_bytes(dtype: Option<TensorDtype>, k: usize) -> usize {
         Some(TensorDtype::Q8) => (k / 32) * 34,
         Some(TensorDtype::FP8) => k, // 1 byte per weight, no block overhead
         Some(TensorDtype::TQ3) => (k / 32) * 16,
+        Some(TensorDtype::NVFP4) => (k / 32) * 18,
         None => k * 2, // bf16
         _ => panic!("quant_row_bytes called for unsupported dtype {dtype:?}"),
     }
@@ -51,6 +53,7 @@ pub(crate) fn quant_dtype_name(dtype: TensorDtype) -> &'static str {
         TensorDtype::Q8 => "Q8",
         TensorDtype::FP8 => "FP8",
         TensorDtype::TQ3 => "TQ3",
+        TensorDtype::NVFP4 => "NVFP4",
         _ => "bf16",
     }
 }
@@ -180,6 +183,7 @@ pub(crate) fn upload_sharded<B: GpuCore>(
                         TensorDtype::Q8 => ([m, k / 32], 34usize),
                         TensorDtype::FP8 => ([m, k], 1usize),
                         TensorDtype::TQ3 => ([m, k / 32], 16usize),
+                        TensorDtype::NVFP4 => ([m, k / 32], 18usize),
                         _ => unreachable!(),
                     };
 
@@ -194,7 +198,7 @@ pub(crate) fn upload_sharded<B: GpuCore>(
 
                     // Convert shard block shape back to logical weight shape.
                     let shard_shape = match qdt {
-                        TensorDtype::Q4 | TensorDtype::Q8 | TensorDtype::TQ3 => {
+                        TensorDtype::Q4 | TensorDtype::Q8 | TensorDtype::TQ3 | TensorDtype::NVFP4 => {
                             [shard_block_shape[0], shard_block_shape[1] * 32]
                         }
                         _ => shard_block_shape,

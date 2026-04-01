@@ -32,7 +32,7 @@ import psutil
 import pytest
 import requests
 
-from benchmark import BenchResult, detect_gpu_name, format_markdown_table, write_results
+from benchmark import BenchResult, detect_gpu_name, format_markdown_table, write_results, append_result_line, _resolve_output_path
 from models import MODEL_REGISTRY, ModelConfig, is_base_model, check_model_shards
 
 
@@ -267,30 +267,40 @@ class BenchContext:
     """Collects benchmark measurements during a pytest session.
 
     When --bench is not active, all methods are no-ops.
+    Results are streamed to a live output file as they arrive, so you
+    can `tail -f results/bench-*.md` to watch progress during a run.
     """
 
     def __init__(self, enabled: bool = False, runs: int = 1,
-                 max_tokens: int = 128, prompt: str = ""):
+                 max_tokens: int = 128, prompt: str = "",
+                 live_output_path: "Path | None" = None):
         self.enabled = enabled
         self.runs = runs
         self.max_tokens = max_tokens
         self.prompt = prompt
         self.results: list[BenchResult] = []
+        self.live_output_path = live_output_path
 
     def record(self, model_name: str, family: str,
                gen_tps: float | None = None, ttft_ms: float | None = None,
                quality: str = "", scores: dict[str, float] | None = None) -> None:
-        """Record a benchmark result.  No-op if --bench is not active."""
+        """Record a benchmark result.  No-op if --bench is not active.
+
+        Each result is immediately appended to the live output file.
+        """
         if not self.enabled:
             return
-        self.results.append(BenchResult(
+        result = BenchResult(
             model_name=model_name,
             family=family,
             gen_tps=gen_tps,
             ttft_ms=ttft_ms,
             quality=quality,
             scores=scores or {},
-        ))
+        )
+        self.results.append(result)
+        if self.live_output_path:
+            append_result_line(result, self.live_output_path)
 
 
 # ---------------------------------------------------------------------------
@@ -434,12 +444,15 @@ def pytest_sessionstart(session):
     # Always stash the session so the fixture can find it.
     # Bench is always on — every test run measures performance and writes results.
     session.config._tmp_session = session
+    output = session.config.getoption("--bench-output", default=None)
+    live_path = _resolve_output_path(Path(output) if output else None)
     session._bench_context = BenchContext(
         enabled=True,
         runs=session.config.getoption("--bench-runs", default=1),
         max_tokens=session.config.getoption("--bench-max-tokens", default=128),
         prompt=session.config.getoption("--bench-prompt",
                                         default="The meaning of life is"),
+        live_output_path=live_path,
     )
 
 

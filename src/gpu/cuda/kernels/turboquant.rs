@@ -4,11 +4,12 @@
 // Trait contract: gpu/ops/turboquant.rs
 // CUDA shader:    cuda/shaders/turboquant.cu
 //
-// Four kernels:
-//   turbo_quantize_paged       — rotate + quantize one K/V vector
-//   turbo_quantize_paged_batch — batched version for prefill
-//   turbo_rotate_q             — pre-rotate query
-//   turbo_paged_attention      — paged attention with inline dequant
+// Five kernels:
+//   turbo_quantize_paged        — rotate + quantize one K/V vector
+//   turbo_quantize_paged_batch  — batched version for prefill
+//   turbo_rotate_q              — pre-rotate query
+//   turbo_paged_attention       — paged attention with inline dequant
+//   turbo_paged_attention_v_only — asymmetric: BF16 K + TurboQuant V
 //
 // Related files:
 //   Metal shader:  metal/shaders/turboquant.metal
@@ -72,6 +73,24 @@ struct TurboPagedAttentionParams {
     has_sinks: u32,
 }
 unsafe impl DeviceRepr for TurboPagedAttentionParams {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TurboPagedAttentionVOnlyParams {
+    seq_len: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    bits: u32,
+    kv_dim: u32,
+    v_bytes_per_head_pos: u32,
+    block_size: u32,
+    num_centroids: u32,
+    window_size: u32,
+    attn_scale: f32,
+    has_sinks: u32,
+}
+unsafe impl DeviceRepr for TurboPagedAttentionVOnlyParams {}
 
 impl GpuTurboQuant for CudaBackend {
     fn turbo_quantize_to_paged(
@@ -225,5 +244,58 @@ impl GpuTurboQuant for CudaBackend {
                 .launch(cfg)
         }
         .expect("turbo_paged_attention launch failed");
+    }
+
+    fn turbo_paged_attention_v_only(
+        &self,
+        q: &CudaTensor,
+        k_pool: &CudaTensor,
+        v_pool: &CudaTensor,
+        block_table: &CudaTensor,
+        pi_t: &CudaTensor,
+        centroids: &CudaTensor,
+        out: &CudaTensor,
+        seq_len: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        bits: u32,
+        kv_dim: u32,
+        v_bytes_per_head_pos: u32,
+        window_size: u32,
+        attn_scale: f32,
+        sinks: Option<&CudaTensor>,
+    ) {
+        let params = TurboPagedAttentionVOnlyParams {
+            seq_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            bits,
+            kv_dim,
+            v_bytes_per_head_pos,
+            block_size: crate::model::kv_cache::BLOCK_SIZE as u32,
+            num_centroids: 1 << bits,
+            window_size,
+            attn_scale,
+            has_sinks: if sinks.is_some() { 1 } else { 0 },
+        };
+        let sinks_buf = sinks.map(|s| &s.buf).unwrap_or(&out.buf);
+        let cfg = CudaBackend::cfg_blocks(num_heads, 256);
+        unsafe {
+            self.stream
+                .launch_builder(&self.fn_turbo_paged_attention_v_only)
+                .arg(&params)
+                .arg(&q.buf)
+                .arg(&k_pool.buf)
+                .arg(&v_pool.buf)
+                .arg(&block_table.buf)
+                .arg(&pi_t.buf)
+                .arg(&centroids.buf)
+                .arg(&out.buf)
+                .arg(sinks_buf)
+                .launch(cfg)
+        }
+        .expect("turbo_paged_attention_v_only launch failed");
     }
 }

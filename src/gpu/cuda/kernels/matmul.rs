@@ -47,6 +47,7 @@ impl GpuMatmul for CudaBackend {
             TensorDtype::Q4 => &self.fn_matvec_q4,
             TensorDtype::Q8 => &self.fn_matvec_q8,
             TensorDtype::FP8 => &self.fn_matvec_fp8,
+            TensorDtype::NVFP4 => &self.fn_matvec_nvfp4,
             TensorDtype::TQ3 => todo!("TQ3 CUDA matvec kernel not yet implemented"),
             _ => &self.fn_matvec_bf16,
         };
@@ -86,6 +87,7 @@ impl GpuMatmul for CudaBackend {
                 TensorDtype::Q4 => self.fn_gemm_q4_tc.as_ref().unwrap(),
                 TensorDtype::Q8 => self.fn_gemm_q8_tc.as_ref().unwrap(),
                 TensorDtype::FP8 => self.fn_gemm_fp8_tc.as_ref().unwrap(),
+                TensorDtype::NVFP4 => self.fn_gemm_nvfp4_tc.as_ref().unwrap(),
                 TensorDtype::TQ3 => todo!("TQ3 CUDA tensor-core GEMM not yet implemented"),
                 _ => self.fn_gemm_bf16_tc.as_ref().unwrap(),
             };
@@ -110,6 +112,7 @@ impl GpuMatmul for CudaBackend {
                 TensorDtype::Q4 => &self.fn_gemm_q4,
                 TensorDtype::Q8 => &self.fn_gemm_q8,
                 TensorDtype::FP8 => &self.fn_gemm_fp8,
+                TensorDtype::NVFP4 => &self.fn_gemm_nvfp4,
                 TensorDtype::TQ3 => todo!("TQ3 CUDA GEMM kernel not yet implemented"),
                 _ => &self.fn_gemm_bf16,
             };

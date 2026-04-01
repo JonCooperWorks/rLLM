@@ -25,6 +25,7 @@ import base64
 import json
 import os
 import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -34,7 +35,7 @@ from models import (
     MODEL_REGISTRY, TURBOQUANT_CONFIGS, PROMPTS, MAX_TOKENS,
     get_test_models, get_vision_models, prompt_for_index,
 )
-from quality import check_quality
+from quality import check_quality, QualityResult
 from conftest import _should_stream_experts
 
 
@@ -44,6 +45,22 @@ from conftest import _should_stream_experts
 
 BASE_MODELS = get_test_models()
 VISION_MODELS = get_vision_models()
+
+
+# ---------------------------------------------------------------------------
+# Streaming result container
+# ---------------------------------------------------------------------------
+
+@dataclass
+class StreamingResult:
+    """Parsed result from a streaming SSE request."""
+    content: str
+    chunk_count: int
+    completion_tokens: int
+    prompt_tokens: int
+    ttft_ms: float       # Time to first content token (from request start).
+    total_ms: float      # Total request duration.
+    gen_tps: float       # Generation throughput (tokens / generation time).
 
 
 # ---------------------------------------------------------------------------
@@ -77,20 +94,85 @@ def _estimate_memory_gb(config, is_q4: bool, model_dir: str = "") -> float:
     return weight_gb * 1.2
 
 
-def _chat_completion(base_url: str, prompt: str, max_tokens: int = MAX_TOKENS,
-                     temperature: float = 0, stream: bool = False,
-                     thinking: bool = False) -> requests.Response:
-    """Send an OpenAI-format chat completion request."""
-    body = {
+def _streaming_chat_completion(base_url: str, prompt: str,
+                               max_tokens: int = MAX_TOKENS,
+                               temperature: float = 0) -> StreamingResult:
+    """Send a streaming OpenAI chat completion and measure real TTFT + tok/s.
+
+    TTFT = time from HTTP request to first content token in the SSE stream.
+    tok/s = completion_tokens / (total_time - TTFT), i.e. pure generation speed.
+    """
+    payload = {
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": temperature,
-        "stream": stream,
-        "thinking": thinking,
+        "stream": True,
+        "stream_options": {"include_usage": True},
     }
-    return requests.post(
+
+    t_start = time.monotonic()
+    t_first_token = None
+    t_first_reasoning = None
+    completion_tokens = 0
+    prompt_tokens = 0
+    content_pieces = []
+    chunk_count = 0
+
+    resp = requests.post(
         f"{base_url}/v1/chat/completions",
-        json=body, timeout=300, stream=stream,
+        json=payload, timeout=600, stream=True,
+    )
+    assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text[:500]}"
+
+    for line in resp.iter_lines(decode_unicode=True):
+        if not line or not line.startswith("data: "):
+            continue
+        data = line[len("data: "):]
+        if data.strip() == "[DONE]":
+            break
+        try:
+            obj = json.loads(data)
+            delta = obj.get("choices", [{}])[0].get("delta", {})
+            if delta.get("reasoning_content") and t_first_reasoning is None:
+                t_first_reasoning = time.monotonic()
+            if delta.get("content"):
+                content_pieces.append(delta["content"])
+                chunk_count += 1
+                if t_first_token is None:
+                    t_first_token = time.monotonic()
+            usage = obj.get("usage")
+            if usage:
+                prompt_tokens = usage.get("prompt_tokens", 0)
+                completion_tokens = usage.get("completion_tokens", 0)
+        except json.JSONDecodeError:
+            continue
+
+    t_end = time.monotonic()
+
+    # TTFT: time to first output of any kind (reasoning or content).
+    # For thinking models, the first reasoning token is the meaningful TTFT.
+    t_first_output = t_first_reasoning or t_first_token
+    if t_first_output is not None:
+        ttft_ms = (t_first_output - t_start) * 1000
+    else:
+        ttft_ms = (t_end - t_start) * 1000
+
+    total_ms = (t_end - t_start) * 1000
+
+    # tok/s = tokens / generation_time (from first output to end).
+    # For thinking models this includes reasoning + content tokens.
+    gen_ms = total_ms - ttft_ms
+    gen_tps = (completion_tokens / (gen_ms / 1000)
+               if gen_ms > 0 and completion_tokens > 0 else 0)
+
+    return StreamingResult(
+        content="".join(content_pieces),
+        chunk_count=chunk_count,
+        completion_tokens=completion_tokens,
+        prompt_tokens=prompt_tokens,
+        ttft_ms=ttft_ms,
+        total_ms=total_ms,
+        gen_tps=gen_tps,
     )
 
 
@@ -107,28 +189,6 @@ def _anthropic_message(base_url: str, prompt: str, max_tokens: int = MAX_TOKENS,
         },
         timeout=300, stream=stream,
     )
-
-
-def _collect_sse_content(response: requests.Response) -> tuple[str, int]:
-    """Parse SSE stream, return (concatenated content, chunk_count)."""
-    content_parts = []
-    chunk_count = 0
-    for line in response.iter_lines(decode_unicode=True):
-        if not line or not line.startswith("data: "):
-            continue
-        data = line[len("data: "):]
-        if data.strip() == "[DONE]":
-            break
-        try:
-            obj = json.loads(data)
-            delta = obj.get("choices", [{}])[0].get("delta", {})
-            text = delta.get("content", "")
-            if text:
-                content_parts.append(text)
-                chunk_count += 1
-        except json.JSONDecodeError:
-            continue
-    return "".join(content_parts), chunk_count
 
 
 def _collect_anthropic_sse_content(response: requests.Response) -> tuple[str, int]:
@@ -152,8 +212,8 @@ def _collect_anthropic_sse_content(response: requests.Response) -> tuple[str, in
     return "".join(content_parts), chunk_count
 
 
-def _assert_quality(content: str, test_id: str, prompt: str) -> None:
-    """Run quality checks and assert the output passes."""
+def _assert_quality(content: str, test_id: str, prompt: str) -> QualityResult:
+    """Run quality checks, assert the output passes, return the result."""
     result = check_quality(content)
     assert result.passed, (
         f"quality check failed for {test_id}: {result.reason}\n"
@@ -161,34 +221,33 @@ def _assert_quality(content: str, test_id: str, prompt: str) -> None:
     )
     if result.warnings:
         print(f"  Quality warnings for {test_id}: {'; '.join(result.warnings)}")
+    return result
 
 
-def _record_bench(bench_context, config, content: str, t_start: float,
-                  t_end: float, completion_tokens: int) -> None:
+def _record_bench(bench_context, test_id: str, family: str,
+                  quality_result: QualityResult,
+                  gen_tps: float, ttft_ms: float) -> None:
     """Record benchmark measurements if --bench is active."""
     if not bench_context.enabled:
         return
 
-    total_ms = (t_end - t_start) * 1000
-    gen_duration = total_ms / 1000
-    gen_tps = (completion_tokens / gen_duration
-               if gen_duration > 0 and completion_tokens > 0 else 0)
-
-    result = check_quality(content)
-    quality = "PASS" if result.passed else f"FAIL: {result.reason}"
+    quality = "PASS" if quality_result.passed else f"FAIL: {quality_result.reason}"
 
     bench_context.record(
-        model_name=config.test_id,
-        family=config.family,
+        model_name=test_id,
+        family=family,
         gen_tps=gen_tps,
-        ttft_ms=total_ms,  # Approximation for non-streaming.
+        ttft_ms=ttft_ms,
         quality=quality,
-        scores=result.scores,
+        scores=quality_result.scores,
     )
 
 
 # ---------------------------------------------------------------------------
-# Tests — Basic model inference (one per family, bf16 + optional Q4/Q8)
+# Tests — Basic model inference (one per family, bf16 + optional Q4/Q8/TQ3)
+#
+# All tests use streaming requests so we get real TTFT (time to first token)
+# and accurate tok/s (completion_tokens / generation_time, excluding prefill).
 # ---------------------------------------------------------------------------
 
 @pytest.mark.gpu
@@ -197,7 +256,7 @@ def _record_bench(bench_context, config, content: str, t_start: float,
     ids=[c.test_id for c in BASE_MODELS],
 )
 def test_model_bf16(config_index, server_manager, models_dir, bench_context):
-    """Each model family produces coherent English via the OpenAI API."""
+    """Each model family produces coherent English via streaming OpenAI API."""
     config = BASE_MODELS[config_index]
 
     if config.is_moe and _should_stream_experts(config.bf16_size_gb, is_q4=False):
@@ -212,21 +271,14 @@ def test_model_bf16(config_index, server_manager, models_dir, bench_context):
     base_url = server_manager.get_or_start(str(model_dir), extra_args, memory_gb=mem)
 
     prompt = prompt_for_index(config_index)
-    t_start = time.monotonic()
-    resp = _chat_completion(base_url, prompt, temperature=config.temperature)
-    assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text[:500]}"
+    sr = _streaming_chat_completion(base_url, prompt, temperature=config.temperature)
 
-    body = resp.json()
-    content = body["choices"][0]["message"]["content"]
-    usage = body.get("usage", {})
-    t_end = time.monotonic()
+    assert sr.completion_tokens > 0, "no tokens generated"
+    assert len(sr.content.strip()) > 0, "empty response"
 
-    assert usage.get("completion_tokens", 0) > 0, "no tokens generated"
-    assert len(content.strip()) > 0, "empty response"
-
-    _assert_quality(content, config.test_id, prompt)
-    _record_bench(bench_context, config, content, t_start, t_end,
-                  usage.get("completion_tokens", 0))
+    qr = _assert_quality(sr.content, config.test_id, prompt)
+    _record_bench(bench_context, config.test_id, config.family, qr,
+                  sr.gen_tps, sr.ttft_ms)
 
 
 @pytest.mark.gpu
@@ -242,30 +294,21 @@ def test_model_q4(config_index, server_manager, models_dir, bench_context):
     if model_dir is None:
         pytest.skip(f"Q4 model not found: {config.model_name}-q4")
 
-    extra_args = _build_extra_args(config, is_q4=True)
-    mem = _estimate_memory_gb(config, is_q4=True)
+    extra_args = _build_extra_args(config, is_q4=True, model_dir=str(model_dir))
+    mem = _estimate_memory_gb(config, is_q4=True, model_dir=str(model_dir))
     base_url = server_manager.get_or_start(str(model_dir), extra_args, memory_gb=mem)
 
-    # Q4 quantization noise + non-greedy sampling can cause repetition in
-    # quality-sensitive models (e.g. gpt-oss-20b).  Use greedy decoding to
-    # avoid amplifying quantization error through the sampling distribution.
     temp = 0 if config.quality_sensitive else config.temperature
 
     prompt = prompt_for_index(config_index + 5)
-    t_start = time.monotonic()
-    resp = _chat_completion(base_url, prompt, temperature=temp)
-    assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text[:500]}"
+    test_id = f"{config.test_id}-q4"
+    sr = _streaming_chat_completion(base_url, prompt, temperature=temp)
 
-    body = resp.json()
-    content = body["choices"][0]["message"]["content"]
-    usage = body.get("usage", {})
-    t_end = time.monotonic()
+    assert sr.completion_tokens > 0, "no tokens generated"
 
-    assert usage.get("completion_tokens", 0) > 0, "no tokens generated"
-
-    _assert_quality(content, f"{config.test_id}-q4", prompt)
-    _record_bench(bench_context, config, content, t_start, t_end,
-                  usage.get("completion_tokens", 0))
+    qr = _assert_quality(sr.content, test_id, prompt)
+    _record_bench(bench_context, test_id, config.family, qr,
+                  sr.gen_tps, sr.ttft_ms)
 
 
 @pytest.mark.gpu
@@ -282,24 +325,18 @@ def test_model_q8(config_index, server_manager, models_dir, bench_context):
         pytest.skip(f"Q8 model not found: {config.model_name}-q8")
 
     extra_args = _build_extra_args(config, is_q4=False, model_dir=str(model_dir))
-    mem = _estimate_memory_gb(config, is_q4=False, model_dir=str(model_dir)) * 0.53
+    mem = _estimate_memory_gb(config, is_q4=False, model_dir=str(model_dir))
     base_url = server_manager.get_or_start(str(model_dir), extra_args, memory_gb=mem)
 
     prompt = prompt_for_index(config_index + 3)
-    t_start = time.monotonic()
-    resp = _chat_completion(base_url, prompt, temperature=config.temperature)
-    assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text[:500]}"
+    test_id = f"{config.test_id}-q8"
+    sr = _streaming_chat_completion(base_url, prompt, temperature=config.temperature)
 
-    body = resp.json()
-    content = body["choices"][0]["message"]["content"]
-    usage = body.get("usage", {})
-    t_end = time.monotonic()
+    assert sr.completion_tokens > 0, "no tokens generated"
 
-    assert usage.get("completion_tokens", 0) > 0, "no tokens generated"
-
-    _assert_quality(content, f"{config.test_id}-q8", prompt)
-    _record_bench(bench_context, config, content, t_start, t_end,
-                  usage.get("completion_tokens", 0))
+    qr = _assert_quality(sr.content, test_id, prompt)
+    _record_bench(bench_context, test_id, config.family, qr,
+                  sr.gen_tps, sr.ttft_ms)
 
 
 @pytest.mark.gpu
@@ -316,31 +353,20 @@ def test_model_tq3(config_index, server_manager, models_dir, bench_context):
         pytest.skip(f"TQ3 model not found: {config.model_name}-tq3")
 
     extra_args = _build_extra_args(config, is_q4=True, model_dir=str(model_dir))
-    # TQ3 is 4.0 bpw (slightly smaller than Q4's 4.5 bpw).
     mem = _estimate_memory_gb(config, is_q4=True, model_dir=str(model_dir))
     base_url = server_manager.get_or_start(str(model_dir), extra_args, memory_gb=mem)
 
     temp = 0 if config.quality_sensitive else config.temperature
 
     prompt = prompt_for_index(config_index + 7)
-    t_start = time.monotonic()
-    resp = _chat_completion(base_url, prompt, temperature=temp)
-    assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text[:500]}"
+    test_id = f"{config.test_id}-tq3"
+    sr = _streaming_chat_completion(base_url, prompt, temperature=temp)
 
-    body = resp.json()
-    content = body["choices"][0]["message"]["content"]
-    usage = body.get("usage", {})
-    t_end = time.monotonic()
+    assert sr.completion_tokens > 0, "no tokens generated"
 
-    assert usage.get("completion_tokens", 0) > 0, "no tokens generated"
-
-    _assert_quality(content, f"{config.test_id}-tq3", prompt)
-
-    # Override model_name so the bench table shows "xxx-tq3" not just "xxx".
-    from dataclasses import replace
-    tq3_config = replace(config, test_id=f"{config.test_id}-tq3")
-    _record_bench(bench_context, tq3_config, content, t_start, t_end,
-                  usage.get("completion_tokens", 0))
+    qr = _assert_quality(sr.content, test_id, prompt)
+    _record_bench(bench_context, test_id, config.family, qr,
+                  sr.gen_tps, sr.ttft_ms)
 
 
 # ---------------------------------------------------------------------------
@@ -363,17 +389,17 @@ def test_turboquant(config_index, server_manager, models_dir, bench_context):
     base_url = server_manager.get_or_start(str(model_dir), list(config.extra_args), memory_gb=mem)
 
     prompt = prompt_for_index(config_index + 3)
-    resp = _chat_completion(base_url, prompt)
-    assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text[:500]}"
+    sr = _streaming_chat_completion(base_url, prompt)
 
-    body = resp.json()
-    content = body["choices"][0]["message"]["content"]
+    assert sr.completion_tokens > 0, "no tokens generated"
 
-    _assert_quality(content, config.test_id, prompt)
+    qr = _assert_quality(sr.content, config.test_id, prompt)
+    _record_bench(bench_context, config.test_id, config.family, qr,
+                  sr.gen_tps, sr.ttft_ms)
 
 
 # ---------------------------------------------------------------------------
-# Tests — Streaming (SSE)
+# Tests — Streaming protocol validation (SSE format, chunk delivery)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.gpu
@@ -386,15 +412,12 @@ def test_openai_streaming(server_manager, models_dir, bench_context):
     base_url = server_manager.get_or_start(str(model_dir), [], memory_gb=7.2)
 
     prompt = PROMPTS[1]
-    resp = _chat_completion(base_url, prompt, stream=True)
-    assert resp.status_code == 200
+    sr = _streaming_chat_completion(base_url, prompt)
 
-    content, chunk_count = _collect_sse_content(resp)
+    assert sr.chunk_count > 1, f"expected multiple SSE chunks, got {sr.chunk_count}"
+    assert len(sr.content.strip()) > 0, "empty streamed response"
 
-    assert chunk_count > 1, f"expected multiple SSE chunks, got {chunk_count}"
-    assert len(content.strip()) > 0, "empty streamed response"
-
-    _assert_quality(content, "openai-streaming", prompt)
+    _assert_quality(sr.content, "openai-streaming", prompt)
 
 
 @pytest.mark.gpu

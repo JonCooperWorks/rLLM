@@ -142,6 +142,14 @@ pub(crate) enum TensorDtype {
     /// then Max-Lloyd scalar quantization maps each to one of 8 optimal centroids.
     /// Inference requires WHT-rotating activations before the dot product.
     TQ3,
+    /// NVFP4 E2M1 — NVIDIA 4-bit float (1 sign + 2 exponent + 1 mantissa).
+    /// Same block layout as Q4: 32 weights per block, 18 bytes per block
+    /// (2-byte bf16 scale + 16 packed nibble bytes).  Values are E2M1 floats
+    /// rather than symmetric integers.  Used on NVIDIA SM 100+ (Blackwell).
+    ///
+    /// Dequant: weight = FP4_E2M1_LUT[nibble] * scale
+    /// LUT: [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+    NVFP4,
 }
 
 impl TensorDtype {
@@ -154,6 +162,7 @@ impl TensorDtype {
             TensorDtype::Q4 => panic!("Q4 has variable byte size; use q4_byte_count()"),
             TensorDtype::Q8 => panic!("Q8 has variable byte size; use q8_byte_count()"),
             TensorDtype::TQ3 => panic!("TQ3 has variable byte size; use tq3_byte_count()"),
+            TensorDtype::NVFP4 => panic!("NVFP4 has variable byte size; use nvfp4_byte_count()"),
         }
     }
 }
@@ -198,6 +207,114 @@ pub(crate) fn tq3_byte_count(m: usize, k: usize) -> usize {
     m.checked_mul(blocks_per_row)
         .and_then(|v| v.checked_mul(16))
         .expect("tq3_byte_count overflow: tensor dimensions too large")
+}
+
+/// Compute total byte count for an NVFP4 weight tensor [m, k].
+///
+/// Same block layout as Q4: 32 weights per block, 18 bytes per block
+/// (2-byte bf16 scale + 16 packed nibble bytes with E2M1 values).
+pub(crate) fn nvfp4_byte_count(m: usize, k: usize) -> usize {
+    let blocks_per_row = k / 32;
+    m.checked_mul(blocks_per_row)
+        .and_then(|v| v.checked_mul(18))
+        .expect("nvfp4_byte_count overflow: tensor dimensions too large")
+}
+
+/// FP4 E2M1 lookup table — maps 4-bit nibble values [0..15] to f32.
+///
+/// Encoding: 1 sign + 2 exponent (bias 1) + 1 mantissa.
+/// Same table as MXFP4 (see model/loader/mxfp4.rs FP4_E2M1_LUT).
+const FP4_E2M1_LUT: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,      // positive (sign=0)
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0, // negative (sign=1)
+];
+
+/// Maximum representable magnitude in FP4 E2M1 (used as scale divisor).
+const FP4_E2M1_MAX: f32 = 6.0;
+
+/// Convert an f32 value to the nearest FP4 E2M1 nibble index [0..15].
+///
+/// Finds the LUT entry with minimum absolute distance to `val`.
+pub(crate) fn f32_to_nvfp4_e2m1(val: f32) -> u8 {
+    let mut best_idx = 0u8;
+    let mut best_dist = f32::INFINITY;
+    for (i, &lut_val) in FP4_E2M1_LUT.iter().enumerate() {
+        let d = (val - lut_val).abs();
+        if d < best_dist {
+            best_dist = d;
+            best_idx = i as u8;
+        }
+    }
+    best_idx
+}
+
+/// Quantise a bf16 weight matrix [m, k] to block-wise NVFP4 E2M1.
+///
+/// Block layout (same as Q4, 18 bytes per 32 weights):
+///   [0..2]:   bf16 scale (little-endian)
+///   [2..18]:  16 packed nibble bytes (2 E2M1 values per byte)
+///             byte[i] = nibble[2i] | (nibble[2i+1] << 4)
+///
+/// Quantization: scale = max(|w_i|) / 6.0, then each w_i/scale → nearest E2M1 nibble.
+pub(crate) fn quantize_bf16_to_nvfp4(bf16_data: &[u8], m: usize, k: usize) -> Vec<u8> {
+    use half::bf16;
+
+    assert_eq!(bf16_data.len(), m * k * 2);
+
+    let owned_buf: Vec<bf16>;
+    let values: &[bf16] = match bytemuck::try_cast_slice(bf16_data) {
+        Ok(v) => v,
+        Err(_) => {
+            owned_buf = bf16_data
+                .chunks_exact(2)
+                .map(|c| bf16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            &owned_buf
+        }
+    };
+    assert_eq!(values.len(), m * k);
+
+    let mut out = vec![0u8; nvfp4_byte_count(m, k)];
+
+    let blocks_per_row = k / 32;
+    let bytes_per_block = 18;
+
+    for row in 0..m {
+        for block_idx in 0..blocks_per_row {
+            let block_start = row * k + block_idx * 32;
+            let block_values: Vec<f32> = (0..32)
+                .map(|i| values[block_start + i].to_f32())
+                .collect();
+
+            // Compute per-block scale.
+            let max_abs = block_values
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0f32, f32::max);
+            let scale = if max_abs > 0.0 {
+                max_abs / FP4_E2M1_MAX
+            } else {
+                1.0
+            };
+
+            let out_offset = (row * blocks_per_row + block_idx) * bytes_per_block;
+
+            // Write bf16 scale.
+            let scale_bf16 = bf16::from_f32(scale);
+            out[out_offset..out_offset + 2].copy_from_slice(&scale_bf16.to_le_bytes());
+
+            // Quantize and pack nibbles.
+            for i in 0..16 {
+                let v0 = block_values[i * 2] / scale;
+                let v1 = block_values[i * 2 + 1] / scale;
+                let n0 = f32_to_nvfp4_e2m1(v0);
+                let n1 = f32_to_nvfp4_e2m1(v1);
+                out[out_offset + 2 + i] = n0 | (n1 << 4);
+            }
+        }
+    }
+
+    out
 }
 
 // ---------------------------------------------------------------------------

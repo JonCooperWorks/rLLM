@@ -832,6 +832,16 @@ pub(crate) fn moe_expert_dispatch_streamed<B: GpuMatmul + GpuElementwise + GpuMo
     // Run expert FFNs using the streamer's buffer slots.
     backend.fill_zero(moe_output, hidden_size);
 
+    // Start prefetching next layer's experts while GPU computes (CUDA only).
+    // Prediction heuristic: reuse this layer's selected expert indices.
+    // Expert popularity is correlated across adjacent layers.
+    #[cfg(not(target_os = "macos"))]
+    {
+        streamer.prefetch_log_accuracy(layer_idx, &selected);
+        streamer.prefetch_clear();
+        streamer.prefetch_start(layer_idx, &selected);
+    }
+
     for (slot_idx, &(_expert_idx, routing_weight)) in selected.iter().enumerate() {
         let slot = streamer.active_slot(slot_idx);
 

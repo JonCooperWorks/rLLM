@@ -319,14 +319,9 @@ def format_markdown_table(results: list[BenchResult], gpu_name: str,
     return "\n".join(lines)
 
 
-def write_results(results: list[BenchResult], gpu_name: str, gpu_count: int,
-                  max_tokens: int, runs: int, output_path: Path | None = None,
-                  results_dir: str = "results") -> Path:
-    """Write benchmark results to a markdown file.
-
-    If output_path is None, auto-generates results/bench-TIMESTAMP.md.
-    Returns the path written to.
-    """
+def _resolve_output_path(output_path: Path | None = None,
+                         results_dir: str = "results") -> Path:
+    """Resolve the output path, creating directories as needed."""
     if output_path is None:
         repo_root = Path(__file__).resolve().parent.parent
         rdir = repo_root / results_dir
@@ -335,6 +330,67 @@ def write_results(results: list[BenchResult], gpu_name: str, gpu_count: int,
         output_path = rdir / f"bench-{timestamp}.md"
     else:
         output_path.parent.mkdir(parents=True, exist_ok=True)
+    return output_path
+
+
+def append_result_line(result: BenchResult, output_path: Path) -> None:
+    """Append a single result row to the live output file.
+
+    Creates the file with a markdown header on first call, then appends
+    one table row per result so you can `tail -f` the file during a run.
+    """
+    if result.gen_tps is not None:
+        tps = f"{result.gen_tps:.1f} tok/s"
+        ttft_ms = result.ttft_ms
+        if ttft_ms >= 1000:
+            secs = int(ttft_ms) // 1000
+            ms = int(ttft_ms) % 1000
+            ttft = f"{secs},{ms:03d} ms"
+        else:
+            ttft = f"{ttft_ms:.0f} ms"
+    else:
+        tps = "FAIL"
+        ttft = "--"
+
+    quality = result.quality or "--"
+    has_scores = bool(result.scores)
+
+    if not output_path.exists():
+        # Write header on first result.
+        gpu_name = detect_gpu_name()
+        lines = [
+            f"## Benchmark Results -- {gpu_name}",
+            f"_(live — updated after each test)_",
+            "",
+        ]
+        if has_scores:
+            lines.append("| Model | Family | tok/s | TTFT | Quality | Flesch | TTR |")
+            lines.append("|---|---|---|---|---|---|---|")
+        else:
+            lines.append("| Model | Family | tok/s | TTFT | Quality |")
+            lines.append("|---|---|---|---|---|")
+        output_path.write_text("\n".join(lines) + "\n")
+
+    if has_scores:
+        flesch = f"{result.scores['flesch']:.0f}" if "flesch" in result.scores else "--"
+        ttr = f"{result.scores['ttr']:.2f}" if "ttr" in result.scores else "--"
+        row = f"| {result.model_name} | {result.family} | {tps} | {ttft} | {quality} | {flesch} | {ttr} |"
+    else:
+        row = f"| {result.model_name} | {result.family} | {tps} | {ttft} | {quality} |"
+
+    with open(output_path, "a") as f:
+        f.write(row + "\n")
+
+
+def write_results(results: list[BenchResult], gpu_name: str, gpu_count: int,
+                  max_tokens: int, runs: int, output_path: Path | None = None,
+                  results_dir: str = "results") -> Path:
+    """Write benchmark results to a markdown file.
+
+    If output_path is None, auto-generates results/bench-TIMESTAMP.md.
+    Returns the path written to.
+    """
+    output_path = _resolve_output_path(output_path, results_dir)
 
     table = format_markdown_table(results, gpu_name, gpu_count, max_tokens, runs)
     output_path.write_text(table)

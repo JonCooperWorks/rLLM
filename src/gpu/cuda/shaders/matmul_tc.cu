@@ -721,3 +721,146 @@ extern "C" __global__ void gemm_fp8_tc(
 ) {
     gemm_fp8_tc_impl(params, W_fp8, X, Y);
 }
+
+// ---------------------------------------------------------------------------
+// NVFP4 E2M1 tile loader for tensor-core GEMM.
+//
+// Same block layout as Q4 (18 bytes per 32 weights), but nibbles are
+// FP4 E2M1 floats dequantized via constant LUT.
+// ---------------------------------------------------------------------------
+
+__device__ __constant__ float nvfp4_lut_tc[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+};
+
+__device__ __forceinline__ void load_weight_tile_nvfp4(
+    __nv_bfloat16 A_shared[TILE_N][TILE_K],
+    const unsigned char* __restrict__ W_nvfp4,
+    unsigned int tile_n_start,
+    unsigned int k_start,
+    unsigned int M,
+    unsigned int K,
+    unsigned int tid
+) {
+    const unsigned int blocks_per_row = K / Q4_BLOCK_SIZE;
+    const unsigned int k_block = k_start / Q4_BLOCK_SIZE;
+
+    const unsigned int total_elems = TILE_N * TILE_K;
+    for (unsigned int idx = tid; idx < total_elems; idx += 256) {
+        unsigned int row = idx / TILE_K;
+        unsigned int col = idx % TILE_K;
+        unsigned int global_row = tile_n_start + row;
+
+        __nv_bfloat16 val;
+        if (global_row < M && (k_start + col) < K) {
+            const unsigned char* row_data = W_nvfp4 + global_row * blocks_per_row * Q4_BYTES_PER_BLOCK;
+            const unsigned char* block_ptr = row_data + k_block * Q4_BYTES_PER_BLOCK;
+
+            float scale = __bfloat162float(*((const __nv_bfloat16*)block_ptr));
+
+            unsigned int nibble_idx = col;
+            unsigned int byte_idx = nibble_idx / 2;
+            unsigned int is_high = nibble_idx & 1;
+            unsigned char packed = block_ptr[2 + byte_idx];
+            int nibble = is_high ? (packed >> 4) : (packed & 0xF);
+
+            val = __float2bfloat16(nvfp4_lut_tc[nibble] * scale);
+        } else {
+            val = __float2bfloat16(0.0f);
+        }
+        A_shared[row][col] = val;
+    }
+}
+
+// NVFP4 tensor-core GEMM — same structure as Q4 TC but with E2M1 tile loader.
+__global__ void gemm_nvfp4_tc_impl(
+    const GemmParams params,
+    const unsigned char* __restrict__ W_nvfp4,
+    const __nv_bfloat16* __restrict__ X,
+    __nv_bfloat16* __restrict__ Y
+) {
+    const unsigned int batch_size = params.batch_size;
+    const unsigned int M = params.M;
+    const unsigned int K = params.K;
+
+    const unsigned int tile_n_start = blockIdx.x * TILE_N;
+    const unsigned int tile_m_start = blockIdx.y * TILE_M;
+
+    if (tile_n_start >= M && tile_m_start >= batch_size) return;
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int warp_id = tid / 32;
+    const unsigned int warp_row = warp_id / WARPS_N;
+    const unsigned int warp_col = warp_id % WARPS_N;
+
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag[WARP_TILES_M][WARP_TILES_N];
+    for (int i = 0; i < WARP_TILES_M; i++)
+        for (int j = 0; j < WARP_TILES_N; j++)
+            wmma::fill_fragment(c_frag[i][j], 0.0f);
+
+    __shared__ __nv_bfloat16 A_shared[2][TILE_N][TILE_K];
+    __shared__ __nv_bfloat16 B_shared[2][TILE_K][TILE_M];
+
+    const unsigned int num_k_tiles = (K + TILE_K - 1) / TILE_K;
+
+    for (unsigned int kt = 0; kt < num_k_tiles; kt++) {
+        int buf = kt % 2;
+        unsigned int k_start = kt * TILE_K;
+
+        load_weight_tile_nvfp4(A_shared[buf], W_nvfp4, tile_n_start, k_start, M, K, tid);
+        load_input_tile(B_shared[buf], X, tile_m_start, k_start, batch_size, K, tid);
+        __syncthreads();
+
+        for (int k_inner = 0; k_inner < TILE_K; k_inner += WMMA_K) {
+            for (int wi = 0; wi < WARP_TILES_M; wi++) {
+                unsigned int a_row = warp_row * (TILE_N / WARPS_M) + wi * WMMA_M;
+                wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K,
+                               __nv_bfloat16, wmma::row_major> a_frag;
+                wmma::load_matrix_sync(a_frag, &A_shared[buf][a_row][k_inner], TILE_K);
+
+                for (int wj = 0; wj < WARP_TILES_N; wj++) {
+                    unsigned int b_col = warp_col * (TILE_M / WARPS_N) + wj * WMMA_N;
+                    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K,
+                                   __nv_bfloat16, wmma::row_major> b_frag;
+                    wmma::load_matrix_sync(b_frag, &B_shared[buf][k_inner][b_col], TILE_M);
+                    wmma::mma_sync(c_frag[wi][wj], a_frag, b_frag, c_frag[wi][wj]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Epilogue: store f32 fragments to global memory as bf16.
+    float* warp_staging = (float*)&A_shared[0][0][0] + warp_id * WMMA_M * WMMA_N;
+    const unsigned int lane = tid % 32;
+
+    for (int wi = 0; wi < WARP_TILES_M; wi++) {
+        for (int wj = 0; wj < WARP_TILES_N; wj++) {
+            wmma::store_matrix_sync(warp_staging, c_frag[wi][wj], WMMA_N, wmma::mem_row_major);
+
+            unsigned int frag_m_start = tile_n_start + warp_row * (TILE_N / WARPS_M) + wi * WMMA_M;
+            unsigned int frag_batch_start = tile_m_start + warp_col * (TILE_M / WARPS_N) + wj * WMMA_N;
+
+            for (unsigned int idx = lane; idx < WMMA_M * WMMA_N; idx += 32) {
+                unsigned int r = idx / WMMA_N;
+                unsigned int c = idx % WMMA_N;
+                unsigned int global_m = frag_m_start + r;
+                unsigned int global_batch = frag_batch_start + c;
+
+                if (global_batch < batch_size && global_m < M) {
+                    Y[global_batch * M + global_m] = __float2bfloat16(warp_staging[idx]);
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void gemm_nvfp4_tc(
+    const GemmParams params,
+    const unsigned char* __restrict__ W_nvfp4,
+    const __nv_bfloat16* __restrict__ X,
+    __nv_bfloat16* __restrict__ Y
+) {
+    gemm_nvfp4_tc_impl(params, W_nvfp4, X, Y);
+}

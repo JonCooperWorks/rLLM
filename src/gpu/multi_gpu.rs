@@ -137,6 +137,7 @@ pub(crate) mod tp {
                         q8_map: HashMap::new(),
                         fp8_map: HashMap::new(),
                         tq3_map: HashMap::new(),
+                        nvfp4_map: HashMap::new(),
                     };
                     if let Some(vw) = loader::load_vision_weights(backend_ref, &store, &config) {
                         if let Some(vc) = &config.vision {

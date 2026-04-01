@@ -80,6 +80,10 @@ pub(crate) enum QuantFormat {
     /// 32 weights per block, 16 bytes per block (2× bf16 dual scales + 12 packed
     /// 3-bit centroid codes).  4.0 bits per weight.
     TQ3,
+    /// NVFP4 E2M1 — NVIDIA 4-bit float, same block layout as Q4.
+    /// 32 weights per block, 18 bytes per block (2-byte bf16 scale + 16 packed
+    /// E2M1 nibbles).  Used on NVIDIA SM 100+ (Blackwell).
+    NVFP4,
 }
 
 impl QuantFormat {
@@ -90,6 +94,7 @@ impl QuantFormat {
             "q8" | "Q8" => Some(Self::Q8),
             "fp8" | "FP8" => Some(Self::FP8),
             "tq3" | "TQ3" => Some(Self::TQ3),
+            "nvfp4" | "NVFP4" => Some(Self::NVFP4),
             _ => None,
         }
     }
@@ -101,6 +106,7 @@ impl QuantFormat {
             Self::Q8 => "q8",
             Self::FP8 => "fp8",
             Self::TQ3 => "tq3",
+            Self::NVFP4 => "nvfp4",
         }
     }
 
@@ -112,6 +118,7 @@ impl QuantFormat {
             Self::Q8 => TensorDtype::Q8,
             Self::FP8 => TensorDtype::FP8,
             Self::TQ3 => TensorDtype::TQ3,
+            Self::NVFP4 => TensorDtype::NVFP4,
         }
     }
 
@@ -122,6 +129,7 @@ impl QuantFormat {
             Self::Q8 => "rllm-q8",
             Self::FP8 => "rllm-fp8",
             Self::TQ3 => "rllm-tq3",
+            Self::NVFP4 => "rllm-nvfp4",
         }
     }
 
@@ -132,6 +140,7 @@ impl QuantFormat {
             Self::Q8 => "rllm_q8:",
             Self::FP8 => "rllm_fp8:",
             Self::TQ3 => "rllm_tq3:",
+            Self::NVFP4 => "rllm_nvfp4:",
         }
     }
 
@@ -142,6 +151,7 @@ impl QuantFormat {
             "rllm-q8" => Some(Self::Q8),
             "rllm-fp8" => Some(Self::FP8),
             "rllm-tq3" => Some(Self::TQ3),
+            "rllm-nvfp4" => Some(Self::NVFP4),
             _ => None,
         }
     }
@@ -318,6 +328,34 @@ impl WeightQuantiser for TQ3Quantiser {
 }
 
 // ---------------------------------------------------------------------------
+// NVFP4 quantiser — NVIDIA FP4 E2M1 (SM 100+ / Blackwell).
+//
+// Same block layout as Q4 (32 weights per block, 18 bytes per block) but
+// nibbles encode E2M1 float values instead of symmetric integers.
+// Dequant: weight = FP4_E2M1_LUT[nibble] * scale.
+// ---------------------------------------------------------------------------
+
+pub(crate) struct NVFP4Quantiser;
+
+impl WeightQuantiser for NVFP4Quantiser {
+    fn format(&self) -> QuantFormat {
+        QuantFormat::NVFP4
+    }
+
+    fn block_size(&self) -> usize {
+        32
+    }
+
+    fn bytes_per_block(&self) -> usize {
+        18
+    }
+
+    fn quantise(&self, bf16_data: &[u8], m: usize, k: usize) -> Vec<u8> {
+        super::super::quantize_bf16_to_nvfp4(bf16_data, m, k)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Factory — get the quantiser for a given format.
 // ---------------------------------------------------------------------------
 
@@ -328,6 +366,7 @@ pub(crate) fn quantiser(format: QuantFormat) -> &'static dyn WeightQuantiser {
         QuantFormat::Q8 => &Q8Quantiser,
         QuantFormat::FP8 => &FP8Quantiser,
         QuantFormat::TQ3 => &TQ3Quantiser,
+        QuantFormat::NVFP4 => &NVFP4Quantiser,
     }
 }
 

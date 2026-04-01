@@ -481,3 +481,42 @@ pread with fused gate+up reads and an LRU expert cache.
 We tested mmap-based streaming but found it slower for large shard files
 (751 GB across 94 files) — page fault overhead (16 KB granularity) exceeds
 the cost of targeted 8-16 MB pread calls.
+
+## Expert Prefetching (CUDA-only)
+
+On CUDA, the SSD read is the bottleneck — PCIe DMA is fast once data is in
+CPU pinned RAM.  Expert prefetching overlaps SSD→RAM reads with GPU compute
+by preading the *predicted* next-layer experts while the current layer runs.
+
+**Flow:**
+
+```
+Layer N:
+  1. Router selects experts → load from SSD → DMA to GPU → compute
+  2. While GPU computes: prefetch_start(layer N+1)
+     → spawn threads to pread predicted experts into prefetch_bufs
+     → threads complete, data sits in CPU pinned RAM
+
+Layer N+1:
+  1. Router selects experts
+  2. For hits in prefetch: skip pread, just DMA from prefetch_buf → GPU
+  3. For misses: normal pread + DMA path
+```
+
+**Prediction heuristic:** Reuse layer N's selected expert indices for layer N+1.
+Expert popularity is strongly correlated across adjacent layers (same tokens
+activate similar experts).  Accuracy is logged at debug level.
+
+**Why CUDA-only:** Apple Silicon's unified memory controller can't overlap
+SSD DMA with GPU compute — the hardware serializes these operations anyway.
+Serial I/O→compute is optimal on Metal (see `expert_stream.rs` line 36).
+
+**Edge cases:**
+- First MoE layer: no prior prefetch, runs normally
+- Last MoE layer: no prefetch started (nothing to prefetch)
+- Prediction misses: fall back to normal pread for non-prefetched experts
+- macOS: all prefetch code behind `#[cfg(not(target_os = "macos"))]`
+
+**Files:**
+- `src/model/expert_stream.rs` — `PrefetchState`, `prefetch_start()`, `prefetch_clear()`, `prefetch_log_accuracy()`
+- `src/model/primitives.rs` — integration in `moe_expert_dispatch_streamed()`

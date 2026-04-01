@@ -395,3 +395,91 @@ extern "C" __global__ void fused_gate_up_swiglu_fp8(
         output[row] = __float2bfloat16(silu * acc_up);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Fused gate+up+SwiGLU for NVFP4 E2M1 expert weights.
+//
+// Same block layout as Q4 (18 bytes per 32 weights) but nibbles decoded
+// via FP4 E2M1 lookup table instead of (nibble - 8) integer subtraction.
+// ---------------------------------------------------------------------------
+
+__device__ __constant__ float nvfp4_lut_moe[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+};
+
+extern "C" __global__ void fused_gate_up_swiglu_nvfp4(
+    const FusedGateUpParams params,
+    const unsigned char* __restrict__ W_gate_nvfp4,
+    const unsigned char* __restrict__ W_up_nvfp4,
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ output
+) {
+    const unsigned int M = params.M;
+    const unsigned int K = params.K;
+    const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    unsigned int row = gid / 32;
+    unsigned int lane = gid % 32;
+    if (row >= M) return;
+
+    const unsigned int blocks_per_row = K / 32;
+    const unsigned int bytes_per_block = 18;
+    const unsigned char* gate_row = W_gate_nvfp4 + row * blocks_per_row * bytes_per_block;
+    const unsigned char* up_row   = W_up_nvfp4   + row * blocks_per_row * bytes_per_block;
+
+    float acc_gate = 0.0f;
+    float acc_up   = 0.0f;
+
+    for (unsigned int block_idx = lane; block_idx < blocks_per_row; block_idx += 32) {
+        const unsigned char* g_ptr = gate_row + block_idx * bytes_per_block;
+        float g_scale = __bfloat162float(*((const __nv_bfloat16*)g_ptr));
+        const unsigned char* g_data = g_ptr + 2;
+
+        const unsigned char* u_ptr = up_row + block_idx * bytes_per_block;
+        float u_scale = __bfloat162float(*((const __nv_bfloat16*)u_ptr));
+        const unsigned char* u_data = u_ptr + 2;
+
+        unsigned int x_base = block_idx * 32;
+
+        for (unsigned int i = 0; i < 16; i += 4) {
+            unsigned char gb0 = g_data[i], gb1 = g_data[i+1], gb2 = g_data[i+2], gb3 = g_data[i+3];
+            unsigned char ub0 = u_data[i], ub1 = u_data[i+1], ub2 = u_data[i+2], ub3 = u_data[i+3];
+
+            float x0 = __bfloat162float(x[x_base + i*2]);
+            float x1 = __bfloat162float(x[x_base + i*2 + 1]);
+            float x2 = __bfloat162float(x[x_base + i*2 + 2]);
+            float x3 = __bfloat162float(x[x_base + i*2 + 3]);
+            float x4 = __bfloat162float(x[x_base + i*2 + 4]);
+            float x5 = __bfloat162float(x[x_base + i*2 + 5]);
+            float x6 = __bfloat162float(x[x_base + i*2 + 6]);
+            float x7 = __bfloat162float(x[x_base + i*2 + 7]);
+
+            acc_gate += nvfp4_lut_moe[gb0 & 0xF] * g_scale * x0;
+            acc_gate += nvfp4_lut_moe[gb0 >> 4]  * g_scale * x1;
+            acc_gate += nvfp4_lut_moe[gb1 & 0xF] * g_scale * x2;
+            acc_gate += nvfp4_lut_moe[gb1 >> 4]  * g_scale * x3;
+            acc_gate += nvfp4_lut_moe[gb2 & 0xF] * g_scale * x4;
+            acc_gate += nvfp4_lut_moe[gb2 >> 4]  * g_scale * x5;
+            acc_gate += nvfp4_lut_moe[gb3 & 0xF] * g_scale * x6;
+            acc_gate += nvfp4_lut_moe[gb3 >> 4]  * g_scale * x7;
+
+            acc_up += nvfp4_lut_moe[ub0 & 0xF] * u_scale * x0;
+            acc_up += nvfp4_lut_moe[ub0 >> 4]  * u_scale * x1;
+            acc_up += nvfp4_lut_moe[ub1 & 0xF] * u_scale * x2;
+            acc_up += nvfp4_lut_moe[ub1 >> 4]  * u_scale * x3;
+            acc_up += nvfp4_lut_moe[ub2 & 0xF] * u_scale * x4;
+            acc_up += nvfp4_lut_moe[ub2 >> 4]  * u_scale * x5;
+            acc_up += nvfp4_lut_moe[ub3 & 0xF] * u_scale * x6;
+            acc_up += nvfp4_lut_moe[ub3 >> 4]  * u_scale * x7;
+        }
+    }
+
+    acc_gate = warp_sum(acc_gate);
+    acc_up   = warp_sum(acc_up);
+
+    if (lane == 0) {
+        float silu = acc_gate / (1.0f + expf(-acc_gate));
+        output[row] = __float2bfloat16(silu * acc_up);
+    }
+}

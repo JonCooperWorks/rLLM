@@ -70,8 +70,7 @@ of normalized K vectors, causing correlated quantization errors that softmax
 amplifies.  V is tolerant because errors average out in weighted sums.
 
 **Asymmetric mode** keeps K at BF16 and turbo-quantizes V only.  Auto-selected
-on Metal for affected architectures; CUDA falls back to full BF16 until the
-V-only kernel is ported.
+for affected architectures on both Metal and CUDA.
 
 ```
 Qwen 3.5 27B Q8 (M4 Max 64GB):
@@ -142,16 +141,18 @@ model/turboquant.rs                    — KvQuantMode, KvQuantPair, TurboQuantC
 gpu/ops/turboquant.rs                  — GpuTurboQuant trait
 gpu/metal/shaders/turboquant.metal     — Metal kernels (quantize, rotate_q, paged_attention, v_only)
 gpu/metal/kernels/turboquant.rs        — Metal dispatch (#[repr(C)] param structs)
+gpu/cuda/shaders/turboquant.cu         — CUDA kernels (same five kernels as Metal)
+gpu/cuda/kernels/turboquant.rs         — CUDA dispatch
 model/primitives.rs                    — paged_kv_and_attention_maybe_quantized() (3-path dispatch)
                                          paged_kv_and_prefill_attention_maybe_quantized()
 model/kv_cache.rs                      — KvPool with asymmetric K/V buffer allocation
 engine/loader.rs                       — Auto-select symmetric/asymmetric, TurboContext creation
 ```
 
-### Metal Kernels
+### GPU Kernels (Metal & CUDA)
 
-| Kernel | Threadgroups | Threads/Group | Purpose |
-|--------|-------------|---------------|---------|
+| Kernel | Blocks/Threadgroups | Threads | Purpose |
+|--------|-------------|---------|---------|
 | `turbo_quantize_paged` | num_kv_heads | head_dim | Rotate + quantize + pack |
 | `turbo_quantize_paged_batch` | batch × num_kv_heads | head_dim | Batched prefill variant |
 | `turbo_rotate_q` | num_heads | head_dim | Pre-rotate query |

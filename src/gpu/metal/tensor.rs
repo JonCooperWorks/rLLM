@@ -30,6 +30,9 @@ impl MetalTensor {
                 assert!(self.shape.len() == 2, "TQ3 tensors must be 2D [m, k]");
                 crate::gpu::tq3_byte_count(self.shape[0], self.shape[1])
             }
+            TensorDtype::NVFP4 => {
+                panic!("NVFP4 is CUDA-only (Blackwell SM 100+), not supported on Metal")
+            }
             _ => self.shape.iter().product::<usize>() * self.dtype.byte_size(),
         }
     }

@@ -197,6 +197,15 @@ pub(crate) struct CudaBackend {
     // FP8 MoE kernel.
     pub(crate) fn_fused_gate_up_swiglu_fp8: CudaFunction,
 
+    // NVFP4 E2M1 kernels — NVIDIA SM 100+ (Blackwell).
+    // Same block layout as Q4 (18 bytes per 32 weights), E2M1 float nibbles.
+    pub(crate) fn_matvec_nvfp4: CudaFunction,
+    pub(crate) fn_gemm_nvfp4: CudaFunction,
+    pub(crate) fn_gemm_nvfp4_tc: Option<CudaFunction>,
+
+    // NVFP4 MoE kernel.
+    pub(crate) fn_fused_gate_up_swiglu_nvfp4: CudaFunction,
+
     // Mamba2 kernels (Nemotron-H).
     pub(crate) fn_mamba2_conv1d_silu: CudaFunction,
     pub(crate) fn_mamba2_ssm_step: CudaFunction,
@@ -222,6 +231,7 @@ pub(crate) struct CudaBackend {
     pub(crate) fn_turbo_quantize_paged_batch: CudaFunction,
     pub(crate) fn_turbo_rotate_q: CudaFunction,
     pub(crate) fn_turbo_paged_attention: CudaFunction,
+    pub(crate) fn_turbo_paged_attention_v_only: CudaFunction,
 }
 
 impl CudaBackend {
@@ -448,6 +458,14 @@ impl CudaBackend {
             // FP8 MoE kernel.
             fn_fused_gate_up_swiglu_fp8: func(&mod_moe, "fused_gate_up_swiglu_fp8")?,
 
+            // NVFP4 E2M1 kernels.
+            fn_matvec_nvfp4: func(&mod_matmul, "matvec_nvfp4")?,
+            fn_gemm_nvfp4: func(&mod_matmul, "gemm_nvfp4")?,
+            fn_gemm_nvfp4_tc: mod_matmul_tc.as_ref().map(|m| func(m, "gemm_nvfp4_tc")).transpose()?,
+
+            // NVFP4 MoE kernel.
+            fn_fused_gate_up_swiglu_nvfp4: func(&mod_moe, "fused_gate_up_swiglu_nvfp4")?,
+
             // Mamba2 kernels.
             fn_mamba2_conv1d_silu: func(&mod_mamba2, "mamba2_conv1d_silu")?,
             fn_mamba2_ssm_step: func(&mod_mamba2, "mamba2_ssm_step")?,
@@ -473,6 +491,7 @@ impl CudaBackend {
             fn_turbo_quantize_paged_batch: func(&mod_turboquant, "turbo_quantize_paged_batch")?,
             fn_turbo_rotate_q: func(&mod_turboquant, "turbo_rotate_q")?,
             fn_turbo_paged_attention: func(&mod_turboquant, "turbo_paged_attention")?,
+            fn_turbo_paged_attention_v_only: func(&mod_turboquant, "turbo_paged_attention_v_only")?,
         })
     }
 

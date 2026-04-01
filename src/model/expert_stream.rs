@@ -234,6 +234,23 @@ struct SlotReadBufs {
 /// rate but consume more VRAM.
 const DEFAULT_CACHE_SLOTS: usize = 64;
 
+/// Tracks an in-flight background prefetch operation (CUDA only).
+///
+/// Between layers, prefetch_start() spawns background pread threads that
+/// read the predicted next-layer experts from SSD into CPU pinned buffers.
+/// When the next layer's load_experts() is called, it checks if there's a
+/// completed prefetch for that layer and uses the prefetched data for hits,
+/// falling back to normal pread for mispredictions.
+#[cfg(not(target_os = "macos"))]
+struct PrefetchState {
+    /// Which layer was prefetched.
+    layer_idx: usize,
+    /// Expert indices that were prefetched (in order matching prefetch_bufs slots).
+    experts: Vec<usize>,
+    /// Whether the prefetch has been completed (threads joined).
+    completed: bool,
+}
+
 pub(crate) struct ExpertStreamer<B: GpuCore> {
     /// Expert index (file locations for all experts).
     pub index: ExpertIndex,
@@ -261,6 +278,17 @@ pub(crate) struct ExpertStreamer<B: GpuCore> {
     /// inference is single-threaded within a model).  Each slot's buffers
     /// are accessed by exactly one thread during parallel pread.
     read_bufs: UnsafeCell<Vec<SlotReadBufs>>,
+
+    /// Second set of CPU read buffers for background prefetch (CUDA only).
+    /// Populated by prefetch_start(), consumed by load_experts() on the next
+    /// layer when the prediction matches.  Gated by cfg(not(target_os = "macos"))
+    /// because Metal's unified memory controller can't overlap SSD DMA with
+    /// GPU compute — serial I/O→compute is optimal there.
+    #[cfg(not(target_os = "macos"))]
+    prefetch_bufs: UnsafeCell<Vec<SlotReadBufs>>,
+    /// State of in-flight prefetch, if any.
+    #[cfg(not(target_os = "macos"))]
+    prefetch_state: UnsafeCell<Option<PrefetchState>>,
 }
 
 /// Safety: ExpertStreamer uses interior mutability (Cell, UnsafeCell) for
@@ -336,6 +364,16 @@ impl<B: GpuCore> ExpertStreamer<B> {
             "expert streaming initialized",
         );
 
+        #[cfg(not(target_os = "macos"))]
+        let prefetch_bufs = UnsafeCell::new(
+            (0..k)
+                .map(|_| SlotReadBufs {
+                    gate_up: alloc_buf(gate_up_bytes),
+                    down: alloc_buf(down_bytes),
+                })
+                .collect(),
+        );
+
         ExpertStreamer {
             index,
             cache,
@@ -345,6 +383,10 @@ impl<B: GpuCore> ExpertStreamer<B> {
             active_indices: UnsafeCell::new(vec![0usize; k]),
             k,
             read_bufs,
+            #[cfg(not(target_os = "macos"))]
+            prefetch_bufs,
+            #[cfg(not(target_os = "macos"))]
+            prefetch_state: UnsafeCell::new(None),
         }
     }
 
@@ -357,6 +399,7 @@ impl<B: GpuCore> ExpertStreamer<B> {
             Some(crate::gpu::ops::quant::QuantFormat::Q8) => TensorDtype::Q8,
             Some(crate::gpu::ops::quant::QuantFormat::FP8) => TensorDtype::FP8,
             Some(crate::gpu::ops::quant::QuantFormat::TQ3) => TensorDtype::TQ3,
+            Some(crate::gpu::ops::quant::QuantFormat::NVFP4) => TensorDtype::NVFP4,
             None => TensorDtype::BF16,
         };
 
@@ -597,6 +640,202 @@ impl<B: GpuCore> ExpertStreamer<B> {
             backend.sync_transfers();
         }
     }
+
+    /// Find the next MoE layer after `from` (handles interleaved non-MoE layers).
+    #[cfg(not(target_os = "macos"))]
+    fn next_moe_layer(&self, from: usize) -> Option<usize> {
+        for i in (from + 1)..self.index.layers.len() {
+            if !self.index.layers[i].is_empty() {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Start background prefetch of predicted experts for the next MoE layer.
+    ///
+    /// Spawns pread threads that read expert weights from SSD into CPU pinned
+    /// buffers.  The threads are joined when `prefetch_join()` is called.
+    /// Prediction heuristic: reuse this layer's selected expert indices.
+    ///
+    /// CUDA-only — Metal's unified memory can't overlap SSD DMA with GPU compute.
+    #[cfg(not(target_os = "macos"))]
+    pub fn prefetch_start(
+        &self,
+        layer_idx: usize,
+        predicted_experts: &[(usize, f32)],
+    ) {
+        let next_layer = match self.next_moe_layer(layer_idx) {
+            Some(l) => l,
+            None => return, // last MoE layer — nothing to prefetch
+        };
+
+        let prefetch_state = unsafe { &mut *self.prefetch_state.get() };
+        let k = unsafe { &*self.prefetch_bufs.get() }.len();
+
+        // Collect expert indices to prefetch (same as current layer's selection).
+        let experts: Vec<usize> = predicted_experts
+            .iter()
+            .take(k)
+            .map(|&(idx, _)| idx)
+            .collect();
+
+        // Validate that the predicted experts exist in the next layer.
+        let next_experts = &self.index.layers[next_layer];
+        let valid_experts: Vec<usize> = experts
+            .iter()
+            .filter(|&&e| e < next_experts.len())
+            .copied()
+            .collect();
+
+        if valid_experts.is_empty() {
+            return;
+        }
+
+        // Synchronous prefetch: use scoped threads to pread into prefetch_bufs.
+        // This blocks until all reads complete, but the GPU is still computing
+        // asynchronously on its CUDA stream.  The benefit: when the next layer
+        // needs these experts, the data is already in CPU pinned RAM — only
+        // the fast PCIe DMA transfer remains.
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(valid_experts.len());
+
+            for (buf_idx, &expert_idx) in valid_experts.iter().enumerate() {
+                let loc = &next_experts[expert_idx];
+                let shard_files = &self.index.shard_files;
+                // Safety: each thread writes to a disjoint prefetch buffer slot.
+                let bufs_ptr = self.prefetch_bufs.get();
+                let slot_bufs = unsafe { &mut (&mut (*bufs_ptr))[buf_idx] };
+
+                handles.push(s.spawn(move || -> std::io::Result<()> {
+                    let gate_up = slot_bufs.gate_up.as_mut_slice();
+                    if loc.gate_bytes == 0 {
+                        pread_exact(
+                            &shard_files[loc.shard_up],
+                            &mut gate_up[..loc.up_bytes],
+                            loc.up_offset,
+                        )?;
+                    } else if loc.gate_up_contiguous() {
+                        let total = loc.gate_bytes + loc.up_bytes;
+                        pread_exact(
+                            &shard_files[loc.shard_gate_up],
+                            &mut gate_up[..total],
+                            loc.gate_offset,
+                        )?;
+                    } else {
+                        pread_exact(
+                            &shard_files[loc.shard_gate_up],
+                            &mut gate_up[..loc.gate_bytes],
+                            loc.gate_offset,
+                        )?;
+                        pread_exact(
+                            &shard_files[loc.shard_up],
+                            &mut gate_up[loc.gate_bytes..loc.gate_bytes + loc.up_bytes],
+                            loc.up_offset,
+                        )?;
+                    }
+
+                    pread_exact(
+                        &shard_files[loc.shard_down],
+                        &mut slot_bufs.down.as_mut_slice()[..loc.down_bytes],
+                        loc.down_offset,
+                    )?;
+                    Ok(())
+                }));
+            }
+
+            for h in handles {
+                match h.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!("prefetch I/O error (non-fatal): {e}");
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::warn!("prefetch thread panicked (non-fatal)");
+                        return;
+                    }
+                }
+            }
+        });
+
+        *prefetch_state = Some(PrefetchState {
+            layer_idx: next_layer,
+            experts: valid_experts,
+            completed: true,
+        });
+    }
+
+    /// Check if there's a completed prefetch for the given layer, and if the
+    /// given expert was prefetched, return a reference to its prefetch buffer.
+    ///
+    /// Returns `Some(buf_idx)` if the expert was prefetched, `None` otherwise.
+    #[cfg(not(target_os = "macos"))]
+    fn prefetch_hit(&self, layer_idx: usize, expert_idx: usize) -> Option<usize> {
+        let state = unsafe { &*self.prefetch_state.get() };
+        if let Some(ps) = state {
+            if ps.layer_idx == layer_idx && ps.completed {
+                return ps.experts.iter().position(|&e| e == expert_idx);
+            }
+        }
+        None
+    }
+
+    /// Upload a prefetched expert from prefetch_bufs to GPU via async DMA.
+    ///
+    /// Called during load_experts() for cache misses that were correctly predicted.
+    #[cfg(not(target_os = "macos"))]
+    fn upload_prefetched(
+        &self,
+        backend: &B,
+        layer_idx: usize,
+        expert_idx: usize,
+        cache_slot: usize,
+        prefetch_buf_idx: usize,
+    ) {
+        let prefetch_bufs = unsafe { &*self.prefetch_bufs.get() };
+        let loc = &self.index.layers[layer_idx][expert_idx];
+        let slot = &self.cache[cache_slot];
+        let bufs = &prefetch_bufs[prefetch_buf_idx];
+        let gate_up = bufs.gate_up.as_slice();
+
+        if loc.gate_bytes > 0 {
+            backend.copy_to_tensor_async(&slot.gate_proj, &gate_up[..loc.gate_bytes]);
+            backend.copy_to_tensor_async(
+                &slot.up_proj,
+                &gate_up[loc.gate_bytes..loc.gate_bytes + loc.up_bytes],
+            );
+        } else {
+            backend.copy_to_tensor_async(&slot.up_proj, &gate_up[..loc.up_bytes]);
+        }
+        backend.copy_to_tensor_async(&slot.down_proj, &bufs.down.as_slice()[..loc.down_bytes]);
+    }
+
+    /// Log prediction accuracy for this layer's prefetch.
+    #[cfg(not(target_os = "macos"))]
+    pub fn prefetch_log_accuracy(&self, layer_idx: usize, selected: &[(usize, f32)]) {
+        let state = unsafe { &*self.prefetch_state.get() };
+        if let Some(ps) = state {
+            if ps.layer_idx == layer_idx && ps.completed {
+                let hits = ps.experts.iter()
+                    .filter(|&&e| selected.iter().any(|&(s, _)| s == e))
+                    .count();
+                tracing::debug!(
+                    layer = layer_idx,
+                    hits = hits,
+                    total = ps.experts.len(),
+                    "expert prefetch accuracy"
+                );
+            }
+        }
+    }
+
+    /// Clear prefetch state after it's been consumed.
+    #[cfg(not(target_os = "macos"))]
+    pub fn prefetch_clear(&self) {
+        let state = unsafe { &mut *self.prefetch_state.get() };
+        *state = None;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -761,6 +1000,10 @@ fn expert_byte_sizes(
         Some(crate::gpu::ops::quant::QuantFormat::TQ3) => (
             crate::gpu::tq3_byte_count(gate_up_rows, hidden),
             crate::gpu::tq3_byte_count(hidden, moe_inter),
+        ),
+        Some(crate::gpu::ops::quant::QuantFormat::NVFP4) => (
+            crate::gpu::nvfp4_byte_count(gate_up_rows, hidden),
+            crate::gpu::nvfp4_byte_count(hidden, moe_inter),
         ),
         None => (
             gate_up_rows * hidden * 2, // bf16

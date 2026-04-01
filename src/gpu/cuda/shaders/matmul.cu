@@ -561,3 +561,154 @@ extern "C" __global__ void gemm_fp8(
         Y[batch * M + row] = __float2bfloat16(acc);
     }
 }
+
+// ===========================================================================
+// NVFP4 E2M1 kernels — same block layout as Q4 (18 bytes per 32 weights)
+// but nibbles are FP4 E2M1 floats dequantized via lookup table.
+//
+// Block layout: [2-byte bf16 scale][16 packed nibble bytes]
+// Dequant: weight = FP4_LUT[nibble] * scale
+// ===========================================================================
+
+__device__ __constant__ float nvfp4_e2m1_lut[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,       // positive
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f  // negative
+};
+
+// ---------------------------------------------------------------------------
+// matvec_nvfp4 — SIMD-cooperative matvec with inline NVFP4 E2M1 dequantisation.
+//
+// Same block iteration and access patterns as matvec_q4, but dequant uses
+// FP4 E2M1 lookup table instead of (nibble - 8) integer subtraction.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void matvec_nvfp4(
+    const MatvecParams params,
+    const unsigned char* __restrict__ W_nvfp4,
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ y
+) {
+    const unsigned int M = params.M;
+    const unsigned int K = params.K;
+    const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    unsigned int row = gid / 32;
+    unsigned int lane = gid % 32;
+    if (row >= M) return;
+
+    const unsigned int blocks_per_row = K / 32;
+    const unsigned int bytes_per_block = 18;
+    const unsigned char* row_data = W_nvfp4 + row * blocks_per_row * bytes_per_block;
+
+    float acc = 0.0f;
+
+    if (blocks_per_row <= 64) {
+        for (unsigned int block_idx = lane; block_idx < blocks_per_row; block_idx += 32) {
+            const unsigned char* block_ptr = row_data + block_idx * bytes_per_block;
+            float scale = __bfloat162float(*((const __nv_bfloat16*)block_ptr));
+            const unsigned char* data = block_ptr + 2;
+            unsigned int x_base = block_idx * 32;
+
+            for (unsigned int i = 0; i < 16; i += 4) {
+                unsigned char b0 = data[i];
+                unsigned char b1 = data[i + 1];
+                unsigned char b2 = data[i + 2];
+                unsigned char b3 = data[i + 3];
+
+                acc += nvfp4_e2m1_lut[b0 & 0xF] * scale * __bfloat162float(x[x_base + i * 2]);
+                acc += nvfp4_e2m1_lut[b0 >> 4]  * scale * __bfloat162float(x[x_base + i * 2 + 1]);
+                acc += nvfp4_e2m1_lut[b1 & 0xF] * scale * __bfloat162float(x[x_base + i * 2 + 2]);
+                acc += nvfp4_e2m1_lut[b1 >> 4]  * scale * __bfloat162float(x[x_base + i * 2 + 3]);
+                acc += nvfp4_e2m1_lut[b2 & 0xF] * scale * __bfloat162float(x[x_base + i * 2 + 4]);
+                acc += nvfp4_e2m1_lut[b2 >> 4]  * scale * __bfloat162float(x[x_base + i * 2 + 5]);
+                acc += nvfp4_e2m1_lut[b3 & 0xF] * scale * __bfloat162float(x[x_base + i * 2 + 6]);
+                acc += nvfp4_e2m1_lut[b3 >> 4]  * scale * __bfloat162float(x[x_base + i * 2 + 7]);
+            }
+        }
+    } else {
+        const unsigned int byte_in_block = lane / 2;
+        const unsigned int nibble_hi = lane & 1;
+
+        unsigned int base = 0;
+        for (; base + 3 < blocks_per_row; base += 4) {
+            float my_scale = 0.0f;
+            if (lane < 4) {
+                my_scale = __bfloat162float(*((const __nv_bfloat16*)(row_data + (base + lane) * bytes_per_block)));
+            }
+
+            for (int blk = 0; blk < 4; blk++) {
+                float scale = __shfl_sync(0xffffffff, my_scale, blk);
+                unsigned char packed = row_data[(base + blk) * bytes_per_block + 2 + byte_in_block];
+                float w = nibble_hi ? nvfp4_e2m1_lut[packed >> 4] : nvfp4_e2m1_lut[packed & 0xF];
+                acc += w * scale * __bfloat162float(x[(base + blk) * 32 + lane]);
+            }
+        }
+        for (; base < blocks_per_row; base++) {
+            float scale = __bfloat162float(*((const __nv_bfloat16*)(row_data + base * bytes_per_block)));
+            scale = __shfl_sync(0xffffffff, scale, 0);
+            unsigned char packed = row_data[base * bytes_per_block + 2 + byte_in_block];
+            float w = nibble_hi ? nvfp4_e2m1_lut[packed >> 4] : nvfp4_e2m1_lut[packed & 0xF];
+            acc += w * scale * __bfloat162float(x[base * 32 + lane]);
+        }
+    }
+
+    acc = warp_sum(acc);
+    if (lane == 0) {
+        y[row] = __float2bfloat16(acc);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// gemm_nvfp4 — batched GEMM with NVFP4 E2M1 dequantisation.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void gemm_nvfp4(
+    const GemmParams params,
+    const unsigned char* __restrict__ W_nvfp4,
+    const __nv_bfloat16* __restrict__ X,
+    __nv_bfloat16* __restrict__ Y
+) {
+    const unsigned int M = params.M;
+    const unsigned int K = params.K;
+    const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    unsigned int elem = gid / 32;
+    unsigned int lane = gid % 32;
+    unsigned int batch = elem / M;
+    unsigned int row   = elem % M;
+
+    if (batch >= params.batch_size) return;
+
+    const unsigned int blocks_per_row = K / 32;
+    const unsigned int bytes_per_block = 18;
+    const unsigned char* row_data = W_nvfp4 + row * blocks_per_row * bytes_per_block;
+    const __nv_bfloat16* x_vec = X + batch * K;
+
+    float acc = 0.0f;
+
+    for (unsigned int block_idx = lane; block_idx < blocks_per_row; block_idx += 32) {
+        const unsigned char* block_ptr = row_data + block_idx * bytes_per_block;
+        float scale = __bfloat162float(*((const __nv_bfloat16*)block_ptr));
+        const unsigned char* data = block_ptr + 2;
+        unsigned int x_base = block_idx * 32;
+
+        for (unsigned int i = 0; i < 16; i += 4) {
+            unsigned char b0 = data[i];
+            unsigned char b1 = data[i + 1];
+            unsigned char b2 = data[i + 2];
+            unsigned char b3 = data[i + 3];
+
+            acc += nvfp4_e2m1_lut[b0 & 0xF] * scale * __bfloat162float(x_vec[x_base + i * 2]);
+            acc += nvfp4_e2m1_lut[b0 >> 4]  * scale * __bfloat162float(x_vec[x_base + i * 2 + 1]);
+            acc += nvfp4_e2m1_lut[b1 & 0xF] * scale * __bfloat162float(x_vec[x_base + i * 2 + 2]);
+            acc += nvfp4_e2m1_lut[b1 >> 4]  * scale * __bfloat162float(x_vec[x_base + i * 2 + 3]);
+            acc += nvfp4_e2m1_lut[b2 & 0xF] * scale * __bfloat162float(x_vec[x_base + i * 2 + 4]);
+            acc += nvfp4_e2m1_lut[b2 >> 4]  * scale * __bfloat162float(x_vec[x_base + i * 2 + 5]);
+            acc += nvfp4_e2m1_lut[b3 & 0xF] * scale * __bfloat162float(x_vec[x_base + i * 2 + 6]);
+            acc += nvfp4_e2m1_lut[b3 >> 4]  * scale * __bfloat162float(x_vec[x_base + i * 2 + 7]);
+        }
+    }
+
+    acc = warp_sum(acc);
+    if (lane == 0) {
+        Y[batch * M + row] = __float2bfloat16(acc);
+    }
+}

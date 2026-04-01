@@ -180,6 +180,8 @@ TURBOQUANT_CONFIGS = [
                 extra_args=("--kv-quant", "turbo2"), bf16_size_gb=6),
     ModelConfig("no-kv-quant-llama", "llama-3.2-3b-instruct", "Llama",
                 extra_args=("--kv-quant", "none"), bf16_size_gb=6),
+    ModelConfig("turbo4-vonly-llama", "llama-3.2-3b-instruct", "Llama",
+                extra_args=("--kv-quant", "none:turbo4"), bf16_size_gb=6),
 ]
 
 
