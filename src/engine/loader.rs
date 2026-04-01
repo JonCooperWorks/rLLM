@@ -269,25 +269,36 @@ fn load_and_run_single_gpu(
     // mode").  On CUDA the V-only kernel doesn't exist yet, so we fully disable.
     let needs_asymmetric = arch.has_qkv_bias() || config.has_sparse_attention();
     let kv_quant = if kv_quant.is_any_quantized() && needs_asymmetric {
-        let pair = KvQuantPair::asymmetric(KvQuantMode::None, kv_quant.v);
-        if arch.has_qkv_bias() {
-            warn!(
-                arch = ?arch,
-                k = "BF16",
-                v = ?kv_quant.v,
-                "TurboQuant asymmetric mode (K=BF16, V=turbo) — QKV bias",
-            );
-        } else {
-            warn!(
-                arch = ?arch,
-                kv_layers = config.num_kv_layers(),
-                total_layers = config.num_hidden_layers,
-                k = "BF16",
-                v = ?kv_quant.v,
-                "TurboQuant asymmetric mode (K=BF16, V=turbo) — sparse attention",
-            );
+        #[cfg(target_os = "macos")]
+        {
+            let pair = KvQuantPair::asymmetric(KvQuantMode::None, kv_quant.v);
+            if arch.has_qkv_bias() {
+                warn!(
+                    arch = ?arch,
+                    k = "BF16",
+                    v = ?kv_quant.v,
+                    "TurboQuant asymmetric mode (K=BF16, V=turbo) — QKV bias",
+                );
+            } else {
+                warn!(
+                    arch = ?arch,
+                    kv_layers = config.num_kv_layers(),
+                    total_layers = config.num_hidden_layers,
+                    k = "BF16",
+                    v = ?kv_quant.v,
+                    "TurboQuant asymmetric mode (K=BF16, V=turbo) — sparse attention",
+                );
+            }
+            pair
         }
-        pair
+        #[cfg(not(target_os = "macos"))]
+        {
+            warn!(
+                arch = ?arch,
+                "TurboQuant disabled for QKV-bias/sparse-attention model on CUDA; using BF16 KV cache",
+            );
+            KvQuantPair::symmetric(KvQuantMode::None)
+        }
     } else {
         kv_quant
     };
