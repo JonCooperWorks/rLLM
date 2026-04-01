@@ -263,6 +263,7 @@ impl CudaBackend {
         let compute_capability = ctx
             .compute_capability()
             .unwrap_or((0, 0));
+        let arch_flag = format!("-arch=compute_{}{}", compute_capability.0, compute_capability.1);
 
         // Compile shader sources via NVRTC.
         // NVRTC needs the CUDA include path for headers like cuda_bf16.h.
@@ -273,7 +274,7 @@ impl CudaBackend {
 
         let compile = |source: &str| -> anyhow::Result<cudarc::nvrtc::Ptx> {
             let opts = cudarc::nvrtc::CompileOptions {
-                options: vec![format!("-I{include_path}")],
+                options: vec![format!("-I{include_path}"), arch_flag.clone()],
                 ..Default::default()
             };
             cudarc::nvrtc::compile_ptx_with_opts(source, opts)
@@ -317,14 +318,14 @@ impl CudaBackend {
         let mod_turboquant = load(ptx_turboquant)?;
 
         // Tensor-core WMMA module (sm_80+ only).
-        // Compiled with -arch=compute_80 so NVRTC emits WMMA (mma.h) instructions.
+        // Compiled with the device's native arch so NVRTC emits optimal WMMA instructions.
         // On older GPUs, we skip this entirely and use the scalar GEMM fallback.
         let mod_matmul_tc = if compute_capability.0 >= 8 {
             let ptx_tc = {
                 let opts = cudarc::nvrtc::CompileOptions {
                     options: vec![
                         format!("-I{include_path}"),
-                        "-arch=compute_80".to_string(),
+                        arch_flag.clone(),
                     ],
                     ..Default::default()
                 };
