@@ -73,17 +73,17 @@ All models support bf16 and Q4. Multi-GPU via `--tp N` requires CUDA + NCCL.
 
 Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Q4 uses NVFP4 E2M1 (native on SM 12.0 Blackwell). Q8 uses FP8 E4M3 (native on SM 12.0). TTFT measured via streaming (time to first SSE token).
 
-| Model | Params | bf16 | TTFT (bf16) |
-|---|---|---|---|
-| Llama 3.2 3B Instruct | 3.2B | 135 tok/s | 124 ms |
-| Qwen 2.5 3B Instruct | 3.1B | 144 tok/s | 136 ms |
-| Gemma 3 4B Instruct | 4.3B | 68 tok/s | 130 ms |
-| Mistral 7B Instruct | 7.2B | 73 tok/s | 187 ms |
-| Qwen3.5 9B † | ~9B | — | 7,760 ms |
-| Phi-4 | 14.7B | 41 tok/s | 329 ms |
-| Qwen3.5 27B Q8 (FP8) † | ~27B | — | 21,430 ms |
+| Model | Params | bf16 | Q8 (FP8) | Q4 (NVFP4) | TTFT (bf16) | TTFT (Q4) |
+|---|---|---|---|---|---|---|
+| Llama 3.2 3B Instruct | 3.2B | 135 tok/s | — | — | 124 ms | — |
+| Qwen 2.5 3B Instruct | 3.1B | 144 tok/s | — | — | 136 ms | — |
+| Gemma 3 4B Instruct | 4.3B | 68 tok/s | 59 tok/s | 62 tok/s | 130 ms | 164 ms |
+| Mistral 7B Instruct | 7.2B | 73 tok/s | — | — | 187 ms | — |
+| Qwen3.5 9B † | ~9B | — | — | — | 7,760 ms | — |
+| Phi-4 | 14.7B | 41 tok/s | — | — | 329 ms | — |
+| Qwen3.5 27B † | ~27B | OOM | — | — | — | 31,253 ms |
 
-† = thinking model (TTFT includes reasoning time). Partial run — Q4/Q8 variants pending. Benchmarked via `pytest --bench` (HTTP API, streaming TTFT).
+† = thinking model (TTFT includes reasoning time). bf16 is faster than Q4/Q8 for Gemma 3 4B — the 5090's 1.79 TB/s bandwidth makes bf16 matvec fast enough that dequant overhead exceeds the bandwidth savings (same pattern as H100). Qwen3.5 27B bf16 (52 GB) exceeds 32 GB VRAM. Benchmarked via `pytest --bench` (HTTP API, streaming TTFT). Partial run — more Q4/Q8 variants pending.
 
 </details>
 
