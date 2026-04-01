@@ -100,7 +100,7 @@ MODEL_REGISTRY: dict[str, ModelConfig] = {
     ),
     "gpt-oss-20b": ModelConfig(
         "gpt-oss-20b", "gpt-oss-20b", "GptOss",
-        is_moe=True, bf16_size_gb=40, supports_stream_experts=False,
+        is_moe=True, bf16_size_gb=40, supports_stream_experts=True,
         temperature=0.6, is_chat=True, quality_sensitive=True, in_test_suite=True,
     ),
     "nemotron-3-30b": ModelConfig(
