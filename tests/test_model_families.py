@@ -326,9 +326,10 @@ def test_model_q8(config_index, server_manager, models_dir, bench_context):
     mem = _estimate_memory_gb(config, is_q4=False, model_dir=str(model_dir))
     base_url = server_manager.get_or_start(str(model_dir), extra_args, memory_gb=mem)
 
+    temp = 0 if config.quality_sensitive else config.temperature
     prompt = prompt_for_index(config_index + 3)
     test_id = f"{config.test_id}-q8"
-    sr = _streaming_chat_completion(base_url, prompt, temperature=config.temperature)
+    sr = _streaming_chat_completion(base_url, prompt, temperature=temp)
 
     assert sr.completion_tokens > 0, "no tokens generated"
 

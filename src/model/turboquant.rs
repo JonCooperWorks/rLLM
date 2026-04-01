@@ -112,10 +112,24 @@ impl KvQuantMode {
 
     /// Bits used for stage-1 PolarQuant codebook.
     ///
-    /// All quantized modes use the two-stage QJL pipeline: (bits-1) bits
-    /// for PolarQuant centroids + 1 bit for the QJL residual sign.
+    /// Bits used for stage-1 PolarQuant codebook.
+    ///
+    /// Turbo3/Turbo4 use the two-stage QJL pipeline: (bits-1) bits for
+    /// PolarQuant + 1 bit for QJL sign.  Turbo2 uses all 2 bits for
+    /// PolarQuant (4 centroids) without QJL — at only 2 total bits,
+    /// the 4-centroid codebook outperforms the 2-centroid + sign split.
     pub fn stage1_bits(self) -> u32 {
-        if self.is_quantized() { self.bits() - 1 } else { 0 }
+        match self {
+            Self::Turbo2 => 2, // all bits to PolarQuant (no QJL at 2-bit)
+            Self::Turbo3 | Self::Turbo4 => self.bits() - 1,
+            Self::None => 0,
+        }
+    }
+
+    /// Whether this mode uses the QJL residual (two-stage pipeline).
+    /// Turbo2 does not — at 2 bits, all bits go to PolarQuant.
+    pub fn has_qjl(self) -> bool {
+        matches!(self, Self::Turbo3 | Self::Turbo4)
     }
 
     /// Number of stage-1 codebook centroids: 2^stage1_bits.
@@ -289,10 +303,17 @@ impl TurboQuantConfig {
         let centroids: Vec<f32> = base_centroids.iter().map(|&c| c * scale).collect();
 
         // Storage layout per head per position:
-        //   [2 bf16 norm] [2 bf16 gamma] [ceil(hd * stage1_bits / 8) codes] [ceil(hd / 8) sign bits]
-        let stage1_code_bytes = (head_dim * stage1_bits as usize + 7) / 8;
-        let sign_bytes = (head_dim + 7) / 8;
-        let bytes_per_head_pos = 2 + 2 + stage1_code_bytes + sign_bytes;
+        //   With QJL:    [2 bf16 norm] [2 bf16 gamma] [stage1 codes] [sign bits]
+        //   Without QJL: [2 bf16 norm] [codes]  (turbo2: all bits to PolarQuant)
+        let is_plus = mode.has_qjl();
+        let bytes_per_head_pos = if is_plus {
+            let stage1_code_bytes = (head_dim * stage1_bits as usize + 7) / 8;
+            let sign_bytes = (head_dim + 7) / 8;
+            2 + 2 + stage1_code_bytes + sign_bytes
+        } else {
+            let code_bytes = (head_dim * bits as usize + 7) / 8;
+            2 + code_bytes
+        };
 
         Self {
             mode,
@@ -302,7 +323,7 @@ impl TurboQuantConfig {
             centroids,
             bytes_per_head_pos,
             head_dim,
-            is_plus: true, // all quantized modes use the QJL pipeline
+            is_plus,
         }
     }
 }
@@ -310,16 +331,22 @@ impl TurboQuantConfig {
 /// Bytes per KV position across all KV heads for one pool (K or V).
 ///
 /// For BF16: num_kv_heads × head_dim × 2.
-/// For TurboQuant: num_kv_heads × (2 norm + 2 gamma + stage1_codes + sign_bits).
+/// For TurboQuant with QJL: num_kv_heads × (2 norm + 2 gamma + stage1_codes + sign_bits).
+/// For TurboQuant without QJL (turbo2): num_kv_heads × (2 norm + codes).
 pub(crate) fn bytes_per_kv_position(
     head_dim: usize,
     num_kv_heads: usize,
     mode: KvQuantMode,
 ) -> usize {
     if mode.is_quantized() {
-        let stage1_code_bytes = (head_dim * mode.stage1_bits() as usize + 7) / 8;
-        let sign_bytes = (head_dim + 7) / 8;
-        num_kv_heads * (2 + 2 + stage1_code_bytes + sign_bytes) // norm + gamma + codes + signs
+        if mode.has_qjl() {
+            let stage1_code_bytes = (head_dim * mode.stage1_bits() as usize + 7) / 8;
+            let sign_bytes = (head_dim + 7) / 8;
+            num_kv_heads * (2 + 2 + stage1_code_bytes + sign_bytes)
+        } else {
+            let code_bytes = (head_dim * mode.bits() as usize + 7) / 8;
+            num_kv_heads * (2 + code_bytes)
+        }
     } else {
         num_kv_heads * head_dim * 2 // BF16
     }
@@ -717,10 +744,8 @@ mod tests {
 
     #[test]
     fn test_bytes_per_kv_position_turbo2() {
-        // 2-bit (1-bit stage1 + 1-bit QJL):
-        // 8 heads × (2 + 2 + ceil(128*1/8) + ceil(128/8))
-        // = 8 × (2 + 2 + 16 + 16) = 8 × 36 = 288
-        assert_eq!(bytes_per_kv_position(128, 8, KvQuantMode::Turbo2), 288);
+        // 2-bit PolarQuant (no QJL): 8 heads × (2 + 128*2/8) = 8 × 34 = 272
+        assert_eq!(bytes_per_kv_position(128, 8, KvQuantMode::Turbo2), 272);
     }
 
     #[test]
@@ -787,10 +812,12 @@ mod tests {
     /// CPU reference: compute Q·K score via the two-stage TurboQuant pipeline.
     ///
     /// Stage 1: PolarQuant — rotate + nearest centroid at (bits-1) bits.
-    /// Stage 2: QJL — 1-bit sign of the residual + residual norm gamma.
+    /// Stage 2 (if has_qjl): QJL — 1-bit sign of the residual + gamma norm.
     /// Dequant: centroid[code] + gamma * sqrt(π/2) / sqrt(hd) * sign.
+    /// Without QJL (turbo2): dequant = centroid[code].
     fn cpu_turbo_score(
         q: &[f32], k: &[f32], pi: &[f32], centroids: &[f32], hd: usize,
+        has_qjl: bool,
     ) -> f32 {
         // Rotate Q.
         let mut q_rot = vec![0.0f32; hd];
@@ -800,7 +827,7 @@ mod tests {
             }
         }
 
-        // Quantize K: rotate + stage-1 centroid + QJL residual.
+        // Quantize K: rotate + stage-1 centroid.
         let k_norm: f32 = k.iter().map(|v| v * v).sum::<f32>().sqrt();
         let inv_norm = 1.0 / k_norm.max(1e-6);
 
@@ -821,22 +848,30 @@ mod tests {
             codes.push(best);
         }
 
-        // QJL residual: sign + gamma.
-        let mut residuals = vec![0.0f32; hd];
-        for j in 0..hd {
-            residuals[j] = rotated_k[j] - centroids[codes[j]];
-        }
-        let gamma: f32 = residuals.iter().map(|r| r * r).sum::<f32>().sqrt();
-        let qjl_scale = (std::f32::consts::PI / 2.0).sqrt() / (hd as f32).sqrt();
+        if has_qjl {
+            // QJL residual: sign + gamma.
+            let mut residuals = vec![0.0f32; hd];
+            for j in 0..hd {
+                residuals[j] = rotated_k[j] - centroids[codes[j]];
+            }
+            let gamma: f32 = residuals.iter().map(|r| r * r).sum::<f32>().sqrt();
+            let qjl_scale = (std::f32::consts::PI / 2.0).sqrt() / (hd as f32).sqrt();
 
-        // Score with QJL correction.
-        let mut score = 0.0f32;
-        for j in 0..hd {
-            let sign = if residuals[j] >= 0.0 { 1.0f32 } else { -1.0f32 };
-            let dequant = centroids[codes[j]] + gamma * qjl_scale * sign;
-            score += q_rot[j] * dequant * k_norm;
+            let mut score = 0.0f32;
+            for j in 0..hd {
+                let sign = if residuals[j] >= 0.0 { 1.0f32 } else { -1.0f32 };
+                let dequant = centroids[codes[j]] + gamma * qjl_scale * sign;
+                score += q_rot[j] * dequant * k_norm;
+            }
+            score
+        } else {
+            // No QJL: simple centroid dequant.
+            let mut score = 0.0f32;
+            for j in 0..hd {
+                score += q_rot[j] * centroids[codes[j]] * k_norm;
+            }
+            score
         }
-        score
     }
 
     #[test]
@@ -855,7 +890,7 @@ mod tests {
         let direct: f32 = q.iter().zip(k.iter()).map(|(a, b)| a * b).sum();
 
         // TurboQuant score (3-bit PolarQuant + 1-bit QJL sign)
-        let turbo = cpu_turbo_score(&q, &k, &pi, &config.centroids, hd);
+        let turbo = cpu_turbo_score(&q, &k, &pi, &config.centroids, hd, config.is_plus);
 
         // Should be close (quantization introduces small error)
         let rel_error = ((turbo - direct) / direct.abs().max(1e-6)).abs();
@@ -969,10 +1004,11 @@ mod tests {
 
     #[test]
     fn test_kv_quant_mode_stage1_bits() {
-        // All quantized modes use (bits-1) for stage-1 PolarQuant.
+        // Turbo3/4: (bits-1) for stage-1 PolarQuant + 1-bit QJL.
+        // Turbo2: all bits to PolarQuant (no QJL split).
         assert_eq!(KvQuantMode::Turbo4.stage1_bits(), 3);
         assert_eq!(KvQuantMode::Turbo3.stage1_bits(), 2);
-        assert_eq!(KvQuantMode::Turbo2.stage1_bits(), 1);
+        assert_eq!(KvQuantMode::Turbo2.stage1_bits(), 2); // no QJL
         assert_eq!(KvQuantMode::None.stage1_bits(), 0);
     }
 
@@ -981,8 +1017,16 @@ mod tests {
         // Centroids = 2^stage1_bits.
         assert_eq!(KvQuantMode::Turbo4.num_centroids(), 8);  // 2^3
         assert_eq!(KvQuantMode::Turbo3.num_centroids(), 4);  // 2^2
-        assert_eq!(KvQuantMode::Turbo2.num_centroids(), 2);  // 2^1
+        assert_eq!(KvQuantMode::Turbo2.num_centroids(), 4);  // 2^2, no QJL
         assert_eq!(KvQuantMode::None.num_centroids(), 0);
+    }
+
+    #[test]
+    fn test_kv_quant_mode_has_qjl() {
+        assert!(KvQuantMode::Turbo4.has_qjl());
+        assert!(KvQuantMode::Turbo3.has_qjl());
+        assert!(!KvQuantMode::Turbo2.has_qjl());
+        assert!(!KvQuantMode::None.has_qjl());
     }
 
     #[test]
@@ -1000,6 +1044,12 @@ mod tests {
         assert_eq!(cfg4.centroids.len(), 8);
         assert_eq!(cfg4.stage1_bits, 3);
         assert!(cfg4.is_plus);
+
+        // Turbo2 uses 2-bit PolarQuant (4 centroids), no QJL.
+        let cfg2 = TurboQuantConfig::new(KvQuantMode::Turbo2, 128);
+        assert_eq!(cfg2.centroids.len(), 4);
+        assert_eq!(cfg2.stage1_bits, 2);
+        assert!(!cfg2.is_plus);
     }
 
     #[test]
@@ -1016,10 +1066,10 @@ mod tests {
 
         for mode in [KvQuantMode::Turbo2, KvQuantMode::Turbo3, KvQuantMode::Turbo4] {
             let config = TurboQuantConfig::new(mode, hd);
-            let turbo = cpu_turbo_score(&q, &k, &pi, &config.centroids, hd);
+            let turbo = cpu_turbo_score(&q, &k, &pi, &config.centroids, hd, config.is_plus);
             let rel_error = ((turbo - direct) / direct.abs().max(1e-6)).abs();
-            // Turbo2 (1-bit stage-1) is coarser; turbo3/4 are tighter.
-            let tolerance = if mode == KvQuantMode::Turbo2 { 0.50 } else { 0.30 };
+            // Turbo2 has higher error at small head_dim (only 4 centroids, no QJL).
+            let tolerance = if mode == KvQuantMode::Turbo2 { 0.40 } else { 0.30 };
             assert!(
                 rel_error < tolerance,
                 "{:?} score error too large: {rel_error} (direct={direct}, turbo={turbo})",
