@@ -33,6 +33,7 @@ struct TurboQuantizeParams {
     bytes_per_head_pos: u32,
     block_size: u32,
     num_centroids: u32,
+    is_plus: u32,
 }
 unsafe impl DeviceRepr for TurboQuantizeParams {}
 
@@ -46,6 +47,7 @@ struct TurboQuantizeBatchParams {
     bytes_per_head_pos: u32,
     block_size: u32,
     num_centroids: u32,
+    is_plus: u32,
 }
 unsafe impl DeviceRepr for TurboQuantizeBatchParams {}
 
@@ -71,6 +73,7 @@ struct TurboPagedAttentionParams {
     window_size: u32,
     attn_scale: f32,
     has_sinks: u32,
+    is_plus: u32,
 }
 unsafe impl DeviceRepr for TurboPagedAttentionParams {}
 
@@ -89,6 +92,7 @@ struct TurboPagedAttentionVOnlyParams {
     window_size: u32,
     attn_scale: f32,
     has_sinks: u32,
+    is_plus: u32,
 }
 unsafe impl DeviceRepr for TurboPagedAttentionVOnlyParams {}
 
@@ -105,6 +109,7 @@ impl GpuTurboQuant for CudaBackend {
         head_dim: u32,
         bits: u32,
         bytes_per_head_pos: u32,
+        is_plus: bool,
     ) {
         let params = TurboQuantizeParams {
             pos,
@@ -114,6 +119,7 @@ impl GpuTurboQuant for CudaBackend {
             bytes_per_head_pos,
             block_size: crate::model::kv_cache::BLOCK_SIZE as u32,
             num_centroids: centroids.shape[0] as u32,
+            is_plus: is_plus as u32,
         };
         let cfg = CudaBackend::cfg_blocks(num_kv_heads, head_dim);
         unsafe {
@@ -143,6 +149,7 @@ impl GpuTurboQuant for CudaBackend {
         head_dim: u32,
         bits: u32,
         bytes_per_head_pos: u32,
+        is_plus: bool,
     ) {
         let params = TurboQuantizeBatchParams {
             batch_size,
@@ -152,6 +159,7 @@ impl GpuTurboQuant for CudaBackend {
             bytes_per_head_pos,
             block_size: crate::model::kv_cache::BLOCK_SIZE as u32,
             num_centroids: centroids.shape[0] as u32,
+            is_plus: is_plus as u32,
         };
         let num_blocks = batch_size * num_kv_heads;
         let cfg = CudaBackend::cfg_blocks(num_blocks, head_dim);
@@ -213,6 +221,7 @@ impl GpuTurboQuant for CudaBackend {
         window_size: u32,
         attn_scale: f32,
         sinks: Option<&CudaTensor>,
+        is_plus: bool,
     ) {
         let params = TurboPagedAttentionParams {
             seq_len,
@@ -226,6 +235,7 @@ impl GpuTurboQuant for CudaBackend {
             window_size,
             attn_scale,
             has_sinks: if sinks.is_some() { 1 } else { 0 },
+            is_plus: is_plus as u32,
         };
         let sinks_buf = sinks.map(|s| &s.buf).unwrap_or(&out.buf);
         let cfg = CudaBackend::cfg_blocks(num_heads, 256);
@@ -265,6 +275,7 @@ impl GpuTurboQuant for CudaBackend {
         window_size: u32,
         attn_scale: f32,
         sinks: Option<&CudaTensor>,
+        is_plus: bool,
     ) {
         let params = TurboPagedAttentionVOnlyParams {
             seq_len,
@@ -279,6 +290,7 @@ impl GpuTurboQuant for CudaBackend {
             window_size,
             attn_scale,
             has_sinks: if sinks.is_some() { 1 } else { 0 },
+            is_plus: is_plus as u32,
         };
         let sinks_buf = sinks.map(|s| &s.buf).unwrap_or(&out.buf);
         let cfg = CudaBackend::cfg_blocks(num_heads, 256);

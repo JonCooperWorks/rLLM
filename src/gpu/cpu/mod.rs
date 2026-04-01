@@ -2079,7 +2079,7 @@ impl GpuTurboQuant for CpuBackend {
     fn turbo_quantize_to_paged(
         &self, _src: &CpuTensor, _pool: &CpuTensor, _block_table: &CpuTensor,
         _pi: &CpuTensor, _centroids: &CpuTensor, _pos: u32, _num_kv_heads: u32,
-        _head_dim: u32, _bits: u32, _bytes_per_head_pos: u32,
+        _head_dim: u32, _bits: u32, _bytes_per_head_pos: u32, _is_plus: bool,
     ) {
         todo!("TurboQuant not yet implemented for CPU backend")
     }
@@ -2088,7 +2088,7 @@ impl GpuTurboQuant for CpuBackend {
         &self, _src: &CpuTensor, _pool: &CpuTensor, _block_table: &CpuTensor,
         _positions: &CpuTensor, _pi: &CpuTensor, _centroids: &CpuTensor,
         _batch_size: u32, _num_kv_heads: u32, _head_dim: u32, _bits: u32,
-        _bytes_per_head_pos: u32,
+        _bytes_per_head_pos: u32, _is_plus: bool,
     ) {
         todo!("TurboQuant not yet implemented for CPU backend")
     }
@@ -2105,7 +2105,7 @@ impl GpuTurboQuant for CpuBackend {
         _block_table: &CpuTensor, _pi_t: &CpuTensor, _centroids: &CpuTensor,
         _out: &CpuTensor, _seq_len: u32, _num_heads: u32, _num_kv_heads: u32,
         _head_dim: u32, _bits: u32, _bytes_per_head_pos: u32, _window_size: u32,
-        _attn_scale: f32, _sinks: Option<&CpuTensor>,
+        _attn_scale: f32, _sinks: Option<&CpuTensor>, _is_plus: bool,
     ) {
         todo!("TurboQuant not yet implemented for CPU backend")
     }

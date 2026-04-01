@@ -301,6 +301,11 @@ pub(crate) fn paged_kv_and_attention_maybe_quantized<B: GpuAttention + GpuTurboQ
     turbo: Option<&crate::model::turboquant::TurboContext<B>>,
 ) {
     if let Some(tc) = turbo {
+        // Select config/centroids for this layer.  Boundary layers may use
+        // a higher-precision mode (TurboQuant+ boundary protection).
+        let num_layers = pool.k_pool.len();
+        let (cfg, centroids) = tc.config_for_layer(layer_idx, num_layers);
+
         if tc.kv_pair.is_asymmetric() {
             // Asymmetric mode: K=BF16, V=TurboQuant.
             // Write K as BF16 to paged cache.
@@ -318,12 +323,13 @@ pub(crate) fn paged_kv_and_attention_maybe_quantized<B: GpuAttention + GpuTurboQ
                 &pool.v_pool[layer_idx],
                 &seq_state.block_table_gpu,
                 &tc.pi,
-                &tc.centroids,
+                centroids,
                 pos,
                 num_kv_heads,
                 head_dim,
-                tc.config.bits,
-                tc.config.bytes_per_head_pos as u32,
+                cfg.stage1_bits,
+                cfg.bytes_per_head_pos as u32,
+                cfg.is_plus,
             );
             // V-only attention: BF16 K scoring + turbo V accumulation.
             backend.turbo_paged_attention_v_only(
@@ -332,18 +338,19 @@ pub(crate) fn paged_kv_and_attention_maybe_quantized<B: GpuAttention + GpuTurboQ
                 &pool.v_pool[layer_idx],
                 &seq_state.block_table_gpu,
                 &tc.pi_t,
-                &tc.centroids,
+                centroids,
                 attn_out,
                 pos + 1,
                 num_heads,
                 num_kv_heads,
                 head_dim,
-                tc.config.bits,
+                cfg.stage1_bits,
                 (num_kv_heads * head_dim) as u32, // kv_dim for BF16 K addressing
-                tc.config.bytes_per_head_pos as u32,
+                cfg.bytes_per_head_pos as u32,
                 window_size,
                 attn_scale,
                 sinks,
+                cfg.is_plus,
             );
         } else {
             // Symmetric mode: both K and V are turbo-quantized.
@@ -356,18 +363,19 @@ pub(crate) fn paged_kv_and_attention_maybe_quantized<B: GpuAttention + GpuTurboQ
                 &seq_state.block_table_gpu,
                 &tc.pi,
                 &tc.pi_t,
-                &tc.centroids,
+                centroids,
                 &tc.q_rot_buf,
                 attn_out,
                 pos,
                 num_heads,
                 num_kv_heads,
                 head_dim,
-                tc.config.bits,
-                tc.config.bytes_per_head_pos as u32,
+                cfg.stage1_bits,
+                cfg.bytes_per_head_pos as u32,
                 window_size,
                 attn_scale,
                 sinks,
+                cfg.is_plus,
             );
         }
     } else {
@@ -1230,6 +1238,10 @@ pub(crate) fn paged_kv_and_prefill_attention_maybe_quantized<
     turbo: Option<&crate::model::turboquant::TurboContext<B>>,
 ) {
     if let Some(tc) = turbo {
+        // Select config/centroids for this layer (boundary protection).
+        let num_layers = pool.k_pool.len();
+        let (cfg, centroids) = tc.config_for_layer(layer_idx, num_layers);
+
         if tc.kv_pair.is_asymmetric() {
             // Asymmetric: K=BF16 copy, V=TurboQuant.
             backend.copy_to_paged_kv_cache_batch(
@@ -1247,12 +1259,13 @@ pub(crate) fn paged_kv_and_prefill_attention_maybe_quantized<
                 &seq_state.block_table_gpu,
                 &bufs.positions,
                 &tc.pi,
-                &tc.centroids,
+                centroids,
                 bs,
                 num_kv_heads,
                 head_dim,
-                tc.config.bits,
-                tc.config.bytes_per_head_pos as u32,
+                cfg.stage1_bits,
+                cfg.bytes_per_head_pos as u32,
+                cfg.is_plus,
             );
         } else {
             // Symmetric TurboQuant: rotate + quantize both K and V.
@@ -1262,12 +1275,13 @@ pub(crate) fn paged_kv_and_prefill_attention_maybe_quantized<
                 &seq_state.block_table_gpu,
                 &bufs.positions,
                 &tc.pi,
-                &tc.centroids,
+                centroids,
                 bs,
                 num_kv_heads,
                 head_dim,
-                tc.config.bits,
-                tc.config.bytes_per_head_pos as u32,
+                cfg.stage1_bits,
+                cfg.bytes_per_head_pos as u32,
+                cfg.is_plus,
             );
             backend.turbo_quantize_to_paged_batch(
                 &bufs.v_buf,
@@ -1275,12 +1289,13 @@ pub(crate) fn paged_kv_and_prefill_attention_maybe_quantized<
                 &seq_state.block_table_gpu,
                 &bufs.positions,
                 &tc.pi,
-                &tc.centroids,
+                centroids,
                 bs,
                 num_kv_heads,
                 head_dim,
-                tc.config.bits,
-                tc.config.bytes_per_head_pos as u32,
+                cfg.stage1_bits,
+                cfg.bytes_per_head_pos as u32,
+                cfg.is_plus,
             );
         }
     } else {

@@ -857,8 +857,9 @@ pub(crate) fn forward_prefill_paged<
                         bs,
                         d.num_kv_heads,
                         d.head_dim,
-                        tc.config.bits,
+                        tc.config.stage1_bits,
                         tc.config.bytes_per_head_pos as u32,
+                        tc.config.is_plus,
                     );
                 } else {
                     // Symmetric TurboQuant: rotate + quantize both K and V.
@@ -872,8 +873,9 @@ pub(crate) fn forward_prefill_paged<
                         bs,
                         d.num_kv_heads,
                         d.head_dim,
-                        tc.config.bits,
+                        tc.config.stage1_bits,
                         tc.config.bytes_per_head_pos as u32,
+                        tc.config.is_plus,
                     );
                     m.backend.turbo_quantize_to_paged_batch(
                         &bufs.v_buf,
@@ -885,8 +887,9 @@ pub(crate) fn forward_prefill_paged<
                         bs,
                         d.num_kv_heads,
                         d.head_dim,
-                        tc.config.bits,
+                        tc.config.stage1_bits,
                         tc.config.bytes_per_head_pos as u32,
+                        tc.config.is_plus,
                     );
                 }
             } else {

@@ -119,12 +119,12 @@ pub(crate) struct ModelArgs {
     #[arg(long, requires = "chat")]
     pub image: Option<PathBuf>,
 
-    /// KV cache quantization mode.  TurboQuant applies a random orthogonal
-    /// rotation followed by optimal scalar quantization (Max-Lloyd) per
-    /// coordinate, achieving near-optimal distortion rates.
-    /// "turbo4" (default): 4-bit, ~4x compression, quality-neutral.
-    /// "turbo3": 3-bit, ~5x compression, near-lossless.
-    /// "turbo2": 2-bit, ~7.5x compression, marginal quality loss.
+    /// KV cache quantization mode.  TurboQuant uses a two-stage pipeline:
+    /// PolarQuant (random orthogonal rotation + Max-Lloyd scalar quantization)
+    /// followed by QJL residual quantization (1-bit sign of the residual).
+    /// "turbo4" (default): 4-bit (3-bit PolarQuant + 1-bit QJL), ~3.8x compression.
+    /// "turbo3": 3-bit (2-bit PolarQuant + 1-bit QJL), ~4.9x compression.
+    /// "turbo2": 2-bit (1-bit PolarQuant + 1-bit QJL), ~7.1x compression.
     /// "none": BF16 (no quantization, for debugging/benchmarking).
     #[arg(long, default_value = "turbo4")]
     pub kv_quant: String,

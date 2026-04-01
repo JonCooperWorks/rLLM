@@ -91,20 +91,22 @@ struct TurboQuantizeParams {
     unsigned int pos;
     unsigned int num_kv_heads;
     unsigned int head_dim;
-    unsigned int bits;
+    unsigned int bits;           // stage-1 bits
     unsigned int bytes_per_head_pos;
     unsigned int block_size;
     unsigned int num_centroids;
+    unsigned int is_plus;
 };
 
 struct TurboQuantizeBatchParams {
     unsigned int batch_size;
     unsigned int num_kv_heads;
     unsigned int head_dim;
-    unsigned int bits;
+    unsigned int bits;           // stage-1 bits
     unsigned int bytes_per_head_pos;
     unsigned int block_size;
     unsigned int num_centroids;
+    unsigned int is_plus;
 };
 
 struct TurboRotateQParams {
@@ -117,13 +119,14 @@ struct TurboPagedAttentionParams {
     unsigned int num_heads;
     unsigned int num_kv_heads;
     unsigned int head_dim;
-    unsigned int bits;
+    unsigned int bits;           // stage-1 bits
     unsigned int bytes_per_head_pos;
     unsigned int block_size;
     unsigned int num_centroids;
     unsigned int window_size;
     float attn_scale;
     unsigned int has_sinks;
+    unsigned int is_plus;
 };
 
 // ===========================================================================
@@ -213,7 +216,33 @@ extern "C" __global__ void turbo_quantize_paged(
     shared_codes[tid] = (tid < hd) ? best_idx : 0;
     __syncthreads();
 
-    pack_codes_shared(shared_codes, head_base + 2, tid, hd, params.bits);
+    if (params.is_plus) {
+        // TurboQuant+ QJL residual.
+        unsigned int stage1_code_bytes = (hd * params.bits + 7) / 8;
+        float residual = (tid < hd) ? (y - centroids[best_idx]) : 0.0f;
+        unsigned int sign_bit = (residual >= 0.0f) ? 1u : 0u;
+
+        // Parallel reduction for gamma = ||residual||₂.
+        float rsq = residual * residual;
+        rsq = warp_sum(rsq);
+        __shared__ float gamma_partials[8];
+        if (lane_id == 0) gamma_partials[warp_id] = rsq;
+        __syncthreads();
+        if (tid == 0) {
+            float gamma_sq = 0.0f;
+            for (unsigned int i = 0; i < (blockDim.x + 31) / 32; i++) gamma_sq += gamma_partials[i];
+            *((__nv_bfloat16*)(head_base + 2)) = __float2bfloat16(sqrtf(fmaxf(gamma_sq, 0.0f)));
+        }
+
+        pack_codes_shared(shared_codes, head_base + 4, tid, hd, params.bits);
+        __syncthreads();
+
+        shared_codes[tid] = (tid < hd) ? sign_bit : 0u;
+        __syncthreads();
+        pack_codes_shared(shared_codes, head_base + 4 + stage1_code_bytes, tid, hd, 1);
+    } else {
+        pack_codes_shared(shared_codes, head_base + 2, tid, hd, params.bits);
+    }
 }
 
 // ===========================================================================
@@ -303,7 +332,30 @@ extern "C" __global__ void turbo_quantize_paged_batch(
     shared_codes[tid] = (tid < hd) ? best_idx : 0;
     __syncthreads();
 
-    pack_codes_shared(shared_codes, head_base + 2, tid, hd, params.bits);
+    if (params.is_plus) {
+        unsigned int stage1_code_bytes = (hd * params.bits + 7) / 8;
+        float residual = (tid < hd) ? (y - centroids[best_idx]) : 0.0f;
+        unsigned int sign_bit = (residual >= 0.0f) ? 1u : 0u;
+
+        float rsq = residual * residual;
+        rsq = warp_sum(rsq);
+        __shared__ float gamma_partials[8];
+        if (lane_id == 0) gamma_partials[warp_id] = rsq;
+        __syncthreads();
+        if (tid == 0) {
+            float gamma_sq = 0.0f;
+            for (unsigned int i = 0; i < (blockDim.x + 31) / 32; i++) gamma_sq += gamma_partials[i];
+            *((__nv_bfloat16*)(head_base + 2)) = __float2bfloat16(sqrtf(fmaxf(gamma_sq, 0.0f)));
+        }
+
+        pack_codes_shared(shared_codes, head_base + 4, tid, hd, params.bits);
+        __syncthreads();
+        shared_codes[tid] = (tid < hd) ? sign_bit : 0u;
+        __syncthreads();
+        pack_codes_shared(shared_codes, head_base + 4 + stage1_code_bytes, tid, hd, 1);
+    } else {
+        pack_codes_shared(shared_codes, head_base + 2, tid, hd, params.bits);
+    }
 }
 
 // ===========================================================================
@@ -401,6 +453,8 @@ extern "C" __global__ void turbo_paged_attention(
 
     unsigned int bytes_per_pos = num_kv_heads * bytes_per_head_pos;
     float scale = (params.attn_scale != 0.0f) ? params.attn_scale : rsqrtf((float)hd);
+    float qjl_scale = 1.2533141f / sqrtf((float)hd);
+    unsigned int code_bytes = (hd * bits + 7) / 8;
 
     // Block table caching.
     unsigned int prev_logical_block = ~0u;
@@ -424,14 +478,23 @@ extern "C" __global__ void turbo_paged_attention(
 
         const unsigned char* k_pos_base = k_pool + pool_pos * bytes_per_pos + kv_head * bytes_per_head_pos;
 
+        // Read K norm + gamma, precompute correction scalar.
         float k_norm = __bfloat162float(*(const __nv_bfloat16*)k_pos_base);
-        const unsigned char* k_codes = k_pos_base + 2;
+        float k_correction = __bfloat162float(*(const __nv_bfloat16*)(k_pos_base + 2)) * qjl_scale * k_norm;
+        const unsigned char* k_codes = k_pos_base + 4;
+        const unsigned char* k_signs = k_pos_base + 4 + code_bytes;
 
         // Score = Q_rot · dequant(K)
+        // Batch-read sign bits as uint32 (32 signs per read).
         float score = 0.0f;
-        for (unsigned int j = 0; j < hd; j++) {
-            unsigned int code = extract_code(k_codes, j, bits);
-            score += q_shared[j] * shared_centroids[code] * k_norm;
+        for (unsigned int j = 0; j < hd; j += 32) {
+            unsigned int sign_word = *(const unsigned int*)(k_signs + (j >> 3));
+            unsigned int end = min(j + 32, hd);
+            for (unsigned int d = j; d < end; d++) {
+                unsigned int code = extract_code(k_codes, d, bits);
+                float sign_val = ((sign_word >> (d - j)) & 1u) ? 1.0f : -1.0f;
+                score += q_shared[d] * (shared_centroids[code] * k_norm + k_correction * sign_val);
+            }
         }
         score *= scale;
 
@@ -447,14 +510,25 @@ extern "C" __global__ void turbo_paged_attention(
 
         float weight = expf(score - local_max);
 
-        // Accumulate weighted V in rotated space.
-        const unsigned char* v_pos_base = v_pool + pool_pos * bytes_per_pos + kv_head * bytes_per_head_pos;
-        float v_norm = __bfloat162float(*(const __nv_bfloat16*)v_pos_base);
-        const unsigned char* v_codes = v_pos_base + 2;
+        // Accumulate weighted V — sparse skip when weight is negligible.
+        if (weight > 1e-6f) {
+            const unsigned char* v_pos_base = v_pool + pool_pos * bytes_per_pos + kv_head * bytes_per_head_pos;
+            float v_norm = __bfloat162float(*(const __nv_bfloat16*)v_pos_base);
+            float v_correction = __bfloat162float(*(const __nv_bfloat16*)(v_pos_base + 2)) * qjl_scale;
+            const unsigned char* v_codes = v_pos_base + 4;
+            const unsigned char* v_signs = v_pos_base + 4 + code_bytes;
 
-        for (unsigned int d = 0; d < hd; d++) {
-            unsigned int v_code = extract_code(v_codes, d, bits);
-            v_acc[d] += weight * shared_centroids[v_code] * v_norm;
+            float wv_norm = weight * v_norm;
+            float wv_correction = weight * v_correction;
+            for (unsigned int j = 0; j < hd; j += 32) {
+                unsigned int sign_word = *(const unsigned int*)(v_signs + (j >> 3));
+                unsigned int end = min(j + 32, hd);
+                for (unsigned int d = j; d < end; d++) {
+                    unsigned int v_code = extract_code(v_codes, d, bits);
+                    float sign_val = ((sign_word >> (d - j)) & 1u) ? 1.0f : -1.0f;
+                    v_acc[d] += shared_centroids[v_code] * wv_norm + wv_correction * sign_val;
+                }
+            }
         }
     }
 
@@ -567,7 +641,7 @@ struct TurboPagedAttentionVOnlyParams {
     unsigned int num_heads;
     unsigned int num_kv_heads;
     unsigned int head_dim;
-    unsigned int bits;              // V quantization bits
+    unsigned int bits;              // V stage-1 quantization bits
     unsigned int kv_dim;            // num_kv_heads * head_dim (for BF16 K addressing)
     unsigned int v_bytes_per_head_pos;  // bytes per V head per position (quantized)
     unsigned int block_size;
@@ -575,6 +649,7 @@ struct TurboPagedAttentionVOnlyParams {
     unsigned int window_size;
     float attn_scale;
     unsigned int has_sinks;
+    unsigned int is_plus;
 };
 
 extern "C" __global__ void turbo_paged_attention_v_only(
@@ -627,8 +702,10 @@ extern "C" __global__ void turbo_paged_attention_v_only(
     // V pool addressing: bytes per position across all V KV heads.
     unsigned int v_bytes_per_pos = num_kv_heads * v_bytes_per_head_pos;
 
-    // Attention scale.
+    // Attention scale and QJL constants.
     float scale = (params.attn_scale != 0.0f) ? params.attn_scale : rsqrtf((float)hd);
+    float qjl_scale = 1.2533141f / sqrtf((float)hd);
+    unsigned int v_code_bytes = (hd * bits + 7) / 8;
 
     // Block table caching.
     unsigned int prev_logical_block = ~0u;
@@ -672,13 +749,25 @@ extern "C" __global__ void turbo_paged_attention_v_only(
         float weight = expf(score - local_max);
 
         // --- V accumulation: turbo-quantized dequant in rotated space. ---
-        const unsigned char* v_pos_base = v_pool + pool_pos * v_bytes_per_pos + kv_head * v_bytes_per_head_pos;
-        float v_norm = __bfloat162float(*(const __nv_bfloat16*)v_pos_base);
-        const unsigned char* v_codes = v_pos_base + 2;
+        // Sparse V dequantization: skip when weight is negligible.
+        if (weight > 1e-6f) {
+            const unsigned char* v_pos_base = v_pool + pool_pos * v_bytes_per_pos + kv_head * v_bytes_per_head_pos;
+            float v_norm = __bfloat162float(*(const __nv_bfloat16*)v_pos_base);
+            float v_correction = __bfloat162float(*(const __nv_bfloat16*)(v_pos_base + 2)) * qjl_scale;
+            const unsigned char* v_codes = v_pos_base + 4;
+            const unsigned char* v_signs = v_pos_base + 4 + v_code_bytes;
 
-        for (unsigned int d = 0; d < hd; d++) {
-            unsigned int v_code = extract_code(v_codes, d, bits);
-            v_acc[d] += weight * shared_centroids[v_code] * v_norm;
+            float wv_norm = weight * v_norm;
+            float wv_correction = weight * v_correction;
+            for (unsigned int j = 0; j < hd; j += 32) {
+                unsigned int sign_word = *(const unsigned int*)(v_signs + (j >> 3));
+                unsigned int end = min(j + 32, hd);
+                for (unsigned int d = j; d < end; d++) {
+                    unsigned int v_code = extract_code(v_codes, d, bits);
+                    float sign_val = ((sign_word >> (d - j)) & 1u) ? 1.0f : -1.0f;
+                    v_acc[d] += shared_centroids[v_code] * wv_norm + wv_correction * sign_val;
+                }
+            }
         }
     }
 

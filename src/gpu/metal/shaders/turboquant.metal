@@ -63,20 +63,22 @@ struct TurboQuantizeParams {
     uint pos;
     uint num_kv_heads;
     uint head_dim;
-    uint bits;
+    uint bits;           // stage-1 bits (centroid codebook)
     uint bytes_per_head_pos;
     uint block_size;
     uint num_centroids;
+    uint is_plus;        // 1 = QJL residual (TurboQuant+)
 };
 
 struct TurboQuantizeBatchParams {
     uint batch_size;
     uint num_kv_heads;
     uint head_dim;
-    uint bits;
+    uint bits;           // stage-1 bits
     uint bytes_per_head_pos;
     uint block_size;
     uint num_centroids;
+    uint is_plus;
 };
 
 struct TurboRotateQParams {
@@ -89,13 +91,14 @@ struct TurboPagedAttentionParams {
     uint num_heads;
     uint num_kv_heads;
     uint head_dim;
-    uint bits;
+    uint bits;           // stage-1 bits
     uint bytes_per_head_pos;
     uint block_size;
     uint num_centroids;
     uint window_size;
     float attn_scale;
     uint has_sinks;
+    uint is_plus;
 };
 
 // V-only variant: K is BF16, V is TurboQuant.
@@ -104,7 +107,7 @@ struct TurboPagedAttentionVOnlyParams {
     uint num_heads;
     uint num_kv_heads;
     uint head_dim;
-    uint bits;              // V quantization bits
+    uint bits;              // V stage-1 quantization bits
     uint kv_dim;            // num_kv_heads * head_dim (for BF16 K addressing)
     uint v_bytes_per_head_pos;  // bytes per V head per position (quantized)
     uint block_size;
@@ -112,6 +115,7 @@ struct TurboPagedAttentionVOnlyParams {
     uint window_size;
     float attn_scale;
     uint has_sinks;
+    uint is_plus;
 };
 
 // ---------------------------------------------------------------------------
@@ -285,7 +289,49 @@ kernel void turbo_quantize_paged(
     shared_codes[tid] = (tid < hd) ? best_idx : 0;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    pack_codes_shared(shared_codes, head_base + 2, tid, hd, params.bits);
+    if (params.is_plus) {
+        // TurboQuant+ QJL residual: compute residual, gamma, and sign bits.
+        // Layout: [2 bf16 norm] [2 bf16 gamma] [stage1 codes] [sign bits]
+        uint stage1_code_bytes = (hd * params.bits + 7) / 8;
+
+        // Compute residual and sign for this coordinate.
+        float residual = 0.0f;
+        uint sign_bit = 0;
+        if (tid < hd) {
+            residual = y - centroids[best_idx];
+            sign_bit = (residual >= 0.0f) ? 1u : 0u;
+        }
+
+        // Compute gamma = ||residual||₂ via parallel reduction.
+        float rsq = residual * residual;
+        rsq = simd_sum(rsq);
+        threadgroup float gamma_partials[8];
+        if (simd_lane == 0) gamma_partials[simd_group] = rsq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid == 0) {
+            float gamma_sq = 0.0f;
+            uint num_groups = (tg_size + 31) / 32;
+            for (uint i = 0; i < num_groups; i++) gamma_sq += gamma_partials[i];
+            // Write gamma as bf16 at offset 2 (after norm).
+            device bfloat* gamma_ptr = (device bfloat*)(head_base + 2);
+            *gamma_ptr = bfloat(sqrt(max(gamma_sq, 0.0f)));
+        }
+
+        // Pack stage-1 codes at offset 4 (after norm + gamma).
+        pack_codes_shared(shared_codes, head_base + 4, tid, hd, params.bits);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Pack sign bits at offset 4 + stage1_code_bytes.
+        // Reuse shared_codes for sign bits (1-bit per coordinate).
+        shared_codes[tid] = (tid < hd) ? sign_bit : 0u;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        pack_codes_shared(shared_codes, head_base + 4 + stage1_code_bytes, tid, hd, 1);
+    } else {
+        // Base TurboQuant: pack codes at offset 2 (after norm).
+        pack_codes_shared(shared_codes, head_base + 2, tid, hd, params.bits);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -380,7 +426,41 @@ kernel void turbo_quantize_paged_batch(
     shared_codes[tid] = (tid < hd) ? best_idx : 0;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    pack_codes_shared(shared_codes, head_base + 2, tid, hd, params.bits);
+    if (params.is_plus) {
+        // TurboQuant+ QJL residual.
+        uint stage1_code_bytes = (hd * params.bits + 7) / 8;
+
+        float residual = 0.0f;
+        uint sign_bit = 0;
+        if (tid < hd) {
+            residual = y - centroids[best_idx];
+            sign_bit = (residual >= 0.0f) ? 1u : 0u;
+        }
+
+        float rsq = residual * residual;
+        rsq = simd_sum(rsq);
+        threadgroup float gamma_partials[8];
+        if (simd_lane == 0) gamma_partials[simd_group] = rsq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid == 0) {
+            float gamma_sq = 0.0f;
+            uint num_groups = (tg_size + 31) / 32;
+            for (uint i = 0; i < num_groups; i++) gamma_sq += gamma_partials[i];
+            device bfloat* gamma_ptr = (device bfloat*)(head_base + 2);
+            *gamma_ptr = bfloat(sqrt(max(gamma_sq, 0.0f)));
+        }
+
+        pack_codes_shared(shared_codes, head_base + 4, tid, hd, params.bits);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        shared_codes[tid] = (tid < hd) ? sign_bit : 0u;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        pack_codes_shared(shared_codes, head_base + 4 + stage1_code_bytes, tid, hd, 1);
+    } else {
+        pack_codes_shared(shared_codes, head_base + 2, tid, hd, params.bits);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -511,8 +591,10 @@ kernel void turbo_paged_attention(
     // Compute bytes_per_pos for the full position (all kv heads).
     uint bytes_per_pos = num_kv_heads * bytes_per_head_pos;
 
-    // Attention scale (compute once outside the loop).
+    // Attention scale and QJL constants (computed once outside the loop).
     float scale = (params.attn_scale != 0.0f) ? params.attn_scale : rsqrt(float(hd));
+    float qjl_scale = 1.2533141f / sqrt(float(hd)); // sqrt(pi/2) / sqrt(hd)
+    uint code_bytes = (hd * bits + 7) / 8;           // stage-1 code bytes per head
 
     // Block table caching.
     uint prev_logical_block = ~0u;
@@ -536,18 +618,27 @@ kernel void turbo_paged_attention(
         uint pool_pos = physical_base + offset_in_block;
 
         // Address of this position's K data for our KV head.
+        // Layout: [2B norm] [2B gamma] [stage1 codes] [sign bits]
         device const uchar* k_pos_base = k_pool + pool_pos * bytes_per_pos + kv_head * bytes_per_head_pos;
 
-        // Read K norm (bf16 → f32).
+        // Read K norm + gamma, compute QJL correction scalar.
         float k_norm = float(*(device const bfloat*)k_pos_base);
-        device const uchar* k_codes = k_pos_base + 2;
+        float k_correction = float(*(device const bfloat*)(k_pos_base + 2)) * qjl_scale * k_norm;
+        device const uchar* k_codes = k_pos_base + 4;
+        device const uchar* k_signs = k_pos_base + 4 + code_bytes;
 
-        // Compute Q_rot · dequant(K) = sum_j q_rot[j] * (centroid[code_j] * k_norm)
+        // Score = Q_rot · dequant(K)
+        // dequant[j] = centroid[code_j] * k_norm + k_correction * sign_j
+        // Batch-read sign bits as uint32 (32 signs per read) for efficiency.
         float score = 0.0f;
-        for (uint j = 0; j < hd; j++) {
-            uint code = extract_code(k_codes, j, bits);
-            float k_val = shared_centroids[code] * k_norm;
-            score += q_shared[j] * k_val;
+        for (uint j = 0; j < hd; j += 32) {
+            uint sign_word = *(device const uint*)(k_signs + (j >> 3));
+            uint end = min(j + 32, hd);
+            for (uint d = j; d < end; d++) {
+                uint code = extract_code(k_codes, d, bits);
+                float sign_val = ((sign_word >> (d - j)) & 1u) ? 1.0f : -1.0f;
+                score += q_shared[d] * (shared_centroids[code] * k_norm + k_correction * sign_val);
+            }
         }
 
         score *= scale;
@@ -565,13 +656,25 @@ kernel void turbo_paged_attention(
         float weight = exp(score - local_max);
 
         // Accumulate weighted V in rotated space — ALL dimensions.
-        device const uchar* v_pos_base = v_pool + pool_pos * bytes_per_pos + kv_head * bytes_per_head_pos;
-        float v_norm = float(*(device const bfloat*)v_pos_base);
-        device const uchar* v_codes = v_pos_base + 2;
+        // Sparse V dequantization: skip V dequant when weight is negligible.
+        if (weight > 1e-6f) {
+            device const uchar* v_pos_base = v_pool + pool_pos * bytes_per_pos + kv_head * bytes_per_head_pos;
+            float v_norm = float(*(device const bfloat*)v_pos_base);
+            float v_correction = float(*(device const bfloat*)(v_pos_base + 2)) * qjl_scale;
+            device const uchar* v_codes = v_pos_base + 4;
+            device const uchar* v_signs = v_pos_base + 4 + code_bytes;
 
-        for (uint d = 0; d < hd; d++) {
-            uint v_code = extract_code(v_codes, d, bits);
-            v_acc[d] += weight * shared_centroids[v_code] * v_norm;
+            float wv_norm = weight * v_norm;
+            float wv_correction = weight * v_correction;
+            for (uint j = 0; j < hd; j += 32) {
+                uint sign_word = *(device const uint*)(v_signs + (j >> 3));
+                uint end = min(j + 32, hd);
+                for (uint d = j; d < end; d++) {
+                    uint v_code = extract_code(v_codes, d, bits);
+                    float sign_val = ((sign_word >> (d - j)) & 1u) ? 1.0f : -1.0f;
+                    v_acc[d] += shared_centroids[v_code] * wv_norm + wv_correction * sign_val;
+                }
+            }
         }
     }
 
@@ -752,8 +855,10 @@ kernel void turbo_paged_attention_v_only(
     // V pool addressing: bytes per position across all V KV heads.
     uint v_bytes_per_pos = num_kv_heads * v_bytes_per_head_pos;
 
-    // Attention scale.
+    // Attention scale and QJL constants.
     float scale = (params.attn_scale != 0.0f) ? params.attn_scale : rsqrt(float(hd));
+    float qjl_scale = 1.2533141f / sqrt(float(hd));
+    uint v_code_bytes = (hd * bits + 7) / 8;
 
     // Block table caching.
     uint prev_logical_block = ~0u;
@@ -797,13 +902,25 @@ kernel void turbo_paged_attention_v_only(
         float weight = exp(score - local_max);
 
         // --- V accumulation: turbo-quantized dequant in rotated space. ---
-        device const uchar* v_pos_base = v_pool + pool_pos * v_bytes_per_pos + kv_head * v_bytes_per_head_pos;
-        float v_norm = float(*(device const bfloat*)v_pos_base);
-        device const uchar* v_codes = v_pos_base + 2;
+        // Sparse V dequantization: skip when weight is negligible.
+        if (weight > 1e-6f) {
+            device const uchar* v_pos_base = v_pool + pool_pos * v_bytes_per_pos + kv_head * v_bytes_per_head_pos;
+            float v_norm = float(*(device const bfloat*)v_pos_base);
+            float v_correction = float(*(device const bfloat*)(v_pos_base + 2)) * qjl_scale;
+            device const uchar* v_codes = v_pos_base + 4;
+            device const uchar* v_signs = v_pos_base + 4 + v_code_bytes;
 
-        for (uint d = 0; d < hd; d++) {
-            uint v_code = extract_code(v_codes, d, bits);
-            v_acc[d] += weight * shared_centroids[v_code] * v_norm;
+            float wv_norm = weight * v_norm;
+            float wv_correction = weight * v_correction;
+            for (uint j = 0; j < hd; j += 32) {
+                uint sign_word = *(device const uint*)(v_signs + (j >> 3));
+                uint end = min(j + 32, hd);
+                for (uint d = j; d < end; d++) {
+                    uint v_code = extract_code(v_codes, d, bits);
+                    float sign_val = ((sign_word >> (d - j)) & 1u) ? 1.0f : -1.0f;
+                    v_acc[d] += shared_centroids[v_code] * wv_norm + wv_correction * sign_val;
+                }
+            }
         }
     }
 

@@ -214,7 +214,7 @@ impl<'a, B: GpuCore> Model<'a, B> {
     ) -> anyhow::Result<Self> {
         let kv_dim = config.num_key_value_heads * config.head_dim;
         let num_kv_layers = config.num_kv_layers();
-        let pool = KvPool::new(backend, num_blocks, kv_dim, num_kv_layers, turboquant::KvQuantPair::symmetric(turboquant::KvQuantMode::None), config.head_dim);
+        let pool = KvPool::new(backend, num_blocks, kv_dim, num_kv_layers, turboquant::KvQuantPair::symmetric(turboquant::KvQuantMode::None), config.head_dim, None);
         let seq_state = pool.new_sequence(backend);
 
         let kv_mode = KvMode::Paged { pool, seq_state };

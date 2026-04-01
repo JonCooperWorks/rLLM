@@ -47,7 +47,7 @@
 use std::collections::HashMap;
 
 use crate::gpu::{GpuCore, TensorDtype};
-use crate::model::turboquant::KvQuantPair;
+use crate::model::turboquant::{BoundaryConfig, KvQuantPair};
 #[cfg(test)]
 use crate::model::turboquant::KvQuantMode;
 
@@ -729,23 +729,31 @@ impl<B: GpuCore> KvPool<B> {
         num_layers: usize,
         kv_quant: KvQuantPair,
         head_dim: usize,
+        boundary: Option<BoundaryConfig>,
     ) -> Self {
+        use crate::model::turboquant::{bytes_per_kv_position, effective_kv_pair_for_layer};
+
         let total_positions = num_blocks * BLOCK_SIZE;
         let num_kv_heads = if head_dim > 0 { kv_dim / head_dim } else { 0 };
-        let k_bytes_per_pos = crate::model::turboquant::bytes_per_kv_position(
-            head_dim, num_kv_heads, kv_quant.k,
-        );
-        let v_bytes_per_pos = crate::model::turboquant::bytes_per_kv_position(
-            head_dim, num_kv_heads, kv_quant.v,
-        );
+
+        // Base (interior layer) bytes per position — used for reporting.
+        let k_bytes_per_pos = bytes_per_kv_position(head_dim, num_kv_heads, kv_quant.k);
+        let v_bytes_per_pos = bytes_per_kv_position(head_dim, num_kv_heads, kv_quant.v);
 
         let mut k_pool = Vec::with_capacity(num_layers);
         let mut v_pool = Vec::with_capacity(num_layers);
 
-        // Allocate K pool — quantized or BF16 depending on kv_quant.k.
-        for _ in 0..num_layers {
-            if kv_quant.k.is_quantized() {
-                let bf16_elems = (k_bytes_per_pos + 1) / 2;
+        // Allocate K and V pools per layer.  Boundary layers may use a different
+        // quantization mode (more bytes per position) than interior layers.
+        for layer_idx in 0..num_layers {
+            let layer_pair = effective_kv_pair_for_layer(
+                kv_quant, boundary.as_ref(), layer_idx, num_layers,
+            );
+
+            // K pool for this layer.
+            if layer_pair.k.is_quantized() {
+                let k_bpp = bytes_per_kv_position(head_dim, num_kv_heads, layer_pair.k);
+                let bf16_elems = (k_bpp + 1) / 2;
                 k_pool.push(backend.alloc_tensor(
                     &[total_positions, bf16_elems],
                     TensorDtype::BF16,
@@ -753,12 +761,11 @@ impl<B: GpuCore> KvPool<B> {
             } else {
                 k_pool.push(backend.alloc_tensor(&[total_positions, kv_dim], TensorDtype::BF16));
             }
-        }
 
-        // Allocate V pool — quantized or BF16 depending on kv_quant.v.
-        for _ in 0..num_layers {
-            if kv_quant.v.is_quantized() {
-                let bf16_elems = (v_bytes_per_pos + 1) / 2;
+            // V pool for this layer.
+            if layer_pair.v.is_quantized() {
+                let v_bpp = bytes_per_kv_position(head_dim, num_kv_heads, layer_pair.v);
+                let bf16_elems = (v_bpp + 1) / 2;
                 v_pool.push(backend.alloc_tensor(
                     &[total_positions, bf16_elems],
                     TensorDtype::BF16,
@@ -1090,7 +1097,7 @@ mod tests {
 
     fn make_pool(num_blocks: usize) -> (CpuBackend, KvPool<CpuBackend>) {
         let backend = CpuBackend;
-        let pool = KvPool::new(&backend, num_blocks, 4, 2, KvQuantPair::symmetric(KvQuantMode::None), 4); // kv_dim=4, 2 layers
+        let pool = KvPool::new(&backend, num_blocks, 4, 2, KvQuantPair::symmetric(KvQuantMode::None), 4, None); // kv_dim=4, 2 layers
         (backend, pool)
     }
 

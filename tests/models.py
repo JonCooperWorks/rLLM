@@ -105,7 +105,7 @@ MODEL_REGISTRY: dict[str, ModelConfig] = {
     ),
     "nemotron-3-30b": ModelConfig(
         "nemotron-h-30b", "nemotron-3-30b", "NemotronH",
-        is_moe=True, bf16_size_gb=63, supports_stream_experts=False,
+        is_moe=True, bf16_size_gb=63, supports_stream_experts=True,
         is_chat=True, in_test_suite=True,
     ),
     "nemotron-3-120b": ModelConfig(

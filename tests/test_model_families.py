@@ -99,8 +99,12 @@ def _streaming_chat_completion(base_url: str, prompt: str,
                                temperature: float = 0) -> StreamingResult:
     """Send a streaming OpenAI chat completion and measure real TTFT + tok/s.
 
-    TTFT = time from HTTP request to first content token in the SSE stream.
-    tok/s = completion_tokens / (total_time - TTFT), i.e. pure generation speed.
+    TTFT = time from HTTP request to first SSE token (content or reasoning).
+    tok/s = completion_tokens / total_time (end-to-end throughput).
+
+    We use total_time (not total - TTFT) because for thinking models, TTFT
+    includes reasoning time which IS generation.  End-to-end tok/s is the
+    metric users care about — TTFT is reported separately.
     """
     payload = {
         "messages": [{"role": "user", "content": prompt}],
@@ -112,7 +116,6 @@ def _streaming_chat_completion(base_url: str, prompt: str,
 
     t_start = time.monotonic()
     t_first_token = None
-    t_first_reasoning = None
     completion_tokens = 0
     prompt_tokens = 0
     content_pieces = []
@@ -133,10 +136,9 @@ def _streaming_chat_completion(base_url: str, prompt: str,
         try:
             obj = json.loads(data)
             delta = obj.get("choices", [{}])[0].get("delta", {})
-            if delta.get("reasoning_content") and t_first_reasoning is None:
-                t_first_reasoning = time.monotonic()
-            if delta.get("content"):
-                content_pieces.append(delta["content"])
+            if delta.get("reasoning_content") or delta.get("content"):
+                if delta.get("content"):
+                    content_pieces.append(delta["content"])
                 chunk_count += 1
                 if t_first_token is None:
                     t_first_token = time.monotonic()
@@ -149,21 +151,16 @@ def _streaming_chat_completion(base_url: str, prompt: str,
 
     t_end = time.monotonic()
 
-    # TTFT: time to first output of any kind (reasoning or content).
-    # For thinking models, the first reasoning token is the meaningful TTFT.
-    t_first_output = t_first_reasoning or t_first_token
-    if t_first_output is not None:
-        ttft_ms = (t_first_output - t_start) * 1000
+    if t_first_token is not None:
+        ttft_ms = (t_first_token - t_start) * 1000
     else:
         ttft_ms = (t_end - t_start) * 1000
 
     total_ms = (t_end - t_start) * 1000
 
-    # tok/s = tokens / generation_time (from first output to end).
-    # For thinking models this includes reasoning + content tokens.
-    gen_ms = total_ms - ttft_ms
-    gen_tps = (completion_tokens / (gen_ms / 1000)
-               if gen_ms > 0 and completion_tokens > 0 else 0)
+    # End-to-end tok/s: completion_tokens / total_time.
+    gen_tps = (completion_tokens / (total_ms / 1000)
+               if total_ms > 0 and completion_tokens > 0 else 0)
 
     return StreamingResult(
         content="".join(content_pieces),
@@ -260,7 +257,8 @@ def test_model_bf16(config_index, server_manager, models_dir, bench_context):
     config = BASE_MODELS[config_index]
 
     if config.is_moe and _should_stream_experts(config.bf16_size_gb, is_q4=False):
-        pytest.skip(f"bf16 MoE too large for memory ({config.bf16_size_gb}GB), use Q4")
+        if not config.supports_stream_experts:
+            pytest.skip(f"bf16 MoE too large for memory ({config.bf16_size_gb}GB), use Q4")
 
     model_dir = _resolve_model_dir(models_dir, config)
     if model_dir is None:

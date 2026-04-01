@@ -1,13 +1,32 @@
 // ===========================================================================
-// TurboQuant — online KV cache vector quantization.
+// TurboQuant — online KV cache vector quantization with QJL residual.
 //
 // LEARNING OVERVIEW
 //
 // What this file does:
-//   Implements TurboQuant (Zandieh et al., arXiv:2504.19874), a data-oblivious
-//   vector quantization algorithm for compressing the KV cache during inference.
-//   At 4 bits per channel it matches full-precision quality while reducing KV
-//   cache memory by ~4x.
+//   Implements a two-stage vector quantization pipeline for compressing the
+//   KV cache during inference, combining PolarQuant (Zandieh et al.,
+//   arXiv:2504.19874) with QJL residual quantization (Turney, 2025):
+//
+//   Stage 1 — PolarQuant ((b-1) bits):
+//     Random orthogonal rotation makes coordinates approximately independent
+//     and Gaussian, then Max-Lloyd scalar quantization per coordinate.
+//
+//   Stage 2 — QJL residual (1 bit):
+//     The quantization residual's sign is stored as a single bit per
+//     coordinate, along with the residual's L2 norm (gamma).  At decode
+//     time: dequant[j] = centroid[code_j] + gamma * sqrt(π/2)/sqrt(d) * sign_j.
+//     This halves the MSE vs stage-1 alone at the cost of 2 extra bytes
+//     (bf16 gamma) + ceil(d/8) sign bytes per head per position.
+//
+//   Boundary layer protection:
+//     First/last 2 layers use higher-precision quantization (turbo4 when
+//     base is turbo2/3).  Recovers 37-91% of quality gap at aggressive
+//     compression with zero speed penalty.
+//
+//   Sparse V dequantization:
+//     Attention kernel skips V dequant when weight < 1e-6.  At long contexts,
+//     most positions get negligible attention — saves significant compute.
 //
 // Why TurboQuant?
 //   The KV cache is the primary memory bottleneck for long-context inference.
@@ -15,55 +34,27 @@
 //   to the cache.  For a 32-layer model with 8 KV heads × 128 head_dim, that
 //   is 128 KB per token in BF16.  At 128K context, the KV cache alone is 16 GB.
 //
-//   TurboQuant compresses each KV vector by:
-//     1. Applying a random orthogonal rotation (making coordinates approximately
-//        independent and Gaussian — a consequence of the high-dimensional
-//        concentration of measure phenomenon).
-//     2. Applying an optimal Max-Lloyd scalar quantizer per coordinate, using
-//        precomputed codebook centroids matched to the Gaussian distribution.
-//
-//   The codebook is tiny (4-16 entries for 2-4 bits) and the rotation matrix is
-//   generated once at model load time from a fixed seed (for reproducibility
-//   and prefix cache compatibility).
-//
 // Attention-time efficiency:
 //   The rotation can be folded into the attention computation:
 //     - For K (inner products): rotate Q once, then <Pi*Q, dequant(Pi*K)> ≈ <Q,K>.
-//       No inverse rotation needed per position — just centroid table lookup.
-//     - For V (weighted sums): accumulate dequantized centroids in rotated space,
+//       No inverse rotation needed per position — just centroid + sign lookup.
+//     - For V (weighted sums): accumulate dequantized values in rotated space,
 //       then apply Pi^T once per query head at the end.
-//   This means the per-position cost is just a centroid lookup (trivial),
-//   while memory bandwidth drops ~4x (the decode bottleneck on Apple Silicon).
-//
-// Paper citation:
-//   "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate"
-//   Amir Zandieh (Google Research), Majid Daliri (NYU), Majid Hadian (Google
-//   DeepMind), Vahab Mirrokni (Google Research).  arXiv:2504.19874v1, Apr 2025.
-//   https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/
+//   Per-position cost is a centroid lookup + sign bit read (trivial),
+//   while memory bandwidth drops ~3.8x (the decode bottleneck on Apple Silicon).
 //
 // Storage format:
-//   Per KV head per position:
-//     [2 bytes bf16 norm] [ceil(head_dim × bits / 8) bytes packed codes]
-//   For 4-bit, head_dim=128: 2 + 64 = 66 bytes (vs 256 bytes BF16 = 3.9x compression)
-//   For 3-bit, head_dim=128: 2 + 48 = 50 bytes (5.1x compression)
-//   For 2-bit, head_dim=128: 2 + 32 = 34 bytes (7.5x compression)
+//   Per KV head per position (two-stage: PolarQuant + QJL):
+//     [2 bytes bf16 norm] [2 bytes bf16 gamma] [stage1 codes] [sign bits]
+//   For 4-bit (3-bit stage1), head_dim=128: 2+2+48+16 = 68 bytes (3.8x compression)
+//   For 3-bit (2-bit stage1), head_dim=128: 2+2+32+16 = 52 bytes (4.9x compression)
+//   For 2-bit (1-bit stage1), head_dim=128: 2+2+16+16 = 36 bytes (7.1x compression)
 //
-// Simplifications vs paper:
-//   1. Single shared rotation matrix across all layers (paper is agnostic,
-//      but per-layer matrices would give ~1% better quality by decorrelating
-//      layer-specific weight distributions — not worth the complexity for v1).
-//   2. Hardcoded Max-Lloyd centroids rather than running the Lloyd-Max iterative
-//      algorithm at startup.  The centroids for N(0,1) are universal constants,
-//      so precomputation is both correct and faster.
-//   3. Gram-Schmidt orthogonalisation instead of Householder QR for generating
-//      the rotation matrix.  Both produce valid random orthogonal matrices;
-//      Gram-Schmidt is simpler and fast enough for head_dim ≤ 256.
-//   4. Prefill uses full BF16 attention (K/V are quantized into the paged pool
-//      for future decode, but the prefill attention itself reads BF16 Q/K/V
-//      directly).  This is strictly better quality than quantized prefill.
-//   5. No product quantization — the paper discusses splitting dimensions into
-//      subvectors for higher-dimensional inputs, but we use scalar quantization
-//      per coordinate only.  At head_dim ≤ 256 this is sufficient.
+// References:
+//   PolarQuant: "TurboQuant: Online Vector Quantization with Near-optimal
+//   Distortion Rate", Zandieh et al.  arXiv:2504.19874v1, Apr 2025.
+//   QJL residual + boundary protection + sparse V: Turney, 2025.
+//   https://github.com/TheTom/turboquant_plus
 //
 // Related files:
 //   gpu/ops/turboquant.rs        — GpuTurboQuant trait (GPU kernel interface)
@@ -89,11 +80,11 @@ use crate::gpu::{GpuCore, TensorDtype};
 pub(crate) enum KvQuantMode {
     /// No quantization — store KV in BF16 (debugging/benchmarking only).
     None,
-    /// 2-bit TurboQuant (~7.5x compression, marginal quality degradation).
+    /// 2-bit TurboQuant (1-bit PolarQuant + 1-bit QJL sign, ~7.1x compression).
     Turbo2,
-    /// 3-bit TurboQuant (~5.1x compression, near-lossless).
+    /// 3-bit TurboQuant (2-bit PolarQuant + 1-bit QJL sign, ~4.9x compression).
     Turbo3,
-    /// 4-bit TurboQuant (~3.9x compression, quality-neutral).  Default.
+    /// 4-bit TurboQuant (3-bit PolarQuant + 1-bit QJL sign, ~3.8x compression).  Default.
     Turbo4,
 }
 
@@ -109,7 +100,7 @@ impl KvQuantMode {
         }
     }
 
-    /// Bits per coordinate for this mode.  Returns 0 for None (BF16).
+    /// Total bits per coordinate for this mode.  Returns 0 for None (BF16).
     pub fn bits(self) -> u32 {
         match self {
             Self::None => 0,
@@ -119,14 +110,17 @@ impl KvQuantMode {
         }
     }
 
-    /// Number of codebook centroids: 2^bits.
+    /// Bits used for stage-1 PolarQuant codebook.
+    ///
+    /// All quantized modes use the two-stage QJL pipeline: (bits-1) bits
+    /// for PolarQuant centroids + 1 bit for the QJL residual sign.
+    pub fn stage1_bits(self) -> u32 {
+        if self.is_quantized() { self.bits() - 1 } else { 0 }
+    }
+
+    /// Number of stage-1 codebook centroids: 2^stage1_bits.
     pub fn num_centroids(self) -> u32 {
-        match self {
-            Self::None => 0,
-            Self::Turbo2 => 4,
-            Self::Turbo3 => 8,
-            Self::Turbo4 => 16,
-        }
+        if self.is_quantized() { 1 << self.stage1_bits() } else { 0 }
     }
 
     /// Whether quantization is active.
@@ -216,6 +210,11 @@ impl KvQuantPair {
 //   Max, "Quantizing for minimum distortion", IRE Trans. IT, 1960.
 // ---------------------------------------------------------------------------
 
+/// 1-bit (2 centroids) Max-Lloyd codebook for N(0,1).
+/// Optimal: ±E[|X|] where X ~ N(0,1), i.e. ±√(2/π) ≈ ±0.7979.
+/// Used by Turbo2Plus (1-bit PolarQuant stage-1 + 1-bit QJL sign).
+const CENTROIDS_1BIT: [f32; 2] = [-0.7979, 0.7979];
+
 /// 2-bit (4 centroids) Max-Lloyd codebook for N(0,1).
 /// Optimal partition boundaries: {-0.9816, 0, 0.9816}.
 const CENTROIDS_2BIT: [f32; 4] = [-1.5104, -0.4528, 0.4528, 1.5104];
@@ -245,16 +244,21 @@ const CENTROIDS_4BIT: [f32; 16] = [
 pub(crate) struct TurboQuantConfig {
     #[allow(dead_code)] // stored for diagnostics and future per-layer mode selection
     pub mode: KvQuantMode,
+    /// Total bits per coordinate (2, 3, or 4).
     pub bits: u32,
+    /// Stage-1 (PolarQuant) bits per coordinate.
+    /// Same as `bits` for base modes; `bits - 1` for Plus modes.
+    pub stage1_bits: u32,
     pub num_centroids: u32,
-    /// Scaled Max-Lloyd centroids for the target distribution.
+    /// Scaled Max-Lloyd centroids for the stage-1 codebook.
     /// Length = num_centroids.  Sorted ascending.
     pub centroids: Vec<f32>,
-    /// Bytes per KV head per position: 2 (bf16 norm) + ceil(head_dim × bits / 8).
+    /// Bytes per KV head per position (including norm, gamma, codes, signs).
     pub bytes_per_head_pos: usize,
     /// Head dimension (for validation and kernel dispatch).
-    #[allow(dead_code)] // stored for validation; kernel uses bytes_per_head_pos for sizing
     pub head_dim: usize,
+    /// Whether this is a TurboQuant+ mode (two-stage with QJL residual).
+    pub is_plus: bool,
 }
 
 impl TurboQuantConfig {
@@ -262,32 +266,43 @@ impl TurboQuantConfig {
     ///
     /// Centroids are scaled from the standard N(0,1) codebook to N(0, 1/√d)
     /// by dividing each centroid by √head_dim.
+    ///
+    /// The centroids correspond to the stage-1 PolarQuant codebook
+    /// ((bits-1) bits), and bytes_per_head_pos includes space for the
+    /// QJL gamma norm + sign bits.
     pub fn new(mode: KvQuantMode, head_dim: usize) -> Self {
         assert!(mode.is_quantized(), "TurboQuantConfig::new called with None mode");
         let bits = mode.bits();
+        let stage1_bits = mode.stage1_bits();
         let num_centroids = mode.num_centroids();
 
         // Scale centroids from N(0,1) to N(0, 1/sqrt(d)).
+        // Use the stage-1 codebook (fewer centroids than total bit budget).
         let scale = 1.0 / (head_dim as f32).sqrt();
-        let base_centroids: &[f32] = match mode {
-            KvQuantMode::Turbo2 => &CENTROIDS_2BIT,
-            KvQuantMode::Turbo3 => &CENTROIDS_3BIT,
-            KvQuantMode::Turbo4 => &CENTROIDS_4BIT,
-            KvQuantMode::None => unreachable!(),
+        let base_centroids: &[f32] = match stage1_bits {
+            1 => &CENTROIDS_1BIT,
+            2 => &CENTROIDS_2BIT,
+            3 => &CENTROIDS_3BIT,
+            4 => &CENTROIDS_4BIT,
+            _ => unreachable!("unsupported stage1_bits: {stage1_bits}"),
         };
         let centroids: Vec<f32> = base_centroids.iter().map(|&c| c * scale).collect();
 
-        // Packed code bytes: ceil(head_dim * bits / 8).
-        let code_bytes = (head_dim * bits as usize + 7) / 8;
-        let bytes_per_head_pos = 2 + code_bytes; // 2 bytes bf16 norm + packed codes
+        // Storage layout per head per position:
+        //   [2 bf16 norm] [2 bf16 gamma] [ceil(hd * stage1_bits / 8) codes] [ceil(hd / 8) sign bits]
+        let stage1_code_bytes = (head_dim * stage1_bits as usize + 7) / 8;
+        let sign_bytes = (head_dim + 7) / 8;
+        let bytes_per_head_pos = 2 + 2 + stage1_code_bytes + sign_bytes;
 
         Self {
             mode,
             bits,
+            stage1_bits,
             num_centroids,
             centroids,
             bytes_per_head_pos,
             head_dim,
+            is_plus: true, // all quantized modes use the QJL pipeline
         }
     }
 }
@@ -295,15 +310,16 @@ impl TurboQuantConfig {
 /// Bytes per KV position across all KV heads for one pool (K or V).
 ///
 /// For BF16: num_kv_heads × head_dim × 2.
-/// For TurboQuant: num_kv_heads × bytes_per_head_pos.
+/// For TurboQuant: num_kv_heads × (2 norm + 2 gamma + stage1_codes + sign_bits).
 pub(crate) fn bytes_per_kv_position(
     head_dim: usize,
     num_kv_heads: usize,
     mode: KvQuantMode,
 ) -> usize {
     if mode.is_quantized() {
-        let code_bytes = (head_dim * mode.bits() as usize + 7) / 8;
-        num_kv_heads * (2 + code_bytes)
+        let stage1_code_bytes = (head_dim * mode.stage1_bits() as usize + 7) / 8;
+        let sign_bytes = (head_dim + 7) / 8;
+        num_kv_heads * (2 + 2 + stage1_code_bytes + sign_bytes) // norm + gamma + codes + signs
     } else {
         num_kv_heads * head_dim * 2 // BF16
     }
@@ -397,11 +413,88 @@ pub(crate) fn transpose_matrix(m: &[f32], dim: usize) -> Vec<f32> {
 }
 
 // ---------------------------------------------------------------------------
+// Boundary layer protection — per-layer quantization mode override.
+//
+// TurboQuant+ discovery (Turney, 2025): K compression drives quality loss
+// while V compression is nearly lossless.  Boundary layers (first/last N)
+// are most sensitive, so protecting them at higher precision recovers
+// 37-91% of the quality gap at turbo2/turbo3 with zero speed penalty.
+//
+// Implementation: the engine allocates boundary layers with larger KV pool
+// buffers (more bytes_per_pos) and the attention kernel receives different
+// bits/bytes_per_head_pos/centroids for those layers.
+// ---------------------------------------------------------------------------
+
+/// Boundary layer protection configuration.
+///
+/// When active, the first `first_n` and last `last_n` transformer layers
+/// use `boundary_mode` instead of the base quantization mode.  This is
+/// most effective for aggressive compression (turbo2, turbo3) where
+/// boundary layers disproportionately affect quality.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BoundaryConfig {
+    /// Number of initial layers to protect (typically 2).
+    pub first_n: usize,
+    /// Number of final layers to protect (typically 2).
+    pub last_n: usize,
+    /// Quantization mode for boundary layers (e.g., Turbo4 when base is Turbo2).
+    pub boundary_mode: KvQuantMode,
+}
+
+impl BoundaryConfig {
+    /// Default boundary protection for a given base mode.
+    ///
+    /// Returns Some for aggressive modes (Turbo2, Turbo3) where boundary
+    /// protection significantly improves quality.  Returns None for Turbo4
+    /// (already quality-neutral) and None (BF16).
+    pub fn default_for(mode: KvQuantMode) -> Option<Self> {
+        match mode {
+            KvQuantMode::Turbo2 | KvQuantMode::Turbo3 => Some(Self {
+                first_n: 2,
+                last_n: 2,
+                boundary_mode: KvQuantMode::Turbo4,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether a layer index is a boundary layer.
+    pub fn is_boundary_layer(&self, layer_idx: usize, num_layers: usize) -> bool {
+        layer_idx < self.first_n || layer_idx >= num_layers.saturating_sub(self.last_n)
+    }
+}
+
+/// Compute the effective KV quantization pair for a specific layer.
+///
+/// Interior layers use the base pair.  Boundary layers (first/last N) use
+/// the boundary mode for whichever of K/V is quantized in the base pair.
+pub(crate) fn effective_kv_pair_for_layer(
+    base: KvQuantPair,
+    boundary: Option<&BoundaryConfig>,
+    layer_idx: usize,
+    num_layers: usize,
+) -> KvQuantPair {
+    match boundary {
+        Some(bc) if bc.is_boundary_layer(layer_idx, num_layers) => {
+            // Replace quantized modes with the boundary mode.
+            KvQuantPair {
+                k: if base.k.is_quantized() { bc.boundary_mode } else { base.k },
+                v: if base.v.is_quantized() { bc.boundary_mode } else { base.v },
+            }
+        }
+        _ => base,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TurboContext — GPU-resident state for TurboQuant, bundled for forward pass.
 //
 // Created once at model load and passed by reference to every attention call.
 // Holds the rotation matrix, its transpose, the codebook centroids, and a
 // scratch buffer for the rotated query vector.
+//
+// When boundary layer protection is active, stores a second set of centroids
+// and config for boundary layers (which may use a different bit width).
 // ---------------------------------------------------------------------------
 
 /// GPU-resident TurboQuant state for a single model instance.
@@ -426,6 +519,15 @@ pub(crate) struct TurboContext<B: GpuCore> {
     /// K/V quantization pair — needed by primitives to choose the right
     /// attention path (symmetric turbo, asymmetric V-only, or BF16).
     pub kv_pair: KvQuantPair,
+
+    // Boundary layer protection (TurboQuant+).
+    /// Boundary config, if boundary layer protection is active.
+    pub boundary: Option<BoundaryConfig>,
+    /// Centroids for boundary layers (different bit width than base).
+    /// None when boundary is None or boundary mode == base mode.
+    pub boundary_centroids: Option<B::Tensor>,
+    /// Config for boundary layers.
+    pub boundary_config: Option<TurboQuantConfig>,
 }
 
 impl<B: GpuCore> TurboContext<B> {
@@ -438,7 +540,17 @@ impl<B: GpuCore> TurboContext<B> {
     /// choose the right attention path.  The V mode determines the config
     /// (bits, codebook, bytes_per_head_pos) since only V is guaranteed to
     /// be quantized when this context exists.
-    pub fn new(backend: &B, kv_pair: KvQuantPair, head_dim: usize, num_heads: usize) -> Self {
+    ///
+    /// `boundary` enables boundary layer protection: first/last N layers
+    /// use a higher-precision mode.  When the boundary mode differs from
+    /// the base mode, a separate set of centroids is uploaded for those layers.
+    pub fn new(
+        backend: &B,
+        kv_pair: KvQuantPair,
+        head_dim: usize,
+        num_heads: usize,
+        boundary: Option<BoundaryConfig>,
+    ) -> Self {
         // V mode drives the TurboQuant config — it's always quantized when
         // a TurboContext is created.
         let mode = kv_pair.v;
@@ -468,6 +580,21 @@ impl<B: GpuCore> TurboContext<B> {
             TensorDtype::F32,
         );
 
+        // Upload boundary centroids if boundary mode differs from base.
+        let (boundary_centroids, boundary_config) = match boundary {
+            Some(bc) if bc.boundary_mode != mode => {
+                let bc_config = TurboQuantConfig::new(bc.boundary_mode, head_dim);
+                let bc_bytes: &[u8] = bytemuck::cast_slice(&bc_config.centroids);
+                let bc_centroids = backend.upload_tensor(
+                    bc_bytes,
+                    &[bc_config.num_centroids as usize],
+                    TensorDtype::F32,
+                );
+                (Some(bc_centroids), Some(bc_config))
+            }
+            _ => (None, None),
+        };
+
         Self {
             pi,
             pi_t,
@@ -475,7 +602,27 @@ impl<B: GpuCore> TurboContext<B> {
             q_rot_buf,
             config,
             kv_pair,
+            boundary,
+            boundary_centroids,
+            boundary_config,
         }
+    }
+
+    /// Get the config and centroids for a specific layer.
+    ///
+    /// Returns the boundary config/centroids for boundary layers,
+    /// or the base config/centroids for interior layers.
+    pub fn config_for_layer(
+        &self, layer_idx: usize, num_layers: usize,
+    ) -> (&TurboQuantConfig, &B::Tensor) {
+        if let (Some(bc), Some(bc_config), Some(bc_centroids)) =
+            (&self.boundary, &self.boundary_config, &self.boundary_centroids)
+        {
+            if bc.is_boundary_layer(layer_idx, num_layers) {
+                return (bc_config, bc_centroids);
+            }
+        }
+        (&self.config, &self.centroids)
     }
 }
 
@@ -554,20 +701,26 @@ mod tests {
 
     #[test]
     fn test_bytes_per_kv_position_turbo4() {
-        // 4-bit: 8 heads × (2 + 128*4/8) = 8 × (2 + 64) = 8 × 66 = 528
-        assert_eq!(bytes_per_kv_position(128, 8, KvQuantMode::Turbo4), 528);
+        // 4-bit (3-bit stage1 + 1-bit QJL):
+        // 8 heads × (2 norm + 2 gamma + ceil(128*3/8) codes + ceil(128/8) signs)
+        // = 8 × (2 + 2 + 48 + 16) = 8 × 68 = 544
+        assert_eq!(bytes_per_kv_position(128, 8, KvQuantMode::Turbo4), 544);
     }
 
     #[test]
     fn test_bytes_per_kv_position_turbo3() {
-        // 3-bit: 8 heads × (2 + ceil(128*3/8)) = 8 × (2 + 48) = 8 × 50 = 400
-        assert_eq!(bytes_per_kv_position(128, 8, KvQuantMode::Turbo3), 400);
+        // 3-bit (2-bit stage1 + 1-bit QJL):
+        // 8 heads × (2 + 2 + ceil(128*2/8) + ceil(128/8))
+        // = 8 × (2 + 2 + 32 + 16) = 8 × 52 = 416
+        assert_eq!(bytes_per_kv_position(128, 8, KvQuantMode::Turbo3), 416);
     }
 
     #[test]
     fn test_bytes_per_kv_position_turbo2() {
-        // 2-bit: 8 heads × (2 + 128*2/8) = 8 × (2 + 32) = 8 × 34 = 272
-        assert_eq!(bytes_per_kv_position(128, 8, KvQuantMode::Turbo2), 272);
+        // 2-bit (1-bit stage1 + 1-bit QJL):
+        // 8 heads × (2 + 2 + ceil(128*1/8) + ceil(128/8))
+        // = 8 × (2 + 2 + 16 + 16) = 8 × 36 = 288
+        assert_eq!(bytes_per_kv_position(128, 8, KvQuantMode::Turbo2), 288);
     }
 
     #[test]
@@ -631,52 +784,57 @@ mod tests {
         }
     }
 
-    /// CPU reference: quantize a vector using rotation + nearest centroid.
-    /// Returns (norm, codes).
-    fn cpu_quantize(x: &[f32], pi: &[f32], centroids: &[f32], hd: usize) -> (f32, Vec<usize>) {
-        // L2 norm
-        let norm: f32 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
-        let inv_norm = 1.0 / norm.max(1e-6);
-
-        // Rotate normalized vector: y = Pi * (x / norm)
-        let mut codes = Vec::with_capacity(hd);
-        for j in 0..hd {
-            let mut y = 0.0f32;
-            for i in 0..hd {
-                y += pi[j * hd + i] * (x[i] * inv_norm);
-            }
-            // Nearest centroid
-            let mut best = 0;
-            let mut best_dist = f32::INFINITY;
-            for (c, &cent) in centroids.iter().enumerate() {
-                let d = (y - cent).abs();
-                if d < best_dist {
-                    best_dist = d;
-                    best = c;
-                }
-            }
-            codes.push(best);
-        }
-        (norm, codes)
-    }
-
-    /// CPU reference: compute Q·K score via rotated quantized path.
+    /// CPU reference: compute Q·K score via the two-stage TurboQuant pipeline.
+    ///
+    /// Stage 1: PolarQuant — rotate + nearest centroid at (bits-1) bits.
+    /// Stage 2: QJL — 1-bit sign of the residual + residual norm gamma.
+    /// Dequant: centroid[code] + gamma * sqrt(π/2) / sqrt(hd) * sign.
     fn cpu_turbo_score(
         q: &[f32], k: &[f32], pi: &[f32], centroids: &[f32], hd: usize,
     ) -> f32 {
-        // Rotate Q
+        // Rotate Q.
         let mut q_rot = vec![0.0f32; hd];
         for j in 0..hd {
             for i in 0..hd {
                 q_rot[j] += pi[j * hd + i] * q[i];
             }
         }
-        // Quantize K
-        let (k_norm, k_codes) = cpu_quantize(k, pi, centroids, hd);
-        // Score = q_rot · dequant(k) = sum q_rot[j] * centroid[code_j] * k_norm
+
+        // Quantize K: rotate + stage-1 centroid + QJL residual.
+        let k_norm: f32 = k.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let inv_norm = 1.0 / k_norm.max(1e-6);
+
+        let mut codes = Vec::with_capacity(hd);
+        let mut rotated_k = vec![0.0f32; hd];
+        for j in 0..hd {
+            let mut y = 0.0f32;
+            for i in 0..hd {
+                y += pi[j * hd + i] * (k[i] * inv_norm);
+            }
+            rotated_k[j] = y;
+            let mut best = 0;
+            let mut best_dist = f32::INFINITY;
+            for (c, &cent) in centroids.iter().enumerate() {
+                let d = (y - cent).abs();
+                if d < best_dist { best_dist = d; best = c; }
+            }
+            codes.push(best);
+        }
+
+        // QJL residual: sign + gamma.
+        let mut residuals = vec![0.0f32; hd];
+        for j in 0..hd {
+            residuals[j] = rotated_k[j] - centroids[codes[j]];
+        }
+        let gamma: f32 = residuals.iter().map(|r| r * r).sum::<f32>().sqrt();
+        let qjl_scale = (std::f32::consts::PI / 2.0).sqrt() / (hd as f32).sqrt();
+
+        // Score with QJL correction.
         let mut score = 0.0f32;
         for j in 0..hd {
-            score += q_rot[j] * centroids[k_codes[j]] * k_norm;
+            let sign = if residuals[j] >= 0.0 { 1.0f32 } else { -1.0f32 };
+            let dequant = centroids[codes[j]] + gamma * qjl_scale * sign;
+            score += q_rot[j] * dequant * k_norm;
         }
         score
     }
@@ -696,10 +854,10 @@ mod tests {
         // Direct dot product (ground truth)
         let direct: f32 = q.iter().zip(k.iter()).map(|(a, b)| a * b).sum();
 
-        // TurboQuant score (rotate, quantize K, dot product with rotated Q)
+        // TurboQuant score (3-bit PolarQuant + 1-bit QJL sign)
         let turbo = cpu_turbo_score(&q, &k, &pi, &config.centroids, hd);
 
-        // Should be close (4-bit quantization introduces small error)
+        // Should be close (quantization introduces small error)
         let rel_error = ((turbo - direct) / direct.abs().max(1e-6)).abs();
         assert!(
             rel_error < 0.15,
@@ -722,5 +880,151 @@ mod tests {
             ratio,
             expected_ratio,
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Boundary layer protection tests.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_boundary_config_default_for() {
+        // Turbo2 and Turbo3 get boundary protection; Turbo4 and None do not.
+        assert!(BoundaryConfig::default_for(KvQuantMode::Turbo2).is_some());
+        assert!(BoundaryConfig::default_for(KvQuantMode::Turbo3).is_some());
+        assert!(BoundaryConfig::default_for(KvQuantMode::Turbo4).is_none());
+        assert!(BoundaryConfig::default_for(KvQuantMode::None).is_none());
+
+        let bc = BoundaryConfig::default_for(KvQuantMode::Turbo2).unwrap();
+        assert_eq!(bc.first_n, 2);
+        assert_eq!(bc.last_n, 2);
+        assert_eq!(bc.boundary_mode, KvQuantMode::Turbo4);
+    }
+
+    #[test]
+    fn test_boundary_is_boundary_layer() {
+        let bc = BoundaryConfig { first_n: 2, last_n: 2, boundary_mode: KvQuantMode::Turbo4 };
+        let num_layers = 32;
+
+        // First 2 layers are boundary.
+        assert!(bc.is_boundary_layer(0, num_layers));
+        assert!(bc.is_boundary_layer(1, num_layers));
+        assert!(!bc.is_boundary_layer(2, num_layers));
+
+        // Last 2 layers are boundary.
+        assert!(!bc.is_boundary_layer(29, num_layers));
+        assert!(bc.is_boundary_layer(30, num_layers));
+        assert!(bc.is_boundary_layer(31, num_layers));
+
+        // Interior layers are not.
+        assert!(!bc.is_boundary_layer(15, num_layers));
+    }
+
+    #[test]
+    fn test_boundary_small_model() {
+        // Model with only 4 layers: all layers are boundary.
+        let bc = BoundaryConfig { first_n: 2, last_n: 2, boundary_mode: KvQuantMode::Turbo4 };
+        for i in 0..4 {
+            assert!(
+                bc.is_boundary_layer(i, 4),
+                "layer {i} should be boundary in a 4-layer model",
+            );
+        }
+    }
+
+    #[test]
+    fn test_effective_kv_pair_for_layer() {
+        let base = KvQuantPair::symmetric(KvQuantMode::Turbo2);
+        let bc = BoundaryConfig { first_n: 2, last_n: 2, boundary_mode: KvQuantMode::Turbo4 };
+        let num_layers = 32;
+
+        // Boundary layer: upgraded to Turbo4.
+        let pair = effective_kv_pair_for_layer(base, Some(&bc), 0, num_layers);
+        assert_eq!(pair.k, KvQuantMode::Turbo4);
+        assert_eq!(pair.v, KvQuantMode::Turbo4);
+
+        // Interior layer: stays at Turbo2.
+        let pair = effective_kv_pair_for_layer(base, Some(&bc), 15, num_layers);
+        assert_eq!(pair.k, KvQuantMode::Turbo2);
+        assert_eq!(pair.v, KvQuantMode::Turbo2);
+
+        // No boundary config: always base.
+        let pair = effective_kv_pair_for_layer(base, None, 0, num_layers);
+        assert_eq!(pair.k, KvQuantMode::Turbo2);
+    }
+
+    #[test]
+    fn test_effective_kv_pair_asymmetric_with_boundary() {
+        // Asymmetric K=None, V=Turbo2.  Boundary should only upgrade V.
+        let base = KvQuantPair::asymmetric(KvQuantMode::None, KvQuantMode::Turbo2);
+        let bc = BoundaryConfig { first_n: 2, last_n: 2, boundary_mode: KvQuantMode::Turbo4 };
+
+        let pair = effective_kv_pair_for_layer(base, Some(&bc), 0, 32);
+        assert_eq!(pair.k, KvQuantMode::None); // K stays BF16
+        assert_eq!(pair.v, KvQuantMode::Turbo4); // V upgraded
+    }
+
+    // -----------------------------------------------------------------------
+    // QJL two-stage pipeline tests.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_kv_quant_mode_stage1_bits() {
+        // All quantized modes use (bits-1) for stage-1 PolarQuant.
+        assert_eq!(KvQuantMode::Turbo4.stage1_bits(), 3);
+        assert_eq!(KvQuantMode::Turbo3.stage1_bits(), 2);
+        assert_eq!(KvQuantMode::Turbo2.stage1_bits(), 1);
+        assert_eq!(KvQuantMode::None.stage1_bits(), 0);
+    }
+
+    #[test]
+    fn test_kv_quant_mode_num_centroids() {
+        // Centroids = 2^stage1_bits.
+        assert_eq!(KvQuantMode::Turbo4.num_centroids(), 8);  // 2^3
+        assert_eq!(KvQuantMode::Turbo3.num_centroids(), 4);  // 2^2
+        assert_eq!(KvQuantMode::Turbo2.num_centroids(), 2);  // 2^1
+        assert_eq!(KvQuantMode::None.num_centroids(), 0);
+    }
+
+    #[test]
+    fn test_turbo_config_qjl() {
+        // Turbo3 uses 2-bit stage-1 (4 centroids) + 1-bit QJL sign.
+        let cfg = TurboQuantConfig::new(KvQuantMode::Turbo3, 128);
+        assert_eq!(cfg.centroids.len(), 4);
+        assert_eq!(cfg.num_centroids, 4);
+        assert_eq!(cfg.stage1_bits, 2);
+        assert_eq!(cfg.bits, 3);
+        assert!(cfg.is_plus);
+
+        // Turbo4 uses 3-bit stage-1 (8 centroids) + 1-bit QJL sign.
+        let cfg4 = TurboQuantConfig::new(KvQuantMode::Turbo4, 128);
+        assert_eq!(cfg4.centroids.len(), 8);
+        assert_eq!(cfg4.stage1_bits, 3);
+        assert!(cfg4.is_plus);
+    }
+
+    #[test]
+    fn test_turbo_score_all_modes() {
+        // Verify QJL roundtrip for all quantized modes.
+        let hd = 64;
+        let pi = generate_rotation_matrix(hd, 42);
+
+        use rand::{SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(123);
+        let q: Vec<f32> = (0..hd).map(|_| rng.random_normal()).collect();
+        let k: Vec<f32> = (0..hd).map(|_| rng.random_normal()).collect();
+        let direct: f32 = q.iter().zip(k.iter()).map(|(a, b)| a * b).sum();
+
+        for mode in [KvQuantMode::Turbo2, KvQuantMode::Turbo3, KvQuantMode::Turbo4] {
+            let config = TurboQuantConfig::new(mode, hd);
+            let turbo = cpu_turbo_score(&q, &k, &pi, &config.centroids, hd);
+            let rel_error = ((turbo - direct) / direct.abs().max(1e-6)).abs();
+            // Turbo2 (1-bit stage-1) is coarser; turbo3/4 are tighter.
+            let tolerance = if mode == KvQuantMode::Turbo2 { 0.50 } else { 0.30 };
+            assert!(
+                rel_error < tolerance,
+                "{:?} score error too large: {rel_error} (direct={direct}, turbo={turbo})",
+                mode,
+            );
+        }
     }
 }

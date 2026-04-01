@@ -305,12 +305,26 @@ fn load_and_run_single_gpu(
 
     // Set up TurboQuant KV cache quantization if any pool is quantized.
     // In asymmetric mode (K=BF16, V=Turbo), V still needs rotation + centroids.
+    //
+    // Boundary layer protection (TurboQuant+): at aggressive compression (turbo2,
+    // turbo3), first/last 2 layers are protected at turbo4 precision.  This
+    // recovers 37-91% of the quality gap with zero speed penalty.
+    let boundary = model::turboquant::BoundaryConfig::default_for(kv_quant.v);
     if kv_quant.is_any_quantized() {
+        if let Some(ref bc) = boundary {
+            info!(
+                first_n = bc.first_n,
+                last_n = bc.last_n,
+                boundary_mode = ?bc.boundary_mode,
+                "TurboQuant+ boundary layer protection enabled",
+            );
+        }
         model.turbo_ctx = Some(model::turboquant::TurboContext::new(
             &backend,
             kv_quant,
             config.head_dim,
             config.num_attention_heads,
+            boundary,
         ));
     }
 
@@ -339,6 +353,7 @@ fn load_and_run_single_gpu(
     let kv_dim = config.num_key_value_heads * config.head_dim;
     let kv_pool = kv_cache::KvPool::new(
         &backend, num_blocks, kv_dim, config.num_kv_layers(), kv_quant, config.head_dim,
+        boundary,
     );
 
     let weight_mb = config.estimate_weight_bytes(is_quantized, &qpb) as f64 / (1024.0 * 1024.0);

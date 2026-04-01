@@ -31,6 +31,7 @@ struct TurboQuantizeParams {
     bytes_per_head_pos: u32,
     block_size: u32,
     num_centroids: u32,
+    is_plus: u32,
 }
 
 #[repr(C)]
@@ -43,6 +44,7 @@ struct TurboQuantizeBatchParams {
     bytes_per_head_pos: u32,
     block_size: u32,
     num_centroids: u32,
+    is_plus: u32,
 }
 
 #[repr(C)]
@@ -66,6 +68,7 @@ struct TurboPagedAttentionParams {
     window_size: u32,
     attn_scale: f32,
     has_sinks: u32,
+    is_plus: u32,
 }
 
 #[repr(C)]
@@ -83,6 +86,7 @@ struct TurboPagedAttentionVOnlyParams {
     window_size: u32,
     attn_scale: f32,
     has_sinks: u32,
+    is_plus: u32,
 }
 
 impl GpuTurboQuant for MetalBackend {
@@ -98,6 +102,7 @@ impl GpuTurboQuant for MetalBackend {
         head_dim: u32,
         bits: u32,
         bytes_per_head_pos: u32,
+        is_plus: bool,
     ) {
         let params = TurboQuantizeParams {
             pos,
@@ -107,6 +112,7 @@ impl GpuTurboQuant for MetalBackend {
             bytes_per_head_pos,
             block_size: kv_cache::BLOCK_SIZE as u32,
             num_centroids: 1 << bits,
+            is_plus: is_plus as u32,
         };
 
         // One threadgroup per KV head, head_dim threads per group.
@@ -141,6 +147,7 @@ impl GpuTurboQuant for MetalBackend {
         head_dim: u32,
         bits: u32,
         bytes_per_head_pos: u32,
+        is_plus: bool,
     ) {
         let params = TurboQuantizeBatchParams {
             batch_size,
@@ -150,6 +157,7 @@ impl GpuTurboQuant for MetalBackend {
             bytes_per_head_pos,
             block_size: kv_cache::BLOCK_SIZE as u32,
             num_centroids: 1 << bits,
+            is_plus: is_plus as u32,
         };
 
         let threads_per_group = head_dim.max(32) as u64;
@@ -218,6 +226,7 @@ impl GpuTurboQuant for MetalBackend {
         window_size: u32,
         attn_scale: f32,
         sinks: Option<&MetalTensor>,
+        is_plus: bool,
     ) {
         let params = TurboPagedAttentionParams {
             seq_len,
@@ -231,6 +240,7 @@ impl GpuTurboQuant for MetalBackend {
             window_size,
             attn_scale,
             has_sinks: if sinks.is_some() { 1 } else { 0 },
+            is_plus: is_plus as u32,
         };
 
         let sinks_buf = sinks.map(|s| &s.buffer).unwrap_or(&out.buffer);
@@ -274,6 +284,7 @@ impl GpuTurboQuant for MetalBackend {
         window_size: u32,
         attn_scale: f32,
         sinks: Option<&MetalTensor>,
+        is_plus: bool,
     ) {
         let params = TurboPagedAttentionVOnlyParams {
             seq_len,
@@ -288,6 +299,7 @@ impl GpuTurboQuant for MetalBackend {
             window_size,
             attn_scale,
             has_sinks: if sinks.is_some() { 1 } else { 0 },
+            is_plus: is_plus as u32,
         };
 
         let sinks_buf = sinks.map(|s| &s.buffer).unwrap_or(&out.buffer);
