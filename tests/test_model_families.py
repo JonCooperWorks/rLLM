@@ -36,7 +36,7 @@ from models import (
     get_test_models, get_vision_models, prompt_for_index,
 )
 from quality import check_quality, QualityResult
-from conftest import _should_stream_experts
+from conftest import _should_stream_experts, _get_available_memory_gb, _get_model_disk_size_gb
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +92,26 @@ def _estimate_memory_gb(config, is_q4: bool, model_dir: str = "") -> float:
         if _should_stream_experts(config.bf16_size_gb, is_q4, model_dir):
             weight_gb *= 0.25
     return weight_gb * 1.2
+
+
+def _skip_if_too_large(config, model_dir: str, is_q4: bool = False):
+    """Skip the test if the model won't fit in available GPU memory.
+
+    Uses actual disk size when available (accurate for pre-quantized models),
+    otherwise estimates from bf16_size_gb.  Adds 20% headroom for KV cache
+    and runtime buffers.
+    """
+    if model_dir and Path(model_dir).is_dir():
+        weight_gb = _get_model_disk_size_gb(model_dir)
+    else:
+        weight_gb = config.bf16_size_gb * 0.5 if is_q4 else config.bf16_size_gb
+    required_gb = weight_gb * 1.2
+    available_gb = _get_available_memory_gb()
+    if required_gb > available_gb:
+        pytest.skip(
+            f"model needs ~{required_gb:.0f} GB but only {available_gb:.0f} GB "
+            f"GPU memory available"
+        )
 
 
 def _streaming_chat_completion(base_url: str, prompt: str,
@@ -256,20 +276,13 @@ def test_model_bf16(config_index, server_manager, models_dir, bench_context):
     """Each model family produces coherent English via streaming OpenAI API."""
     config = BASE_MODELS[config_index]
 
-    if config.is_moe and _should_stream_experts(config.bf16_size_gb, is_q4=False):
-        if not config.supports_stream_experts:
-            pytest.skip(f"bf16 MoE too large for memory ({config.bf16_size_gb}GB), use Q4")
-
     model_dir = _resolve_model_dir(models_dir, config)
     if model_dir is None:
         pytest.skip(f"model not found: {config.model_name}")
 
+    _skip_if_too_large(config, str(model_dir))
+
     extra_args = _build_extra_args(config, is_q4=False)
-    if "--stream-experts" in extra_args:
-        pytest.skip(
-            f"bf16 model too large for GPU memory without expert streaming "
-            f"({config.bf16_size_gb}GB)"
-        )
     mem = _estimate_memory_gb(config, is_q4=False)
     base_url = server_manager.get_or_start(str(model_dir), extra_args, memory_gb=mem)
 
@@ -297,11 +310,9 @@ def test_model_q4(config_index, server_manager, models_dir, bench_context):
     if model_dir is None:
         pytest.skip(f"Q4 model not found: {config.model_name}-q4")
 
+    _skip_if_too_large(config, str(model_dir), is_q4=True)
+
     extra_args = _build_extra_args(config, is_q4=True, model_dir=str(model_dir))
-    if "--stream-experts" in extra_args:
-        pytest.skip(
-            f"Q4 model too large for GPU memory without expert streaming"
-        )
     mem = _estimate_memory_gb(config, is_q4=True, model_dir=str(model_dir))
     base_url = server_manager.get_or_start(str(model_dir), extra_args, memory_gb=mem)
 
@@ -331,11 +342,9 @@ def test_model_q8(config_index, server_manager, models_dir, bench_context):
     if model_dir is None:
         pytest.skip(f"Q8 model not found: {config.model_name}-q8")
 
+    _skip_if_too_large(config, str(model_dir))
+
     extra_args = _build_extra_args(config, is_q4=False, model_dir=str(model_dir))
-    if "--stream-experts" in extra_args:
-        pytest.skip(
-            f"Q8 model too large for GPU memory without expert streaming"
-        )
     mem = _estimate_memory_gb(config, is_q4=False, model_dir=str(model_dir))
     base_url = server_manager.get_or_start(str(model_dir), extra_args, memory_gb=mem)
 
@@ -363,6 +372,8 @@ def test_model_tq3(config_index, server_manager, models_dir, bench_context):
     model_dir = _resolve_model_dir(models_dir, config, tq3=True)
     if model_dir is None:
         pytest.skip(f"TQ3 model not found: {config.model_name}-tq3")
+
+    _skip_if_too_large(config, str(model_dir), is_q4=True)
 
     extra_args = _build_extra_args(config, is_q4=True, model_dir=str(model_dir))
     mem = _estimate_memory_gb(config, is_q4=True, model_dir=str(model_dir))
@@ -396,6 +407,8 @@ def test_turboquant(config_index, server_manager, models_dir, bench_context):
     model_dir = _resolve_model_dir(models_dir, config)
     if model_dir is None:
         pytest.skip(f"model not found: {config.model_name}")
+
+    _skip_if_too_large(config, str(model_dir))
 
     mem = _estimate_memory_gb(config, is_q4=False)
     base_url = server_manager.get_or_start(str(model_dir), list(config.extra_args), memory_gb=mem)
@@ -580,6 +593,8 @@ def test_vision(config_index, server_manager, models_dir, bench_context):
     if model_dir is None:
         pytest.skip(f"model not found: {config.model_name}")
 
+    _skip_if_too_large(config, str(model_dir))
+
     extra_args = _build_extra_args(config, is_q4=False)
     mem = _estimate_memory_gb(config, is_q4=False)
     base_url = server_manager.get_or_start(str(model_dir), extra_args, memory_gb=mem)
@@ -623,6 +638,8 @@ def test_vision_q4(config_index, server_manager, models_dir, bench_context):
     model_dir = _resolve_model_dir(models_dir, config, q4=True)
     if model_dir is None:
         pytest.skip(f"Q4 model not found: {config.model_name}-q4")
+
+    _skip_if_too_large(config, str(model_dir), is_q4=True)
 
     extra_args = _build_extra_args(config, is_q4=True)
     mem = _estimate_memory_gb(config, is_q4=True)
