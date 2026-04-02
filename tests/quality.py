@@ -86,8 +86,8 @@ def _strip_markdown(text: str) -> str:
     """Strip markdown formatting for prose analysis.
 
     Removes heading markers (###), bold/italic markers (**), link syntax,
-    and other formatting that creates false-positive punctuation runs.
-    The goal is to get plain prose for structural checks.
+    table rows, and other formatting that creates false-positive punctuation
+    runs.  The goal is to get plain prose for structural checks.
     """
     # Remove heading markers.
     text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
@@ -99,6 +99,24 @@ def _strip_markdown(text: str) -> str:
     text = re.sub(r'`[^`]*`', 'code', text)
     # Remove LaTeX delimiters.
     text = re.sub(r'\\\(|\\\)|\\\[|\\\]|\$\$?', '', text)
+    # Remove markdown table separator rows (|---|---|).
+    text = re.sub(r'^\|[-:| ]+\|$', '', text, flags=re.MULTILINE)
+    # Remove markdown table data rows (lines with | delimiters).
+    text = re.sub(r'^\|.*\|$', '', text, flags=re.MULTILINE)
+    return text
+
+
+def _normalize_smart_quotes(text: str) -> str:
+    """Replace smart/curly quotes and dashes with ASCII equivalents.
+
+    Models sometimes generate typographic punctuation (U+201C/U+201D
+    double quotes, U+2018/U+2019 single quotes, U+2013/U+2014 dashes).
+    These are valid prose but their multi-byte UTF-8 encoding creates
+    false-positive punctuation runs in check 9a.
+    """
+    text = text.replace('\u201c', '"').replace('\u201d', '"')
+    text = text.replace('\u2018', "'").replace('\u2019', "'")
+    text = text.replace('\u2013', '-').replace('\u2014', '-')
     return text
 
 
@@ -306,7 +324,7 @@ def check_quality(text: str) -> QualityResult:
     # 9a. Excessive punctuation runs (5+ consecutive non-markdown).
     # Run on markdown-stripped text so heading markers (####), bold (**text**),
     # LaTeX (\(\)), and other formatting don't trigger false positives.
-    stripped_for_punct = _strip_markdown(_strip_code_blocks(text))
+    stripped_for_punct = _normalize_smart_quotes(_strip_markdown(_strip_code_blocks(text)))
     for m in re.finditer(r'[^\w\s]{5,}', stripped_for_punct):
         span = m.group()
         # Allow ellipsis variants.

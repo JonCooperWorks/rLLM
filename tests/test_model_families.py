@@ -265,6 +265,11 @@ def test_model_bf16(config_index, server_manager, models_dir, bench_context):
         pytest.skip(f"model not found: {config.model_name}")
 
     extra_args = _build_extra_args(config, is_q4=False)
+    if "--stream-experts" in extra_args:
+        pytest.skip(
+            f"bf16 model too large for GPU memory without expert streaming "
+            f"({config.bf16_size_gb}GB)"
+        )
     mem = _estimate_memory_gb(config, is_q4=False)
     base_url = server_manager.get_or_start(str(model_dir), extra_args, memory_gb=mem)
 
@@ -293,6 +298,10 @@ def test_model_q4(config_index, server_manager, models_dir, bench_context):
         pytest.skip(f"Q4 model not found: {config.model_name}-q4")
 
     extra_args = _build_extra_args(config, is_q4=True, model_dir=str(model_dir))
+    if "--stream-experts" in extra_args:
+        pytest.skip(
+            f"Q4 model too large for GPU memory without expert streaming"
+        )
     mem = _estimate_memory_gb(config, is_q4=True, model_dir=str(model_dir))
     base_url = server_manager.get_or_start(str(model_dir), extra_args, memory_gb=mem)
 
@@ -323,6 +332,10 @@ def test_model_q8(config_index, server_manager, models_dir, bench_context):
         pytest.skip(f"Q8 model not found: {config.model_name}-q8")
 
     extra_args = _build_extra_args(config, is_q4=False, model_dir=str(model_dir))
+    if "--stream-experts" in extra_args:
+        pytest.skip(
+            f"Q8 model too large for GPU memory without expert streaming"
+        )
     mem = _estimate_memory_gb(config, is_q4=False, model_dir=str(model_dir))
     base_url = server_manager.get_or_start(str(model_dir), extra_args, memory_gb=mem)
 

@@ -517,7 +517,7 @@ pub(crate) fn forward_prefill_paged<
 
 use crate::model::loader::{
     TensorStore, LayerWeights, LoaderHints, ExpertWeights, FfnLoaded,
-    upload_tensor, upload_raw_bf16, dequantize_mxfp4,
+    upload_tensor, upload_raw_bf16, upload_optional_bf16, dequantize_mxfp4,
     load_layer_norms, load_attention_weights, assemble_layer_weights,
 };
 use crate::model::config::ModelConfig;
@@ -615,7 +615,7 @@ fn load_gpt_oss_moe<B: GpuCore>(
     } else if is_mxfp4 {
         load_mxfp4_experts_local(store, backend, prefix, hidden, moe_inter, num_experts, ep_expert_range.as_deref())?
     } else {
-        // Fallback: per-expert format (shouldn't happen for GPT-OSS, but be safe).
+        // Per-expert format: pre-quantized Q4/Q8 models store each expert separately.
         let expert_iter: Vec<usize> = ep_expert_range.as_ref()
             .map(|indices| indices.clone())
             .unwrap_or_else(|| (0..num_experts).collect());
@@ -626,9 +626,9 @@ fn load_gpt_oss_moe<B: GpuCore>(
                 gate_proj: upload_tensor(store, backend, &format!("{ep}.gate_proj.weight"), &[moe_inter, hidden])?,
                 up_proj: upload_tensor(store, backend, &format!("{ep}.up_proj.weight"), &[moe_inter, hidden])?,
                 down_proj: upload_tensor(store, backend, &format!("{ep}.down_proj.weight"), &[hidden, moe_inter])?,
-                gate_bias: None,
-                up_bias: None,
-                down_bias: None,
+                gate_bias: upload_optional_bf16(store, backend, &format!("{ep}.gate_proj.bias"), &[moe_inter]),
+                up_bias: upload_optional_bf16(store, backend, &format!("{ep}.up_proj.bias"), &[moe_inter]),
+                down_bias: upload_optional_bf16(store, backend, &format!("{ep}.down_proj.bias"), &[hidden]),
             });
         }
         experts

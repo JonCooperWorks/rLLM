@@ -305,6 +305,31 @@ class TestPunctuationPatterns:
         result = check_quality(text)
         assert result.passed, f"balanced brackets should pass: {result.reason}"
 
+    def test_allows_markdown_tables(self):
+        """Markdown tables with mixed punctuation should pass."""
+        text = (
+            "Public-key cryptography uses two mathematically linked keys.\n\n"
+            "| Algorithm | Key Size | Use Case |\n"
+            "|-----------|----------|----------|\n"
+            '| RSA | 2048-bit | Encryption ("standard"). |\n'
+            "| ECDSA | 256-bit | Digital signatures |\n"
+            "| Ed25519 | 256-bit | SSH, TLS |\n\n"
+            "These algorithms form the basis of modern secure communications."
+        )
+        result = check_quality(text)
+        assert result.passed, f"markdown tables should pass: {result.reason}"
+
+    def test_allows_smart_quotes(self):
+        """Smart/curly quotes in prose should pass."""
+        text = (
+            "The professor said \u201cquantum computing will change everything.\u201d "
+            "Her colleague\u2019s response was measured \u2014 he noted that "
+            "practical applications remain years away. The field continues "
+            "to attract significant research investment worldwide."
+        )
+        result = check_quality(text)
+        assert result.passed, f"smart quotes should pass: {result.reason}"
+
 
 class TestVocabularyDiversity:
     """Verify vocabulary diversity check (check 11)."""

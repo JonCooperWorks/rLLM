@@ -1845,7 +1845,7 @@ pub(crate) fn load_moe_ffn_weights<B: GpuCore>(
 
 /// Upload an optional bf16 tensor.  Returns None if the tensor doesn't exist
 /// in the store (used for per-expert biases that may or may not be present).
-fn upload_optional_bf16<B: GpuCore>(
+pub(crate) fn upload_optional_bf16<B: GpuCore>(
     store: &TensorStore,
     backend: &B,
     name: &str,
