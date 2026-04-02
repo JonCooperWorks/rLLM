@@ -71,7 +71,7 @@ All models support bf16 and Q4. Multi-GPU via `--tp N` requires CUDA + NCCL.
 <details>
 <summary><b>NVIDIA RTX 5090 32 GB</b> — 1.79 TB/s GDDR7X (April 1, 2026)</summary>
 
-Benchmarked on [Vast.ai](https://cloud.vast.ai/?ref_id=394548). Q4 uses NVFP4 E2M1 (native on SM 12.0 Blackwell). Q8 uses FP8 E4M3 (native on SM 12.0). TTFT measured via streaming (time to first SSE token).
+Benchmarked on [RunPod](https://runpod.io?ref=249k2lel). Q4 uses NVFP4 E2M1 (native on SM 12.0 Blackwell). Q8 uses FP8 E4M3 (native on SM 12.0). TTFT measured via streaming (time to first SSE token).
 
 | Model | Params | bf16 | Q8 (FP8) | Q4 (NVFP4) | TTFT (bf16) | TTFT (Q4) |
 |---|---|---|---|---|---|---|
